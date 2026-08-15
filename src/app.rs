@@ -179,7 +179,7 @@ impl<U: Ui> App<U> {
             if state
                 .change
                 .as_ref()
-                .is_some_and(|change| !changes.changes.contains_key(change))
+                .is_some_and(|change| archive_is_absent(&changes, change))
             {
                 self.ui
                     .warn("The active change is already absent; continuing at completion commit");
@@ -443,7 +443,25 @@ impl<U: Ui> App<U> {
                 "READY or BLOCKED",
             ),
             "Claude is archiving the OpenSpec change",
-        )?;
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => match openspec_snapshot(repo, &self.ui) {
+                Ok(changes) if archive_is_absent(&changes, &change) => {
+                    self.ui.warn(
+                        "Archive completed but Claude omitted its terminal marker; accepting OpenSpec state",
+                    );
+                    state.stage = state.stage.after_ready()?;
+                    return persist_state(repo, state, &self.ui);
+                }
+                Ok(_) => return Err(error),
+                Err(check_error) => {
+                    return Err(error.context(format!(
+                        "could not also confirm archive state: {check_error}"
+                    )));
+                }
+            },
+        };
         require_ready("archive", &result.text, result.signal)?;
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)
@@ -644,6 +662,10 @@ fn require_change(state: &RunState) -> Result<String> {
         .context("workflow state has no OpenSpec change name")
 }
 
+fn archive_is_absent(changes: &ChangeSnapshot, change: &str) -> bool {
+    !changes.changes.contains_key(change)
+}
+
 fn validate_change_name(change: &str) -> Result<()> {
     let valid = !change.is_empty()
         && change
@@ -841,5 +863,15 @@ mod tests {
     fn validates_change_names() {
         assert!(validate_change_name("slice-m").is_ok());
         assert!(validate_change_name("../slice-m").is_err());
+    }
+
+    #[test]
+    fn absent_active_change_is_durable_archive_evidence() {
+        let mut changes = ChangeSnapshot::default();
+        changes
+            .changes
+            .insert("other-change".to_owned(), Value::Null);
+        assert!(archive_is_absent(&changes, "slice-n"));
+        assert!(!archive_is_absent(&changes, "other-change"));
     }
 }
