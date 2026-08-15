@@ -16,12 +16,12 @@ pub struct Cli {
     pub repo: PathBuf,
     pub interactive: bool,
     pub resume: bool,
-    pub abort: bool,
+    pub forget: bool,
+    pub direction: Option<String>,
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
     pub verbose: bool,
     pub debug: bool,
-    pub strict: bool,
     pub stream_claude: Option<StreamFilter>,
     pub dry_run: bool,
     pub permission_mode: String,
@@ -54,7 +54,7 @@ impl Cli {
 )]
 struct CliArgs {
     /// Change request, or an optional initial prompt in interactive mode.
-    #[arg(required_unless_present_any = ["interactive", "resume", "abort"])]
+    #[arg(required_unless_present_any = ["interactive", "resume", "forget"])]
     request: Option<String>,
 
     /// Repository containing .git, openspec/, and Claude skills.
@@ -69,9 +69,13 @@ struct CliArgs {
     #[arg(long, conflicts_with = "interactive")]
     resume: bool,
 
-    /// Abort an unfinished pre-milestone run and remove its owned proposal output.
-    #[arg(long, conflicts_with_all = ["interactive", "resume"])]
-    abort: bool,
+    /// Forget the saved workflow checkpoint without changing repository files or Git history.
+    #[arg(long, conflicts_with_all = ["interactive", "resume", "direction"])]
+    forget: bool,
+
+    /// One-shot guidance for the next code-changing stage of a resumed run.
+    #[arg(long, requires = "resume", value_name = "TEXT")]
+    direction: Option<String>,
 
     /// Additional arguments passed directly to Claude after `--`.
     #[arg(last = true, value_name = "CLAUDE_ARGS", requires = "interactive")]
@@ -96,17 +100,6 @@ struct CliArgs {
     /// Show resolved commands, Claude session details, and complete prompts.
     #[arg(long)]
     debug: bool,
-
-    /// Block on any unexpected commit instead of adopting safe linear descendants.
-    #[arg(
-        long,
-        env = "OSPX_BUILD_STRICT",
-        action = clap::ArgAction::Set,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        require_equals = true
-    )]
-    strict: Option<bool>,
 
     /// Stream Claude activity; optionally select activity, full, or raw filtering.
     #[arg(
@@ -170,7 +163,6 @@ struct FileConfig {
     verify_command: Option<String>,
     archive_command: Option<String>,
     stream_claude: Option<StreamFilter>,
-    strict: Option<bool>,
 }
 
 fn load_config(args: &CliArgs) -> Result<(FileConfig, Option<PathBuf>)> {
@@ -212,7 +204,8 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         repo: args.repo,
         interactive: args.interactive,
         resume: args.resume,
-        abort: args.abort,
+        forget: args.forget,
+        direction: args.direction,
         interactive_args: args.interactive_args,
         max_verify_retries: args
             .max_verify_retries
@@ -220,7 +213,6 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .unwrap_or(DEFAULT_MAX_VERIFY_RETRIES),
         verbose: args.verbose,
         debug: args.debug,
-        strict: args.strict.or(config.strict).unwrap_or(false),
         stream_claude: args.stream_claude.or(config.stream_claude),
         dry_run: args.dry_run,
         permission_mode: args
@@ -262,7 +254,6 @@ mod tests {
                 claude_model = "local-model"
                 verify_command = "/opsx:verify"
                 stream_claude = "full"
-                strict = true
             "#,
         )
         .unwrap();
@@ -278,7 +269,6 @@ mod tests {
         assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
         assert_eq!(cli.verify_command.as_deref(), Some("/opsx:verify"));
         assert_eq!(cli.stream_claude, Some(StreamFilter::Full));
-        assert!(cli.strict);
     }
 
     #[test]
@@ -386,22 +376,24 @@ mod tests {
     }
 
     #[test]
-    fn pragmatic_is_default_and_strict_is_explicit() {
-        let pragmatic = Cli::resolve(args(["ospx-build", "build something"])).unwrap();
-        assert!(!pragmatic.strict);
-        let strict = Cli::resolve(args(["ospx-build", "--strict", "build something"])).unwrap();
-        assert!(strict.strict);
-
-        let config = FileConfig {
-            strict: Some(true),
-            ..FileConfig::default()
-        };
-        let overridden = resolve_values(
-            args(["ospx-build", "--strict=false", "build something"]),
-            config,
-            None,
+    fn direction_is_one_shot_resume_input() {
+        let cli = Cli::resolve(args([
+            "ospx-build",
+            "--resume",
+            "--direction",
+            "keep the AST unchanged",
+        ]))
+        .unwrap();
+        assert_eq!(cli.direction.as_deref(), Some("keep the AST unchanged"));
+        assert!(
+            CliArgs::try_parse_from([
+                "ospx-build",
+                "--direction",
+                "orphaned direction",
+                "build something"
+            ])
+            .is_err()
         );
-        assert!(!overridden.strict);
     }
 
     #[test]
@@ -433,11 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn abort_allows_no_request_and_conflicts_with_resume() {
-        let cli = Cli::resolve(args(["ospx-build", "--abort"])).unwrap();
-        assert!(cli.abort);
+    fn forget_allows_no_request_and_conflicts_with_resume() {
+        let cli = Cli::resolve(args(["ospx-build", "--forget"])).unwrap();
+        assert!(cli.forget);
         assert!(cli.request.is_empty());
-        assert!(CliArgs::try_parse_from(["ospx-build", "--abort", "--resume"]).is_err());
+        assert!(CliArgs::try_parse_from(["ospx-build", "--forget", "--resume"]).is_err());
     }
 
     #[test]

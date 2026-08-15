@@ -9,10 +9,6 @@ claude_model = "qwen3.6-35b-a3b"
 # Optional live Claude output: "activity", "full", or "raw".
 # stream_claude = "activity"
 
-# Use the old fail-closed Git policy instead of adopting linear commits made
-# by Claude during Apply, Verify, Repair, or Archive.
-# strict = true
-
 # Uncomment these only when automatic project discovery does not match your
 # installed OpenSpec delivery profile.
 # explore_command = "/explore-unattended"

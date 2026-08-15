@@ -525,8 +525,13 @@ fn split_command(command: &str) -> Result<Vec<String>> {
 }
 
 pub fn stage_prompt(command: &str, subject: &str, terminal_values: &str) -> String {
+    let task = if command.is_empty() {
+        subject.to_owned()
+    } else {
+        format!("{command} {subject}")
+    };
     format!(
-        "{command} {subject}\n\nThis invocation is controlled by ospx-build. Operate autonomously and do not commit changes. End the final response with exactly one line in the form `OSPX_STATUS: <value>`. Allowed values for this stage: {terminal_values}. Use BLOCKED only for a genuine ambiguity or external dependency, not for an ordinary correctable engineering failure."
+        "{task}\n\nThis invocation is controlled by ospx-build. Operate autonomously. End the final response with exactly one line in the form `OSPX_STATUS: <value>`. Allowed values for this stage: {terminal_values}. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input."
     )
 }
 
