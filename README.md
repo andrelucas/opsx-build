@@ -150,6 +150,60 @@ The corresponding environment variables are:
 - `OSPX_BUILD_ARCHIVE_COMMAND`
 - `OSPX_BUILD_STREAM_CLAUDE`
 
+## Claude launcher compatibility
+
+`ospx-build` does not call an oMLX API. It starts the configured launcher as a
+synchronous subprocess and appends ordinary Claude Code CLI arguments. The
+launcher command is split into an executable and literal prefix arguments; it
+is not evaluated by a shell.
+
+For example, this configuration:
+
+```toml
+claude_command = "omlx launch claude"
+claude_model = "Qwen3.6-35B-A3B-4bit"
+```
+
+produces commands beginning with:
+
+```text
+omlx launch claude --model Qwen3.6-35B-A3B-4bit ...
+```
+
+A compatible launcher must run Claude Code synchronously, preserve its exit
+status, keep machine-readable results on stdout, and forward these Claude Code
+options:
+
+- `--print` and `--permission-mode`;
+- `--session-id`, `--resume`, and `--name`;
+- `--model` when `claude_model` is configured;
+- `--output-format json` for normal unattended operation;
+- `--output-format stream-json --verbose --forward-subagent-text` when live
+  streaming is enabled;
+- preferably `--json-schema`, returning `structured_output` in the final JSON
+  result event.
+
+For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
+`structured_output`. For streaming output it finds the final JSONL event whose
+`type` is `result`. A launcher may write diagnostics to stderr, but should not
+mix banners or unrelated prose into non-streaming JSON stdout.
+
+`--json-schema` is optional for compatibility: if the launcher clearly rejects
+that option before execution, ospx-build retries once using the documented
+`OSPX_STATUS` marker protocol. It similarly degrades from streaming JSON to
+ordinary JSON or text when an older Claude CLI clearly rejects
+`--output-format`. It never retries merely because a successful, potentially
+mutating invocation returned malformed terminal data.
+
+### oMLX-specific behavior
+
+The only oMLX-specific configuration is the launcher prefix and model name.
+The oMLX server must already be listening, normally on its default local port;
+ospx-build does not start, stop, configure, or query that server. `omlx launch
+claude` must forward the Claude Code options above. Structured and streaming
+output were tested through this launcher with Claude Code 2.1.221 and
+`Qwen3.6-35B-A3B-4bit`.
+
 ## Live output and diagnostics
 
 Stream Claude's normal assistant text and concise tool activity:
