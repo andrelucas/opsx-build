@@ -17,6 +17,8 @@ pub struct Cli {
     pub interactive: bool,
     pub resume: bool,
     pub forget: bool,
+    pub continue_existing: bool,
+    pub change: Option<String>,
     pub direction: Option<String>,
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
@@ -54,7 +56,7 @@ impl Cli {
 )]
 struct CliArgs {
     /// Change request, or an optional initial prompt in interactive mode.
-    #[arg(required_unless_present_any = ["interactive", "resume", "forget"])]
+    #[arg(required_unless_present_any = ["interactive", "resume", "forget", "continue_existing"])]
     request: Option<String>,
 
     /// Repository containing .git, openspec/, and Claude skills.
@@ -72,6 +74,22 @@ struct CliArgs {
     /// Forget the saved workflow checkpoint without changing repository files or Git history.
     #[arg(long, conflicts_with_all = ["interactive", "resume", "direction"])]
     forget: bool,
+
+    /// Continue an active OpenSpec change, committing planning work first if necessary.
+    #[arg(
+        long,
+        conflicts_with_all = ["interactive", "resume", "forget"]
+    )]
+    continue_existing: bool,
+
+    /// Select the OpenSpec change used by --continue-existing when several are active.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "continue_existing",
+        conflicts_with_all = ["interactive", "resume", "forget"]
+    )]
+    change: Option<String>,
 
     /// One-shot guidance for the next code-changing stage of a resumed run.
     #[arg(long, requires = "resume", value_name = "TEXT")]
@@ -205,6 +223,8 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         interactive: args.interactive,
         resume: args.resume,
         forget: args.forget,
+        continue_existing: args.continue_existing,
+        change: args.change,
         direction: args.direction,
         interactive_args: args.interactive_args,
         max_verify_retries: args
@@ -422,6 +442,35 @@ mod tests {
         assert!(cli.resume);
         assert!(cli.request.is_empty());
         assert!(CliArgs::try_parse_from(["ospx-build", "--resume", "--interactive"]).is_err());
+    }
+
+    #[test]
+    fn continues_existing_change_without_request() {
+        let cli = Cli::resolve(args([
+            "ospx-build",
+            "--continue-existing",
+            "--change",
+            "fix-test-harness",
+        ]))
+        .unwrap();
+        assert!(cli.continue_existing);
+        assert_eq!(cli.change.as_deref(), Some("fix-test-harness"));
+        assert!(cli.request.is_empty());
+    }
+
+    #[test]
+    fn change_selection_requires_continue_existing() {
+        assert!(CliArgs::try_parse_from(["ospx-build", "--change", "fix-test-harness"]).is_err());
+        assert!(
+            CliArgs::try_parse_from([
+                "ospx-build",
+                "--resume",
+                "--continue-existing",
+                "--change",
+                "fix-test-harness",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

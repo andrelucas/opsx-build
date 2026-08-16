@@ -16,7 +16,9 @@ use crate::{
     },
     cli::Cli,
     git::{current_head, metadata_dir, remove_metadata, repository_root},
-    openspec::{ChangeSnapshot, identify_change, snapshot as openspec_snapshot},
+    openspec::{
+        ChangeSnapshot, identify_change, select_existing_change, snapshot as openspec_snapshot,
+    },
     process::{ProcessRunner, prerequisite_exists},
     state::Stage,
     ui::Ui,
@@ -54,6 +56,22 @@ impl RunState {
             stage: Stage::Explore,
             verify_retries: 0,
             before_changes,
+            planning_session: None,
+            pending_repair: None,
+            pending_direction: None,
+            proposal_head: None,
+            final_head: None,
+        }
+    }
+
+    fn continue_existing(change: String, active_changes: ChangeSnapshot) -> Self {
+        Self {
+            schema_version: STATE_SCHEMA_VERSION,
+            request: format!("Continue existing OpenSpec change `{change}`"),
+            change: Some(change),
+            stage: Stage::ProposalCommit,
+            verify_retries: 0,
+            before_changes: active_changes,
             planning_session: None,
             pending_repair: None,
             pending_direction: None,
@@ -130,6 +148,10 @@ impl<U: Ui> App<U> {
             );
         }
 
+        if self.cli.continue_existing {
+            return self.continue_existing(&repo, &launcher, &commands);
+        }
+
         if self.cli.dry_run {
             return self.print_new_dry_run(&repo, &launcher, &commands);
         }
@@ -138,6 +160,26 @@ impl<U: Ui> App<U> {
         let state = RunState::new(self.cli.request.clone(), before_changes);
         persist_state(&repo, &state, &self.ui)?;
         self.execute(&repo, &launcher, &commands, state)
+    }
+
+    fn continue_existing(
+        &self,
+        repo: &Path,
+        launcher: &ClaudeLauncher,
+        commands: &SkillCommands,
+    ) -> Result<()> {
+        let active_changes = openspec_snapshot(repo, &self.ui)?;
+        let change = select_existing_change(&active_changes, self.cli.change.as_deref())?;
+        validate_change_name(&change)?;
+        let state = RunState::continue_existing(change.clone(), active_changes);
+        self.ui.info(&format!(
+            "Continuing OpenSpec change `{change}`; planning work will be committed if necessary"
+        ));
+        if self.cli.dry_run {
+            return self.print_resume_dry_run(&state, commands);
+        }
+        persist_state(repo, &state, &self.ui)?;
+        self.execute(repo, launcher, commands, state)
     }
 
     fn forget_checkpoint(&self, repo: &Path) -> Result<()> {
@@ -827,6 +869,17 @@ mod tests {
 
         state.consume_direction();
         assert!(state.pending_direction.is_none());
+    }
+
+    #[test]
+    fn existing_change_starts_at_proposal_commit() {
+        let state = RunState::continue_existing(
+            "test-infrastructure".to_owned(),
+            ChangeSnapshot::default(),
+        );
+        assert_eq!(state.change.as_deref(), Some("test-infrastructure"));
+        assert_eq!(state.stage, Stage::ProposalCommit);
+        assert!(state.planning_session.is_none());
     }
 
     #[test]

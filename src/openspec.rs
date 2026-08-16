@@ -111,6 +111,30 @@ pub fn identify_change(before: &ChangeSnapshot, after: &ChangeSnapshot) -> Resul
     )
 }
 
+pub fn select_existing_change(active: &ChangeSnapshot, requested: Option<&str>) -> Result<String> {
+    if let Some(change) = requested {
+        if active.changes.contains_key(change) {
+            return Ok(change.to_owned());
+        }
+        bail!("OpenSpec change `{change}` is not active");
+    }
+
+    match active
+        .changes
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [change] => Ok(change.clone()),
+        [] => bail!("no active OpenSpec change exists to continue"),
+        changes => bail!(
+            "multiple OpenSpec changes are active ({}); select one with `--change NAME`",
+            changes.join(", ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +189,23 @@ mod tests {
         let before = ChangeSnapshot::default();
         let after = parse_list_json(r#"{"changes":[{"name":"one"},{"name":"two"}]}"#).unwrap();
         assert!(identify_change(&before, &after).is_err());
+    }
+
+    #[test]
+    fn selects_only_active_change_or_explicit_change() {
+        let active =
+            parse_list_json(r#"{"changes":[{"name":"slice-m"},{"name":"test-infrastructure"}]}"#)
+                .unwrap();
+        assert_eq!(
+            select_existing_change(&active, Some("test-infrastructure")).unwrap(),
+            "test-infrastructure"
+        );
+        assert!(select_existing_change(&active, None).is_err());
+
+        let one = parse_list_json(r#"{"changes":[{"name":"test-infrastructure"}]}"#).unwrap();
+        assert_eq!(
+            select_existing_change(&one, None).unwrap(),
+            "test-infrastructure"
+        );
     }
 }

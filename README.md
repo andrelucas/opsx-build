@@ -48,6 +48,34 @@ Inspect what resume would do without changing the checkpoint or repository:
 ospx-build --repo ~/git/my-project --resume --dry-run
 ```
 
+## Continuing an existing OpenSpec change
+
+When Explore and Propose were performed outside ospx-build, continue the sole
+active OpenSpec change with:
+
+```sh
+ospx-build --repo ~/git/my-project --continue-existing
+```
+
+If several changes are active, select one explicitly:
+
+```sh
+ospx-build --repo ~/git/my-project --continue-existing \
+  --change fix-test-infrastructure
+```
+
+This does not rerun Explore or Propose. It deliberately enters at the proposal
+commit milestone: Claude commits uncommitted planning artifacts if necessary,
+or treats that step as complete when they are already committed. Apply then
+continues any remaining OpenSpec tasks, followed by Verify, Archive, and the
+completion commit. Each stage inspects durable repository/OpenSpec state, so a
+separate model call does not have to guess which stages are safe to skip.
+
+`--continue-existing --dry-run` shows the selected change and entry stage
+without writing a checkpoint. An unfinished ospx-build checkpoint must still be
+resumed or forgotten before adopting another change; a completed checkpoint is
+replaced by the adopted run.
+
 ## Directing the next iteration
 
 Supply durable, one-shot implementation guidance while resuming:
