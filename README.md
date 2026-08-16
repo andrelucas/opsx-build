@@ -98,7 +98,7 @@ without manufacturing an empty commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
-terminal markers, missing prerequisites, and retry-limit exhaustion are normal
+terminal results, missing prerequisites, and retry-limit exhaustion are normal
 errors. Their checkpoint remains at the unfinished stage for resume.
 
 ## Claude launcher and configuration
@@ -185,7 +185,12 @@ OpenSpec workflow checkpoint.
 
 ## Terminal protocol
 
-Each unattended stage ends with one marker:
+Each unattended stage asks Claude Code for schema-validated structured output.
+The result contains an `ospx_status` and a concise `summary`; Claude Code can
+re-prompt the model when its first result does not satisfy the schema.
+
+For older or compatibility-layer Claude CLIs that reject `--json-schema`,
+ospx-build falls back to final-line markers:
 
 ```text
 OSPX_STATUS: READY
@@ -196,6 +201,11 @@ OSPX_STATUS: BLOCKED
 
 Explore, Propose, Apply, Repair, Archive, and commit stages use `READY` or
 `BLOCKED`. Verify uses `VERIFIED`, `RETRY`, or `BLOCKED`.
+
+If the Claude process exits successfully but returns neither structured output
+nor a fallback marker, ospx-build does not rerun that potentially mutating
+stage. Archive additionally checks durable OpenSpec state so a completed
+archive is not repeated merely because its acknowledgement was malformed.
 
 ## Prerequisites and limitations
 

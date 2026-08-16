@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     claude::{
-        ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode, SkillCommands, StageSignal,
-        build_claude_command, build_interactive_claude_command, stage_prompt,
+        ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode, SkillCommands,
+        StageProtocol, StageSignal, build_claude_command, build_interactive_claude_command,
+        stage_prompt,
     },
     cli::Cli,
     git::{current_head, metadata_dir, remove_metadata, repository_root},
@@ -251,8 +252,9 @@ impl<U: Ui> App<U> {
         persist_state(repo, state, &self.ui)?;
         let result = claude.invoke(
             session_mode(session, is_new, "ospx-build-planning"),
-            &stage_prompt(&commands.explore, &state.request, "READY or BLOCKED"),
+            &stage_prompt(&commands.explore, &state.request, StageProtocol::Ready),
             "Claude is exploring the change",
+            StageProtocol::Ready,
         )?;
         require_ready("explore", &result.text, result.signal)?;
         state.stage = state.stage.after_ready()?;
@@ -274,8 +276,9 @@ impl<U: Ui> App<U> {
         );
         let result = claude.invoke(
             session_mode(session, is_new, "ospx-build-planning"),
-            &stage_prompt(&commands.propose, &base, "READY or BLOCKED"),
+            &stage_prompt(&commands.propose, &base, StageProtocol::Ready),
             "Claude is creating OpenSpec artifacts",
+            StageProtocol::Ready,
         )?;
         require_ready("propose", &result.text, result.signal)?;
 
@@ -307,8 +310,9 @@ impl<U: Ui> App<U> {
         );
         let result = claude.invoke(
             session_mode(session, is_new, &format!("{change}-proposal-commit")),
-            &stage_prompt("", &task, "READY or BLOCKED"),
+            &stage_prompt("", &task, StageProtocol::Ready),
             "Claude is committing the proposal",
+            StageProtocol::Ready,
         )?;
         require_ready("proposal commit", &result.text, result.signal)?;
         state.proposal_head = current_head(repo, &self.ui)?;
@@ -331,8 +335,9 @@ impl<U: Ui> App<U> {
         let result = invoke_fresh(
             claude,
             &format!("{change}-apply"),
-            &stage_prompt(&commands.apply, &subject, "READY or BLOCKED"),
+            &stage_prompt(&commands.apply, &subject, StageProtocol::Ready),
             "Claude is applying the OpenSpec change",
+            StageProtocol::Ready,
         )?;
         require_ready("apply", &result.text, result.signal)?;
         state.consume_direction();
@@ -356,9 +361,10 @@ impl<U: Ui> App<U> {
                 &format!(
                     "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
                 ),
-                "VERIFIED, RETRY, or BLOCKED",
+                StageProtocol::Verify,
             ),
             "Claude is verifying specification compliance",
+            StageProtocol::Verify,
         )?;
         match result.signal {
             StageSignal::Verified => {
@@ -414,8 +420,9 @@ impl<U: Ui> App<U> {
         let result = invoke_fresh(
             claude,
             &format!("{change}-repair-{}", state.verify_retries),
-            &stage_prompt(&commands.apply, &subject, "READY or BLOCKED"),
+            &stage_prompt(&commands.apply, &subject, StageProtocol::Ready),
             "Claude is repairing the implementation",
+            StageProtocol::Ready,
         )?;
         require_ready("repair", &result.text, result.signal)?;
         state.pending_repair = None;
@@ -440,16 +447,17 @@ impl<U: Ui> App<U> {
                 &format!(
                     "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization."
                 ),
-                "READY or BLOCKED",
+                StageProtocol::Ready,
             ),
             "Claude is archiving the OpenSpec change",
+            StageProtocol::Ready,
         );
         let result = match result {
             Ok(result) => result,
             Err(error) => match openspec_snapshot(repo, &self.ui) {
                 Ok(changes) if archive_is_absent(&changes, &change) => {
                     self.ui.warn(
-                        "Archive completed but Claude omitted its terminal marker; accepting OpenSpec state",
+                        "Archive completed but Claude omitted its terminal result; accepting OpenSpec state",
                     );
                     state.stage = state.stage.after_ready()?;
                     return persist_state(repo, state, &self.ui);
@@ -480,8 +488,9 @@ impl<U: Ui> App<U> {
         let result = invoke_fresh(
             claude,
             &format!("{change}-completion-commit"),
-            &stage_prompt("", &task, "READY or BLOCKED"),
+            &stage_prompt("", &task, StageProtocol::Ready),
             "Claude is committing the completed change",
+            StageProtocol::Ready,
         )?;
         require_ready("completion commit", &result.text, result.signal)?;
         state.final_head = current_head(repo, &self.ui)?;
@@ -497,7 +506,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         self.ui
             .warn("DRY RUN — no workflow state or subprocesses will be created");
-        let prompt = stage_prompt(&commands.explore, &self.cli.request, "READY or BLOCKED");
+        let prompt = stage_prompt(&commands.explore, &self.cli.request, StageProtocol::Ready);
         let command = build_claude_command(
             repo,
             launcher,
@@ -508,6 +517,7 @@ impl<U: Ui> App<U> {
             },
             &prompt,
             ClaudeOutputFormat::Json,
+            Some(StageProtocol::Ready.json_schema()),
         );
         self.ui.info(&format!("Explore: {}", command.display()));
         self.ui
@@ -612,6 +622,7 @@ fn invoke_fresh<U: Ui>(
     name: &str,
     prompt: &str,
     activity: &str,
+    protocol: StageProtocol,
 ) -> Result<crate::claude::ClaudeResult> {
     claude.invoke(
         SessionMode::New {
@@ -620,6 +631,7 @@ fn invoke_fresh<U: Ui>(
         },
         prompt,
         activity,
+        protocol,
     )
 }
 

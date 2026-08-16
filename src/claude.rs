@@ -150,6 +150,32 @@ pub enum StageSignal {
     Blocked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageProtocol {
+    Ready,
+    Verify,
+}
+
+impl StageProtocol {
+    fn terminal_values(self) -> &'static str {
+        match self {
+            Self::Ready => "READY or BLOCKED",
+            Self::Verify => "VERIFIED, RETRY, or BLOCKED",
+        }
+    }
+
+    pub(crate) fn json_schema(self) -> &'static str {
+        match self {
+            Self::Ready => {
+                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["READY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+            }
+            Self::Verify => {
+                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaudeResult {
     pub text: String,
@@ -177,6 +203,7 @@ pub fn build_claude_command(
     session: &SessionMode,
     prompt: &str,
     output_format: ClaudeOutputFormat,
+    json_schema: Option<&str>,
 ) -> CommandSpec {
     let mut args = launcher.prefix_args.clone();
     if let Some(model) = &launcher.model {
@@ -193,6 +220,9 @@ pub fn build_claude_command(
             args.push("--verbose".to_owned());
             args.push("--forward-subagent-text".to_owned());
         }
+    }
+    if let Some(schema) = json_schema {
+        args.extend(["--json-schema".to_owned(), schema.to_owned()]);
     }
     args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
     match session {
@@ -261,6 +291,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         session: SessionMode,
         prompt: &str,
         activity: &str,
+        protocol: StageProtocol,
     ) -> Result<ClaudeResult> {
         self.ui.debug(&format!(
             "Claude session: {}",
@@ -272,44 +303,64 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         } else {
             ClaudeOutputFormat::Json
         };
-        let spec = build_claude_command(
-            self.repo,
-            self.launcher,
-            self.permission_mode,
-            &session,
-            prompt,
-            output_format,
-        );
-        let mut output = self.run_stage_command(&spec, activity)?;
-
-        if !output.success && unsupported_json_option(&output) {
-            output_format = match output_format {
-                ClaudeOutputFormat::StreamJson => ClaudeOutputFormat::Json,
-                ClaudeOutputFormat::Json | ClaudeOutputFormat::Text => ClaudeOutputFormat::Text,
-            };
-            self.ui.warn(&format!(
-                "Claude rejected {}; retrying with {}",
-                format_name(if self.stream_filter.is_some() {
-                    ClaudeOutputFormat::StreamJson
-                } else {
-                    ClaudeOutputFormat::Json
-                }),
-                format_name(output_format)
-            ));
-            let fallback = build_claude_command(
+        let mut use_schema = true;
+        let mut first_attempt = true;
+        let output = loop {
+            let schema = use_schema.then(|| protocol.json_schema());
+            let spec = build_claude_command(
                 self.repo,
                 self.launcher,
                 self.permission_mode,
                 &session,
                 prompt,
                 output_format,
+                schema,
             );
-            output = self.runner.run(&fallback, "Retrying Claude output mode")?;
-        }
+            let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
+                self.run_stage_command(&spec, activity)?
+            } else {
+                self.runner.run(
+                    &spec,
+                    if first_attempt {
+                        activity
+                    } else {
+                        "Retrying Claude protocol"
+                    },
+                )?
+            };
+            first_attempt = false;
 
-        if !output.success {
+            if output.success {
+                break output;
+            }
+            if use_schema && unsupported_schema_option(&output) {
+                use_schema = false;
+                self.ui.warn(
+                    "Claude rejected --json-schema; using the terminal-marker compatibility protocol",
+                );
+                continue;
+            }
+            if unsupported_json_option(&output) {
+                let previous = output_format;
+                output_format = match output_format {
+                    ClaudeOutputFormat::StreamJson => ClaudeOutputFormat::Json,
+                    ClaudeOutputFormat::Json | ClaudeOutputFormat::Text => ClaudeOutputFormat::Text,
+                };
+                if output_format == previous {
+                    bail!("Claude stage failed: {}", diagnostic_text(&output));
+                }
+                if output_format == ClaudeOutputFormat::Text {
+                    use_schema = false;
+                }
+                self.ui.warn(&format!(
+                    "Claude rejected {}; retrying with {}",
+                    format_name(previous),
+                    format_name(output_format)
+                ));
+                continue;
+            }
             bail!("Claude stage failed: {}", diagnostic_text(&output));
-        }
+        };
 
         match output_format {
             ClaudeOutputFormat::StreamJson => parse_claude_stream_output(&output.stdout),
@@ -343,6 +394,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             &SessionMode::Resume { id: session_id },
             &prompt,
             ClaudeOutputFormat::Json,
+            None,
         );
         let output = self.runner.run(&spec, "Naming Claude session")?;
         if !output.success {
@@ -393,9 +445,23 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
         bail!("Claude reported an error: {text}");
     }
 
-    let signal = parse_signal(&text).with_context(|| {
-        "Claude response did not contain an `OSPX_STATUS` terminal marker; rerun with --verbose to inspect it"
-    })?;
+    let structured = parsed
+        .as_ref()
+        .map(parse_structured_output)
+        .transpose()?
+        .flatten();
+    let signal = match structured {
+        Some((signal, summary)) => {
+            return Ok(ClaudeResult {
+                text: summary,
+                session_id,
+                signal,
+            });
+        }
+        None => parse_signal(&text).with_context(|| {
+            "Claude response contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --verbose to inspect it"
+        })?,
+    };
 
     Ok(ClaudeResult {
         text,
@@ -427,9 +493,18 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
     {
         bail!("Claude reported an error: {text}");
     }
-    let signal = parse_signal(&text).context(
-        "Claude stream result did not contain an `OSPX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect it",
-    )?;
+    let signal = match parse_structured_output(&result)? {
+        Some((signal, summary)) => {
+            return Ok(ClaudeResult {
+                text: summary,
+                session_id,
+                signal,
+            });
+        }
+        None => parse_signal(&text).context(
+            "Claude stream result contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect it",
+        )?,
+    };
     Ok(ClaudeResult {
         text,
         session_id,
@@ -457,9 +532,56 @@ pub fn parse_signal(text: &str) -> Option<StageSignal> {
     })
 }
 
+fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String)>> {
+    let Some(output) = result.get("structured_output") else {
+        return Ok(None);
+    };
+    let decoded;
+    let output = if let Some(text) = output.as_str() {
+        decoded = serde_json::from_str::<Value>(text)
+            .context("Claude returned invalid JSON in `structured_output`")?;
+        &decoded
+    } else {
+        output
+    };
+    let status = output
+        .get("ospx_status")
+        .and_then(Value::as_str)
+        .context("Claude structured output omitted string field `ospx_status`")?;
+    let signal = parse_status_value(status)
+        .with_context(|| format!("Claude returned unknown structured status `{status}`"))?;
+    let summary = output
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(Some((signal, summary)))
+}
+
+fn parse_status_value(status: &str) -> Option<StageSignal> {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "READY" => Some(StageSignal::Ready),
+        "VERIFIED" => Some(StageSignal::Verified),
+        "RETRY" => Some(StageSignal::Retry),
+        "BLOCKED" => Some(StageSignal::Blocked),
+        _ => None,
+    }
+}
+
 fn unsupported_json_option(output: &ProcessOutput) -> bool {
     let diagnostic = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
-    diagnostic.contains("unknown option") && diagnostic.contains("output-format")
+    unsupported_option(&diagnostic) && diagnostic.contains("output-format")
+}
+
+fn unsupported_schema_option(output: &ProcessOutput) -> bool {
+    let diagnostic = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    unsupported_option(&diagnostic) && diagnostic.contains("json-schema")
+}
+
+fn unsupported_option(diagnostic: &str) -> bool {
+    diagnostic.contains("unknown option")
+        || diagnostic.contains("unrecognized option")
+        || diagnostic.contains("unexpected argument")
 }
 
 fn split_command(command: &str) -> Result<Vec<String>> {
@@ -524,14 +646,15 @@ fn split_command(command: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
-pub fn stage_prompt(command: &str, subject: &str, terminal_values: &str) -> String {
+pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> String {
     let task = if command.is_empty() {
         subject.to_owned()
     } else {
         format!("{command} {subject}")
     };
+    let terminal_values = protocol.terminal_values();
     format!(
-        "{task}\n\nThis invocation is controlled by ospx-build. Operate autonomously. End the final response with exactly one line in the form `OSPX_STATUS: <value>`. Allowed values for this stage: {terminal_values}. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input."
+        "{task}\n\nThis invocation is controlled by ospx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `ospx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OSPX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -555,6 +678,7 @@ mod tests {
             },
             "/apply slice",
             ClaudeOutputFormat::Json,
+            None,
         );
         assert_eq!(new.program, "omlx");
         assert_eq!(
@@ -584,6 +708,7 @@ mod tests {
             &SessionMode::Resume { id },
             "/propose slice",
             ClaudeOutputFormat::Json,
+            None,
         );
         assert!(
             resumed
@@ -599,6 +724,7 @@ mod tests {
             &SessionMode::Resume { id },
             "/verify slice",
             ClaudeOutputFormat::StreamJson,
+            None,
         );
         assert!(
             streamed
@@ -657,6 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn adds_stage_schema_to_unattended_command() {
+        let launcher = ClaudeLauncher::parse("claude", None).unwrap();
+        let schema = StageProtocol::Verify.json_schema();
+        let command = build_claude_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            &SessionMode::New {
+                id: Uuid::nil(),
+                name: None,
+            },
+            "verify",
+            ClaudeOutputFormat::Json,
+            Some(schema),
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--json-schema", schema])
+        );
+    }
+
+    #[test]
     fn parses_terminal_markers_from_last_matching_line() {
         assert_eq!(
             parse_signal("details\nOSPX_STATUS: RETRY"),
@@ -679,5 +829,26 @@ mod tests {
         let parsed = parse_claude_stream_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::Verified);
         assert_eq!(parsed.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn parses_structured_result_without_terminal_marker() {
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-2","result":"{\"ospx_status\":\"READY\",\"summary\":\"Proposal complete\"}","structured_output":{"ospx_status":"READY","summary":"Proposal complete"}}"#;
+        let parsed = parse_claude_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::Ready);
+        assert_eq!(parsed.text, "Proposal complete");
+        assert_eq!(parsed.session_id.as_deref(), Some("session-2"));
+    }
+
+    #[test]
+    fn parses_structured_result_from_jsonl_stream() {
+        let stdout = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-3\",\"result\":\"structured response\",\"structured_output\":{\"ospx_status\":\"VERIFIED\",\"summary\":\"Checks passed\"}}\n"
+        );
+        let parsed = parse_claude_stream_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::Verified);
+        assert_eq!(parsed.text, "Checks passed");
+        assert_eq!(parsed.session_id.as_deref(), Some("session-3"));
     }
 }
