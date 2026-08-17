@@ -257,6 +257,7 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             &self.ui,
         );
+        self.ui.change_name(state.change.as_deref());
 
         loop {
             if state.stage == Stage::Complete {
@@ -328,13 +329,14 @@ impl<U: Ui> App<U> {
         let after = openspec_snapshot(repo, &self.ui)?;
         let change = identify_change(&state.before_changes, &after)?;
         validate_change_name(&change)?;
+        state.change = Some(change.clone());
+        self.ui.change_name(Some(&change));
         self.ui
             .info(&format!("Selected OpenSpec change `{change}`"));
         if let Err(error) = claude.rename_session(session, &change) {
             self.ui
                 .warn(&format!("Could not rename planning session: {error}"));
         }
-        state.change = Some(change);
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)
     }

@@ -248,7 +248,7 @@ phase starts expanded; completed phases collapse but remain available with
 their elapsed time frozen:
 
 ```text
-ospx-build  /path/to/repository
+ospx-build  change: add-function-pointers  /path/to/repository
 [4/7] Apply · 14m 07s  ⠴ Claude is applying the OpenSpec change
 ──────────────────────────────────────────────────────
   ▶ ✓ [1/7] Explore · 3m 12s · 48 lines
@@ -256,6 +256,10 @@ ospx-build  /path/to/repository
   ▶ ✓ [3/7] Proposal commit · 22s · 12 lines
 › ▼ ⠴ [4/7] Apply · 14m 07s · 137 lines
 ```
+
+The change name appears as soon as proposal discovery records it in the
+ospx-build checkpoint. Resumed and `--continue-existing` runs show it from the
+start.
 
 Controls:
 

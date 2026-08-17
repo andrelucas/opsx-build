@@ -15,6 +15,7 @@ use crate::{
 
 pub trait Ui {
     fn banner(&self, repo: &str);
+    fn change_name(&self, change: Option<&str>);
     fn stage(&self, current: usize, total: usize, title: &str);
     fn info(&self, message: &str);
     fn warn(&self, message: &str);
@@ -45,6 +46,7 @@ pub struct TerminalUi {
 #[derive(Default)]
 struct TerminalState {
     repo: String,
+    change_name: Option<String>,
     stage: Option<StageView>,
     dashboard: Option<StreamDashboard>,
 }
@@ -80,6 +82,15 @@ impl Ui for TerminalUi {
         self.state.lock().unwrap().repo = repo.to_owned();
         let title = Style::new().bold().cyan().apply_to("ospx-build");
         self.write_line(&format!("{title}  {repo}"));
+    }
+
+    fn change_name(&self, change: Option<&str>) {
+        let change = change.map(str::to_owned);
+        let mut state = self.state.lock().unwrap();
+        state.change_name = change.clone();
+        if let Some(dashboard) = state.dashboard.as_mut() {
+            dashboard.set_change_name(change);
+        }
     }
 
     fn stage(&self, current: usize, total: usize, title: &str) {
@@ -171,15 +182,19 @@ impl Ui for TerminalUi {
             self.info(message);
             return;
         }
-        let (repo, stage) = {
+        let (repo, change_name, stage) = {
             let mut state = self.state.lock().unwrap();
             if let Some(dashboard) = state.dashboard.as_mut() {
                 dashboard.start_stream(message);
                 return;
             }
-            (state.repo.clone(), state.stage.clone())
+            (
+                state.repo.clone(),
+                state.change_name.clone(),
+                state.stage.clone(),
+            )
         };
-        match StreamDashboard::enter(repo) {
+        match StreamDashboard::enter(repo, change_name) {
             Ok(mut dashboard) => {
                 if let Some(stage) = stage {
                     dashboard.set_stage(stage);

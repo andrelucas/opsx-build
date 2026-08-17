@@ -64,6 +64,7 @@ struct RenderLine {
 
 pub(crate) struct StreamDashboard {
     repo: String,
+    change_name: Option<String>,
     activity: String,
     panels: Vec<PhasePanel>,
     selected_panel: usize,
@@ -80,7 +81,7 @@ pub(crate) struct StreamDashboard {
 }
 
 impl StreamDashboard {
-    pub(crate) fn enter(repo: String) -> io::Result<Self> {
+    pub(crate) fn enter(repo: String, change_name: Option<String>) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut output = io::stderr().lock();
         if let Err(error) = execute!(output, EnterAlternateScreen, EnableMouseCapture, Hide) {
@@ -91,6 +92,7 @@ impl StreamDashboard {
         let now = Instant::now();
         let mut dashboard = Self {
             repo,
+            change_name,
             activity: "Preparing workflow".to_owned(),
             panels: Vec::new(),
             selected_panel: 0,
@@ -107,6 +109,21 @@ impl StreamDashboard {
         };
         dashboard.draw()?;
         Ok(dashboard)
+    }
+
+    pub(crate) fn set_change_name(&mut self, change_name: Option<String>) {
+        self.change_name = change_name;
+        self.dirty = true;
+        if self.active {
+            let _ = self.draw();
+        }
+    }
+
+    fn header_text(&self) -> String {
+        match &self.change_name {
+            Some(change) => format!("ospx-build  change: {change}  {}", self.repo),
+            None => format!("ospx-build  {}", self.repo),
+        }
     }
 
     pub(crate) fn set_stage(&mut self, stage: StageView) {
@@ -426,7 +443,7 @@ impl StreamDashboard {
             &mut output,
             0,
             width,
-            &format!("ospx-build  {}", self.repo),
+            &self.header_text(),
             Color::Cyan,
             true,
         )?;
@@ -610,6 +627,7 @@ mod tests {
         let now = Instant::now();
         let mut dashboard = StreamDashboard {
             repo: "/repo".to_owned(),
+            change_name: None,
             activity: "working".to_owned(),
             panels: Vec::new(),
             selected_panel: 0,
@@ -651,6 +669,18 @@ mod tests {
         assert!(dashboard.panels[1].expanded);
         assert_eq!(dashboard.panels[0].lines[0].text, " claude exploring");
         assert_eq!(dashboard.panels[1].lines[0].text, " claude proposing");
+    }
+
+    #[test]
+    fn header_shows_change_name_when_known() {
+        let mut dashboard = dashboard();
+        assert_eq!(dashboard.header_text(), "ospx-build  /repo");
+
+        dashboard.set_change_name(Some("slice-m-test-infrastructure".to_owned()));
+        assert_eq!(
+            dashboard.header_text(),
+            "ospx-build  change: slice-m-test-infrastructure  /repo"
+        );
     }
 
     #[test]
@@ -728,7 +758,9 @@ mod tests {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             return;
         }
-        let mut dashboard = StreamDashboard::enter("/tmp/example".to_owned()).unwrap();
+        let mut dashboard =
+            StreamDashboard::enter("/tmp/example".to_owned(), Some("example-change".to_owned()))
+                .unwrap();
         dashboard.set_stage(StageView {
             current: 4,
             total: 7,
