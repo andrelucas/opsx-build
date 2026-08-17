@@ -240,6 +240,31 @@ Stream Claude's normal assistant text and concise tool activity:
 ospx-build --stream-claude "add function pointer support"
 ```
 
+When stdin and stderr are terminals, streaming automatically uses an
+alternate-screen dashboard. The current workflow stage and Claude activity
+remain fixed at the top while output arrives in a disclosure pane:
+
+```text
+ospx-build  /path/to/repository
+[4/7] Apply  ⠴ Claude is applying the OpenSpec change
+──────────────────────────────────────────────────────
+▼ Claude output · 137 lines · Enter/Space/click to toggle
+```
+
+Controls:
+
+- Enter, Space, `o`, or a click on the disclosure row expands/collapses output;
+- Up/Down and Page Up/Page Down scroll expanded output;
+- End returns to the newest output;
+- Escape collapses the pane;
+- Ctrl-C interrupts the current subprocess while preserving its ospx-build
+  checkpoint.
+
+The dashboard restores the previous terminal screen after each Claude stage.
+When either stdin or stderr is not a TTY—for example under CI, redirection, or
+a pipe—ospx-build emits the same filtered stream as ordinary linear text and
+does not write cursor-control sequences.
+
 Filters are:
 
 - `activity` (default): assistant/subagent text and concise tool calls;

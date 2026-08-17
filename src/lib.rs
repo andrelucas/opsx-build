@@ -1,6 +1,7 @@
 pub mod app;
 pub mod claude;
 pub mod cli;
+mod dashboard;
 pub mod git;
 pub mod openspec;
 pub mod process;

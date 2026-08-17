@@ -1,9 +1,12 @@
-use std::{io::IsTerminal, time::Duration};
+use std::{io::IsTerminal, sync::Mutex, time::Duration};
 
 use console::{Style, Term};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::stream::StreamItem;
+use crate::{
+    dashboard::{StageView, StreamDashboard},
+    stream::StreamItem,
+};
 
 pub trait Ui {
     fn banner(&self, repo: &str);
@@ -15,7 +18,11 @@ pub trait Ui {
     fn command(&self, command: &str);
     fn debug(&self, message: &str);
     fn debug_prompt(&self, label: &str, prompt: &str);
+    fn start_stream(&self, message: &str);
+    /// Poll dashboard input. Returns true when the current subprocess should stop.
+    fn poll_stream(&self) -> bool;
     fn stream_item(&self, item: &StreamItem);
+    fn finish_stream(&self, success: bool, message: &str);
     fn output(&self, stdout: &str, stderr: &str);
     fn start_activity(&self, message: &str) -> Option<ProgressBar>;
     fn finish_activity(&self, spinner: Option<ProgressBar>, success: bool, message: &str);
@@ -25,14 +32,26 @@ pub struct TerminalUi {
     verbose: bool,
     debug: bool,
     interactive: bool,
+    dashboard_enabled: bool,
+    state: Mutex<TerminalState>,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    repo: String,
+    stage: Option<StageView>,
+    dashboard: Option<StreamDashboard>,
 }
 
 impl TerminalUi {
-    pub fn new(verbose: bool, debug: bool) -> Self {
+    pub fn new(verbose: bool, debug: bool, streaming: bool) -> Self {
+        let stderr_terminal = std::io::stderr().is_terminal();
         Self {
             verbose,
             debug,
-            interactive: std::io::stderr().is_terminal(),
+            interactive: stderr_terminal,
+            dashboard_enabled: streaming && stderr_terminal && std::io::stdin().is_terminal(),
+            state: Mutex::new(TerminalState::default()),
         }
     }
 
@@ -43,11 +62,17 @@ impl TerminalUi {
 
 impl Ui for TerminalUi {
     fn banner(&self, repo: &str) {
+        self.state.lock().unwrap().repo = repo.to_owned();
         let title = Style::new().bold().cyan().apply_to("ospx-build");
         self.write_line(&format!("{title}  {repo}"));
     }
 
     fn stage(&self, current: usize, total: usize, title: &str) {
+        self.state.lock().unwrap().stage = Some(StageView {
+            current,
+            total,
+            title: title.to_owned(),
+        });
         let count = Style::new().dim().apply_to(format!("[{current}/{total}]"));
         let title = Style::new().bold().apply_to(title);
         self.write_line("");
@@ -97,7 +122,40 @@ impl Ui for TerminalUi {
         }
     }
 
+    fn start_stream(&self, message: &str) {
+        if !self.dashboard_enabled {
+            self.info(message);
+            return;
+        }
+        let (repo, stage) = {
+            let state = self.state.lock().unwrap();
+            (state.repo.clone(), state.stage.clone())
+        };
+        match StreamDashboard::enter(repo, stage, message.to_owned()) {
+            Ok(dashboard) => self.state.lock().unwrap().dashboard = Some(dashboard),
+            Err(error) => {
+                self.warn(&format!(
+                    "Could not start terminal dashboard ({error}); using linear stream output"
+                ));
+                self.info(message);
+            }
+        }
+    }
+
+    fn poll_stream(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .dashboard
+            .as_mut()
+            .is_some_and(StreamDashboard::poll)
+    }
+
     fn stream_item(&self, item: &StreamItem) {
+        if let Some(dashboard) = self.state.lock().unwrap().dashboard.as_mut() {
+            dashboard.push(item);
+            return;
+        }
         let (label, style, text) = match item {
             StreamItem::Assistant(text) => ("claude", Style::new().cyan(), text),
             StreamItem::Subagent(text) => ("agent", Style::new().blue(), text),
@@ -114,6 +172,13 @@ impl Ui for TerminalUi {
                 self.write_line(&format!("         {line}"));
             }
         }
+    }
+
+    fn finish_stream(&self, success: bool, message: &str) {
+        if let Some(mut dashboard) = self.state.lock().unwrap().dashboard.take() {
+            dashboard.leave();
+        }
+        self.finish_activity(None, success, message);
     }
 
     fn output(&self, stdout: &str, stderr: &str) {

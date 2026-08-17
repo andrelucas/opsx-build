@@ -3,6 +3,6 @@ use ospx_build::{app::App, cli::Cli, ui::TerminalUi};
 
 fn main() -> Result<()> {
     let cli = Cli::load()?;
-    let ui = TerminalUi::new(cli.verbose, cli.debug);
+    let ui = TerminalUi::new(cli.verbose, cli.debug, cli.stream_claude.is_some());
     App::new(cli, ui).run()
 }

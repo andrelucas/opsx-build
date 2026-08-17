@@ -1,9 +1,10 @@
 use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -110,12 +111,14 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         F: FnMut(&str),
     {
         self.ui.command(&spec.display());
-        self.ui.info(activity);
-        let mut child = Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        command
             .args(&spec.args)
             .current_dir(&spec.cwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_stream_process(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch `{}`", spec.program))?;
         let stdout = child
@@ -131,26 +134,50 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         spawn_pipe_reader(stdout, PipeKind::Stdout, sender.clone());
         spawn_pipe_reader(stderr, PipeKind::Stderr, sender.clone());
         drop(sender);
+        self.ui.start_stream(activity);
 
         let mut captured_stdout = String::new();
         let mut captured_stderr = String::new();
         let mut read_error = None;
-        for chunk in receiver {
-            match chunk {
-                PipeChunk::Line(PipeKind::Stdout, line) => {
+        let mut cancelled = false;
+        let mut cancel_started = None;
+        let mut forced_stop = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(PipeChunk::Line(PipeKind::Stdout, line)) => {
                     on_stdout_line(line.trim_end_matches(['\r', '\n']));
                     captured_stdout.push_str(&line);
                 }
-                PipeChunk::Line(PipeKind::Stderr, line) => captured_stderr.push_str(&line),
-                PipeChunk::Error(error) => {
+                Ok(PipeChunk::Line(PipeKind::Stderr, line)) => captured_stderr.push_str(&line),
+                Ok(PipeChunk::Error(error)) => {
                     read_error.get_or_insert(error);
                 }
-            };
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if !cancelled && self.ui.poll_stream() {
+                cancelled = true;
+                cancel_started = Some(std::time::Instant::now());
+                if let Err(error) = interrupt_stream_process(&mut child) {
+                    read_error.get_or_insert(error);
+                }
+            }
+            if !forced_stop
+                && cancel_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
+            {
+                forced_stop = true;
+                if let Err(error) = kill_stream_process(&mut child) {
+                    read_error.get_or_insert(error);
+                }
+            }
         }
 
-        let status = child
-            .wait()
-            .with_context(|| format!("failed waiting for `{}`", spec.program))?;
+        let status = child.wait();
+        let succeeded = status.as_ref().is_ok_and(|status| status.success())
+            && read_error.is_none()
+            && !cancelled;
+        self.ui.finish_stream(succeeded, activity);
+        let status = status.with_context(|| format!("failed waiting for `{}`", spec.program))?;
         if let Some(error) = read_error {
             bail!("failed reading streamed subprocess output: {error}");
         }
@@ -160,8 +187,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
             stdout: captured_stdout,
             stderr: captured_stderr,
         };
-        self.ui.finish_activity(None, output.success, activity);
         self.ui.output(&output.stdout, &output.stderr);
+        if cancelled {
+            bail!("streamed command interrupted by user");
+        }
         Ok(output)
     }
 
@@ -181,6 +210,51 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn configure_stream_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_stream_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
+    signal_process_group(child, libc::SIGINT)
+}
+
+#[cfg(not(unix))]
+fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+#[cfg(unix)]
+fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
+    signal_process_group(child, libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+#[cfg(unix)]
+fn signal_process_group(child: &Child, signal: libc::c_int) -> std::io::Result<()> {
+    let process_group = -(child.id() as libc::pid_t);
+    // SAFETY: `kill` is called with the process group created for this child and a valid signal.
+    if unsafe { libc::kill(process_group, signal) } == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -259,11 +333,39 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::IsTerminal;
+
+    #[cfg(unix)]
+    use crate::{stream::StreamItem, ui::TerminalUi};
+
     use super::*;
 
     #[test]
     fn displays_shell_safe_commands() {
         let spec = CommandSpec::new("claude", "/tmp/repo").args(["--name", "my change", "simple"]);
         assert_eq!(spec.display(), "claude --name 'my change' simple");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_process_dashboard_smoke_test_when_available() {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return;
+        }
+        let ui = TerminalUi::new(false, false, true);
+        ui.banner("/tmp/example");
+        ui.stage(4, 7, "Apply");
+        let runner = ProcessRunner::new(&ui);
+        let spec = CommandSpec::new("sh", "/tmp").args([
+            "-c",
+            "printf 'first line\\n'; sleep 0.1; printf 'second line\\n'",
+        ]);
+        let output = runner
+            .run_streaming(&spec, "Streaming test output", |line| {
+                ui.stream_item(&StreamItem::Assistant(line.to_owned()));
+            })
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, "first line\nsecond line\n");
     }
 }
