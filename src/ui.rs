@@ -1,4 +1,8 @@
-use std::{io::IsTerminal, sync::Mutex, time::Duration};
+use std::{
+    io::IsTerminal,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use console::{Style, Term};
 use crossterm::style::Color;
@@ -83,6 +87,7 @@ impl Ui for TerminalUi {
             current,
             total,
             title: title.to_owned(),
+            started_at: Instant::now(),
         };
         let mut state = self.state.lock().unwrap();
         state.stage = Some(stage.clone());

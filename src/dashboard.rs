@@ -26,6 +26,7 @@ pub(crate) struct StageView {
     pub current: usize,
     pub total: usize,
     pub title: String,
+    pub started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,7 @@ enum PhaseStatus {
 #[derive(Debug, Clone)]
 struct PhasePanel {
     stage: StageView,
+    finished_at: Option<Instant>,
     occurrence: usize,
     status: PhaseStatus,
     lines: VecDeque<DisplayLine>,
@@ -108,10 +110,12 @@ impl StreamDashboard {
     }
 
     pub(crate) fn set_stage(&mut self, stage: StageView) {
+        let now = Instant::now();
         if let Some(previous) = self.panels.last_mut() {
             if previous.status == PhaseStatus::Running {
                 previous.status = PhaseStatus::Complete;
             }
+            previous.finished_at.get_or_insert(now);
             previous.expanded = false;
         }
         let occurrence = self
@@ -124,6 +128,7 @@ impl StreamDashboard {
             + 1;
         self.panels.push(PhasePanel {
             stage,
+            finished_at: None,
             occurrence,
             status: PhaseStatus::Running,
             lines: VecDeque::new(),
@@ -145,6 +150,7 @@ impl StreamDashboard {
         self.activity = message.to_owned();
         if let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Running;
+            panel.finished_at = None;
         }
         self.dirty = true;
     }
@@ -153,6 +159,7 @@ impl StreamDashboard {
         self.activity = message.to_owned();
         if !success && let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Failed;
+            panel.finished_at = Some(Instant::now());
         }
         self.dirty = true;
         if self.active {
@@ -175,6 +182,7 @@ impl StreamDashboard {
         self.activity = message.to_owned();
         if !success && let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Failed;
+            panel.finished_at = Some(Instant::now());
         }
     }
 
@@ -355,7 +363,7 @@ impl StreamDashboard {
             .unwrap_or_default()
     }
 
-    fn render_lines(&self) -> Vec<RenderLine> {
+    fn render_lines_at(&self, now: Instant) -> Vec<RenderLine> {
         let mut lines = Vec::new();
         for (index, panel) in self.panels.iter().enumerate() {
             let selected = if index == self.selected_panel {
@@ -384,10 +392,11 @@ impl StreamDashboard {
             } else {
                 String::new()
             };
+            let elapsed = format_duration(panel.elapsed_at(now));
             lines.push(RenderLine {
                 text: format!(
-                    "{selected} {arrow} {status} [{}/{}] {}{occurrence} · {} {line_label}{dropped}",
-                    panel.stage.current, panel.stage.total, panel.stage.title, panel.total_lines
+                    "{selected} {arrow} {status} [{}/{}] {}{occurrence} · {elapsed} · {} {line_label}{dropped}",
+                    panel.stage.current, panel.stage.total, panel.stage.title, panel.total_lines,
                 ),
                 color,
                 bold: true,
@@ -406,6 +415,7 @@ impl StreamDashboard {
     }
 
     fn draw(&mut self) -> io::Result<()> {
+        let now = Instant::now();
         let (width, height) = terminal::size()?;
         if width == 0 || height == 0 {
             return Ok(());
@@ -432,8 +442,11 @@ impl StreamDashboard {
                         String::new()
                     };
                     format!(
-                        "[{}/{}] {}{occurrence}",
-                        panel.stage.current, panel.stage.total, panel.stage.title
+                        "[{}/{}] {}{occurrence} · {}",
+                        panel.stage.current,
+                        panel.stage.total,
+                        panel.stage.title,
+                        format_duration(panel.elapsed_at(now))
                     )
                 })
                 .unwrap_or_else(|| "[workflow]".to_owned());
@@ -457,7 +470,7 @@ impl StreamDashboard {
             )?;
         }
 
-        let lines = self.render_lines();
+        let lines = self.render_lines_at(now);
         let body_height = height.saturating_sub(4) as usize;
         let maximum_start = lines.len().saturating_sub(body_height);
         if self.follow_latest {
@@ -516,11 +529,20 @@ impl StreamDashboard {
             && panel.status == PhaseStatus::Running
         {
             panel.status = PhaseStatus::Complete;
+            panel.finished_at = Some(Instant::now());
         }
         let mut output = io::stderr().lock();
         let _ = execute!(output, Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
         self.active = false;
+    }
+}
+
+impl PhasePanel {
+    fn elapsed_at(&self, now: Instant) -> Duration {
+        self.finished_at
+            .unwrap_or(now)
+            .saturating_duration_since(self.stage.started_at)
     }
 }
 
@@ -567,6 +589,17 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    match (hours, minutes % 60) {
+        (0, 0) => format!("{seconds}s"),
+        (0, minutes) => format!("{minutes}m {:02}s", seconds % 60),
+        (hours, minutes) => format!("{hours}h {minutes:02}m {:02}s", seconds % 60),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::IsTerminal;
@@ -595,6 +628,7 @@ mod tests {
             current: 1,
             total: 7,
             title: "Explore".to_owned(),
+            started_at: Instant::now(),
         });
         dashboard
     }
@@ -607,6 +641,7 @@ mod tests {
             current: 2,
             total: 7,
             title: "Propose".to_owned(),
+            started_at: Instant::now(),
         });
         dashboard.push(&StreamItem::Assistant("proposing".to_owned()));
 
@@ -625,12 +660,40 @@ mod tests {
             current: 5,
             total: 7,
             title: "Verify".to_owned(),
+            started_at: Instant::now(),
         };
         dashboard.set_stage(verify.clone());
         dashboard.set_stage(verify);
         assert_eq!(dashboard.panels[1].occurrence, 1);
         assert_eq!(dashboard.panels[2].occurrence, 2);
-        assert!(dashboard.render_lines()[2].text.contains("pass 2"));
+        assert!(
+            dashboard.render_lines_at(Instant::now())[2]
+                .text
+                .contains("pass 2")
+        );
+    }
+
+    #[test]
+    fn stage_headings_show_live_and_frozen_elapsed_time() {
+        let mut dashboard = dashboard();
+        let now = Instant::now();
+        dashboard.panels[0].stage.started_at = now - Duration::from_secs(65);
+
+        assert!(dashboard.render_lines_at(now)[0].text.contains("1m 05s"));
+
+        dashboard.panels[0].finished_at = Some(now);
+        assert!(
+            dashboard.render_lines_at(now + Duration::from_secs(60))[0]
+                .text
+                .contains("1m 05s")
+        );
+    }
+
+    #[test]
+    fn formats_stage_durations_compactly() {
+        assert_eq!(format_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_duration(Duration::from_secs(7_445)), "2h 04m 05s");
     }
 
     #[test]
@@ -670,6 +733,7 @@ mod tests {
             current: 4,
             total: 7,
             title: "Apply".to_owned(),
+            started_at: Instant::now(),
         });
         dashboard.start_stream("Claude is applying the OpenSpec change");
         dashboard.push(&StreamItem::Assistant("Dashboard smoke test".to_owned()));
@@ -677,6 +741,7 @@ mod tests {
             current: 5,
             total: 7,
             title: "Verify".to_owned(),
+            started_at: Instant::now(),
         });
         dashboard.start_stream("Claude is verifying specification compliance");
         dashboard.push(&StreamItem::Assistant(

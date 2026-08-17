@@ -243,17 +243,18 @@ ospx-build --stream-claude "add function pointer support"
 When stdin and stderr are terminals, streaming automatically uses an
 alternate-screen dashboard for the whole run. Each workflow phase has its own
 disclosure, headed by status, stage position, phase name, retry/pass number
-when applicable, and captured line count. The current phase starts expanded;
-completed phases collapse but remain available:
+when applicable, live/final elapsed time, and captured line count. The current
+phase starts expanded; completed phases collapse but remain available with
+their elapsed time frozen:
 
 ```text
 ospx-build  /path/to/repository
-[4/7] Apply  ⠴ Claude is applying the OpenSpec change
+[4/7] Apply · 14m 07s  ⠴ Claude is applying the OpenSpec change
 ──────────────────────────────────────────────────────
-  ▶ ✓ [1/7] Explore · 48 lines
-  ▶ ✓ [2/7] Propose · 31 lines
-  ▶ ✓ [3/7] Proposal commit · 12 lines
-› ▼ ⠴ [4/7] Apply · 137 lines
+  ▶ ✓ [1/7] Explore · 3m 12s · 48 lines
+  ▶ ✓ [2/7] Propose · 8m 41s · 31 lines
+  ▶ ✓ [3/7] Proposal commit · 22s · 12 lines
+› ▼ ⠴ [4/7] Apply · 14m 07s · 137 lines
 ```
 
 Controls:
