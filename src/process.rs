@@ -367,5 +367,16 @@ mod tests {
             .unwrap();
         assert!(output.success);
         assert_eq!(output.stdout, "first line\nsecond line\n");
+
+        ui.stage(5, 7, "Verify");
+        let verify = CommandSpec::new("sh", "/tmp").args(["-c", "printf 'verified\\n'"]);
+        let output = runner
+            .run_streaming(&verify, "Streaming verification output", |line| {
+                ui.stream_item(&StreamItem::Assistant(line.to_owned()));
+            })
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, "verified\n");
+        ui.finish_dashboard();
     }
 }

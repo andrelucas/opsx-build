@@ -1,6 +1,7 @@
 use std::{io::IsTerminal, sync::Mutex, time::Duration};
 
 use console::{Style, Term};
+use crossterm::style::Color;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::{
@@ -23,6 +24,7 @@ pub trait Ui {
     fn poll_stream(&self) -> bool;
     fn stream_item(&self, item: &StreamItem);
     fn finish_stream(&self, success: bool, message: &str);
+    fn finish_dashboard(&self);
     fn output(&self, stdout: &str, stderr: &str);
     fn start_activity(&self, message: &str) -> Option<ProgressBar>;
     fn finish_activity(&self, spinner: Option<ProgressBar>, success: bool, message: &str);
@@ -58,6 +60,15 @@ impl TerminalUi {
     fn write_line(&self, message: &str) {
         let _ = Term::stderr().write_line(message);
     }
+
+    fn dashboard_message(&self, label: &str, color: Color, message: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(dashboard) = state.dashboard.as_mut() else {
+            return false;
+        };
+        dashboard.push_message(label, color, message);
+        true
+    }
 }
 
 impl Ui for TerminalUi {
@@ -68,11 +79,18 @@ impl Ui for TerminalUi {
     }
 
     fn stage(&self, current: usize, total: usize, title: &str) {
-        self.state.lock().unwrap().stage = Some(StageView {
+        let stage = StageView {
             current,
             total,
             title: title.to_owned(),
-        });
+        };
+        let mut state = self.state.lock().unwrap();
+        state.stage = Some(stage.clone());
+        if let Some(dashboard) = state.dashboard.as_mut() {
+            dashboard.set_stage(stage);
+            return;
+        }
+        drop(state);
         let count = Style::new().dim().apply_to(format!("[{current}/{total}]"));
         let title = Style::new().bold().apply_to(title);
         self.write_line("");
@@ -80,10 +98,16 @@ impl Ui for TerminalUi {
     }
 
     fn info(&self, message: &str) {
+        if self.dashboard_message("info", Color::Blue, message) {
+            return;
+        }
         self.write_line(&format!("{} {message}", Style::new().blue().apply_to("●")));
     }
 
     fn warn(&self, message: &str) {
+        if self.dashboard_message("warn", Color::Yellow, message) {
+            return;
+        }
         self.write_line(&format!(
             "{} {message}",
             Style::new().yellow().apply_to("!")
@@ -91,21 +115,33 @@ impl Ui for TerminalUi {
     }
 
     fn success(&self, message: &str) {
+        if self.dashboard_message("ok", Color::Green, message) {
+            return;
+        }
         self.write_line(&format!("{} {message}", Style::new().green().apply_to("✓")));
     }
 
     fn failure(&self, message: &str) {
+        if self.dashboard_message("error", Color::Red, message) {
+            return;
+        }
         self.write_line(&format!("{} {message}", Style::new().red().apply_to("✗")));
     }
 
     fn command(&self, command: &str) {
         if self.verbose || self.debug {
+            if self.dashboard_message("$", Color::DarkGrey, command) {
+                return;
+            }
             self.write_line(&format!("  {} {command}", Style::new().dim().apply_to("$")));
         }
     }
 
     fn debug(&self, message: &str) {
         if self.debug {
+            if self.dashboard_message("debug", Color::Magenta, message) {
+                return;
+            }
             let label = Style::new().magenta().apply_to("debug");
             self.write_line(&format!("  {label} {message}"));
         }
@@ -113,6 +149,9 @@ impl Ui for TerminalUi {
 
     fn debug_prompt(&self, label: &str, prompt: &str) {
         if !self.debug {
+            return;
+        }
+        if self.dashboard_message("prompt", Color::Magenta, &format!("{label}\n{prompt}")) {
             return;
         }
         let marker = Style::new().magenta().apply_to("prompt");
@@ -128,11 +167,21 @@ impl Ui for TerminalUi {
             return;
         }
         let (repo, stage) = {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            if let Some(dashboard) = state.dashboard.as_mut() {
+                dashboard.start_stream(message);
+                return;
+            }
             (state.repo.clone(), state.stage.clone())
         };
-        match StreamDashboard::enter(repo, stage, message.to_owned()) {
-            Ok(dashboard) => self.state.lock().unwrap().dashboard = Some(dashboard),
+        match StreamDashboard::enter(repo) {
+            Ok(mut dashboard) => {
+                if let Some(stage) = stage {
+                    dashboard.set_stage(stage);
+                }
+                dashboard.start_stream(message);
+                self.state.lock().unwrap().dashboard = Some(dashboard);
+            }
             Err(error) => {
                 self.warn(&format!(
                     "Could not start terminal dashboard ({error}); using linear stream output"
@@ -175,14 +224,30 @@ impl Ui for TerminalUi {
     }
 
     fn finish_stream(&self, success: bool, message: &str) {
-        if let Some(mut dashboard) = self.state.lock().unwrap().dashboard.take() {
-            dashboard.leave();
+        if let Some(dashboard) = self.state.lock().unwrap().dashboard.as_mut() {
+            dashboard.finish_stream(success, message);
+            return;
         }
         self.finish_activity(None, success, message);
     }
 
+    fn finish_dashboard(&self) {
+        if let Some(mut dashboard) = self.state.lock().unwrap().dashboard.take() {
+            dashboard.leave();
+        }
+    }
+
     fn output(&self, stdout: &str, stderr: &str) {
         if !self.verbose {
+            return;
+        }
+        if self.state.lock().unwrap().dashboard.is_some() {
+            if !stdout.is_empty() {
+                self.dashboard_message("stdout", Color::DarkGrey, stdout);
+            }
+            if !stderr.is_empty() {
+                self.dashboard_message("stderr", Color::Yellow, stderr);
+            }
             return;
         }
         for line in stdout.lines() {
@@ -194,6 +259,10 @@ impl Ui for TerminalUi {
     }
 
     fn start_activity(&self, message: &str) -> Option<ProgressBar> {
+        if let Some(dashboard) = self.state.lock().unwrap().dashboard.as_mut() {
+            dashboard.start_activity(message);
+            return None;
+        }
         if !self.interactive {
             self.info(message);
             return None;
@@ -213,6 +282,10 @@ impl Ui for TerminalUi {
     fn finish_activity(&self, spinner: Option<ProgressBar>, success: bool, message: &str) {
         if let Some(spinner) = spinner {
             spinner.finish_and_clear();
+        }
+        if let Some(dashboard) = self.state.lock().unwrap().dashboard.as_mut() {
+            dashboard.finish_activity(success, message);
+            return;
         }
         if success {
             self.success(message);

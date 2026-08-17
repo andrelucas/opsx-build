@@ -18,7 +18,6 @@ use crossterm::{
 
 use crate::stream::StreamItem;
 
-const DISCLOSURE_ROW: u16 = 3;
 const MAX_DISPLAY_LINES: usize = 20_000;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -35,15 +34,42 @@ struct DisplayLine {
     color: Color,
 }
 
-pub(crate) struct StreamDashboard {
-    repo: String,
-    stage: Option<StageView>,
-    activity: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseStatus {
+    Running,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct PhasePanel {
+    stage: StageView,
+    occurrence: usize,
+    status: PhaseStatus,
     lines: VecDeque<DisplayLine>,
     total_lines: usize,
     dropped_lines: usize,
     expanded: bool,
-    scroll_from_bottom: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RenderLine {
+    text: String,
+    color: Color,
+    bold: bool,
+    panel: Option<usize>,
+}
+
+pub(crate) struct StreamDashboard {
+    repo: String,
+    activity: String,
+    panels: Vec<PhasePanel>,
+    selected_panel: usize,
+    viewport_start: usize,
+    follow_latest: bool,
+    ensure_selected: bool,
+    heading_rows: Vec<(u16, usize)>,
+    retained_lines: usize,
     spinner_index: usize,
     last_tick: Instant,
     last_draw: Instant,
@@ -52,11 +78,7 @@ pub(crate) struct StreamDashboard {
 }
 
 impl StreamDashboard {
-    pub(crate) fn enter(
-        repo: String,
-        stage: Option<StageView>,
-        activity: String,
-    ) -> io::Result<Self> {
+    pub(crate) fn enter(repo: String) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut output = io::stderr().lock();
         if let Err(error) = execute!(output, EnterAlternateScreen, EnableMouseCapture, Hide) {
@@ -67,13 +89,14 @@ impl StreamDashboard {
         let now = Instant::now();
         let mut dashboard = Self {
             repo,
-            stage,
-            activity,
-            lines: VecDeque::new(),
-            total_lines: 0,
-            dropped_lines: 0,
-            expanded: true,
-            scroll_from_bottom: 0,
+            activity: "Preparing workflow".to_owned(),
+            panels: Vec::new(),
+            selected_panel: 0,
+            viewport_start: 0,
+            follow_latest: true,
+            ensure_selected: false,
+            heading_rows: Vec::new(),
+            retained_lines: 0,
             spinner_index: 0,
             last_tick: now,
             last_draw: now,
@@ -84,15 +107,78 @@ impl StreamDashboard {
         Ok(dashboard)
     }
 
-    pub(crate) fn push(&mut self, item: &StreamItem) {
-        let (label, color, text) = match item {
-            StreamItem::Assistant(text) => ("claude", Color::Cyan, text),
-            StreamItem::Subagent(text) => ("agent", Color::Blue, text),
-            StreamItem::Tool(text) => ("tool", Color::Yellow, text),
-            StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
-            StreamItem::Lifecycle(text) => ("event", Color::Magenta, text),
-            StreamItem::Raw(text) => ("json", Color::DarkGrey, text),
-        };
+    pub(crate) fn set_stage(&mut self, stage: StageView) {
+        if let Some(previous) = self.panels.last_mut() {
+            if previous.status == PhaseStatus::Running {
+                previous.status = PhaseStatus::Complete;
+            }
+            previous.expanded = false;
+        }
+        let occurrence = self
+            .panels
+            .iter()
+            .filter(|panel| {
+                panel.stage.current == stage.current && panel.stage.title == stage.title
+            })
+            .count()
+            + 1;
+        self.panels.push(PhasePanel {
+            stage,
+            occurrence,
+            status: PhaseStatus::Running,
+            lines: VecDeque::new(),
+            total_lines: 0,
+            dropped_lines: 0,
+            expanded: true,
+        });
+        self.selected_panel = self.panels.len() - 1;
+        self.activity = "Preparing phase".to_owned();
+        self.follow_latest = true;
+        self.ensure_selected = true;
+        self.dirty = true;
+        if self.active {
+            let _ = self.draw();
+        }
+    }
+
+    pub(crate) fn start_stream(&mut self, message: &str) {
+        self.activity = message.to_owned();
+        if let Some(panel) = self.panels.last_mut() {
+            panel.status = PhaseStatus::Running;
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn finish_stream(&mut self, success: bool, message: &str) {
+        self.activity = message.to_owned();
+        if !success && let Some(panel) = self.panels.last_mut() {
+            panel.status = PhaseStatus::Failed;
+        }
+        self.dirty = true;
+        if self.active {
+            let _ = self.draw();
+        }
+    }
+
+    pub(crate) fn start_activity(&mut self, message: &str) {
+        self.activity = message.to_owned();
+        self.dirty = true;
+    }
+
+    pub(crate) fn finish_activity(&mut self, success: bool, message: &str) {
+        let marker = if success { "✓" } else { "✗" };
+        let color = if success { Color::Green } else { Color::Red };
+        self.push_line(DisplayLine {
+            text: format!("  event {marker} {}", sanitize(message)),
+            color,
+        });
+        self.activity = message.to_owned();
+        if !success && let Some(panel) = self.panels.last_mut() {
+            panel.status = PhaseStatus::Failed;
+        }
+    }
+
+    pub(crate) fn push_message(&mut self, label: &str, color: Color, text: &str) {
         for (index, line) in text.lines().enumerate() {
             let prefix = if index == 0 {
                 format!("{label:>7} ")
@@ -106,17 +192,38 @@ impl StreamDashboard {
         }
     }
 
+    pub(crate) fn push(&mut self, item: &StreamItem) {
+        let (label, color, text) = match item {
+            StreamItem::Assistant(text) => ("claude", Color::Cyan, text),
+            StreamItem::Subagent(text) => ("agent", Color::Blue, text),
+            StreamItem::Tool(text) => ("tool", Color::Yellow, text),
+            StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
+            StreamItem::Lifecycle(text) => ("event", Color::Magenta, text),
+            StreamItem::Raw(text) => ("json", Color::DarkGrey, text),
+        };
+        self.push_message(label, color, text);
+    }
+
     fn push_line(&mut self, line: DisplayLine) {
-        self.total_lines += 1;
-        if self.scroll_from_bottom > 0 {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
-        }
-        self.lines.push_back(line);
-        if self.lines.len() > MAX_DISPLAY_LINES {
-            self.lines.pop_front();
-            self.dropped_lines += 1;
-        }
+        let Some(panel) = self.panels.last_mut() else {
+            return;
+        };
+        panel.total_lines += 1;
+        panel.lines.push_back(line);
+        self.retained_lines += 1;
+        self.trim_oldest_lines();
         self.dirty = true;
+    }
+
+    fn trim_oldest_lines(&mut self) {
+        while self.retained_lines > MAX_DISPLAY_LINES {
+            let Some(panel) = self.panels.iter_mut().find(|panel| !panel.lines.is_empty()) else {
+                break;
+            };
+            panel.lines.pop_front();
+            panel.dropped_lines += 1;
+            self.retained_lines -= 1;
+        }
     }
 
     pub(crate) fn poll(&mut self) -> bool {
@@ -124,11 +231,7 @@ impl StreamDashboard {
         for _ in 0..32 {
             match event::poll(Duration::ZERO) {
                 Ok(true) => match event::read() {
-                    Ok(event) => {
-                        if self.handle_event(event) {
-                            cancel = true;
-                        }
-                    }
+                    Ok(event) => cancel |= self.handle_event(event),
                     Err(_) => break,
                 },
                 Ok(false) | Err(_) => break,
@@ -157,34 +260,35 @@ impl StreamDashboard {
                 return true;
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('o') => {
-                    self.expanded = !self.expanded;
-                    self.dirty = true;
-                }
-                KeyCode::Esc => {
-                    self.expanded = false;
-                    self.dirty = true;
-                }
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('o') => self.toggle_selected(),
+                KeyCode::Tab | KeyCode::Right => self.select_next(),
+                KeyCode::BackTab | KeyCode::Left => self.select_previous(),
+                KeyCode::Esc => self.collapse_selected(),
                 KeyCode::Up => self.scroll_up(1),
                 KeyCode::Down => self.scroll_down(1),
                 KeyCode::PageUp => self.scroll_up(self.body_height().max(1)),
                 KeyCode::PageDown => self.scroll_down(self.body_height().max(1)),
                 KeyCode::Home => {
-                    self.scroll_from_bottom = usize::MAX;
+                    self.viewport_start = 0;
+                    self.follow_latest = false;
                     self.dirty = true;
                 }
                 KeyCode::End => {
-                    self.scroll_from_bottom = 0;
+                    self.follow_latest = true;
                     self.dirty = true;
                 }
                 _ => {}
             },
-            Event::Mouse(mouse)
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && mouse.row == DISCLOSURE_ROW =>
-            {
-                self.expanded = !self.expanded;
-                self.dirty = true;
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, panel)) = self
+                    .heading_rows
+                    .iter()
+                    .find(|(row, _)| *row == mouse.row)
+                    .copied()
+                {
+                    self.selected_panel = panel;
+                    self.toggle_selected();
+                }
             }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => self.scroll_up(3),
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => self.scroll_down(3),
@@ -194,24 +298,111 @@ impl StreamDashboard {
         false
     }
 
-    fn scroll_up(&mut self, amount: usize) {
-        if self.expanded {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(amount);
+    fn toggle_selected(&mut self) {
+        if let Some(panel) = self.panels.get_mut(self.selected_panel) {
+            panel.expanded = !panel.expanded;
+            self.ensure_selected = true;
+            self.follow_latest = false;
             self.dirty = true;
         }
     }
 
-    fn scroll_down(&mut self, amount: usize) {
-        if self.expanded {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(amount);
+    fn collapse_selected(&mut self) {
+        if let Some(panel) = self.panels.get_mut(self.selected_panel) {
+            panel.expanded = false;
+            self.ensure_selected = true;
+            self.follow_latest = false;
             self.dirty = true;
         }
+    }
+
+    fn select_next(&mut self) {
+        if !self.panels.is_empty() {
+            self.selected_panel = (self.selected_panel + 1) % self.panels.len();
+            self.ensure_selected = true;
+            self.follow_latest = false;
+            self.dirty = true;
+        }
+    }
+
+    fn select_previous(&mut self) {
+        if !self.panels.is_empty() {
+            self.selected_panel = self
+                .selected_panel
+                .checked_sub(1)
+                .unwrap_or(self.panels.len() - 1);
+            self.ensure_selected = true;
+            self.follow_latest = false;
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.viewport_start = self.viewport_start.saturating_sub(amount);
+        self.follow_latest = false;
+        self.dirty = true;
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.viewport_start = self.viewport_start.saturating_add(amount);
+        self.follow_latest = false;
+        self.dirty = true;
     }
 
     fn body_height(&self) -> usize {
         terminal::size()
-            .map(|(_, height)| height.saturating_sub(5) as usize)
+            .map(|(_, height)| height.saturating_sub(4) as usize)
             .unwrap_or_default()
+    }
+
+    fn render_lines(&self) -> Vec<RenderLine> {
+        let mut lines = Vec::new();
+        for (index, panel) in self.panels.iter().enumerate() {
+            let selected = if index == self.selected_panel {
+                "›"
+            } else {
+                " "
+            };
+            let arrow = if panel.expanded { "▼" } else { "▶" };
+            let (status, color) = match panel.status {
+                PhaseStatus::Running => (SPINNER[self.spinner_index], Color::Yellow),
+                PhaseStatus::Complete => ("✓", Color::Green),
+                PhaseStatus::Failed => ("✗", Color::Red),
+            };
+            let occurrence = if panel.occurrence > 1 {
+                format!(" · pass {}", panel.occurrence)
+            } else {
+                String::new()
+            };
+            let line_label = if panel.total_lines == 1 {
+                "line"
+            } else {
+                "lines"
+            };
+            let dropped = if panel.dropped_lines > 0 {
+                format!(" · {} older hidden", panel.dropped_lines)
+            } else {
+                String::new()
+            };
+            lines.push(RenderLine {
+                text: format!(
+                    "{selected} {arrow} {status} [{}/{}] {}{occurrence} · {} {line_label}{dropped}",
+                    panel.stage.current, panel.stage.total, panel.stage.title, panel.total_lines
+                ),
+                color,
+                bold: true,
+                panel: Some(index),
+            });
+            if panel.expanded {
+                lines.extend(panel.lines.iter().cloned().map(|line| RenderLine {
+                    text: line.text,
+                    color: line.color,
+                    bold: false,
+                    panel: None,
+                }));
+            }
+        }
+        lines
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -221,7 +412,6 @@ impl StreamDashboard {
         }
         let mut output = io::stderr().lock();
         queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
-
         draw_row(
             &mut output,
             0,
@@ -230,17 +420,28 @@ impl StreamDashboard {
             Color::Cyan,
             true,
         )?;
+
         if height > 1 {
-            let stage = self
-                .stage
-                .as_ref()
-                .map(|stage| format!("[{}/{}] {}", stage.current, stage.total, stage.title))
+            let phase = self
+                .panels
+                .last()
+                .map(|panel| {
+                    let occurrence = if panel.occurrence > 1 {
+                        format!(" · pass {}", panel.occurrence)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "[{}/{}] {}{occurrence}",
+                        panel.stage.current, panel.stage.total, panel.stage.title
+                    )
+                })
                 .unwrap_or_else(|| "[workflow]".to_owned());
             draw_row(
                 &mut output,
                 1,
                 width,
-                &format!("{stage}  {} {}", SPINNER[self.spinner_index], self.activity),
+                &format!("{phase}  {} {}", SPINNER[self.spinner_index], self.activity),
                 Color::White,
                 true,
             )?;
@@ -255,62 +456,48 @@ impl StreamDashboard {
                 false,
             )?;
         }
-        if height > DISCLOSURE_ROW {
-            let arrow = if self.expanded { "▼" } else { "▶" };
-            let line_label = if self.total_lines == 1 {
-                "line"
-            } else {
-                "lines"
-            };
-            let history = if self.dropped_lines == 0 {
-                format!("{} {line_label}", self.total_lines)
-            } else {
-                format!(
-                    "{} {line_label} · {} older hidden",
-                    self.total_lines, self.dropped_lines
-                )
-            };
-            let scroll = if self.expanded && self.scroll_from_bottom > 0 {
-                format!(" · {} from latest", self.scroll_from_bottom)
-            } else {
-                String::new()
-            };
-            draw_row(
-                &mut output,
-                DISCLOSURE_ROW,
-                width,
-                &format!("{arrow} Claude output · {history}{scroll} · Enter/Space/click to toggle"),
-                Color::Green,
-                true,
-            )?;
+
+        let lines = self.render_lines();
+        let body_height = height.saturating_sub(4) as usize;
+        let maximum_start = lines.len().saturating_sub(body_height);
+        if self.follow_latest {
+            self.viewport_start = maximum_start;
+        } else {
+            self.viewport_start = self.viewport_start.min(maximum_start);
+        }
+        if self.ensure_selected
+            && let Some(position) = lines
+                .iter()
+                .position(|line| line.panel == Some(self.selected_panel))
+        {
+            if position < self.viewport_start {
+                self.viewport_start = position;
+            } else if position >= self.viewport_start + body_height.max(1) {
+                self.viewport_start = position.saturating_sub(body_height.saturating_sub(1));
+            }
+            self.ensure_selected = false;
         }
 
-        if self.expanded && height > 5 {
-            let body_height = height.saturating_sub(5) as usize;
-            let maximum_scroll = self.lines.len().saturating_sub(body_height);
-            self.scroll_from_bottom = self.scroll_from_bottom.min(maximum_scroll);
-            let start = self
-                .lines
-                .len()
-                .saturating_sub(body_height + self.scroll_from_bottom);
-            for (index, line) in self.lines.iter().skip(start).take(body_height).enumerate() {
-                draw_row(
-                    &mut output,
-                    4 + index as u16,
-                    width,
-                    &line.text,
-                    line.color,
-                    false,
-                )?;
+        self.heading_rows.clear();
+        for (index, line) in lines
+            .iter()
+            .skip(self.viewport_start)
+            .take(body_height)
+            .enumerate()
+        {
+            let row = 3 + index as u16;
+            draw_row(&mut output, row, width, &line.text, line.color, line.bold)?;
+            if let Some(panel) = line.panel {
+                self.heading_rows.push((row, panel));
             }
         }
 
-        if height > 4 {
+        if height > 3 {
             draw_row(
                 &mut output,
                 height - 1,
                 width,
-                "↑↓/PgUp/PgDn scroll · End follows latest · Ctrl-C stops current command",
+                "click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · End latest · Ctrl-C stop",
                 Color::DarkGrey,
                 false,
             )?;
@@ -324,6 +511,11 @@ impl StreamDashboard {
     pub(crate) fn leave(&mut self) {
         if !self.active {
             return;
+        }
+        if let Some(panel) = self.panels.last_mut()
+            && panel.status == PhaseStatus::Running
+        {
+            panel.status = PhaseStatus::Complete;
         }
         let mut output = io::stderr().lock();
         let _ = execute!(output, Show, DisableMouseCapture, LeaveAlternateScreen);
@@ -383,38 +575,84 @@ mod tests {
 
     fn dashboard() -> StreamDashboard {
         let now = Instant::now();
-        StreamDashboard {
+        let mut dashboard = StreamDashboard {
             repo: "/repo".to_owned(),
-            stage: None,
             activity: "working".to_owned(),
-            lines: VecDeque::new(),
-            total_lines: 0,
-            dropped_lines: 0,
-            expanded: true,
-            scroll_from_bottom: 0,
+            panels: Vec::new(),
+            selected_panel: 0,
+            viewport_start: 0,
+            follow_latest: true,
+            ensure_selected: false,
+            heading_rows: Vec::new(),
+            retained_lines: 0,
             spinner_index: 0,
             last_tick: now,
             last_draw: now,
             dirty: false,
             active: false,
-        }
+        };
+        dashboard.set_stage(StageView {
+            current: 1,
+            total: 7,
+            title: "Explore".to_owned(),
+        });
+        dashboard
     }
 
     #[test]
-    fn stream_items_become_label_prefixed_lines() {
+    fn stages_have_separate_collapsible_panels() {
         let mut dashboard = dashboard();
-        dashboard.push(&StreamItem::Assistant("first\nsecond".to_owned()));
-        assert_eq!(dashboard.total_lines, 2);
-        assert_eq!(dashboard.lines[0].text, " claude first");
-        assert_eq!(dashboard.lines[1].text, "        second");
+        dashboard.push(&StreamItem::Assistant("exploring".to_owned()));
+        dashboard.set_stage(StageView {
+            current: 2,
+            total: 7,
+            title: "Propose".to_owned(),
+        });
+        dashboard.push(&StreamItem::Assistant("proposing".to_owned()));
+
+        assert_eq!(dashboard.panels.len(), 2);
+        assert!(!dashboard.panels[0].expanded);
+        assert_eq!(dashboard.panels[0].status, PhaseStatus::Complete);
+        assert!(dashboard.panels[1].expanded);
+        assert_eq!(dashboard.panels[0].lines[0].text, " claude exploring");
+        assert_eq!(dashboard.panels[1].lines[0].text, " claude proposing");
     }
 
     #[test]
-    fn appending_while_scrolled_preserves_view_position() {
+    fn repeated_stage_headings_get_pass_numbers() {
         let mut dashboard = dashboard();
-        dashboard.scroll_from_bottom = 4;
-        dashboard.push(&StreamItem::Tool("cargo test".to_owned()));
-        assert_eq!(dashboard.scroll_from_bottom, 5);
+        let verify = StageView {
+            current: 5,
+            total: 7,
+            title: "Verify".to_owned(),
+        };
+        dashboard.set_stage(verify.clone());
+        dashboard.set_stage(verify);
+        assert_eq!(dashboard.panels[1].occurrence, 1);
+        assert_eq!(dashboard.panels[2].occurrence, 2);
+        assert!(dashboard.render_lines()[2].text.contains("pass 2"));
+    }
+
+    #[test]
+    fn disclosure_controls_toggle_selected_panel_and_ctrl_c_cancels() {
+        let mut dashboard = dashboard();
+        assert!(!dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))));
+        assert!(!dashboard.panels[0].expanded);
+        dashboard.heading_rows = vec![(5, 0)];
+        assert!(!dashboard.handle_event(Event::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(dashboard.panels[0].expanded);
+        assert!(dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))));
     }
 
     #[test]
@@ -423,44 +661,30 @@ mod tests {
     }
 
     #[test]
-    fn disclosure_controls_toggle_and_ctrl_c_cancels() {
-        let mut dashboard = dashboard();
-        assert!(!dashboard.handle_event(Event::Key(event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))));
-        assert!(!dashboard.expanded);
-        assert!(!dashboard.handle_event(Event::Mouse(event::MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: DISCLOSURE_ROW,
-            modifiers: KeyModifiers::NONE,
-        })));
-        assert!(dashboard.expanded);
-        assert!(dashboard.handle_event(Event::Key(event::KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        ))));
-    }
-
-    #[test]
     fn terminal_lifecycle_smoke_test_when_available() {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             return;
         }
-        let mut dashboard = StreamDashboard::enter(
-            "/tmp/example".to_owned(),
-            Some(StageView {
-                current: 4,
-                total: 7,
-                title: "Apply".to_owned(),
-            }),
-            "Claude is applying the OpenSpec change".to_owned(),
-        )
-        .unwrap();
+        let mut dashboard = StreamDashboard::enter("/tmp/example".to_owned()).unwrap();
+        dashboard.set_stage(StageView {
+            current: 4,
+            total: 7,
+            title: "Apply".to_owned(),
+        });
+        dashboard.start_stream("Claude is applying the OpenSpec change");
         dashboard.push(&StreamItem::Assistant("Dashboard smoke test".to_owned()));
+        dashboard.set_stage(StageView {
+            current: 5,
+            total: 7,
+            title: "Verify".to_owned(),
+        });
+        dashboard.start_stream("Claude is verifying specification compliance");
+        dashboard.push(&StreamItem::Assistant(
+            "Second phase remains independently visible".to_owned(),
+        ));
         std::thread::sleep(Duration::from_millis(40));
         assert!(!dashboard.poll());
+        assert_eq!(dashboard.panels.len(), 2);
         dashboard.leave();
         assert!(!dashboard.active);
     }

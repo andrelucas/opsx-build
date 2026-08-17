@@ -241,26 +241,34 @@ ospx-build --stream-claude "add function pointer support"
 ```
 
 When stdin and stderr are terminals, streaming automatically uses an
-alternate-screen dashboard. The current workflow stage and Claude activity
-remain fixed at the top while output arrives in a disclosure pane:
+alternate-screen dashboard for the whole run. Each workflow phase has its own
+disclosure, headed by status, stage position, phase name, retry/pass number
+when applicable, and captured line count. The current phase starts expanded;
+completed phases collapse but remain available:
 
 ```text
 ospx-build  /path/to/repository
 [4/7] Apply  ⠴ Claude is applying the OpenSpec change
 ──────────────────────────────────────────────────────
-▼ Claude output · 137 lines · Enter/Space/click to toggle
+  ▶ ✓ [1/7] Explore · 48 lines
+  ▶ ✓ [2/7] Propose · 31 lines
+  ▶ ✓ [3/7] Proposal commit · 12 lines
+› ▼ ⠴ [4/7] Apply · 137 lines
 ```
 
 Controls:
 
-- Enter, Space, `o`, or a click on the disclosure row expands/collapses output;
+- Tab or Left/Right selects a phase disclosure;
+- Enter, Space, `o`, or a click on a heading expands/collapses that phase;
 - Up/Down and Page Up/Page Down scroll expanded output;
 - End returns to the newest output;
-- Escape collapses the pane;
+- Escape collapses the selected phase;
 - Ctrl-C interrupts the current subprocess while preserving its ospx-build
   checkpoint.
 
-The dashboard restores the previous terminal screen after each Claude stage.
+Repeated Verify and Repair phases are retained separately as `pass 2`,
+`pass 3`, and so on. The dashboard restores the previous terminal screen when
+the workflow completes or stops.
 When either stdin or stderr is not a TTY—for example under CI, redirection, or
 a pipe—ospx-build emits the same filtered stream as ordinary linear text and
 does not write cursor-control sequences.

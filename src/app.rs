@@ -262,6 +262,7 @@ impl<U: Ui> App<U> {
             if state.stage == Stage::Complete {
                 let change = state.change.as_deref().unwrap_or("change");
                 let head = state.final_head.as_deref().unwrap_or("unknown HEAD");
+                self.ui.finish_dashboard();
                 self.ui
                     .success(&format!("COMPLETE `{change}` — final {}", short_hash(head)));
                 return Ok(());
