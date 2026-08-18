@@ -10,7 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::{
     dashboard::{StageView, StreamDashboard},
-    stream::StreamItem,
+    stream::{StreamControl, StreamItem},
 };
 
 pub trait Ui {
@@ -25,8 +25,8 @@ pub trait Ui {
     fn debug(&self, message: &str);
     fn debug_prompt(&self, label: &str, prompt: &str);
     fn start_stream(&self, message: &str);
-    /// Poll dashboard input. Returns true when the current subprocess should stop.
-    fn poll_stream(&self) -> bool;
+    /// Poll dashboard input for a command to send to the current subprocess.
+    fn poll_stream(&self) -> StreamControl;
     fn stream_item(&self, item: &StreamItem);
     fn finish_stream(&self, success: bool, message: &str);
     fn finish_dashboard(&self);
@@ -211,13 +211,13 @@ impl Ui for TerminalUi {
         }
     }
 
-    fn poll_stream(&self) -> bool {
+    fn poll_stream(&self) -> StreamControl {
         self.state
             .lock()
             .unwrap()
             .dashboard
             .as_mut()
-            .is_some_and(StreamDashboard::poll)
+            .map_or(StreamControl::None, StreamDashboard::poll)
     }
 
     fn stream_item(&self, item: &StreamItem) {

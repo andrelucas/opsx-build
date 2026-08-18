@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::ui::Ui;
+use crate::{stream::StreamControl, ui::Ui};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -17,6 +17,8 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
+    pub initial_stdin: Option<String>,
+    pub accepts_stream_messages: bool,
 }
 
 impl CommandSpec {
@@ -26,6 +28,8 @@ impl CommandSpec {
             args: Vec::new(),
             env: Vec::new(),
             cwd: cwd.into(),
+            initial_stdin: None,
+            accepts_stream_messages: false,
         }
     }
 
@@ -36,6 +40,17 @@ impl CommandSpec {
 
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn stream_input(mut self, initial: impl Into<String>) -> Self {
+        self.initial_stdin = Some(initial.into());
+        self.accepts_stream_messages = true;
+        self
+    }
+
+    pub fn disable_stream_messages(mut self) -> Self {
+        self.accepts_stream_messages = false;
         self
     }
 
@@ -121,6 +136,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         self.ui.command(&spec.display());
         let mut command = command_for(spec);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if spec.initial_stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
         configure_stream_process(&mut command);
         let mut child = command
             .spawn()
@@ -142,14 +160,32 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
 
         let mut captured_stdout = String::new();
         let mut captured_stderr = String::new();
-        let mut read_error = None;
+        let mut read_error: Option<std::io::Error> = None;
         let mut cancelled = false;
         let mut cancel_started = None;
         let mut forced_stop = false;
+        let mut child_stdin = child.stdin.take();
+        let mut sent_messages = usize::from(spec.initial_stdin.is_some());
+        let mut completed_messages = 0usize;
+        if let (Some(stdin), Some(initial)) = (child_stdin.as_mut(), spec.initial_stdin.as_deref())
+            && let Err(error) = write_stream_input(stdin, initial)
+        {
+            read_error = Some(std::io::Error::new(
+                error.kind(),
+                format!("failed writing initial streamed input: {error}"),
+            ));
+            cancelled = true;
+            cancel_started = Some(std::time::Instant::now());
+            let _ = interrupt_stream_process(&mut child);
+        }
         loop {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(PipeChunk::Line(PipeKind::Stdout, line)) => {
-                    on_stdout_line(line.trim_end_matches(['\r', '\n']));
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    on_stdout_line(trimmed);
+                    if is_stream_result(trimmed) {
+                        completed_messages += 1;
+                    }
                     captured_stdout.push_str(&line);
                 }
                 Ok(PipeChunk::Line(PipeKind::Stderr, line)) => captured_stderr.push_str(&line),
@@ -159,12 +195,50 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if !cancelled && self.ui.poll_stream() {
-                cancelled = true;
-                cancel_started = Some(std::time::Instant::now());
-                if let Err(error) = interrupt_stream_process(&mut child) {
-                    read_error.get_or_insert(error);
+            if !cancelled {
+                match self.ui.poll_stream() {
+                    StreamControl::None => {}
+                    StreamControl::Interrupt => {
+                        child_stdin.take();
+                        cancelled = true;
+                        cancel_started = Some(std::time::Instant::now());
+                        if let Err(error) = interrupt_stream_process(&mut child) {
+                            read_error.get_or_insert(error);
+                        }
+                    }
+                    StreamControl::Compact => {
+                        if spec.accepts_stream_messages {
+                            if let Err(error) = queue_stream_message(
+                                &mut child_stdin,
+                                "/compact",
+                                &mut sent_messages,
+                            ) {
+                                self.ui.warn(&format!("Could not queue /compact: {error}"));
+                            }
+                        } else {
+                            self.ui.warn(
+                                "This Claude invocation is already compacting; no second /compact was queued",
+                            );
+                        }
+                    }
+                    StreamControl::Inject(message) => {
+                        if spec.accepts_stream_messages {
+                            if let Err(error) =
+                                queue_stream_message(&mut child_stdin, &message, &mut sent_messages)
+                            {
+                                self.ui
+                                    .warn(&format!("Could not inject Claude message: {error}"));
+                            }
+                        } else {
+                            self.ui.warn(
+                                "The current subprocess does not accept injected Claude messages",
+                            );
+                        }
+                    }
                 }
+            }
+            if child_stdin.is_some() && sent_messages > 0 && completed_messages >= sent_messages {
+                child_stdin.take();
             }
             if !forced_stop
                 && cancel_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
@@ -213,6 +287,57 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         }
         Ok(())
     }
+}
+
+pub fn stream_user_message(message: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": message}]
+            },
+            "parent_tool_use_id": serde_json::Value::Null
+        })
+    )
+}
+
+fn queue_stream_message<W: Write>(
+    stdin: &mut Option<W>,
+    message: &str,
+    sent_messages: &mut usize,
+) -> std::io::Result<()> {
+    let Some(stdin) = stdin.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Claude stdin is already closed",
+        ));
+    };
+    write_stream_input(stdin, &stream_user_message(message))?;
+    *sent_messages += 1;
+    Ok(())
+}
+
+fn write_stream_input(mut stdin: impl Write, input: &str) -> std::io::Result<()> {
+    stdin.write_all(input.as_bytes())?;
+    if !input.ends_with('\n') {
+        stdin.write_all(b"\n")?;
+    }
+    stdin.flush()
+}
+
+fn is_stream_result(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("result")
 }
 
 fn command_for(spec: &CommandSpec) -> Command {
@@ -360,6 +485,29 @@ mod tests {
             spec.display(),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW=196608 claude --name 'my change' simple"
         );
+    }
+
+    #[test]
+    fn encodes_streamed_user_messages_as_json_lines() {
+        let encoded = stream_user_message("/compact");
+        assert!(encoded.ends_with('\n'));
+        let value: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+        assert_eq!(value["message"]["content"][0]["text"], "/compact");
+        assert!(value["parent_tool_use_id"].is_null());
+    }
+
+    #[test]
+    fn queues_follow_up_messages_without_closing_the_writer() {
+        let mut writer = Some(Vec::new());
+        let mut sent_messages = 1;
+        queue_stream_message(&mut writer, "please continue", &mut sent_messages).unwrap();
+
+        assert_eq!(sent_messages, 2);
+        let encoded = String::from_utf8(writer.unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
+        assert_eq!(value["message"]["content"][0]["text"], "please continue");
     }
 
     #[cfg(unix)]

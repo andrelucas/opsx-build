@@ -8,15 +8,15 @@ use console::truncate_str;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::stream::StreamItem;
+use crate::stream::{StreamControl, StreamItem};
 
 const MAX_DISPLAY_LINES: usize = 20_000;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -78,13 +78,21 @@ pub(crate) struct StreamDashboard {
     last_draw: Instant,
     dirty: bool,
     active: bool,
+    compact_requested: bool,
+    injection_input: Option<String>,
 }
 
 impl StreamDashboard {
     pub(crate) fn enter(repo: String, change_name: Option<String>) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut output = io::stderr().lock();
-        if let Err(error) = execute!(output, EnterAlternateScreen, EnableMouseCapture, Hide) {
+        if let Err(error) = execute!(
+            output,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        ) {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
@@ -106,6 +114,8 @@ impl StreamDashboard {
             last_draw: now,
             dirty: true,
             active: true,
+            compact_requested: false,
+            injection_input: None,
         };
         dashboard.draw()?;
         Ok(dashboard)
@@ -165,6 +175,8 @@ impl StreamDashboard {
 
     pub(crate) fn start_stream(&mut self, message: &str) {
         self.activity = message.to_owned();
+        self.compact_requested = false;
+        self.injection_input = None;
         if let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Running;
             panel.finished_at = None;
@@ -251,12 +263,17 @@ impl StreamDashboard {
         }
     }
 
-    pub(crate) fn poll(&mut self) -> bool {
-        let mut cancel = false;
+    pub(crate) fn poll(&mut self) -> StreamControl {
+        let mut control = StreamControl::None;
         for _ in 0..32 {
             match event::poll(Duration::ZERO) {
                 Ok(true) => match event::read() {
-                    Ok(event) => cancel |= self.handle_event(event),
+                    Ok(event) => {
+                        control = self.handle_event(event);
+                        if control != StreamControl::None {
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 },
                 Ok(false) | Err(_) => break,
@@ -272,19 +289,37 @@ impl StreamDashboard {
         if self.dirty && now.duration_since(self.last_draw) >= Duration::from_millis(30) {
             let _ = self.draw();
         }
-        cancel
+        control
     }
 
-    fn handle_event(&mut self, event: Event) -> bool {
+    fn handle_event(&mut self, event: Event) -> StreamControl {
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            return StreamControl::Interrupt;
+        }
+
+        if self.injection_input.is_some() {
+            return self.handle_injection_event(event);
+        }
+
         match event {
-            Event::Key(key)
-                if key.kind == KeyEventKind::Press
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c') =>
-            {
-                return true;
-            }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('c') if !self.compact_requested => {
+                    self.compact_requested = true;
+                    self.push_message(
+                        "compact",
+                        Color::Magenta,
+                        "Queued /compact for Claude's next turn",
+                    );
+                    return StreamControl::Compact;
+                }
+                KeyCode::Char('i') => {
+                    self.injection_input = Some(String::new());
+                    self.dirty = true;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('o') => self.toggle_selected(),
                 KeyCode::Tab | KeyCode::Right => self.select_next(),
                 KeyCode::BackTab | KeyCode::Left => self.select_previous(),
@@ -320,7 +355,51 @@ impl StreamDashboard {
             Event::Resize(_, _) => self.dirty = true,
             _ => {}
         }
-        false
+        StreamControl::None
+    }
+
+    fn handle_injection_event(&mut self, event: Event) -> StreamControl {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => {
+                    let message = self.injection_input.take().unwrap_or_default();
+                    self.dirty = true;
+                    if message.trim().is_empty() {
+                        return StreamControl::None;
+                    }
+                    self.push_message("inject", Color::Magenta, &format!("Queued: {message}"));
+                    return StreamControl::Inject(message);
+                }
+                KeyCode::Esc => {
+                    self.injection_input = None;
+                    self.dirty = true;
+                }
+                KeyCode::Backspace => {
+                    if let Some(input) = self.injection_input.as_mut() {
+                        input.pop();
+                    }
+                    self.dirty = true;
+                }
+                KeyCode::Char(character)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    if let Some(input) = self.injection_input.as_mut() {
+                        input.push(character);
+                    }
+                    self.dirty = true;
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                if let Some(input) = self.injection_input.as_mut() {
+                    input.push_str(&text);
+                }
+                self.dirty = true;
+            }
+            Event::Resize(_, _) => self.dirty = true,
+            _ => {}
+        }
+        StreamControl::None
     }
 
     fn toggle_selected(&mut self) {
@@ -523,11 +602,18 @@ impl StreamDashboard {
         }
 
         if height > 3 {
+            let footer = self.injection_input.as_ref().map_or_else(
+                || {
+                    "c compact · i inject · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
+                        .to_owned()
+                },
+                |input| format!("inject> {input}█   Enter queue · Esc cancel · Ctrl-C stop"),
+            );
             draw_row(
                 &mut output,
                 height - 1,
                 width,
-                "click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · End latest · Ctrl-C stop",
+                &footer,
                 Color::DarkGrey,
                 false,
             )?;
@@ -549,7 +635,13 @@ impl StreamDashboard {
             panel.finished_at = Some(Instant::now());
         }
         let mut output = io::stderr().lock();
-        let _ = execute!(output, Show, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            output,
+            Show,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
         self.active = false;
     }
@@ -641,6 +733,8 @@ mod tests {
             last_draw: now,
             dirty: false,
             active: false,
+            compact_requested: false,
+            injection_input: None,
         };
         dashboard.set_stage(StageView {
             current: 1,
@@ -729,23 +823,90 @@ mod tests {
     #[test]
     fn disclosure_controls_toggle_selected_panel_and_ctrl_c_cancels() {
         let mut dashboard = dashboard();
-        assert!(!dashboard.handle_event(Event::Key(event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))));
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
         assert!(!dashboard.panels[0].expanded);
         dashboard.heading_rows = vec![(5, 0)];
-        assert!(!dashboard.handle_event(Event::Mouse(event::MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        })));
+        assert_eq!(
+            dashboard.handle_event(Event::Mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })),
+            StreamControl::None
+        );
         assert!(dashboard.panels[0].expanded);
-        assert!(dashboard.handle_event(Event::Key(event::KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        ))));
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            StreamControl::Interrupt
+        );
+    }
+
+    #[test]
+    fn plain_c_queues_one_compaction_per_stream() {
+        let mut dashboard = dashboard();
+        let compact = Event::Key(event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.handle_event(compact.clone()),
+            StreamControl::Compact
+        );
+        assert_eq!(dashboard.handle_event(compact), StreamControl::None);
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("Queued /compact")
+        );
+
+        dashboard.start_stream("next Claude invocation");
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::Compact
+        );
+    }
+
+    #[test]
+    fn i_opens_an_injection_prompt_and_enter_queues_the_message() {
+        let mut dashboard = dashboard();
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert_eq!(dashboard.injection_input.as_deref(), Some(""));
+        for character in "/compact".chars() {
+            assert_eq!(
+                dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                StreamControl::None
+            );
+        }
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::Inject("/compact".to_owned())
+        );
+        assert!(dashboard.injection_input.is_none());
     }
 
     #[test]
@@ -780,7 +941,7 @@ mod tests {
             "Second phase remains independently visible".to_owned(),
         ));
         std::thread::sleep(Duration::from_millis(40));
-        assert!(!dashboard.poll());
+        assert_eq!(dashboard.poll(), StreamControl::None);
         assert_eq!(dashboard.panels.len(), 2);
         dashboard.leave();
         assert!(!dashboard.active);

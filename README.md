@@ -27,6 +27,13 @@ Every Claude invocation is a blocking subprocess. The checkpoint records only
 workflow facts: request, change name, next stage, planning session, retry count,
 pending verifier finding, pending user direction, and milestone HEADs.
 
+With live streaming enabled, ospx-build uses Claude Code's documented
+[bidirectional `stream-json` transport][claude-streaming]. It keeps the current
+Claude process's stdin open until the phase and any interactively queued turns
+finish. This allows terminal input to enqueue a slash command or ordinary
+follow-up without turning the workflow into an asynchronous marker-file
+protocol.
+
 Only Explore, Propose, and the proposal commit reuse the planning session.
 Apply, Verify, Repair, Archive, and completion work already use disposable
 fresh sessions, so there is no carried context to compact at those boundaries.
@@ -230,24 +237,33 @@ options:
 - `--session-id`, `--resume`, and `--name`;
 - `--model` when `claude_model` is configured;
 - `--output-format json` for normal unattended operation;
-- `--output-format stream-json --verbose --forward-subagent-text` when live
-  streaming is enabled;
+- `--input-format stream-json --output-format stream-json --verbose
+  --forward-subagent-text` when live streaming is enabled;
 - preferably `--json-schema`, returning `structured_output` in the final JSON
   result event.
+
+For bidirectional streaming, the launcher must pass newline-delimited `user`
+messages from stdin to Claude before EOF, preserve multiple `result` events on
+stdout, and leave the pipe open for later messages. Slash commands use this same
+transport; `/compact` behavior and `compact_boundary` events follow Claude
+Code's [slash-command protocol][claude-slash-commands]. These are Claude
+transport requirements, not oMLX APIs.
 
 When `auto_compact_window` is configured, the launcher must also preserve the
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable for Claude Code.
 
 For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
-`structured_output`. For streaming output it finds the final JSONL event whose
-`type` is `result`. A launcher may write diagnostics to stderr, but should not
-mix banners or unrelated prose into non-streaming JSON stdout.
+`structured_output`. For streaming output it finds the most recent JSONL result
+carrying a valid OpenSpec stage status; later slash-command results such as
+`/compact` do not replace the stage result. A launcher may write diagnostics to
+stderr, but should not mix banners or unrelated prose into non-streaming JSON
+stdout.
 
 `--json-schema` is optional for compatibility: if the launcher clearly rejects
 that option before execution, ospx-build retries once using the documented
 `OSPX_STATUS` marker protocol. It similarly degrades from streaming JSON to
-ordinary JSON or text when an older Claude CLI clearly rejects
-`--output-format`. It never retries merely because a successful, potentially
+ordinary JSON or text when an older Claude CLI clearly rejects `--input-format`
+or `--output-format`. It never retries merely because a successful, potentially
 mutating invocation returned malformed terminal data.
 
 ### oMLX-specific behavior
@@ -255,8 +271,9 @@ mutating invocation returned malformed terminal data.
 The only oMLX-specific configuration is the launcher prefix and model name.
 The oMLX server must already be listening, normally on its default local port;
 ospx-build does not start, stop, configure, or query that server. `omlx launch
-claude` must forward the Claude Code options above. Structured and streaming
-output were tested through this launcher with Claude Code 2.1.221 and
+claude` must forward the Claude Code options above and preserve the streaming
+stdin pipe. Structured and streaming output were tested through this launcher
+with Claude Code 2.1.224 and
 `Qwen3.6-35B-A3B-4bit`.
 
 ## Live output and diagnostics
@@ -290,6 +307,10 @@ start.
 
 Controls:
 
+- `c` queues `/compact` as Claude's next turn (once per Claude invocation);
+- `i` opens an injection prompt; type any Claude slash command or ordinary
+  follow-up instruction, then press Enter to queue it as the next turn;
+- Escape cancels the injection prompt;
 - Tab or Left/Right selects a phase disclosure;
 - Enter, Space, `o`, or a click on a heading expands/collapses that phase;
 - Up/Down and Page Up/Page Down scroll expanded output;
@@ -297,6 +318,12 @@ Controls:
 - Escape collapses the selected phase;
 - Ctrl-C interrupts the current subprocess while preserving its ospx-build
   checkpoint.
+
+Injected messages do not interrupt an agentic turn already in progress. Claude
+finishes that turn and processes queued input afterward. The dashboard records
+the queued text, and a `compact_boundary` event is shown even with the default
+`activity` filter. These controls are available in the TTY dashboard; linear
+non-TTY streaming remains output-only.
 
 Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when
@@ -316,6 +343,9 @@ Select one with `--stream-claude=full` or `--stream-claude=raw`.
 `--debug` displays resolved commands, session IDs, and complete prompts.
 `--verbose` displays captured subprocess stdout and stderr. These are transient
 flags and are not read from the config file.
+
+[claude-streaming]: https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode
+[claude-slash-commands]: https://code.claude.com/docs/en/agent-sdk/slash-commands
 
 ## Interactive launcher testing
 

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     cli::Cli,
-    process::{CommandSpec, ProcessOutput, ProcessRunner, diagnostic_text},
+    process::{CommandSpec, ProcessOutput, ProcessRunner, diagnostic_text, stream_user_message},
     stream::{StreamFilter, filter_line},
     ui::Ui,
 };
@@ -224,6 +224,7 @@ pub fn build_claude_command(
             args.extend(["--output-format".to_owned(), "json".to_owned()]);
         }
         ClaudeOutputFormat::StreamJson => {
+            args.extend(["--input-format".to_owned(), "stream-json".to_owned()]);
             args.extend(["--output-format".to_owned(), "stream-json".to_owned()]);
             args.push("--verbose".to_owned());
             args.push("--forward-subagent-text".to_owned());
@@ -244,11 +245,16 @@ pub fn build_claude_command(
             args.extend(["--resume".to_owned(), id.to_string()]);
         }
     }
-    args.push(prompt.to_owned());
-    with_launcher_environment(
-        CommandSpec::new(&launcher.program, repo).args(args),
-        launcher,
-    )
+    if output_format != ClaudeOutputFormat::StreamJson {
+        args.push(prompt.to_owned());
+    }
+    let spec = CommandSpec::new(&launcher.program, repo).args(args);
+    let spec = if output_format == ClaudeOutputFormat::StreamJson {
+        spec.stream_input(stream_user_message(prompt))
+    } else {
+        spec
+    };
+    with_launcher_environment(spec, launcher)
 }
 
 pub fn build_interactive_claude_command(
@@ -476,6 +482,7 @@ fn build_compact_command(
         output_format,
         None,
     )
+    .disable_stream_messages()
 }
 
 fn format_name(format: ClaudeOutputFormat) -> &'static str {
@@ -545,45 +552,56 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
 }
 
 fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
-    let result = stdout
+    let results = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .rev()
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("result"))
-        .context("Claude stream ended without a result event")?;
-    let text = result
-        .get("result")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let session_id = result
-        .get("session_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if result
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("Claude reported an error: {text}");
+        .filter(|value| value.get("type").and_then(Value::as_str) == Some("result"))
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        bail!("Claude stream ended without a result event");
     }
-    let signal = match parse_structured_output(&result)? {
-        Some((signal, summary)) => {
+
+    for result in results.iter().rev() {
+        let text = result
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some((signal, summary)) = parse_structured_output(result)? {
             return Ok(ClaudeResult {
                 text: summary,
                 session_id,
                 signal,
             });
         }
-        None => parse_signal(&text).context(
-            "Claude stream result contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect it",
-        )?,
-    };
-    Ok(ClaudeResult {
-        text,
-        session_id,
-        signal,
-    })
+        if let Some(signal) = parse_signal(&text) {
+            return Ok(ClaudeResult {
+                text,
+                session_id,
+                signal,
+            });
+        }
+    }
+
+    if let Some(result) = results.iter().rev().find(|result| {
+        result
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }) {
+        let text = result
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        bail!("Claude reported an error: {text}");
+    }
+    bail!(
+        "Claude stream results contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them"
+    )
 }
 
 pub fn parse_signal(text: &str) -> Option<StageSignal> {
@@ -610,6 +628,9 @@ fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String
     let Some(output) = result.get("structured_output") else {
         return Ok(None);
     };
+    if output.is_null() {
+        return Ok(None);
+    }
     let decoded;
     let output = if let Some(text) = output.as_str() {
         decoded = serde_json::from_str::<Value>(text)
@@ -644,7 +665,8 @@ fn parse_status_value(status: &str) -> Option<StageSignal> {
 
 fn unsupported_json_option(output: &ProcessOutput) -> bool {
     let diagnostic = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
-    unsupported_option(&diagnostic) && diagnostic.contains("output-format")
+    unsupported_option(&diagnostic)
+        && (diagnostic.contains("output-format") || diagnostic.contains("input-format"))
 }
 
 fn unsupported_schema_option(output: &ProcessOutput) -> bool {
@@ -831,6 +853,7 @@ mod tests {
                 .windows(2)
                 .any(|args| { args == ["--output-format", "stream-json"] })
         );
+        assert!(!streamed_compact.accepts_stream_messages);
 
         let streamed = build_claude_command(
             Path::new("/repo"),
@@ -847,6 +870,18 @@ mod tests {
                 .windows(2)
                 .any(|args| { args == ["--output-format", "stream-json"] })
         );
+        assert!(
+            streamed
+                .args
+                .windows(2)
+                .any(|args| { args == ["--input-format", "stream-json"] })
+        );
+        assert!(!streamed.args.iter().any(|arg| arg == "/verify slice"));
+        let input = streamed.initial_stdin.as_deref().unwrap().trim();
+        let input: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(input["type"], "user");
+        assert_eq!(input["message"]["content"][0]["text"], "/verify slice");
+        assert!(streamed.accepts_stream_messages);
         assert!(streamed.args.iter().any(|arg| arg == "--verbose"));
         assert!(
             streamed
@@ -974,5 +1009,18 @@ mod tests {
         assert_eq!(parsed.signal, StageSignal::Verified);
         assert_eq!(parsed.text, "Checks passed");
         assert_eq!(parsed.session_id.as_deref(), Some("session-3"));
+    }
+
+    #[test]
+    fn ignores_a_later_compact_result_when_parsing_the_stage_result() {
+        let stdout = concat!(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-4\",\"result\":\"stage response\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"Proposal complete\"}}\n",
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"manual\",\"pre_tokens\":24000}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-4\",\"result\":\"Compacted\",\"structured_output\":null}\n"
+        );
+        let parsed = parse_claude_stream_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::Ready);
+        assert_eq!(parsed.text, "Proposal complete");
+        assert_eq!(parsed.session_id.as_deref(), Some("session-4"));
     }
 }

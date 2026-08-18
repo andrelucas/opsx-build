@@ -2,6 +2,15 @@ use clap::ValueEnum;
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StreamControl {
+    #[default]
+    None,
+    Compact,
+    Inject(String),
+    Interrupt,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum StreamFilter {
@@ -35,6 +44,11 @@ pub fn filter_line(line: &str, filter: StreamFilter) -> Vec<StreamItem> {
     match value.get("type").and_then(Value::as_str) {
         Some("assistant") => assistant_items(&value),
         Some("user") if filter == StreamFilter::Full => tool_result_items(&value),
+        Some("system")
+            if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
+        {
+            vec![StreamItem::Lifecycle(compaction_summary(&value))]
+        }
         Some("system") if filter == StreamFilter::Full => {
             let subtype = value
                 .get("subtype")
@@ -53,6 +67,23 @@ pub fn filter_line(line: &str, filter: StreamFilter) -> Vec<StreamItem> {
             vec![StreamItem::Lifecycle(format!("Claude event: {kind}"))]
         }
         _ => Vec::new(),
+    }
+}
+
+fn compaction_summary(value: &Value) -> String {
+    let metadata = value.get("compact_metadata").unwrap_or(value);
+    let before = metadata.get("pre_tokens").and_then(Value::as_u64);
+    let after = metadata.get("post_tokens").and_then(Value::as_u64);
+    let trigger = metadata.get("trigger").and_then(Value::as_str);
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            format!("Claude compacted context: {before} → {after} tokens")
+        }
+        (Some(before), None) => match trigger {
+            Some(trigger) => format!("Claude compacted context at {before} tokens ({trigger})"),
+            None => format!("Claude compacted context at {before} tokens"),
+        },
+        _ => "Claude compacted context".to_owned(),
     }
 }
 
@@ -202,6 +233,17 @@ mod tests {
         assert_eq!(
             filter_line(line, StreamFilter::Activity),
             [StreamItem::Subagent("Subagent finding".to_owned())]
+        );
+    }
+
+    #[test]
+    fn compaction_boundary_is_visible_in_activity_mode() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":21583,"post_tokens":842}}"#;
+        assert_eq!(
+            filter_line(line, StreamFilter::Activity),
+            [StreamItem::Lifecycle(
+                "Claude compacted context: 21583 → 842 tokens".to_owned()
+            )]
         );
     }
 }
