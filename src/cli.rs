@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer};
 use crate::stream::StreamFilter;
 
 const DEFAULT_MAX_VERIFY_RETRIES: u32 = 3;
+const DEFAULT_MAX_OUTPUT_RETRIES: u32 = 3;
 const DEFAULT_PERMISSION_MODE: &str = "auto";
 const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 
@@ -22,6 +23,7 @@ pub struct Cli {
     pub direction: Option<String>,
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
+    pub max_output_retries: u32,
     pub verbose: bool,
     pub debug: bool,
     pub stream_claude: Option<StreamFilter>,
@@ -112,6 +114,10 @@ struct CliArgs {
     #[arg(long, env = "OSPX_BUILD_MAX_VERIFY_RETRIES", value_name = "N")]
     max_verify_retries: Option<u32>,
 
+    /// Maximum same-session continuations after Claude reaches its output token limit.
+    #[arg(long, env = "OSPX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
+    max_output_retries: Option<u32>,
+
     /// Print commands and captured subprocess output.
     #[arg(long, short)]
     verbose: bool,
@@ -177,6 +183,7 @@ struct CliArgs {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     max_verify_retries: Option<u32>,
+    max_output_retries: Option<u32>,
     permission_mode: Option<String>,
     claude_command: Option<String>,
     claude_model: Option<String>,
@@ -237,6 +244,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .max_verify_retries
             .or(config.max_verify_retries)
             .unwrap_or(DEFAULT_MAX_VERIFY_RETRIES),
+        max_output_retries: args
+            .max_output_retries
+            .or(config.max_output_retries)
+            .unwrap_or(DEFAULT_MAX_OUTPUT_RETRIES),
         verbose: args.verbose,
         debug: args.debug,
         stream_claude: args.stream_claude.or(config.stream_claude),
@@ -339,6 +350,7 @@ mod tests {
         let config: FileConfig = toml::from_str(
             r#"
                 max_verify_retries = 5
+                max_output_retries = 7
                 permission_mode = "dontAsk"
                 claude_command = "omlx launch claude"
                 claude_model = "local-model"
@@ -355,6 +367,7 @@ mod tests {
         );
 
         assert_eq!(cli.max_verify_retries, 5);
+        assert_eq!(cli.max_output_retries, 7);
         assert_eq!(cli.permission_mode, "dontAsk");
         assert_eq!(cli.claude_command, "omlx launch claude");
         assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
@@ -368,6 +381,7 @@ mod tests {
         let config: FileConfig = toml::from_str(
             r#"
                 max_verify_retries = 5
+                max_output_retries = 6
                 claude_model = "config-model"
                 auto_compact_window = 131072
             "#,
@@ -378,6 +392,8 @@ mod tests {
                 "ospx-build",
                 "--max-verify-retries",
                 "2",
+                "--max-output-retries",
+                "4",
                 "--claude-model",
                 "cli-model",
                 "--auto-compact-window",
@@ -389,6 +405,7 @@ mod tests {
         );
 
         assert_eq!(cli.max_verify_retries, 2);
+        assert_eq!(cli.max_output_retries, 4);
         assert_eq!(cli.claude_model.as_deref(), Some("cli-model"));
         assert_eq!(cli.auto_compact_window, Some(204_800));
     }
@@ -407,6 +424,7 @@ mod tests {
             None,
         );
         assert_eq!(cli.max_verify_retries, DEFAULT_MAX_VERIFY_RETRIES);
+        assert_eq!(cli.max_output_retries, DEFAULT_MAX_OUTPUT_RETRIES);
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
         assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
         assert_eq!(cli.auto_compact_window, None);

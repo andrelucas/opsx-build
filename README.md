@@ -40,6 +40,13 @@ fresh sessions, so there is no carried context to compact at those boundaries.
 Explicit planning compaction is best-effort: a launcher incompatibility is
 reported as a warning and does not block otherwise valid repository work.
 
+If a Claude result reports `stop_reason: max_tokens` or a
+`max_output_tokens` API failure, ospx-build treats the turn as interrupted
+rather than failed. It best-effort compacts that same Claude session and asks it
+to continue the current phase from durable repository state. This recovery is
+bounded by `max_output_retries` (default 3); exhausting it leaves the checkpoint
+at the current phase for an ordinary `--resume`.
+
 ## Installation
 
 ```sh
@@ -152,6 +159,7 @@ The default launcher is `claude`. oMLX Claude mode can be configured with:
 ```toml
 # ~/.config/ospx-build/config.toml
 max_verify_retries = 3
+max_output_retries = 3
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
@@ -163,6 +171,12 @@ Set the same threshold for one invocation with:
 
 ```sh
 ospx-build --auto-compact-window 192k "add function pointer support"
+```
+
+Output-limit recovery can likewise be adjusted for one run:
+
+```sh
+ospx-build --max-output-retries 5 "add function pointer support"
 ```
 
 Token counts may be plain integers (`196608`) or use binary `k`/`m` suffixes;

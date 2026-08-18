@@ -258,6 +258,7 @@ impl<U: Ui> App<U> {
             launcher,
             &self.cli.permission_mode,
             self.cli.stream_claude,
+            self.cli.max_output_retries,
             &self.ui,
         );
         self.ui.change_name(state.change.as_deref());

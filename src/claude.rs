@@ -204,6 +204,11 @@ pub enum ClaudeOutputFormat {
     StreamJson,
 }
 
+enum ClaudeAttempt {
+    Complete(ClaudeResult),
+    OutputLimit,
+}
+
 pub fn build_claude_command(
     repo: &Path,
     launcher: &ClaudeLauncher,
@@ -291,6 +296,7 @@ pub struct ClaudeClient<'a, U: Ui> {
     launcher: &'a ClaudeLauncher,
     permission_mode: &'a str,
     stream_filter: Option<StreamFilter>,
+    max_output_retries: u32,
     ui: &'a U,
     runner: ProcessRunner<'a, U>,
 }
@@ -301,6 +307,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         launcher: &'a ClaudeLauncher,
         permission_mode: &'a str,
         stream_filter: Option<StreamFilter>,
+        max_output_retries: u32,
         ui: &'a U,
     ) -> Self {
         Self {
@@ -308,6 +315,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             launcher,
             permission_mode,
             stream_filter,
+            max_output_retries,
             ui,
             runner: ProcessRunner::new(ui),
         }
@@ -320,10 +328,53 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         activity: &str,
         protocol: StageProtocol,
     ) -> Result<ClaudeResult> {
-        self.ui.debug(&format!(
-            "Claude session: {}",
-            session_description(&session)
-        ));
+        let session_id = session_id(&session);
+        let mut current_session = session;
+        let mut current_prompt = prompt.to_owned();
+        let mut current_activity = activity.to_owned();
+        let mut recoveries = 0;
+
+        loop {
+            match self.invoke_once(
+                &current_session,
+                &current_prompt,
+                &current_activity,
+                protocol,
+            )? {
+                ClaudeAttempt::Complete(result) => return Ok(result),
+                ClaudeAttempt::OutputLimit if recoveries < self.max_output_retries => {
+                    recoveries += 1;
+                    self.ui.warn(&format!(
+                        "Claude reached its output token limit; compacting and continuing the same phase ({recoveries}/{})",
+                        self.max_output_retries
+                    ));
+                    self.compact_session(session_id, "an output-limit interruption");
+                    current_session = SessionMode::Resume { id: session_id };
+                    current_prompt = output_limit_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (output-limit continuation {recoveries}/{})",
+                        self.max_output_retries
+                    );
+                }
+                ClaudeAttempt::OutputLimit => {
+                    bail!(
+                        "Claude repeatedly reached its output token limit; the phase remains resumable at its current checkpoint after {} automatic continuation(s). Raise --max-output-retries or resume after reducing the requested output",
+                        self.max_output_retries
+                    );
+                }
+            }
+        }
+    }
+
+    fn invoke_once(
+        &self,
+        session: &SessionMode,
+        prompt: &str,
+        activity: &str,
+        protocol: StageProtocol,
+    ) -> Result<ClaudeAttempt> {
+        self.ui
+            .debug(&format!("Claude session: {}", session_description(session)));
         self.ui.debug_prompt(activity, prompt);
         let mut output_format = if self.stream_filter.is_some() {
             ClaudeOutputFormat::StreamJson
@@ -338,7 +389,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                 self.repo,
                 self.launcher,
                 self.permission_mode,
-                &session,
+                session,
                 prompt,
                 output_format,
                 schema,
@@ -358,7 +409,13 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             first_attempt = false;
 
             if output.success {
+                if output_hit_token_limit(&output) {
+                    return Ok(ClaudeAttempt::OutputLimit);
+                }
                 break output;
+            }
+            if output_hit_token_limit(&output) {
+                return Ok(ClaudeAttempt::OutputLimit);
             }
             if use_schema && unsupported_schema_option(&output) {
                 use_schema = false;
@@ -389,12 +446,13 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             bail!("Claude stage failed: {}", diagnostic_text(&output));
         };
 
-        match output_format {
+        let result = match output_format {
             ClaudeOutputFormat::StreamJson => parse_claude_stream_output(&output.stdout),
             ClaudeOutputFormat::Json | ClaudeOutputFormat::Text => {
                 parse_claude_output(&output.stdout)
             }
-        }
+        }?;
+        Ok(ClaudeAttempt::Complete(result))
     }
 
     fn run_stage_command(&self, spec: &CommandSpec, activity: &str) -> Result<ProcessOutput> {
@@ -456,11 +514,11 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         match result {
             Ok(output) if output.success => {}
             Ok(output) => self.ui.warn(&format!(
-                "Could not compact planning context after {completed_phase}; continuing with the existing session: {}",
+                "Could not compact Claude context after {completed_phase}; continuing with the existing session: {}",
                 diagnostic_text(&output)
             )),
             Err(error) => self.ui.warn(&format!(
-                "Could not compact planning context after {completed_phase}; continuing with the existing session: {error}"
+                "Could not compact Claude context after {completed_phase}; continuing with the existing session: {error}"
             )),
         }
     }
@@ -501,6 +559,113 @@ fn session_description(session: &SessionMode) -> String {
         },
         SessionMode::Resume { id } => format!("resume {id}"),
     }
+}
+
+fn session_id(session: &SessionMode) -> Uuid {
+    match session {
+        SessionMode::New { id, .. } | SessionMode::Resume { id } => *id,
+    }
+}
+
+fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
+    stage_prompt(
+        "",
+        "The preceding Claude turn reached its output token limit before this ospx-build phase produced a terminal result. Continue the same phase from the existing Claude session and durable repository state. Preserve correct completed work, do not restart the phase, and finish the outstanding work now.",
+        protocol,
+    )
+}
+
+fn output_hit_token_limit(output: &ProcessOutput) -> bool {
+    let values = parse_output_values(&output.stdout);
+    let last_limit = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value_hit_token_limit(value).then_some(index))
+        .next_back();
+    let last_terminal = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value_has_stage_terminal(value).then_some(index))
+        .next_back();
+
+    if let Some(limit) = last_limit {
+        return last_terminal.is_none_or(|terminal| terminal < limit);
+    }
+
+    !output.success && text_mentions_output_limit(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn parse_output_values(stdout: &str) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(stdout) {
+        return vec![value];
+    }
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+fn value_hit_token_limit(value: &Value) -> bool {
+    value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+        || value
+            .get("message")
+            .and_then(|message| message.get("stop_reason"))
+            .and_then(Value::as_str)
+            == Some("max_tokens")
+        || value
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(text_mentions_output_limit)
+        || value
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|error| error.as_str().is_some_and(text_mentions_output_limit))
+            })
+        || (value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && value
+                .get("result")
+                .and_then(Value::as_str)
+                .is_some_and(text_mentions_output_limit))
+}
+
+fn value_has_stage_terminal(value: &Value) -> bool {
+    let result_event =
+        value.get("type").is_none() || value.get("type").and_then(Value::as_str) == Some("result");
+    if !result_event {
+        return false;
+    }
+    let structured = value.get("structured_output").and_then(|output| {
+        if let Some(text) = output.as_str() {
+            serde_json::from_str::<Value>(text).ok()
+        } else {
+            Some(output.clone())
+        }
+    });
+    structured
+        .as_ref()
+        .and_then(|output| output.get("ospx_status"))
+        .and_then(Value::as_str)
+        .and_then(parse_status_value)
+        .is_some()
+        || value
+            .get("result")
+            .and_then(Value::as_str)
+            .and_then(parse_signal)
+            .is_some()
+}
+
+fn text_mentions_output_limit(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("max_output_tokens")
+        || text.contains("max output tokens")
+        || text.contains("maximum output tokens")
+        || text.contains("output token limit")
 }
 
 fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
@@ -757,6 +922,41 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use crate::{
+        stream::{StreamControl, StreamItem},
+        ui::Ui,
+    };
+
+    #[cfg(unix)]
+    struct QuietUi;
+
+    #[cfg(unix)]
+    impl Ui for QuietUi {
+        fn banner(&self, _: &str) {}
+        fn change_name(&self, _: Option<&str>) {}
+        fn stage(&self, _: usize, _: usize, _: &str) {}
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn success(&self, _: &str) {}
+        fn failure(&self, _: &str) {}
+        fn command(&self, _: &str) {}
+        fn debug(&self, _: &str) {}
+        fn debug_prompt(&self, _: &str, _: &str) {}
+        fn start_stream(&self, _: &str) {}
+        fn poll_stream(&self) -> StreamControl {
+            StreamControl::None
+        }
+        fn stream_item(&self, _: &StreamItem) {}
+        fn finish_stream(&self, _: bool, _: &str) {}
+        fn finish_dashboard(&self) {}
+        fn output(&self, _: &str, _: &str) {}
+        fn start_activity(&self, _: &str) -> Option<indicatif::ProgressBar> {
+            None
+        }
+        fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
+    }
 
     #[test]
     fn constructs_new_and_resumed_session_commands() {
@@ -1022,5 +1222,110 @@ mod tests {
         assert_eq!(parsed.signal, StageSignal::Ready);
         assert_eq!(parsed.text, "Proposal complete");
         assert_eq!(parsed.session_id.as_deref(), Some("session-4"));
+    }
+
+    #[test]
+    fn detects_success_result_that_stopped_at_the_output_limit() {
+        let output = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: r#"{"type":"result","subtype":"success","stop_reason":"max_tokens","session_id":"session-5","result":"unfinished"}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(output_hit_token_limit(&output));
+    }
+
+    #[test]
+    fn detects_max_output_token_api_failures() {
+        let output = ProcessOutput {
+            success: false,
+            code: Some(1),
+            stdout: r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["max_output_tokens"],"session_id":"session-6"}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(output_hit_token_limit(&output));
+    }
+
+    #[test]
+    fn does_not_retry_a_recovered_api_limit_after_a_terminal_result() {
+        let output = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: concat!(
+                "{\"type\":\"system\",\"subtype\":\"api_retry\",\"error\":\"max_output_tokens\"}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"done\"}}\n"
+            )
+            .to_owned(),
+            stderr: String::new(),
+        };
+        assert!(!output_hit_token_limit(&output));
+    }
+
+    #[test]
+    fn retries_when_an_injected_turn_hits_the_limit_after_a_stage_result() {
+        let output = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: concat!(
+                "{\"type\":\"result\",\"subtype\":\"success\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"initial turn\"}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"max_tokens\",\"result\":\"unfinished follow-up\"}\n"
+            )
+            .to_owned(),
+            stderr: String::new(),
+        };
+        assert!(output_hit_token_limit(&output));
+    }
+
+    #[test]
+    fn continuation_prompt_preserves_the_stage_protocol() {
+        let prompt = output_limit_continuation_prompt(StageProtocol::Verify);
+        assert!(prompt.contains("Continue the same phase"));
+        assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_recovery_compacts_and_resumes_the_same_session() {
+        let directory = std::env::temp_dir().join(format!("ospx-limit-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let script = directory.join("fake-claude.sh");
+        let source = r#"
+state='__STATE__'
+if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
+case "$count" in
+  0) printf '%s\n' '{"is_error":false,"stop_reason":"max_tokens","session_id":"00000000-0000-0000-0000-000000000000","result":"unfinished"}' ;;
+  1) printf '%s\n' 'compacted' ;;
+  *) printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","result":"done","structured_output":{"ospx_status":"READY","summary":"continued successfully"}}' ;;
+esac
+printf '%s\n' "$((count + 1))" > "$state"
+"#
+        .replace("__STATE__", &state.display().to_string());
+        std::fs::write(&script, source).unwrap();
+
+        let launcher = ClaudeLauncher {
+            program: "sh".to_owned(),
+            prefix_args: vec![script.display().to_string()],
+            model: None,
+            auto_compact_window: None,
+        };
+        let ui = QuietUi;
+        let client = ClaudeClient::new(&directory, &launcher, "auto", None, 3, &ui);
+        let result = client
+            .invoke(
+                SessionMode::New {
+                    id: Uuid::nil(),
+                    name: None,
+                },
+                "do the work",
+                "Fake Claude stage",
+                StageProtocol::Ready,
+            )
+            .unwrap();
+
+        assert_eq!(result.signal, StageSignal::Ready);
+        assert_eq!(result.text, "continued successfully");
+        assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "3");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
