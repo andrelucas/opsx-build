@@ -106,8 +106,11 @@ impl<U: Ui> App<U> {
             return self.forget_checkpoint(&repo);
         }
 
-        let launcher =
-            ClaudeLauncher::parse(&self.cli.claude_command, self.cli.claude_model.clone())?;
+        let launcher = ClaudeLauncher::parse(
+            &self.cli.claude_command,
+            self.cli.claude_model.clone(),
+            self.cli.auto_compact_window,
+        )?;
         if launcher.program != "claude" {
             prerequisite_exists(&launcher.program, &repo, &self.ui)?;
         }
@@ -623,10 +626,11 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: program=`{}`, prefix args={:?}, model={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, permission mode=`{}`, stream filter={:?}",
             launcher.program,
             launcher.prefix_args,
             launcher.model,
+            launcher.auto_compact_window,
             self.cli.permission_mode,
             self.cli.stream_claude
         ));

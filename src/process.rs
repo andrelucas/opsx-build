@@ -15,6 +15,7 @@ use crate::ui::Ui;
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
 }
 
@@ -23,6 +24,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: Vec::new(),
             cwd: cwd.into(),
         }
     }
@@ -32,12 +34,20 @@ impl CommandSpec {
         self
     }
 
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
     pub fn display(&self) -> String {
-        std::iter::once(self.program.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .map(shell_quote)
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut parts = self
+            .env
+            .iter()
+            .map(|(name, value)| format!("{name}={}", shell_quote(value)))
+            .collect::<Vec<_>>();
+        parts.push(shell_quote(&self.program));
+        parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
+        parts.join(" ")
     }
 }
 
@@ -61,9 +71,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
     pub fn run(&self, spec: &CommandSpec, activity: &str) -> Result<ProcessOutput> {
         self.ui.command(&spec.display());
         let spinner = self.ui.start_activity(activity);
-        let output = Command::new(&spec.program)
-            .args(&spec.args)
-            .current_dir(&spec.cwd)
+        let output = command_for(spec)
             .output()
             .with_context(|| format!("failed to launch `{}`", spec.program));
 
@@ -111,12 +119,8 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         F: FnMut(&str),
     {
         self.ui.command(&spec.display());
-        let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .current_dir(&spec.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = command_for(spec);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_stream_process(&mut command);
         let mut child = command
             .spawn()
@@ -196,9 +200,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
 
     pub fn run_interactive(&self, spec: &CommandSpec) -> Result<()> {
         self.ui.command(&spec.display());
-        let status = Command::new(&spec.program)
-            .args(&spec.args)
-            .current_dir(&spec.cwd)
+        let status = command_for(spec)
             .status()
             .with_context(|| format!("failed to launch `{}`", spec.program))?;
         if !status.success() {
@@ -211,6 +213,15 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         }
         Ok(())
     }
+}
+
+fn command_for(spec: &CommandSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .envs(spec.env.iter().map(|(name, value)| (name, value)))
+        .current_dir(&spec.cwd);
+    command
 }
 
 #[cfg(unix)]
@@ -342,8 +353,24 @@ mod tests {
 
     #[test]
     fn displays_shell_safe_commands() {
-        let spec = CommandSpec::new("claude", "/tmp/repo").args(["--name", "my change", "simple"]);
-        assert_eq!(spec.display(), "claude --name 'my change' simple");
+        let spec = CommandSpec::new("claude", "/tmp/repo")
+            .args(["--name", "my change", "simple"])
+            .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "196608");
+        assert_eq!(
+            spec.display(),
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW=196608 claude --name 'my change' simple"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passes_explicit_environment_to_subprocesses() {
+        let spec = CommandSpec::new("sh", "/tmp")
+            .args(["-c", "printf %s \"$OSPX_BUILD_TEST_WINDOW\""])
+            .env("OSPX_BUILD_TEST_WINDOW", "196608");
+        let output = command_for(&spec).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "196608");
     }
 
     #[cfg(unix)]

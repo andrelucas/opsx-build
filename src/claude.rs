@@ -11,15 +11,22 @@ use crate::{
     ui::Ui,
 };
 
+const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeLauncher {
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
+    pub auto_compact_window: Option<u64>,
 }
 
 impl ClaudeLauncher {
-    pub fn parse(command: &str, model: Option<String>) -> Result<Self> {
+    pub fn parse(
+        command: &str,
+        model: Option<String>,
+        auto_compact_window: Option<u64>,
+    ) -> Result<Self> {
         let mut words = split_command(command)?;
         if words.is_empty() {
             bail!("--claude-command cannot be empty");
@@ -28,6 +35,7 @@ impl ClaudeLauncher {
             program: words.remove(0),
             prefix_args: words,
             model,
+            auto_compact_window,
         })
     }
 }
@@ -237,7 +245,10 @@ pub fn build_claude_command(
         }
     }
     args.push(prompt.to_owned());
-    CommandSpec::new(&launcher.program, repo).args(args)
+    with_launcher_environment(
+        CommandSpec::new(&launcher.program, repo).args(args),
+        launcher,
+    )
 }
 
 pub fn build_interactive_claude_command(
@@ -256,7 +267,17 @@ pub fn build_interactive_claude_command(
     if let Some(prompt) = initial_prompt {
         args.push(prompt.to_owned());
     }
-    CommandSpec::new(&launcher.program, repo).args(args)
+    with_launcher_environment(
+        CommandSpec::new(&launcher.program, repo).args(args),
+        launcher,
+    )
+}
+
+fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
+    match launcher.auto_compact_window {
+        Some(window) => spec.env(AUTO_COMPACT_ENV, window.to_string()),
+        None => spec,
+    }
 }
 
 pub struct ClaudeClient<'a, U: Ui> {
@@ -665,9 +686,12 @@ mod tests {
     #[test]
     fn constructs_new_and_resumed_session_commands() {
         let id = Uuid::nil();
-        let launcher =
-            ClaudeLauncher::parse("omlx launch claude", Some("qwen3.6-35b-a3b".to_owned()))
-                .unwrap();
+        let launcher = ClaudeLauncher::parse(
+            "omlx launch claude",
+            Some("qwen3.6-35b-a3b".to_owned()),
+            Some(196_608),
+        )
+        .unwrap();
         let new = build_claude_command(
             Path::new("/repo"),
             &launcher,
@@ -681,6 +705,10 @@ mod tests {
             None,
         );
         assert_eq!(new.program, "omlx");
+        assert_eq!(
+            new.env,
+            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+        );
         assert_eq!(
             new.args,
             vec![
@@ -746,17 +774,22 @@ mod tests {
         let launcher = ClaudeLauncher::parse(
             r#"'/Applications/oMLX Preview.app/omlx' launch "claude code""#,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(launcher.program, "/Applications/oMLX Preview.app/omlx");
         assert_eq!(launcher.prefix_args, ["launch", "claude code"]);
-        assert!(ClaudeLauncher::parse("omlx 'unterminated", None).is_err());
+        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None).is_err());
     }
 
     #[test]
     fn constructs_interactive_command_without_print_mode() {
-        let launcher =
-            ClaudeLauncher::parse("omlx launch claude", Some("local-model".to_owned())).unwrap();
+        let launcher = ClaudeLauncher::parse(
+            "omlx launch claude",
+            Some("local-model".to_owned()),
+            Some(196_608),
+        )
+        .unwrap();
         let command = build_interactive_claude_command(
             Path::new("/repo"),
             &launcher,
@@ -780,11 +813,15 @@ mod tests {
             ]
         );
         assert!(!command.args.iter().any(|arg| arg == "--print"));
+        assert_eq!(
+            command.env,
+            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+        );
     }
 
     #[test]
     fn adds_stage_schema_to_unattended_command() {
-        let launcher = ClaudeLauncher::parse("claude", None).unwrap();
+        let launcher = ClaudeLauncher::parse("claude", None, None).unwrap();
         let schema = StageProtocol::Verify.json_schema();
         let command = build_claude_command(
             Path::new("/repo"),

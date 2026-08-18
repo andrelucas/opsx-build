@@ -139,8 +139,22 @@ max_verify_retries = 3
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
+auto_compact_window = "192k"
 stream_claude = "activity"
 ```
+
+Set the same threshold for one invocation with:
+
+```sh
+ospx-build --auto-compact-window 192k "add function pointer support"
+```
+
+Token counts may be plain integers (`196608`) or use binary `k`/`m` suffixes;
+`192k` therefore means 196,608 tokens. The configured value is exported to
+every Claude subprocess as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, including
+interactive launcher tests, without changing the parent shell. Percentage
+thresholds are not currently accepted because ospx-build has no portable way
+to discover a launcher's effective model context window.
 
 Configuration precedence is:
 
@@ -171,6 +185,7 @@ The corresponding environment variables are:
 - `OSPX_BUILD_PERMISSION_MODE`
 - `OSPX_BUILD_CLAUDE_COMMAND`
 - `OSPX_BUILD_CLAUDE_MODEL`
+- `OSPX_BUILD_AUTO_COMPACT_WINDOW`
 - `OSPX_BUILD_EXPLORE_COMMAND`
 - `OSPX_BUILD_PROPOSE_COMMAND`
 - `OSPX_BUILD_APPLY_COMMAND`
@@ -210,6 +225,9 @@ options:
   streaming is enabled;
 - preferably `--json-schema`, returning `structured_output` in the final JSON
   result event.
+
+When `auto_compact_window` is configured, the launcher must also preserve the
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable for Claude Code.
 
 For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
 `structured_output`. For streaming output it finds the final JSONL event whose
