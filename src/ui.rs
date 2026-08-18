@@ -27,6 +27,8 @@ pub trait Ui {
     fn start_stream(&self, message: &str);
     /// Poll dashboard input for a command to send to the current subprocess.
     fn poll_stream(&self) -> StreamControl;
+    /// Report that a queued message was written to the subprocess input pipe.
+    fn stream_message_sent(&self, message: &str);
     fn stream_item(&self, item: &StreamItem);
     fn finish_stream(&self, success: bool, message: &str);
     fn finish_dashboard(&self);
@@ -218,6 +220,13 @@ impl Ui for TerminalUi {
             .dashboard
             .as_mut()
             .map_or(StreamControl::None, StreamDashboard::poll)
+    }
+
+    fn stream_message_sent(&self, message: &str) {
+        if self.dashboard_message("sent", Color::Green, message) {
+            return;
+        }
+        self.write_line(&format!("{} {message}", Style::new().green().apply_to("→")));
     }
 
     fn stream_item(&self, item: &StreamItem) {

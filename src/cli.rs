@@ -32,6 +32,7 @@ pub struct Cli {
     pub claude_command: String,
     pub claude_model: Option<String>,
     pub auto_compact_window: Option<u64>,
+    pub auto_compact_percent: Option<u8>,
     pub max_output_tokens: Option<u64>,
     pub explore_command: Option<String>,
     pub propose_command: Option<String>,
@@ -155,9 +156,13 @@ struct CliArgs {
     #[arg(long, env = "OSPX_BUILD_CLAUDE_MODEL", value_name = "MODEL")]
     claude_model: Option<String>,
 
-    /// Claude auto-compaction threshold in tokens (supports binary k/m suffixes).
+    /// Context capacity used for Claude auto-compaction (supports binary k/m suffixes).
     #[arg(long, env = "OSPX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
     auto_compact_window: Option<TokenCount>,
+
+    /// Percentage of the effective context capacity at which Claude auto-compacts.
+    #[arg(long, env = "OSPX_BUILD_AUTO_COMPACT_PERCENT", value_name = "PERCENT")]
+    auto_compact_percent: Option<Percentage>,
 
     /// Maximum Claude output tokens per request (supports binary k/m suffixes).
     #[arg(long, env = "OSPX_BUILD_MAX_OUTPUT_TOKENS", value_name = "TOKENS")]
@@ -193,6 +198,7 @@ struct FileConfig {
     claude_command: Option<String>,
     claude_model: Option<String>,
     auto_compact_window: Option<TokenCount>,
+    auto_compact_percent: Option<Percentage>,
     max_output_tokens: Option<TokenCount>,
     explore_command: Option<String>,
     propose_command: Option<String>,
@@ -271,6 +277,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .auto_compact_window
             .or(config.auto_compact_window)
             .map(|count| count.0),
+        auto_compact_percent: args
+            .auto_compact_percent
+            .or(config.auto_compact_percent)
+            .map(|percentage| percentage.0),
         max_output_tokens: args
             .max_output_tokens
             .or(config.max_output_tokens)
@@ -320,10 +330,7 @@ impl<'de> Deserialize<'de> for TokenCount {
 fn parse_token_count(value: &str) -> Result<u64, String> {
     let normalized = value.trim().replace('_', "").to_ascii_lowercase();
     if normalized.ends_with('%') {
-        return Err(
-            "percentage thresholds require model context-window visibility; use an absolute token count"
-                .to_owned(),
-        );
+        return Err("use --auto-compact-percent for percentage thresholds".to_owned());
     }
     let (digits, multiplier) = if let Some(digits) = normalized.strip_suffix('k') {
         (digits, 1_024_u64)
@@ -342,6 +349,49 @@ fn parse_token_count(value: &str) -> Result<u64, String> {
         return Err("token count must be greater than zero".to_owned());
     }
     Ok(count)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Percentage(u8);
+
+impl std::str::FromStr for Percentage {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_percentage(value).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Percentage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Integer(u8),
+            Text(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Integer(value) => parse_percentage(&value.to_string())
+                .map(Self)
+                .map_err(serde::de::Error::custom),
+            Value::Text(value) => value.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+fn parse_percentage(value: &str) -> Result<u8, String> {
+    let normalized = value.trim().strip_suffix('%').unwrap_or(value.trim());
+    let percentage = normalized
+        .parse::<u8>()
+        .map_err(|_| format!("invalid percentage `{value}`"))?;
+    if !(1..=100).contains(&percentage) {
+        return Err("percentage must be between 1 and 100".to_owned());
+    }
+    Ok(percentage)
 }
 
 #[cfg(test)]
@@ -365,6 +415,7 @@ mod tests {
                 claude_command = "omlx launch claude"
                 claude_model = "local-model"
                 auto_compact_window = "192k"
+                auto_compact_percent = "75%"
                 max_output_tokens = "8k"
                 verify_command = "/opsx:verify"
                 stream_claude = "full"
@@ -383,6 +434,7 @@ mod tests {
         assert_eq!(cli.claude_command, "omlx launch claude");
         assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
         assert_eq!(cli.auto_compact_window, Some(196_608));
+        assert_eq!(cli.auto_compact_percent, Some(75));
         assert_eq!(cli.max_output_tokens, Some(8_192));
         assert_eq!(cli.verify_command.as_deref(), Some("/opsx:verify"));
         assert_eq!(cli.stream_claude, Some(StreamFilter::Full));
@@ -396,6 +448,7 @@ mod tests {
                 max_output_retries = 6
                 claude_model = "config-model"
                 auto_compact_window = 131072
+                auto_compact_percent = 80
                 max_output_tokens = 16384
             "#,
         )
@@ -411,6 +464,8 @@ mod tests {
                 "cli-model",
                 "--auto-compact-window",
                 "200k",
+                "--auto-compact-percent",
+                "50",
                 "--max-output-tokens",
                 "12k",
                 "build something",
@@ -423,6 +478,7 @@ mod tests {
         assert_eq!(cli.max_output_retries, 4);
         assert_eq!(cli.claude_model.as_deref(), Some("cli-model"));
         assert_eq!(cli.auto_compact_window, Some(204_800));
+        assert_eq!(cli.auto_compact_percent, Some(50));
         assert_eq!(cli.max_output_tokens, Some(12_288));
     }
 
@@ -444,17 +500,22 @@ mod tests {
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
         assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
         assert_eq!(cli.auto_compact_window, None);
+        assert_eq!(cli.auto_compact_percent, None);
         assert_eq!(cli.max_output_tokens, None);
     }
 
     #[test]
-    fn parses_absolute_auto_compact_windows_and_explains_percentages() {
+    fn parses_auto_compact_windows_and_percentages() {
         assert_eq!(parse_token_count("196_608").unwrap(), 196_608);
         assert_eq!(parse_token_count("192k").unwrap(), 196_608);
         assert_eq!(parse_token_count("1M").unwrap(), 1_048_576);
 
         let percentage = parse_token_count("75%").unwrap_err();
-        assert!(percentage.contains("model context-window visibility"));
+        assert!(percentage.contains("--auto-compact-percent"));
+        assert_eq!(parse_percentage("75").unwrap(), 75);
+        assert_eq!(parse_percentage("50%").unwrap(), 50);
+        assert!(parse_percentage("0").is_err());
+        assert!(parse_percentage("101").is_err());
         assert!(
             CliArgs::try_parse_from([
                 "ospx-build",

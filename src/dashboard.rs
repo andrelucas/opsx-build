@@ -312,7 +312,7 @@ impl StreamDashboard {
                     self.push_message(
                         "compact",
                         Color::Magenta,
-                        "Queued /compact for Claude's next turn",
+                        "Requested /compact; waiting for the current command to yield",
                     );
                     return StreamControl::Compact;
                 }
@@ -367,7 +367,7 @@ impl StreamDashboard {
                     if message.trim().is_empty() {
                         return StreamControl::None;
                     }
-                    self.push_message("inject", Color::Magenta, &format!("Queued: {message}"));
+                    self.push_message("inject", Color::Magenta, &format!("Requested: {message}"));
                     return StreamControl::Inject(message);
                 }
                 KeyCode::Esc => {
@@ -866,7 +866,7 @@ mod tests {
                 .back()
                 .unwrap()
                 .text
-                .contains("Queued /compact")
+                .contains("Requested /compact")
         );
 
         dashboard.start_stream("next Claude invocation");

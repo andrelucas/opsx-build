@@ -163,7 +163,9 @@ max_output_retries = 3
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
-auto_compact_window = "192k"
+auto_compact_window = "128k"
+# Alternatively, compact at a percentage of the launcher's effective capacity.
+# auto_compact_percent = 50
 max_output_tokens = "8k"
 stream_claude = "activity"
 ```
@@ -171,7 +173,7 @@ stream_claude = "activity"
 Set the same limits for one invocation with:
 
 ```sh
-ospx-build --auto-compact-window 192k --max-output-tokens 8k \
+ospx-build --auto-compact-window 128k --max-output-tokens 8k \
   "add function pointer support"
 ```
 
@@ -182,14 +184,22 @@ ospx-build --max-output-retries 5 "add function pointer support"
 ```
 
 Token counts may be plain integers (`8192`) or use binary `k`/`m` suffixes;
-`8k` therefore means 8,192 tokens. The configured values are exported to every
-Claude subprocess as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and
+`8k` therefore means 8,192 tokens. `auto_compact_percent` accepts an integer
+from 1 to 100 and applies to the effective capacity selected by Claude or its
+launcher, so ospx-build does not need model visibility. The configured values
+are exported to every Claude subprocess as
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, including interactive launcher tests, without
-changing the parent shell. Leaving either setting absent preserves Claude's
-model-specific default. A lower output limit bounds slow decode latency but can
-cause more continuation turns; output-limit recovery handles those turns.
-Percentage thresholds are not accepted because ospx-build has no portable way
-to discover a launcher's effective model context window.
+changing the parent shell. Leaving a setting absent preserves Claude's or the
+launcher's default.
+
+The oMLX launcher supplies the selected model's capacity when no explicit
+window is present. Current oMLX versions preserve an inherited absolute window
+and percentage override. As an alternative to `auto_compact_window = "128k"`,
+`auto_compact_percent = 50` against a 262,144-token capacity targets
+approximately 131,072 tokens. A lower output limit bounds slow decode latency
+but can cause more continuation turns; output-limit recovery handles those
+turns.
 
 Configuration precedence is:
 
@@ -221,6 +231,8 @@ The corresponding environment variables are:
 - `OSPX_BUILD_CLAUDE_COMMAND`
 - `OSPX_BUILD_CLAUDE_MODEL`
 - `OSPX_BUILD_AUTO_COMPACT_WINDOW`
+- `OSPX_BUILD_AUTO_COMPACT_PERCENT`
+- `OSPX_BUILD_MAX_OUTPUT_TOKENS`
 - `OSPX_BUILD_EXPLORE_COMMAND`
 - `OSPX_BUILD_PROPOSE_COMMAND`
 - `OSPX_BUILD_APPLY_COMMAND`
@@ -269,8 +281,10 @@ Code's [slash-command protocol][claude-slash-commands]. These are Claude
 transport requirements, not oMLX APIs.
 
 When token policies are configured, the launcher must preserve
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. The latter
-is Claude Code's documented [maximum-output environment variable][claude-env-vars].
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, unless it explicitly owns one of those policy
+choices. The output limit is Claude Code's documented
+[maximum-output environment variable][claude-env-vars].
 
 For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
 `structured_output`. For streaming output it finds the most recent JSONL result
@@ -327,7 +341,8 @@ start.
 
 Controls:
 
-- `c` queues `/compact` as Claude's next turn (once per Claude invocation);
+- `c` writes `/compact` as Claude's next user turn (once per invocation); it
+  cannot interrupt or compact the middle of the current agentic command;
 - `i` opens an injection prompt; type any Claude slash command or ordinary
   follow-up instruction, then press Enter to queue it as the next turn;
 - Escape cancels the injection prompt;
@@ -340,10 +355,12 @@ Controls:
   checkpoint.
 
 Injected messages do not interrupt an agentic turn already in progress. Claude
-finishes that turn and processes queued input afterward. The dashboard records
-the queued text, and a `compact_boundary` event is shown even with the default
-`activity` filter. These controls are available in the TTY dashboard; linear
-non-TTY streaming remains output-only.
+finishes that command and processes queued input afterward. The dashboard first
+records the request, then records when it has been written to Claude's stdin.
+That write acknowledgement is not a compaction acknowledgement; successful
+compaction is reported separately by Claude's `compact_boundary` event, which
+is shown even with the default `activity` filter. These controls are available
+in the TTY dashboard; linear non-TTY streaming remains output-only.
 
 Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when

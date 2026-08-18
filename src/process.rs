@@ -214,6 +214,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                 &mut sent_messages,
                             ) {
                                 self.ui.warn(&format!("Could not queue /compact: {error}"));
+                            } else {
+                                self.ui.stream_message_sent(
+                                    "/compact written to Claude stdin; it will run after the current command yields",
+                                );
                             }
                         } else {
                             self.ui.warn(
@@ -228,6 +232,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                             {
                                 self.ui
                                     .warn(&format!("Could not inject Claude message: {error}"));
+                            } else {
+                                self.ui.stream_message_sent(
+                                    "Injected message written to Claude stdin; it will run after the current command yields",
+                                );
                             }
                         } else {
                             self.ui.warn(

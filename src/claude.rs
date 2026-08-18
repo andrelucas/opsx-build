@@ -12,6 +12,7 @@ use crate::{
 };
 
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub struct ClaudeLauncher {
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
     pub auto_compact_window: Option<u64>,
+    pub auto_compact_percent: Option<u8>,
     pub max_output_tokens: Option<u64>,
 }
 
@@ -28,6 +30,7 @@ impl ClaudeLauncher {
         command: &str,
         model: Option<String>,
         auto_compact_window: Option<u64>,
+        auto_compact_percent: Option<u8>,
         max_output_tokens: Option<u64>,
     ) -> Result<Self> {
         let mut words = split_command(command)?;
@@ -39,6 +42,7 @@ impl ClaudeLauncher {
             prefix_args: words,
             model,
             auto_compact_window,
+            auto_compact_percent,
             max_output_tokens,
         })
     }
@@ -291,6 +295,10 @@ pub fn build_interactive_claude_command(
 fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
     let spec = match launcher.auto_compact_window {
         Some(window) => spec.env(AUTO_COMPACT_ENV, window.to_string()),
+        None => spec,
+    };
+    let spec = match launcher.auto_compact_percent {
+        Some(percentage) => spec.env(AUTO_COMPACT_PERCENT_ENV, percentage.to_string()),
         None => spec,
     };
     match launcher.max_output_tokens {
@@ -957,6 +965,7 @@ mod tests {
         fn poll_stream(&self) -> StreamControl {
             StreamControl::None
         }
+        fn stream_message_sent(&self, _: &str) {}
         fn stream_item(&self, _: &StreamItem) {}
         fn finish_stream(&self, _: bool, _: &str) {}
         fn finish_dashboard(&self) {}
@@ -974,6 +983,7 @@ mod tests {
             "omlx launch claude",
             Some("qwen3.6-35b-a3b".to_owned()),
             Some(196_608),
+            Some(75),
             Some(8_192),
         )
         .unwrap();
@@ -994,6 +1004,7 @@ mod tests {
             new.env,
             [
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
             ]
         );
@@ -1052,6 +1063,7 @@ mod tests {
             compact.env,
             [
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
             ]
         );
@@ -1114,11 +1126,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(launcher.program, "/Applications/oMLX Preview.app/omlx");
         assert_eq!(launcher.prefix_args, ["launch", "claude code"]);
-        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None).is_err());
+        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None, None).is_err());
     }
 
     #[test]
@@ -1127,6 +1140,7 @@ mod tests {
             "omlx launch claude",
             Some("local-model".to_owned()),
             Some(196_608),
+            Some(75),
             Some(8_192),
         )
         .unwrap();
@@ -1157,6 +1171,7 @@ mod tests {
             command.env,
             [
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
             ]
         );
@@ -1164,7 +1179,7 @@ mod tests {
 
     #[test]
     fn adds_stage_schema_to_unattended_command() {
-        let launcher = ClaudeLauncher::parse("claude", None, None, None).unwrap();
+        let launcher = ClaudeLauncher::parse("claude", None, None, None, None).unwrap();
         let schema = StageProtocol::Verify.json_schema();
         let command = build_claude_command(
             Path::new("/repo"),
@@ -1340,6 +1355,7 @@ printf '%s\n' "$((count + 1))" > "$state"
             prefix_args: vec![script.display().to_string()],
             model: None,
             auto_compact_window: None,
+            auto_compact_percent: None,
             max_output_tokens: None,
         };
         let ui = QuietUi;

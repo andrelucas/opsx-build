@@ -110,6 +110,7 @@ impl<U: Ui> App<U> {
             &self.cli.claude_command,
             self.cli.claude_model.clone(),
             self.cli.auto_compact_window,
+            self.cli.auto_compact_percent,
             self.cli.max_output_tokens,
         )?;
         if launcher.program != "claude" {
@@ -636,11 +637,12 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
             launcher.program,
             launcher.prefix_args,
             launcher.model,
             launcher.auto_compact_window,
+            launcher.auto_compact_percent,
             launcher.max_output_tokens,
             self.cli.permission_mode,
             self.cli.stream_claude
