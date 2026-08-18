@@ -311,8 +311,8 @@ ospx-build does not start, stop, configure, or query that server. `omlx launch
 claude` must forward the Claude Code options above and preserve the streaming
 stdin pipe. Structured and streaming output were tested through this launcher
 with Claude Code 2.1.224 and
-`Qwen3.6-35B-A3B-4bit`. The interrupt → compact → resume cycle was also tested
-through this oMLX launcher.
+`Qwen3.6-35B-A3B-4bit`. The interrupt → slash command → resume cycle was also
+tested with both `/compact` and `/context` through this oMLX launcher.
 
 ## Live output and diagnostics
 
@@ -348,6 +348,8 @@ Controls:
 - `c` sends Claude's interrupt control request—the streaming equivalent of
   Escape—then runs `/compact` and reissues the interrupted stage command (once
   per invocation);
+- `C` follows the same interrupt/resume cycle but runs `/context`, leaving
+  Claude's context report in the phase disclosure for debugging;
 - `i` opens an injection prompt; type any Claude slash command or ordinary
   follow-up instruction, then press Enter to queue it as the next turn;
 - Escape cancels the injection prompt;
@@ -360,11 +362,12 @@ Controls:
   checkpoint.
 
 Arbitrary `i` messages do not interrupt an agentic turn already in progress;
-Claude processes them after that turn. `c` is deliberately different: it asks
-Claude to stop the active turn, waits for the interrupted result, sends
-`/compact`, waits for that result, and then reissues the exact stage input. It
-does not roll back repository changes made before interruption; OpenSpec and the
-repository remain the durable state from which the reissued stage continues.
+Claude processes them after that turn. `c` and `C` are deliberately different:
+they ask Claude to stop the active turn, wait for the interrupted result, send
+their slash command, wait for that result, and then reissue the exact stage
+input. Neither rolls back repository changes made before interruption; OpenSpec
+and the repository remain the durable state from which the reissued stage
+continues.
 The dashboard records each step. A write or interrupt acknowledgement is not a
 compaction acknowledgement; successful compaction is reported by Claude's
 `compact_boundary` event, which is shown even with the default `activity`

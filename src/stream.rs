@@ -7,6 +7,7 @@ pub enum StreamControl {
     #[default]
     None,
     Compact,
+    Context,
     Inject(String),
     Interrupt,
 }

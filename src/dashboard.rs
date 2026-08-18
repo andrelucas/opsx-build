@@ -79,6 +79,7 @@ pub(crate) struct StreamDashboard {
     dirty: bool,
     active: bool,
     compact_requested: bool,
+    context_requested: bool,
     injection_input: Option<String>,
 }
 
@@ -115,6 +116,7 @@ impl StreamDashboard {
             dirty: true,
             active: true,
             compact_requested: false,
+            context_requested: false,
             injection_input: None,
         };
         dashboard.draw()?;
@@ -176,6 +178,7 @@ impl StreamDashboard {
     pub(crate) fn start_stream(&mut self, message: &str) {
         self.activity = message.to_owned();
         self.compact_requested = false;
+        self.context_requested = false;
         self.injection_input = None;
         if let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Running;
@@ -296,7 +299,7 @@ impl StreamDashboard {
         if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('c')
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
             return StreamControl::Interrupt;
         }
@@ -315,6 +318,15 @@ impl StreamDashboard {
                         "Requested mid-command compaction; interrupting Claude first",
                     );
                     return StreamControl::Compact;
+                }
+                KeyCode::Char('C') if !self.context_requested => {
+                    self.context_requested = true;
+                    self.push_message(
+                        "context",
+                        Color::Magenta,
+                        "Requested context inspection; interrupting Claude first",
+                    );
+                    return StreamControl::Context;
                 }
                 KeyCode::Char('i') => {
                     self.injection_input = Some(String::new());
@@ -604,7 +616,7 @@ impl StreamDashboard {
         if height > 3 {
             let footer = self.injection_input.as_ref().map_or_else(
                 || {
-                    "c compact · i inject · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
+                    "c compact · C context · i inject · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
                         .to_owned()
                 },
                 |input| format!("inject> {input}█   Enter queue · Esc cancel · Ctrl-C stop"),
@@ -734,6 +746,7 @@ mod tests {
             dirty: false,
             active: false,
             compact_requested: false,
+            context_requested: false,
             injection_input: None,
         };
         dashboard.set_stage(StageView {
@@ -876,6 +889,37 @@ mod tests {
                 KeyModifiers::NONE,
             ))),
             StreamControl::Compact
+        );
+    }
+
+    #[test]
+    fn capital_c_queues_one_context_inspection_per_stream() {
+        let mut dashboard = dashboard();
+        let context = Event::Key(event::KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            dashboard.handle_event(context.clone()),
+            StreamControl::Context
+        );
+        assert_eq!(dashboard.handle_event(context), StreamControl::None);
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("Requested context inspection")
+        );
+
+        dashboard.start_stream("next Claude invocation");
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::SHIFT,
+            ))),
+            StreamControl::Context
         );
     }
 

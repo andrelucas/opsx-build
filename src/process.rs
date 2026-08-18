@@ -84,7 +84,38 @@ struct PendingTurn {
 #[derive(Debug)]
 enum TurnPurpose {
     Work,
-    Compact { resume_input: Option<String> },
+    InterruptFollowUp {
+        action: InterruptAction,
+        resume_input: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InterruptAction {
+    Compact,
+    Context,
+}
+
+impl InterruptAction {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Compact => "/compact",
+            Self::Context => "/context",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Compact => "compaction",
+            Self::Context => "context inspection",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingInterrupt {
+    request_id: String,
+    action: InterruptAction,
 }
 
 pub struct ProcessRunner<'a, U: Ui> {
@@ -181,7 +212,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut sent_messages = usize::from(spec.initial_stdin.is_some());
         let mut completed_messages = 0usize;
         let mut pending_turns = VecDeque::new();
-        let mut interrupt_request_id: Option<String> = None;
+        let mut pending_interrupt: Option<PendingInterrupt> = None;
         if let (Some(stdin), Some(initial)) = (child_stdin.as_mut(), spec.initial_stdin.as_deref())
         {
             match write_stream_input(stdin, initial) {
@@ -208,26 +239,34 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     if let Some(result) = stream_result(trimmed) {
                         completed_messages += 1;
                         let completed_turn = pending_turns.pop_front();
-                        if interrupt_request_id.take().is_some() {
+                        if let Some(interrupt) = pending_interrupt.take() {
                             let resume_input = completed_turn
                                 .filter(|_| result_was_interrupted(&result))
                                 .map(|turn| turn.input);
-                            if let Err(error) = queue_compaction_turn(
+                            if let Err(error) = queue_interrupt_follow_up(
                                 &mut child_stdin,
+                                interrupt.action,
                                 resume_input,
                                 &mut sent_messages,
                                 &mut pending_turns,
                             ) {
                                 self.ui.warn(&format!(
-                                    "Claude was interrupted, but /compact could not be queued: {error}"
+                                    "Claude was interrupted, but {} could not be queued: {error}",
+                                    interrupt.action.command()
                                 ));
                             } else {
-                                self.ui.stream_message_sent(
-                                    "/compact written after interrupt; waiting for compaction",
-                                );
+                                self.ui.stream_message_sent(&format!(
+                                    "{} written after interrupt; waiting for {}",
+                                    interrupt.action.command(),
+                                    interrupt.action.noun()
+                                ));
                             }
                         } else if let Some(PendingTurn {
-                            purpose: TurnPurpose::Compact { resume_input },
+                            purpose:
+                                TurnPurpose::InterruptFollowUp {
+                                    action,
+                                    resume_input,
+                                },
                             ..
                         }) = completed_turn
                             && let Some(input) = resume_input
@@ -240,38 +279,48 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                 &mut pending_turns,
                             ) {
                                 self.ui.warn(&format!(
-                                    "Claude compacted, but the interrupted command could not be resumed: {error}"
+                                    "Claude completed {}, but the interrupted command could not be resumed: {error}",
+                                    action.noun()
                                 ));
                             } else {
-                                self.ui.stream_message_sent(
-                                    "Interrupted command reissued after compaction",
-                                );
+                                self.ui.stream_message_sent(&format!(
+                                    "Interrupted command reissued after {}",
+                                    action.noun()
+                                ));
                             }
                         }
-                    } else if let Some(response) = interrupt_request_id
-                        .as_deref()
-                        .and_then(|request_id| control_response(trimmed, request_id))
+                    } else if let Some(response) = pending_interrupt
+                        .as_ref()
+                        .and_then(|interrupt| control_response(trimmed, &interrupt.request_id))
                     {
                         match response {
                             Ok(()) => self.ui.stream_message_sent(
                                 "Claude acknowledged the interrupt; waiting for active work to stop",
                             ),
                             Err(error) => {
+                                let interrupt = pending_interrupt
+                                    .take()
+                                    .expect("matched response has a pending interrupt");
                                 self.ui.warn(&format!(
-                                    "Claude rejected the interrupt ({error}); /compact will remain a queued follow-up"
+                                    "Claude rejected the interrupt ({error}); {} will remain a queued follow-up",
+                                    interrupt.action.command()
                                 ));
-                                interrupt_request_id = None;
-                                if let Err(error) = queue_compaction_turn(
+                                if let Err(error) = queue_interrupt_follow_up(
                                     &mut child_stdin,
+                                    interrupt.action,
                                     None,
                                     &mut sent_messages,
                                     &mut pending_turns,
                                 ) {
-                                    self.ui.warn(&format!("Could not queue /compact: {error}"));
+                                    self.ui.warn(&format!(
+                                        "Could not queue {}: {error}",
+                                        interrupt.action.command()
+                                    ));
                                 } else {
-                                    self.ui.stream_message_sent(
-                                        "Interrupt unsupported; /compact queued for the next turn",
-                                    );
+                                    self.ui.stream_message_sent(&format!(
+                                        "Interrupt unsupported; {} queued for the next turn",
+                                        interrupt.action.command()
+                                    ));
                                 }
                             }
                         }
@@ -296,24 +345,35 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                             read_error.get_or_insert(error);
                         }
                     }
-                    StreamControl::Compact => {
+                    control @ (StreamControl::Compact | StreamControl::Context) => {
                         if spec.accepts_stream_messages {
+                            let action = match control {
+                                StreamControl::Context => InterruptAction::Context,
+                                _ => InterruptAction::Compact,
+                            };
+                            if pending_interrupt.is_some() {
+                                self.ui
+                                    .warn("Another interrupting command is already in progress");
+                                continue;
+                            }
                             let request_id = format!("ospx_interrupt_{}", uuid::Uuid::new_v4());
                             if let Err(error) =
                                 queue_stream_interrupt(&mut child_stdin, &request_id)
                             {
                                 self.ui.warn(&format!(
-                                    "Could not interrupt Claude for compaction: {error}"
+                                    "Could not interrupt Claude for {}: {error}",
+                                    action.noun()
                                 ));
                             } else {
-                                interrupt_request_id = Some(request_id);
-                                self.ui.stream_message_sent(
-                                    "Interrupt written to Claude stdin; waiting for active work to stop",
-                                );
+                                pending_interrupt = Some(PendingInterrupt { request_id, action });
+                                self.ui.stream_message_sent(&format!(
+                                    "Interrupt written to Claude stdin for {}; waiting for active work to stop",
+                                    action.noun()
+                                ));
                             }
                         } else {
                             self.ui.warn(
-                                "This Claude invocation is already compacting; no second /compact was queued",
+                                "This Claude invocation does not accept an interrupting slash command",
                             );
                         }
                     }
@@ -429,16 +489,20 @@ fn queue_stream_interrupt<W: Write>(
     write_stream_input(stdin, &stream_interrupt_request(request_id))
 }
 
-fn queue_compaction_turn<W: Write>(
+fn queue_interrupt_follow_up<W: Write>(
     stdin: &mut Option<W>,
+    action: InterruptAction,
     resume_input: Option<String>,
     sent_messages: &mut usize,
     pending_turns: &mut VecDeque<PendingTurn>,
 ) -> std::io::Result<()> {
     queue_raw_turn(
         stdin,
-        stream_user_message("/compact"),
-        TurnPurpose::Compact { resume_input },
+        stream_user_message(action.command()),
+        TurnPurpose::InterruptFollowUp {
+            action,
+            resume_input,
+        },
         sent_messages,
         pending_turns,
     )
@@ -637,13 +701,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::IsTerminal,
-        sync::{
-            Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
+    use std::{io::IsTerminal, sync::Mutex};
 
     #[cfg(unix)]
     use crate::{stream::StreamItem, ui::TerminalUi};
@@ -716,23 +774,23 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct CompactingUi {
-        compact_sent: AtomicBool,
+    struct InterruptingUi {
+        control: Mutex<Option<StreamControl>>,
         messages: Mutex<Vec<String>>,
     }
 
     #[cfg(unix)]
-    impl CompactingUi {
-        fn new() -> Self {
+    impl InterruptingUi {
+        fn new(control: StreamControl) -> Self {
             Self {
-                compact_sent: AtomicBool::new(false),
+                control: Mutex::new(Some(control)),
                 messages: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[cfg(unix)]
-    impl Ui for CompactingUi {
+    impl Ui for InterruptingUi {
         fn banner(&self, _: &str) {}
         fn change_name(&self, _: Option<&str>) {}
         fn stage(&self, _: usize, _: usize, _: &str) {}
@@ -750,11 +808,7 @@ mod tests {
         fn debug_prompt(&self, _: &str, _: &str) {}
         fn start_stream(&self, _: &str) {}
         fn poll_stream(&self) -> StreamControl {
-            if self.compact_sent.swap(true, Ordering::SeqCst) {
-                StreamControl::None
-            } else {
-                StreamControl::Compact
-            }
+            self.control.lock().unwrap().take().unwrap_or_default()
         }
         fn stream_message_sent(&self, message: &str) {
             self.messages.lock().unwrap().push(message.to_owned());
@@ -770,42 +824,65 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn compact_interrupts_then_compacts_and_reissues_the_active_turn() {
+    fn run_interrupting_follow_up(
+        control: StreamControl,
+        slash_command: &str,
+    ) -> (ProcessOutput, String) {
         let script = r#"
 IFS= read -r initial
 IFS= read -r control
+expected=$1
 request_id=$(printf '%s' "$control" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
 test -n "$request_id" || exit 10
 printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"still_queued":[]}}}\n' "$request_id"
 printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools","result":"Interrupted by user"}'
-IFS= read -r compact
-printf '%s' "$compact" | grep -q '"text":"/compact"' || exit 11
-printf '%s\n' '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":24000}}'
-printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Compacted"}'
+IFS= read -r follow_up
+printf '%s' "$follow_up" | grep -Fq "\"text\":\"$expected\"" || exit 11
+if [ "$expected" = /compact ]; then
+  printf '%s\n' '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":24000}}'
+else
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Context diagnostic"}]}}'
+fi
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Follow-up complete"}'
 IFS= read -r resumed
 test "$resumed" = "$initial" || exit 12
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"ospx_status":"APPLIED","summary":"resumed"}}'
 "#;
-        let ui = CompactingUi::new();
+        let ui = InterruptingUi::new(control);
         let runner = ProcessRunner::new(&ui);
         let initial = stream_user_message("/opsx:apply slice-a");
         let spec = CommandSpec::new("sh", "/tmp")
-            .args(["-c", script])
+            .args(["-c", script, "ospx-test", slash_command])
             .stream_input(initial);
 
         let output = runner
             .run_streaming(&spec, "Apply", |_| {})
-            .expect("interrupt/compact/resume cycle should complete");
+            .expect("interrupt/follow-up/resume cycle should complete");
 
         assert!(output.success, "stderr: {}", output.stderr);
-        assert!(output.stdout.contains("compact_boundary"));
         assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
         let messages = ui.messages.lock().unwrap().join("\n");
         assert!(messages.contains("Interrupt written"));
         assert!(messages.contains("acknowledged the interrupt"));
+        (output, messages)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_interrupts_then_compacts_and_reissues_the_active_turn() {
+        let (output, messages) = run_interrupting_follow_up(StreamControl::Compact, "/compact");
+        assert!(output.stdout.contains("compact_boundary"));
         assert!(messages.contains("/compact written after interrupt"));
         assert!(messages.contains("reissued after compaction"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_interrupts_then_reports_and_reissues_the_active_turn() {
+        let (output, messages) = run_interrupting_follow_up(StreamControl::Context, "/context");
+        assert!(output.stdout.contains("Context diagnostic"));
+        assert!(messages.contains("/context written after interrupt"));
+        assert!(messages.contains("reissued after context inspection"));
     }
 
     #[cfg(unix)]
