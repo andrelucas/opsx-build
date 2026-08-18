@@ -312,7 +312,7 @@ impl StreamDashboard {
                     self.push_message(
                         "compact",
                         Color::Magenta,
-                        "Requested /compact; waiting for the current command to yield",
+                        "Requested mid-command compaction; interrupting Claude first",
                     );
                     return StreamControl::Compact;
                 }
@@ -866,7 +866,7 @@ mod tests {
                 .back()
                 .unwrap()
                 .text
-                .contains("Requested /compact")
+                .contains("Requested mid-command compaction")
         );
 
         dashboard.start_stream("next Claude invocation");

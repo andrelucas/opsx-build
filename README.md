@@ -273,12 +273,15 @@ options:
 - preferably `--json-schema`, returning `structured_output` in the final JSON
   result event.
 
-For bidirectional streaming, the launcher must pass newline-delimited `user`
-messages from stdin to Claude before EOF, preserve multiple `result` events on
-stdout, and leave the pipe open for later messages. Slash commands use this same
-transport; `/compact` behavior and `compact_boundary` events follow Claude
-Code's [slash-command protocol][claude-slash-commands]. These are Claude
-transport requirements, not oMLX APIs.
+For bidirectional streaming, the launcher must pass newline-delimited messages
+from stdin to Claude before EOF, preserve multiple `result` events on stdout,
+and leave the pipe open for later messages. Ordinary and slash-command turns use
+Claude's `user` message shape. Mid-command compaction additionally uses Claude's
+`control_request`/`control_response` interrupt protocol, which is the streaming
+equivalent of pressing Escape in the interactive terminal. `/compact` behavior
+and `compact_boundary` events follow Claude Code's
+[slash-command protocol][claude-slash-commands]. These are Claude transport
+requirements, not oMLX APIs.
 
 When token policies are configured, the launcher must preserve
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
@@ -308,7 +311,8 @@ ospx-build does not start, stop, configure, or query that server. `omlx launch
 claude` must forward the Claude Code options above and preserve the streaming
 stdin pipe. Structured and streaming output were tested through this launcher
 with Claude Code 2.1.224 and
-`Qwen3.6-35B-A3B-4bit`.
+`Qwen3.6-35B-A3B-4bit`. The interrupt → compact → resume cycle was also tested
+through this oMLX launcher.
 
 ## Live output and diagnostics
 
@@ -341,8 +345,9 @@ start.
 
 Controls:
 
-- `c` writes `/compact` as Claude's next user turn (once per invocation); it
-  cannot interrupt or compact the middle of the current agentic command;
+- `c` sends Claude's interrupt control request—the streaming equivalent of
+  Escape—then runs `/compact` and reissues the interrupted stage command (once
+  per invocation);
 - `i` opens an injection prompt; type any Claude slash command or ordinary
   follow-up instruction, then press Enter to queue it as the next turn;
 - Escape cancels the injection prompt;
@@ -354,13 +359,18 @@ Controls:
 - Ctrl-C interrupts the current subprocess while preserving its ospx-build
   checkpoint.
 
-Injected messages do not interrupt an agentic turn already in progress. Claude
-finishes that command and processes queued input afterward. The dashboard first
-records the request, then records when it has been written to Claude's stdin.
-That write acknowledgement is not a compaction acknowledgement; successful
-compaction is reported separately by Claude's `compact_boundary` event, which
-is shown even with the default `activity` filter. These controls are available
-in the TTY dashboard; linear non-TTY streaming remains output-only.
+Arbitrary `i` messages do not interrupt an agentic turn already in progress;
+Claude processes them after that turn. `c` is deliberately different: it asks
+Claude to stop the active turn, waits for the interrupted result, sends
+`/compact`, waits for that result, and then reissues the exact stage input. It
+does not roll back repository changes made before interruption; OpenSpec and the
+repository remain the durable state from which the reissued stage continues.
+The dashboard records each step. A write or interrupt acknowledgement is not a
+compaction acknowledgement; successful compaction is reported by Claude's
+`compact_boundary` event, which is shown even with the default `activity`
+filter. If the launcher rejects interrupt controls, ospx-build degrades to
+queuing `/compact` after the current turn. These controls are available in the
+TTY dashboard; linear non-TTY streaming remains output-only.
 
 Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when

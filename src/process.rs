@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -72,6 +73,18 @@ pub struct ProcessOutput {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug)]
+struct PendingTurn {
+    input: String,
+    purpose: TurnPurpose,
+}
+
+#[derive(Debug)]
+enum TurnPurpose {
+    Work,
+    Compact { resume_input: Option<String> },
 }
 
 pub struct ProcessRunner<'a, U: Ui> {
@@ -167,24 +180,101 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut child_stdin = child.stdin.take();
         let mut sent_messages = usize::from(spec.initial_stdin.is_some());
         let mut completed_messages = 0usize;
+        let mut pending_turns = VecDeque::new();
+        let mut interrupt_request_id: Option<String> = None;
         if let (Some(stdin), Some(initial)) = (child_stdin.as_mut(), spec.initial_stdin.as_deref())
-            && let Err(error) = write_stream_input(stdin, initial)
         {
-            read_error = Some(std::io::Error::new(
-                error.kind(),
-                format!("failed writing initial streamed input: {error}"),
-            ));
-            cancelled = true;
-            cancel_started = Some(std::time::Instant::now());
-            let _ = interrupt_stream_process(&mut child);
+            match write_stream_input(stdin, initial) {
+                Ok(()) => pending_turns.push_back(PendingTurn {
+                    input: initial.to_owned(),
+                    purpose: TurnPurpose::Work,
+                }),
+                Err(error) => {
+                    read_error = Some(std::io::Error::new(
+                        error.kind(),
+                        format!("failed writing initial streamed input: {error}"),
+                    ));
+                    cancelled = true;
+                    cancel_started = Some(std::time::Instant::now());
+                    let _ = interrupt_stream_process(&mut child);
+                }
+            }
         }
         loop {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(PipeChunk::Line(PipeKind::Stdout, line)) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     on_stdout_line(trimmed);
-                    if is_stream_result(trimmed) {
+                    if let Some(result) = stream_result(trimmed) {
                         completed_messages += 1;
+                        let completed_turn = pending_turns.pop_front();
+                        if interrupt_request_id.take().is_some() {
+                            let resume_input = completed_turn
+                                .filter(|_| result_was_interrupted(&result))
+                                .map(|turn| turn.input);
+                            if let Err(error) = queue_compaction_turn(
+                                &mut child_stdin,
+                                resume_input,
+                                &mut sent_messages,
+                                &mut pending_turns,
+                            ) {
+                                self.ui.warn(&format!(
+                                    "Claude was interrupted, but /compact could not be queued: {error}"
+                                ));
+                            } else {
+                                self.ui.stream_message_sent(
+                                    "/compact written after interrupt; waiting for compaction",
+                                );
+                            }
+                        } else if let Some(PendingTurn {
+                            purpose: TurnPurpose::Compact { resume_input },
+                            ..
+                        }) = completed_turn
+                            && let Some(input) = resume_input
+                        {
+                            if let Err(error) = queue_raw_turn(
+                                &mut child_stdin,
+                                input,
+                                TurnPurpose::Work,
+                                &mut sent_messages,
+                                &mut pending_turns,
+                            ) {
+                                self.ui.warn(&format!(
+                                    "Claude compacted, but the interrupted command could not be resumed: {error}"
+                                ));
+                            } else {
+                                self.ui.stream_message_sent(
+                                    "Interrupted command reissued after compaction",
+                                );
+                            }
+                        }
+                    } else if let Some(response) = interrupt_request_id
+                        .as_deref()
+                        .and_then(|request_id| control_response(trimmed, request_id))
+                    {
+                        match response {
+                            Ok(()) => self.ui.stream_message_sent(
+                                "Claude acknowledged the interrupt; waiting for active work to stop",
+                            ),
+                            Err(error) => {
+                                self.ui.warn(&format!(
+                                    "Claude rejected the interrupt ({error}); /compact will remain a queued follow-up"
+                                ));
+                                interrupt_request_id = None;
+                                if let Err(error) = queue_compaction_turn(
+                                    &mut child_stdin,
+                                    None,
+                                    &mut sent_messages,
+                                    &mut pending_turns,
+                                ) {
+                                    self.ui.warn(&format!("Could not queue /compact: {error}"));
+                                } else {
+                                    self.ui.stream_message_sent(
+                                        "Interrupt unsupported; /compact queued for the next turn",
+                                    );
+                                }
+                            }
+                        }
                     }
                     captured_stdout.push_str(&line);
                 }
@@ -208,15 +298,17 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     }
                     StreamControl::Compact => {
                         if spec.accepts_stream_messages {
-                            if let Err(error) = queue_stream_message(
-                                &mut child_stdin,
-                                "/compact",
-                                &mut sent_messages,
-                            ) {
-                                self.ui.warn(&format!("Could not queue /compact: {error}"));
+                            let request_id = format!("ospx_interrupt_{}", uuid::Uuid::new_v4());
+                            if let Err(error) =
+                                queue_stream_interrupt(&mut child_stdin, &request_id)
+                            {
+                                self.ui.warn(&format!(
+                                    "Could not interrupt Claude for compaction: {error}"
+                                ));
                             } else {
+                                interrupt_request_id = Some(request_id);
                                 self.ui.stream_message_sent(
-                                    "/compact written to Claude stdin; it will run after the current command yields",
+                                    "Interrupt written to Claude stdin; waiting for active work to stop",
                                 );
                             }
                         } else {
@@ -227,9 +319,14 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     }
                     StreamControl::Inject(message) => {
                         if spec.accepts_stream_messages {
-                            if let Err(error) =
-                                queue_stream_message(&mut child_stdin, &message, &mut sent_messages)
-                            {
+                            let input = stream_user_message(&message);
+                            if let Err(error) = queue_raw_turn(
+                                &mut child_stdin,
+                                input,
+                                TurnPurpose::Work,
+                                &mut sent_messages,
+                                &mut pending_turns,
+                            ) {
                                 self.ui
                                     .warn(&format!("Could not inject Claude message: {error}"));
                             } else {
@@ -311,20 +408,63 @@ pub fn stream_user_message(message: &str) -> String {
     )
 }
 
-fn queue_stream_message<W: Write>(
+fn stream_interrupt_request(request_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt"}
+        })
+    )
+}
+
+fn queue_stream_interrupt<W: Write>(
     stdin: &mut Option<W>,
-    message: &str,
-    sent_messages: &mut usize,
+    request_id: &str,
 ) -> std::io::Result<()> {
     let Some(stdin) = stdin.as_mut() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "Claude stdin is already closed",
-        ));
+        return Err(closed_stdin_error());
     };
-    write_stream_input(stdin, &stream_user_message(message))?;
+    write_stream_input(stdin, &stream_interrupt_request(request_id))
+}
+
+fn queue_compaction_turn<W: Write>(
+    stdin: &mut Option<W>,
+    resume_input: Option<String>,
+    sent_messages: &mut usize,
+    pending_turns: &mut VecDeque<PendingTurn>,
+) -> std::io::Result<()> {
+    queue_raw_turn(
+        stdin,
+        stream_user_message("/compact"),
+        TurnPurpose::Compact { resume_input },
+        sent_messages,
+        pending_turns,
+    )
+}
+
+fn queue_raw_turn<W: Write>(
+    stdin: &mut Option<W>,
+    input: String,
+    purpose: TurnPurpose,
+    sent_messages: &mut usize,
+    pending_turns: &mut VecDeque<PendingTurn>,
+) -> std::io::Result<()> {
+    let Some(stdin) = stdin.as_mut() else {
+        return Err(closed_stdin_error());
+    };
+    write_stream_input(stdin, &input)?;
     *sent_messages += 1;
+    pending_turns.push_back(PendingTurn { input, purpose });
     Ok(())
+}
+
+fn closed_stdin_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "Claude stdin is already closed",
+    )
 }
 
 fn write_stream_input(mut stdin: impl Write, input: &str) -> std::io::Result<()> {
@@ -335,17 +475,37 @@ fn write_stream_input(mut stdin: impl Write, input: &str) -> std::io::Result<()>
     stdin.flush()
 }
 
-fn is_stream_result(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some("result")
+fn stream_result(line: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    (value.get("type").and_then(serde_json::Value::as_str) == Some("result")).then_some(value)
+}
+
+fn result_was_interrupted(result: &serde_json::Value) -> bool {
+    result.get("subtype").and_then(serde_json::Value::as_str) == Some("error_during_execution")
+}
+
+fn control_response(line: &str, request_id: &str) -> Option<Result<(), String>> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("control_response") {
+        return None;
+    }
+    let response = value.get("response")?;
+    if response
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(request_id)
+    {
+        return None;
+    }
+    match response.get("subtype").and_then(serde_json::Value::as_str) {
+        Some("success") => Some(Ok(())),
+        Some("error") => Some(Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown control error")
+            .to_owned())),
+        _ => None,
+    }
 }
 
 fn command_for(spec: &CommandSpec) -> Command {
@@ -477,7 +637,13 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::IsTerminal;
+    use std::{
+        io::IsTerminal,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     #[cfg(unix)]
     use crate::{stream::StreamItem, ui::TerminalUi};
@@ -510,12 +676,136 @@ mod tests {
     fn queues_follow_up_messages_without_closing_the_writer() {
         let mut writer = Some(Vec::new());
         let mut sent_messages = 1;
-        queue_stream_message(&mut writer, "please continue", &mut sent_messages).unwrap();
+        let mut pending_turns = VecDeque::new();
+        queue_raw_turn(
+            &mut writer,
+            stream_user_message("please continue"),
+            TurnPurpose::Work,
+            &mut sent_messages,
+            &mut pending_turns,
+        )
+        .unwrap();
 
         assert_eq!(sent_messages, 2);
+        assert_eq!(pending_turns.len(), 1);
         let encoded = String::from_utf8(writer.unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
         assert_eq!(value["message"]["content"][0]["text"], "please continue");
+    }
+
+    #[test]
+    fn encodes_interrupt_as_a_claude_control_request() {
+        let encoded = stream_interrupt_request("request-123");
+        let value: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
+        assert_eq!(value["type"], "control_request");
+        assert_eq!(value["request_id"], "request-123");
+        assert_eq!(value["request"]["subtype"], "interrupt");
+    }
+
+    #[test]
+    fn recognizes_matching_interrupt_control_responses() {
+        let success = r#"{"type":"control_response","response":{"subtype":"success","request_id":"request-123","response":{"still_queued":[]}}}"#;
+        assert_eq!(control_response(success, "request-123"), Some(Ok(())));
+        assert_eq!(control_response(success, "another-request"), None);
+
+        let failure = r#"{"type":"control_response","response":{"subtype":"error","request_id":"request-123","error":"not supported"}}"#;
+        assert_eq!(
+            control_response(failure, "request-123"),
+            Some(Err("not supported".to_owned()))
+        );
+    }
+
+    #[cfg(unix)]
+    struct CompactingUi {
+        compact_sent: AtomicBool,
+        messages: Mutex<Vec<String>>,
+    }
+
+    #[cfg(unix)]
+    impl CompactingUi {
+        fn new() -> Self {
+            Self {
+                compact_sent: AtomicBool::new(false),
+                messages: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Ui for CompactingUi {
+        fn banner(&self, _: &str) {}
+        fn change_name(&self, _: Option<&str>) {}
+        fn stage(&self, _: usize, _: usize, _: &str) {}
+        fn info(&self, _: &str) {}
+        fn warn(&self, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(format!("warn: {message}"));
+        }
+        fn success(&self, _: &str) {}
+        fn failure(&self, _: &str) {}
+        fn command(&self, _: &str) {}
+        fn debug(&self, _: &str) {}
+        fn debug_prompt(&self, _: &str, _: &str) {}
+        fn start_stream(&self, _: &str) {}
+        fn poll_stream(&self) -> StreamControl {
+            if self.compact_sent.swap(true, Ordering::SeqCst) {
+                StreamControl::None
+            } else {
+                StreamControl::Compact
+            }
+        }
+        fn stream_message_sent(&self, message: &str) {
+            self.messages.lock().unwrap().push(message.to_owned());
+        }
+        fn stream_item(&self, _: &StreamItem) {}
+        fn finish_stream(&self, _: bool, _: &str) {}
+        fn finish_dashboard(&self) {}
+        fn output(&self, _: &str, _: &str) {}
+        fn start_activity(&self, _: &str) -> Option<indicatif::ProgressBar> {
+            None
+        }
+        fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_interrupts_then_compacts_and_reissues_the_active_turn() {
+        let script = r#"
+IFS= read -r initial
+IFS= read -r control
+request_id=$(printf '%s' "$control" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+test -n "$request_id" || exit 10
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"still_queued":[]}}}\n' "$request_id"
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools","result":"Interrupted by user"}'
+IFS= read -r compact
+printf '%s' "$compact" | grep -q '"text":"/compact"' || exit 11
+printf '%s\n' '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":24000}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Compacted"}'
+IFS= read -r resumed
+test "$resumed" = "$initial" || exit 12
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"ospx_status":"APPLIED","summary":"resumed"}}'
+"#;
+        let ui = CompactingUi::new();
+        let runner = ProcessRunner::new(&ui);
+        let initial = stream_user_message("/opsx:apply slice-a");
+        let spec = CommandSpec::new("sh", "/tmp")
+            .args(["-c", script])
+            .stream_input(initial);
+
+        let output = runner
+            .run_streaming(&spec, "Apply", |_| {})
+            .expect("interrupt/compact/resume cycle should complete");
+
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("compact_boundary"));
+        assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
+        let messages = ui.messages.lock().unwrap().join("\n");
+        assert!(messages.contains("Interrupt written"));
+        assert!(messages.contains("acknowledged the interrupt"));
+        assert!(messages.contains("/compact written after interrupt"));
+        assert!(messages.contains("reissued after compaction"));
     }
 
     #[cfg(unix)]
