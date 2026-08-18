@@ -167,7 +167,8 @@ auto_compact_window = "128k"
 # Alternatively, compact at a percentage of the launcher's effective capacity.
 # auto_compact_percent = 50
 max_output_tokens = "8k"
-stream_claude = "activity"
+# Optional: reveal Claude's normal assistant/tool activity in the dashboard.
+# stream_claude = "activity"
 ```
 
 Set the same limits for one invocation with:
@@ -314,20 +315,24 @@ with Claude Code 2.1.224 and
 `Qwen3.6-35B-A3B-4bit`. The interrupt → slash command → resume cycle was also
 tested with both `/compact` and `/context` through this oMLX launcher.
 
-## Live output and diagnostics
+## Terminal dashboard and live diagnostics
 
-Stream Claude's normal assistant text and concise tool activity:
+Normal workflow runs use the alternate-screen dashboard automatically when
+stdin and stderr are terminals. The dashboard itself is the standard terminal
+presentation; it is not enabled by `--stream-claude`.
+
+By default the dashboard shows orchestration events, phase progress, elapsed
+times, and explicit diagnostics such as `/context`, while suppressing Claude's
+ordinary assistant/tool chatter. Show that additional activity with:
 
 ```sh
 ospx-build --stream-claude "add function pointer support"
 ```
 
-When stdin and stderr are terminals, streaming automatically uses an
-alternate-screen dashboard for the whole run. Each workflow phase has its own
-disclosure, headed by status, stage position, phase name, retry/pass number
-when applicable, live/final elapsed time, and captured line count. The current
-phase starts expanded; completed phases collapse but remain available with
-their elapsed time frozen:
+Each workflow phase has its own disclosure, headed by status, stage position,
+phase name, retry/pass number when applicable, live/final elapsed time, and
+captured line count. The current phase starts expanded; completed phases
+collapse but remain available with their elapsed time frozen:
 
 ```text
 ospx-build  change: add-function-pointers  /path/to/repository
@@ -350,8 +355,8 @@ Controls:
   per invocation);
 - `C` follows the same interrupt/resume cycle but runs `/context`, leaving
   Claude's context report in the phase disclosure for debugging;
-- `i` opens an injection prompt; type any Claude slash command or ordinary
-  follow-up instruction, then press Enter to queue it as the next turn;
+- `i` opens a steering prompt; Enter interrupts the active Claude turn and
+  delivers the entered instruction as its continuation;
 - Escape cancels the injection prompt;
 - Tab or Left/Right selects a phase disclosure;
 - Enter, Space, `o`, or a click on a heading expands/collapses that phase;
@@ -361,30 +366,32 @@ Controls:
 - Ctrl-C interrupts the current subprocess while preserving its ospx-build
   checkpoint.
 
-Arbitrary `i` messages do not interrupt an agentic turn already in progress;
-Claude processes them after that turn. `c` and `C` are deliberately different:
-they ask Claude to stop the active turn, wait for the interrupted result, send
-their slash command, wait for that result, and then reissue the exact stage
-input. Neither rolls back repository changes made before interruption; OpenSpec
-and the repository remain the durable state from which the reissued stage
-continues.
+All three injection controls interrupt the active turn first. `i` delivers the
+entered text as the continuation, which lets it steer the work already in
+progress. `c` and `C` send their slash command, wait for that result, and then
+reissue the exact stage input because diagnostic/maintenance slash commands do
+not themselves continue the work. None rolls back repository changes made
+before interruption; OpenSpec and the repository remain the durable state from
+which Claude continues.
 The dashboard records each step. A write or interrupt acknowledgement is not a
 compaction acknowledgement; successful compaction is reported by Claude's
-`compact_boundary` event, which is shown even with the default `activity`
-filter. If the launcher rejects interrupt controls, ospx-build degrades to
-queuing `/compact` after the current turn. These controls are available in the
-TTY dashboard; linear non-TTY streaming remains output-only.
+`compact_boundary` event, which is shown by the `activity` filter. If the
+launcher rejects interrupt controls, ospx-build degrades to
+queuing the requested command after the current turn. These controls are
+available in the TTY dashboard; linear non-TTY streaming remains output-only.
 
 Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when
 the workflow completes or stops.
 When either stdin or stderr is not a TTY—for example under CI, redirection, or
-a pipe—ospx-build emits the same filtered stream as ordinary linear text and
-does not write cursor-control sequences.
+a pipe—ospx-build uses ordinary linear output and does not write cursor-control
+sequences. If `--stream-claude` is enabled there, its selected filtered stream
+is emitted as linear text.
 
-Filters are:
+`--stream-claude` filters are:
 
-- `activity` (default): assistant/subagent text and concise tool calls;
+- `activity` (used when the flag has no value): assistant/subagent text and
+  concise tool calls;
 - `full`: activity plus tool results and lifecycle events;
 - `raw`: original Claude `stream-json` lines.
 

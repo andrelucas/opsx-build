@@ -14,6 +14,10 @@ use crate::{
 };
 
 pub trait Ui {
+    /// Whether Claude stages should use persistent bidirectional stream input.
+    fn supports_stream_input(&self) -> bool {
+        false
+    }
     fn banner(&self, repo: &str);
     fn change_name(&self, change: Option<&str>);
     fn stage(&self, current: usize, total: usize, title: &str);
@@ -54,13 +58,15 @@ struct TerminalState {
 }
 
 impl TerminalUi {
-    pub fn new(verbose: bool, debug: bool, streaming: bool) -> Self {
+    pub fn new(verbose: bool, debug: bool, workflow_dashboard: bool) -> Self {
         let stderr_terminal = std::io::stderr().is_terminal();
         Self {
             verbose,
             debug,
             interactive: stderr_terminal,
-            dashboard_enabled: streaming && stderr_terminal && std::io::stdin().is_terminal(),
+            dashboard_enabled: workflow_dashboard
+                && stderr_terminal
+                && std::io::stdin().is_terminal(),
             state: Mutex::new(TerminalState::default()),
         }
     }
@@ -80,6 +86,10 @@ impl TerminalUi {
 }
 
 impl Ui for TerminalUi {
+    fn supports_stream_input(&self) -> bool {
+        self.dashboard_enabled
+    }
+
     fn banner(&self, repo: &str) {
         self.state.lock().unwrap().repo = repo.to_owned();
         let title = Style::new().bold().cyan().apply_to("ospx-build");
@@ -108,7 +118,23 @@ impl Ui for TerminalUi {
             dashboard.set_stage(stage);
             return;
         }
-        drop(state);
+        if self.dashboard_enabled {
+            let repo = state.repo.clone();
+            let change_name = state.change_name.clone();
+            drop(state);
+            match StreamDashboard::enter(repo, change_name) {
+                Ok(mut dashboard) => {
+                    dashboard.set_stage(stage);
+                    self.state.lock().unwrap().dashboard = Some(dashboard);
+                    return;
+                }
+                Err(error) => self.warn(&format!(
+                    "Could not start terminal dashboard ({error}); using linear output"
+                )),
+            }
+        } else {
+            drop(state);
+        }
         let count = Style::new().dim().apply_to(format!("[{current}/{total}]"));
         let title = Style::new().bold().apply_to(title);
         self.write_line("");
@@ -206,7 +232,7 @@ impl Ui for TerminalUi {
             }
             Err(error) => {
                 self.warn(&format!(
-                    "Could not start terminal dashboard ({error}); using linear stream output"
+                    "Could not start terminal dashboard ({error}); using linear output"
                 ));
                 self.info(message);
             }

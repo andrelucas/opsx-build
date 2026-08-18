@@ -90,25 +90,32 @@ enum TurnPurpose {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum InterruptAction {
     Compact,
     Context,
+    Steer(String),
 }
 
 impl InterruptAction {
-    fn command(self) -> &'static str {
+    fn command(&self) -> &str {
         match self {
             Self::Compact => "/compact",
             Self::Context => "/context",
+            Self::Steer(message) => message,
         }
     }
 
-    fn noun(self) -> &'static str {
+    fn noun(&self) -> &'static str {
         match self {
             Self::Compact => "compaction",
             Self::Context => "context inspection",
+            Self::Steer(_) => "steering instruction",
         }
+    }
+
+    fn resumes_interrupted_input(&self) -> bool {
+        !matches!(self, Self::Steer(_))
     }
 }
 
@@ -240,9 +247,14 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                         completed_messages += 1;
                         let completed_turn = pending_turns.pop_front();
                         if let Some(interrupt) = pending_interrupt.take() {
-                            let resume_input = completed_turn
-                                .filter(|_| result_was_interrupted(&result))
+                            let resume_input = interrupt
+                                .action
+                                .resumes_interrupted_input()
+                                .then(|| completed_turn.filter(|_| result_was_interrupted(&result)))
+                                .flatten()
                                 .map(|turn| turn.input);
+                            let command = interrupt.action.command().to_owned();
+                            let noun = interrupt.action.noun();
                             if let Err(error) = queue_interrupt_follow_up(
                                 &mut child_stdin,
                                 interrupt.action,
@@ -251,15 +263,15 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                 &mut pending_turns,
                             ) {
                                 self.ui.warn(&format!(
-                                    "Claude was interrupted, but {} could not be queued: {error}",
-                                    interrupt.action.command()
+                                    "Claude was interrupted, but {noun} could not be queued: {error}"
                                 ));
                             } else {
-                                self.ui.stream_message_sent(&format!(
-                                    "{} written after interrupt; waiting for {}",
-                                    interrupt.action.command(),
-                                    interrupt.action.noun()
-                                ));
+                                let message = if command.starts_with('/') {
+                                    format!("{command} written after interrupt; waiting for {noun}")
+                                } else {
+                                    "Steering instruction written after interrupt; Claude is continuing the stage".to_owned()
+                                };
+                                self.ui.stream_message_sent(&message);
                             }
                         } else if let Some(PendingTurn {
                             purpose:
@@ -301,9 +313,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                 let interrupt = pending_interrupt
                                     .take()
                                     .expect("matched response has a pending interrupt");
+                                let noun = interrupt.action.noun();
                                 self.ui.warn(&format!(
-                                    "Claude rejected the interrupt ({error}); {} will remain a queued follow-up",
-                                    interrupt.action.command()
+                                    "Claude rejected the interrupt ({error}); {noun} will remain a queued follow-up"
                                 ));
                                 if let Err(error) = queue_interrupt_follow_up(
                                     &mut child_stdin,
@@ -313,13 +325,11 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                     &mut pending_turns,
                                 ) {
                                     self.ui.warn(&format!(
-                                        "Could not queue {}: {error}",
-                                        interrupt.action.command()
+                                        "Could not queue {noun}: {error}"
                                     ));
                                 } else {
                                     self.ui.stream_message_sent(&format!(
-                                        "Interrupt unsupported; {} queued for the next turn",
-                                        interrupt.action.command()
+                                        "Interrupt unsupported; {noun} queued for the next turn"
                                     ));
                                 }
                             }
@@ -345,11 +355,15 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                             read_error.get_or_insert(error);
                         }
                     }
-                    control @ (StreamControl::Compact | StreamControl::Context) => {
+                    control @ (StreamControl::Compact
+                    | StreamControl::Context
+                    | StreamControl::Inject(_)) => {
                         if spec.accepts_stream_messages {
                             let action = match control {
                                 StreamControl::Context => InterruptAction::Context,
-                                _ => InterruptAction::Compact,
+                                StreamControl::Inject(message) => InterruptAction::Steer(message),
+                                StreamControl::Compact => InterruptAction::Compact,
+                                _ => unreachable!("matched interrupting stream control"),
                             };
                             if pending_interrupt.is_some() {
                                 self.ui
@@ -365,38 +379,16 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                     action.noun()
                                 ));
                             } else {
+                                let noun = action.noun();
                                 pending_interrupt = Some(PendingInterrupt { request_id, action });
                                 self.ui.stream_message_sent(&format!(
                                     "Interrupt written to Claude stdin for {}; waiting for active work to stop",
-                                    action.noun()
+                                    noun
                                 ));
                             }
                         } else {
                             self.ui.warn(
-                                "This Claude invocation does not accept an interrupting slash command",
-                            );
-                        }
-                    }
-                    StreamControl::Inject(message) => {
-                        if spec.accepts_stream_messages {
-                            let input = stream_user_message(&message);
-                            if let Err(error) = queue_raw_turn(
-                                &mut child_stdin,
-                                input,
-                                TurnPurpose::Work,
-                                &mut sent_messages,
-                                &mut pending_turns,
-                            ) {
-                                self.ui
-                                    .warn(&format!("Could not inject Claude message: {error}"));
-                            } else {
-                                self.ui.stream_message_sent(
-                                    "Injected message written to Claude stdin; it will run after the current command yields",
-                                );
-                            }
-                        } else {
-                            self.ui.warn(
-                                "The current subprocess does not accept injected Claude messages",
+                                "This Claude invocation does not accept interrupting commands",
                             );
                         }
                     }
@@ -496,16 +488,16 @@ fn queue_interrupt_follow_up<W: Write>(
     sent_messages: &mut usize,
     pending_turns: &mut VecDeque<PendingTurn>,
 ) -> std::io::Result<()> {
-    queue_raw_turn(
-        stdin,
-        stream_user_message(action.command()),
+    let input = stream_user_message(action.command());
+    let purpose = if action.resumes_interrupted_input() {
         TurnPurpose::InterruptFollowUp {
             action,
             resume_input,
-        },
-        sent_messages,
-        pending_turns,
-    )
+        }
+    } else {
+        TurnPurpose::Work
+    };
+    queue_raw_turn(stdin, input, purpose, sent_messages, pending_turns)
 }
 
 fn queue_raw_turn<W: Write>(
@@ -826,7 +818,7 @@ mod tests {
     #[cfg(unix)]
     fn run_interrupting_follow_up(
         control: StreamControl,
-        slash_command: &str,
+        expected_command: &str,
     ) -> (ProcessOutput, String) {
         let script = r#"
 IFS= read -r initial
@@ -840,19 +832,21 @@ IFS= read -r follow_up
 printf '%s' "$follow_up" | grep -Fq "\"text\":\"$expected\"" || exit 11
 if [ "$expected" = /compact ]; then
   printf '%s\n' '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":24000}}'
-else
+elif [ "$expected" = /context ]; then
   printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Context diagnostic"}]}}'
 fi
-printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Follow-up complete"}'
-IFS= read -r resumed
-test "$resumed" = "$initial" || exit 12
+if [ "${expected#/}" != "$expected" ]; then
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Follow-up complete"}'
+  IFS= read -r resumed
+  test "$resumed" = "$initial" || exit 12
+fi
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"ospx_status":"APPLIED","summary":"resumed"}}'
 "#;
         let ui = InterruptingUi::new(control);
         let runner = ProcessRunner::new(&ui);
         let initial = stream_user_message("/opsx:apply slice-a");
         let spec = CommandSpec::new("sh", "/tmp")
-            .args(["-c", script, "ospx-test", slash_command])
+            .args(["-c", script, "ospx-test", expected_command])
             .stream_input(initial);
 
         let output = runner
@@ -860,7 +854,6 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
             .expect("interrupt/follow-up/resume cycle should complete");
 
         assert!(output.success, "stderr: {}", output.stderr);
-        assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
         let messages = ui.messages.lock().unwrap().join("\n");
         assert!(messages.contains("Interrupt written"));
         assert!(messages.contains("acknowledged the interrupt"));
@@ -872,6 +865,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
     fn compact_interrupts_then_compacts_and_reissues_the_active_turn() {
         let (output, messages) = run_interrupting_follow_up(StreamControl::Compact, "/compact");
         assert!(output.stdout.contains("compact_boundary"));
+        assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
         assert!(messages.contains("/compact written after interrupt"));
         assert!(messages.contains("reissued after compaction"));
     }
@@ -881,8 +875,20 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
     fn context_interrupts_then_reports_and_reissues_the_active_turn() {
         let (output, messages) = run_interrupting_follow_up(StreamControl::Context, "/context");
         assert!(output.stdout.contains("Context diagnostic"));
+        assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
         assert!(messages.contains("/context written after interrupt"));
         assert!(messages.contains("reissued after context inspection"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steering_message_interrupts_and_continues_the_active_turn() {
+        let direction = "Use the existing parser helper instead";
+        let (output, messages) =
+            run_interrupting_follow_up(StreamControl::Inject(direction.to_owned()), direction);
+        assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 2);
+        assert!(messages.contains("Steering instruction written after interrupt"));
+        assert!(!messages.contains("Interrupted command reissued"));
     }
 
     #[cfg(unix)]

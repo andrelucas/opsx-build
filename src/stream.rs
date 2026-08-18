@@ -71,6 +71,16 @@ pub fn filter_line(line: &str, filter: StreamFilter) -> Vec<StreamItem> {
     }
 }
 
+/// Keep `/context` useful when ordinary Claude activity is hidden.
+pub fn context_report_items(line: &str) -> Vec<StreamItem> {
+    filter_line(line, StreamFilter::Activity)
+        .into_iter()
+        .filter(|item| {
+            matches!(item, StreamItem::Assistant(text) if text.trim_start().starts_with("## Context Usage"))
+        })
+        .collect()
+}
+
 fn compaction_summary(value: &Value) -> String {
     let metadata = value.get("compact_metadata").unwrap_or(value);
     let before = metadata.get("pre_tokens").and_then(Value::as_u64);
@@ -246,5 +256,19 @@ mod tests {
                 "Claude compacted context: 21583 → 842 tokens".to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn context_report_remains_visible_without_general_activity() {
+        let line = r###"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"## Context Usage\n\n**Tokens:** 21k / 262k"}]},"parent_tool_use_id":null}"###;
+        assert_eq!(
+            context_report_items(line),
+            [StreamItem::Assistant(
+                "## Context Usage\n\n**Tokens:** 21k / 262k".to_owned()
+            )]
+        );
+
+        let ordinary = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Working on it"}]},"parent_tool_use_id":null}"#;
+        assert!(context_report_items(ordinary).is_empty());
     }
 }

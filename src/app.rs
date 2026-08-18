@@ -259,6 +259,7 @@ impl<U: Ui> App<U> {
             repo,
             launcher,
             &self.cli.permission_mode,
+            self.ui.supports_stream_input(),
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,

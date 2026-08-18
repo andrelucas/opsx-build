@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     cli::Cli,
     process::{CommandSpec, ProcessOutput, ProcessRunner, diagnostic_text, stream_user_message},
-    stream::{StreamFilter, filter_line},
+    stream::{StreamFilter, context_report_items, filter_line},
     ui::Ui,
 };
 
@@ -311,6 +311,7 @@ pub struct ClaudeClient<'a, U: Ui> {
     repo: &'a Path,
     launcher: &'a ClaudeLauncher,
     permission_mode: &'a str,
+    stream_transport: bool,
     stream_filter: Option<StreamFilter>,
     max_output_retries: u32,
     ui: &'a U,
@@ -322,6 +323,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         repo: &'a Path,
         launcher: &'a ClaudeLauncher,
         permission_mode: &'a str,
+        stream_transport: bool,
         stream_filter: Option<StreamFilter>,
         max_output_retries: u32,
         ui: &'a U,
@@ -330,6 +332,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             repo,
             launcher,
             permission_mode,
+            stream_transport: stream_transport || stream_filter.is_some(),
             stream_filter,
             max_output_retries,
             ui,
@@ -392,7 +395,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         self.ui
             .debug(&format!("Claude session: {}", session_description(session)));
         self.ui.debug_prompt(activity, prompt);
-        let mut output_format = if self.stream_filter.is_some() {
+        let mut output_format = if self.stream_transport {
             ClaudeOutputFormat::StreamJson
         } else {
             ClaudeOutputFormat::Json
@@ -472,12 +475,15 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
     }
 
     fn run_stage_command(&self, spec: &CommandSpec, activity: &str) -> Result<ProcessOutput> {
-        let Some(filter) = self.stream_filter else {
-            return self.runner.run(spec, activity);
-        };
         self.runner.run_streaming(spec, activity, |line| {
-            for item in filter_line(line, filter) {
-                self.ui.stream_item(&item);
+            if let Some(filter) = self.stream_filter {
+                for item in filter_line(line, filter) {
+                    self.ui.stream_item(&item);
+                }
+            } else {
+                for item in context_report_items(line) {
+                    self.ui.stream_item(&item);
+                }
             }
         })
     }
@@ -510,7 +516,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             "Claude session: resume {session_id} for explicit /compact"
         ));
         self.ui.debug_prompt(&activity, "/compact");
-        let output_format = if self.stream_filter.is_some() {
+        let output_format = if self.stream_transport {
             ClaudeOutputFormat::StreamJson
         } else {
             ClaudeOutputFormat::Text
@@ -522,7 +528,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             session_id,
             output_format,
         );
-        let result = if self.stream_filter.is_some() {
+        let result = if self.stream_transport {
             self.run_stage_command(&spec, &activity)
         } else {
             self.runner.run(&spec, &activity)
@@ -1359,7 +1365,7 @@ printf '%s\n' "$((count + 1))" > "$state"
             max_output_tokens: None,
         };
         let ui = QuietUi;
-        let client = ClaudeClient::new(&directory, &launcher, "auto", None, 3, &ui);
+        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
         let result = client
             .invoke(
                 SessionMode::New {

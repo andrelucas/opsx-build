@@ -379,7 +379,7 @@ impl StreamDashboard {
                     if message.trim().is_empty() {
                         return StreamControl::None;
                     }
-                    self.push_message("inject", Color::Magenta, &format!("Requested: {message}"));
+                    self.push_message("steer", Color::Magenta, &format!("Requested: {message}"));
                     return StreamControl::Inject(message);
                 }
                 KeyCode::Esc => {
@@ -616,10 +616,10 @@ impl StreamDashboard {
         if height > 3 {
             let footer = self.injection_input.as_ref().map_or_else(
                 || {
-                    "c compact · C context · i inject · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
+                    "c compact · C context · i steer · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
                         .to_owned()
                 },
-                |input| format!("inject> {input}█   Enter queue · Esc cancel · Ctrl-C stop"),
+                |input| format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop"),
             );
             draw_row(
                 &mut output,
