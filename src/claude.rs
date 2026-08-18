@@ -423,6 +423,59 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         }
         Ok(())
     }
+
+    pub fn compact_session(&self, session_id: Uuid, completed_phase: &str) {
+        let activity = format!("Hard-compacting context after {completed_phase}");
+        self.ui.debug(&format!(
+            "Claude session: resume {session_id} for explicit /compact"
+        ));
+        self.ui.debug_prompt(&activity, "/compact");
+        let output_format = if self.stream_filter.is_some() {
+            ClaudeOutputFormat::StreamJson
+        } else {
+            ClaudeOutputFormat::Text
+        };
+        let spec = build_compact_command(
+            self.repo,
+            self.launcher,
+            self.permission_mode,
+            session_id,
+            output_format,
+        );
+        let result = if self.stream_filter.is_some() {
+            self.run_stage_command(&spec, &activity)
+        } else {
+            self.runner.run(&spec, &activity)
+        };
+        match result {
+            Ok(output) if output.success => {}
+            Ok(output) => self.ui.warn(&format!(
+                "Could not compact planning context after {completed_phase}; continuing with the existing session: {}",
+                diagnostic_text(&output)
+            )),
+            Err(error) => self.ui.warn(&format!(
+                "Could not compact planning context after {completed_phase}; continuing with the existing session: {error}"
+            )),
+        }
+    }
+}
+
+fn build_compact_command(
+    repo: &Path,
+    launcher: &ClaudeLauncher,
+    permission_mode: &str,
+    session_id: Uuid,
+    output_format: ClaudeOutputFormat,
+) -> CommandSpec {
+    build_claude_command(
+        repo,
+        launcher,
+        permission_mode,
+        &SessionMode::Resume { id: session_id },
+        "/compact",
+        output_format,
+        None,
+    )
 }
 
 fn format_name(format: ClaudeOutputFormat) -> &'static str {
@@ -743,6 +796,40 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|args| { args == ["--resume", "00000000-0000-0000-0000-000000000000"] })
+        );
+
+        let compact = build_compact_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            id,
+            ClaudeOutputFormat::Text,
+        );
+        assert_eq!(compact.args.last().map(String::as_str), Some("/compact"));
+        assert!(
+            compact
+                .args
+                .windows(2)
+                .any(|args| { args == ["--resume", "00000000-0000-0000-0000-000000000000"] })
+        );
+        assert!(!compact.args.iter().any(|arg| arg == "--output-format"));
+        assert_eq!(
+            compact.env,
+            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+        );
+
+        let streamed_compact = build_compact_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            id,
+            ClaudeOutputFormat::StreamJson,
+        );
+        assert!(
+            streamed_compact
+                .args
+                .windows(2)
+                .any(|args| { args == ["--output-format", "stream-json"] })
         );
 
         let streamed = build_claude_command(

@@ -10,19 +10,28 @@ milestone commits under explicit non-destructive instructions.
 
 ## Workflow
 
-1. Run `/explore-unattended` in a new Claude session.
-2. Run `/propose-unattended` in that same session.
-3. Determine the OpenSpec change name from `openspec list --json`.
-4. Ask Claude to commit the proposal as `openspec: propose <change>`.
-5. Run the installed OpenSpec Apply workflow in a fresh session.
-6. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
+1. Run `/explore-unattended` in a new Claude planning session.
+2. Explicitly `/compact` that session.
+3. Run `/propose-unattended` in the compacted planning session.
+4. Determine the OpenSpec change name from `openspec list --json`, then
+   explicitly `/compact` the planning session again.
+5. Ask Claude to commit the proposal as `openspec: propose <change>`.
+6. Run the installed OpenSpec Apply workflow in a fresh session.
+7. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
    Repair/Apply session and then verifies again.
-7. Run Archive after verification succeeds.
-8. Ask Claude to commit the completed change as `openspec: complete <change>`.
+8. Run Archive in a fresh session after verification succeeds.
+9. Ask Claude in another fresh session to commit the completed change as
+   `openspec: complete <change>`.
 
 Every Claude invocation is a blocking subprocess. The checkpoint records only
 workflow facts: request, change name, next stage, planning session, retry count,
 pending verifier finding, pending user direction, and milestone HEADs.
+
+Only Explore, Propose, and the proposal commit reuse the planning session.
+Apply, Verify, Repair, Archive, and completion work already use disposable
+fresh sessions, so there is no carried context to compact at those boundaries.
+Explicit planning compaction is best-effort: a launcher incompatibility is
+reported as a warning and does not block otherwise valid repository work.
 
 ## Installation
 
