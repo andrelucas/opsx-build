@@ -164,13 +164,15 @@ permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
 auto_compact_window = "192k"
+max_output_tokens = "8k"
 stream_claude = "activity"
 ```
 
-Set the same threshold for one invocation with:
+Set the same limits for one invocation with:
 
 ```sh
-ospx-build --auto-compact-window 192k "add function pointer support"
+ospx-build --auto-compact-window 192k --max-output-tokens 8k \
+  "add function pointer support"
 ```
 
 Output-limit recovery can likewise be adjusted for one run:
@@ -179,11 +181,14 @@ Output-limit recovery can likewise be adjusted for one run:
 ospx-build --max-output-retries 5 "add function pointer support"
 ```
 
-Token counts may be plain integers (`196608`) or use binary `k`/`m` suffixes;
-`192k` therefore means 196,608 tokens. The configured value is exported to
-every Claude subprocess as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, including
-interactive launcher tests, without changing the parent shell. Percentage
-thresholds are not currently accepted because ospx-build has no portable way
+Token counts may be plain integers (`8192`) or use binary `k`/`m` suffixes;
+`8k` therefore means 8,192 tokens. The configured values are exported to every
+Claude subprocess as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, including interactive launcher tests, without
+changing the parent shell. Leaving either setting absent preserves Claude's
+model-specific default. A lower output limit bounds slow decode latency but can
+cause more continuation turns; output-limit recovery handles those turns.
+Percentage thresholds are not accepted because ospx-build has no portable way
 to discover a launcher's effective model context window.
 
 Configuration precedence is:
@@ -263,8 +268,9 @@ transport; `/compact` behavior and `compact_boundary` events follow Claude
 Code's [slash-command protocol][claude-slash-commands]. These are Claude
 transport requirements, not oMLX APIs.
 
-When `auto_compact_window` is configured, the launcher must also preserve the
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable for Claude Code.
+When token policies are configured, the launcher must preserve
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. The latter
+is Claude Code's documented [maximum-output environment variable][claude-env-vars].
 
 For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
 `structured_output`. For streaming output it finds the most recent JSONL result
@@ -360,6 +366,7 @@ flags and are not read from the config file.
 
 [claude-streaming]: https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode
 [claude-slash-commands]: https://code.claude.com/docs/en/agent-sdk/slash-commands
+[claude-env-vars]: https://code.claude.com/docs/en/env-vars
 
 ## Interactive launcher testing
 

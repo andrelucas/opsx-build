@@ -32,6 +32,7 @@ pub struct Cli {
     pub claude_command: String,
     pub claude_model: Option<String>,
     pub auto_compact_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub explore_command: Option<String>,
     pub propose_command: Option<String>,
     pub apply_command: Option<String>,
@@ -158,6 +159,10 @@ struct CliArgs {
     #[arg(long, env = "OSPX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
     auto_compact_window: Option<TokenCount>,
 
+    /// Maximum Claude output tokens per request (supports binary k/m suffixes).
+    #[arg(long, env = "OSPX_BUILD_MAX_OUTPUT_TOKENS", value_name = "TOKENS")]
+    max_output_tokens: Option<TokenCount>,
+
     /// Override the exploration slash command.
     #[arg(long, env = "OSPX_BUILD_EXPLORE_COMMAND", value_name = "COMMAND")]
     explore_command: Option<String>,
@@ -188,6 +193,7 @@ struct FileConfig {
     claude_command: Option<String>,
     claude_model: Option<String>,
     auto_compact_window: Option<TokenCount>,
+    max_output_tokens: Option<TokenCount>,
     explore_command: Option<String>,
     propose_command: Option<String>,
     apply_command: Option<String>,
@@ -265,6 +271,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .auto_compact_window
             .or(config.auto_compact_window)
             .map(|count| count.0),
+        max_output_tokens: args
+            .max_output_tokens
+            .or(config.max_output_tokens)
+            .map(|count| count.0),
         explore_command: args.explore_command.or(config.explore_command),
         propose_command: args.propose_command.or(config.propose_command),
         apply_command: args.apply_command.or(config.apply_command),
@@ -300,7 +310,7 @@ impl<'de> Deserialize<'de> for TokenCount {
         match Value::deserialize(deserializer)? {
             Value::Integer(value) if value > 0 => Ok(Self(value)),
             Value::Integer(_) => Err(serde::de::Error::custom(
-                "auto_compact_window must be greater than zero",
+                "token count must be greater than zero",
             )),
             Value::Text(value) => value.parse().map_err(serde::de::Error::custom),
         }
@@ -355,6 +365,7 @@ mod tests {
                 claude_command = "omlx launch claude"
                 claude_model = "local-model"
                 auto_compact_window = "192k"
+                max_output_tokens = "8k"
                 verify_command = "/opsx:verify"
                 stream_claude = "full"
             "#,
@@ -372,6 +383,7 @@ mod tests {
         assert_eq!(cli.claude_command, "omlx launch claude");
         assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
         assert_eq!(cli.auto_compact_window, Some(196_608));
+        assert_eq!(cli.max_output_tokens, Some(8_192));
         assert_eq!(cli.verify_command.as_deref(), Some("/opsx:verify"));
         assert_eq!(cli.stream_claude, Some(StreamFilter::Full));
     }
@@ -384,6 +396,7 @@ mod tests {
                 max_output_retries = 6
                 claude_model = "config-model"
                 auto_compact_window = 131072
+                max_output_tokens = 16384
             "#,
         )
         .unwrap();
@@ -398,6 +411,8 @@ mod tests {
                 "cli-model",
                 "--auto-compact-window",
                 "200k",
+                "--max-output-tokens",
+                "12k",
                 "build something",
             ]),
             config,
@@ -408,6 +423,7 @@ mod tests {
         assert_eq!(cli.max_output_retries, 4);
         assert_eq!(cli.claude_model.as_deref(), Some("cli-model"));
         assert_eq!(cli.auto_compact_window, Some(204_800));
+        assert_eq!(cli.max_output_tokens, Some(12_288));
     }
 
     #[test]
@@ -428,6 +444,7 @@ mod tests {
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
         assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
         assert_eq!(cli.auto_compact_window, None);
+        assert_eq!(cli.max_output_tokens, None);
     }
 
     #[test]
@@ -446,6 +463,10 @@ mod tests {
                 "build something"
             ])
             .is_err()
+        );
+        assert!(
+            CliArgs::try_parse_from(["ospx-build", "--max-output-tokens", "0", "build something"])
+                .is_err()
         );
     }
 

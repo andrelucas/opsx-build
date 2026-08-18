@@ -12,6 +12,7 @@ use crate::{
 };
 
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeLauncher {
@@ -19,6 +20,7 @@ pub struct ClaudeLauncher {
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
     pub auto_compact_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
 }
 
 impl ClaudeLauncher {
@@ -26,6 +28,7 @@ impl ClaudeLauncher {
         command: &str,
         model: Option<String>,
         auto_compact_window: Option<u64>,
+        max_output_tokens: Option<u64>,
     ) -> Result<Self> {
         let mut words = split_command(command)?;
         if words.is_empty() {
@@ -36,6 +39,7 @@ impl ClaudeLauncher {
             prefix_args: words,
             model,
             auto_compact_window,
+            max_output_tokens,
         })
     }
 }
@@ -285,8 +289,12 @@ pub fn build_interactive_claude_command(
 }
 
 fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
-    match launcher.auto_compact_window {
+    let spec = match launcher.auto_compact_window {
         Some(window) => spec.env(AUTO_COMPACT_ENV, window.to_string()),
+        None => spec,
+    };
+    match launcher.max_output_tokens {
+        Some(tokens) => spec.env(MAX_OUTPUT_TOKENS_ENV, tokens.to_string()),
         None => spec,
     }
 }
@@ -666,6 +674,7 @@ fn text_mentions_output_limit(text: &str) -> bool {
         || text.contains("max output tokens")
         || text.contains("maximum output tokens")
         || text.contains("output token limit")
+        || text.contains("output token maximum")
 }
 
 fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
@@ -965,6 +974,7 @@ mod tests {
             "omlx launch claude",
             Some("qwen3.6-35b-a3b".to_owned()),
             Some(196_608),
+            Some(8_192),
         )
         .unwrap();
         let new = build_claude_command(
@@ -982,7 +992,10 @@ mod tests {
         assert_eq!(new.program, "omlx");
         assert_eq!(
             new.env,
-            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+            [
+                (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
+            ]
         );
         assert_eq!(
             new.args,
@@ -1037,7 +1050,10 @@ mod tests {
         assert!(!compact.args.iter().any(|arg| arg == "--output-format"));
         assert_eq!(
             compact.env,
-            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+            [
+                (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
+            ]
         );
 
         let streamed_compact = build_compact_command(
@@ -1097,11 +1113,12 @@ mod tests {
             r#"'/Applications/oMLX Preview.app/omlx' launch "claude code""#,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(launcher.program, "/Applications/oMLX Preview.app/omlx");
         assert_eq!(launcher.prefix_args, ["launch", "claude code"]);
-        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None).is_err());
+        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None).is_err());
     }
 
     #[test]
@@ -1110,6 +1127,7 @@ mod tests {
             "omlx launch claude",
             Some("local-model".to_owned()),
             Some(196_608),
+            Some(8_192),
         )
         .unwrap();
         let command = build_interactive_claude_command(
@@ -1137,13 +1155,16 @@ mod tests {
         assert!(!command.args.iter().any(|arg| arg == "--print"));
         assert_eq!(
             command.env,
-            [(AUTO_COMPACT_ENV.to_owned(), "196608".to_owned())]
+            [
+                (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
+                (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
+            ]
         );
     }
 
     #[test]
     fn adds_stage_schema_to_unattended_command() {
-        let launcher = ClaudeLauncher::parse("claude", None, None).unwrap();
+        let launcher = ClaudeLauncher::parse("claude", None, None, None).unwrap();
         let schema = StageProtocol::Verify.json_schema();
         let command = build_claude_command(
             Path::new("/repo"),
@@ -1247,6 +1268,17 @@ mod tests {
     }
 
     #[test]
+    fn detects_claude_codes_configured_output_maximum_error() {
+        let output = ProcessOutput {
+            success: false,
+            code: Some(1),
+            stdout: r#"{"is_error":true,"stop_reason":"stop_sequence","subtype":"success","result":"API Error: Claude's response exceeded the 64 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(output_hit_token_limit(&output));
+    }
+
+    #[test]
     fn does_not_retry_a_recovered_api_limit_after_a_terminal_result() {
         let output = ProcessOutput {
             success: true,
@@ -1308,6 +1340,7 @@ printf '%s\n' "$((count + 1))" > "$state"
             prefix_args: vec![script.display().to_string()],
             model: None,
             auto_compact_window: None,
+            max_output_tokens: None,
         };
         let ui = QuietUi;
         let client = ClaudeClient::new(&directory, &launcher, "auto", None, 3, &ui);

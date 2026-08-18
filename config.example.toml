@@ -7,6 +7,10 @@ permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
 
+# Optional token policies (binary k/m suffixes are accepted).
+# auto_compact_window = "192k"
+# max_output_tokens = "8k"
+
 # Optional live Claude output: "activity", "full", or "raw".
 # stream_claude = "activity"
 
