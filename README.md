@@ -8,6 +8,14 @@ It deliberately does **not** infer file ownership, fingerprint dirty files,
 police Git HEAD, reset the repository, or clean up work. Claude creates the two
 milestone commits under explicit non-destructive instructions.
 
+`ospx-build` bundles the canonical `explore-unattended` and
+`propose-unattended` Claude skills. Before a workflow starts, it installs
+missing copies and replaces stale copies in the repository selected by
+`--repo`, under `.claude/skills`. This keeps the target project's local Claude
+configuration self-contained. `--dry-run` reports the installation or update
+without writing it. The retired monolithic `build-unattended` skill is not
+installed because orchestration belongs in this process.
+
 ## Workflow
 
 1. Run `/explore-unattended` in a new Claude planning session.
@@ -214,8 +222,9 @@ command-line flags
 Use `--config PATH` to select another file or `--no-config` to disable config
 loading. Unknown TOML keys are errors.
 
-Workflow command names are discovered from common Claude skill and command
-locations. Override them when needed:
+Explore and Propose default to the two bundled skills. Apply, Verify, and
+Archive command names are discovered from common Claude skill and command
+locations. Override any command when needed:
 
 ```sh
 ospx-build \
@@ -446,8 +455,8 @@ archive is not repeated merely because its acknowledgement was malformed.
 
 - The configured Claude launcher, `claude`, `openspec`, and `git` must be on
   `PATH`.
-- The repository must contain `openspec/config.yaml` and the unattended Explore
-  and Propose skills.
+- The repository must contain `openspec/config.yaml`. The unattended Explore
+  and Propose skills are installed into the target repository automatically.
 - Apply, Verify, and Archive workflow names must be discoverable or configured.
 - Change discovery requires one new change, one uniquely modified change, or
   only one active change.

@@ -20,6 +20,7 @@ use crate::{
         ChangeSnapshot, identify_change, select_existing_change, snapshot as openspec_snapshot,
     },
     process::{ProcessRunner, prerequisite_exists},
+    skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::Ui,
 };
@@ -133,6 +134,18 @@ impl<U: Ui> App<U> {
                 "no OpenSpec setup found at `{}`; expected `openspec/config.yaml`",
                 repo.display()
             );
+        }
+        for installed in ensure_unattended_skills(&repo, self.cli.dry_run)? {
+            let action = match installed.action {
+                SkillInstallAction::Installed => "Installed",
+                SkillInstallAction::Updated => "Updated",
+                SkillInstallAction::WouldInstall => "Would install",
+                SkillInstallAction::WouldUpdate => "Would update",
+            };
+            self.ui.info(&format!(
+                "{action} bundled Claude skill `{}` in target repository",
+                installed.name
+            ));
         }
         let commands = SkillCommands::discover(&repo, &self.cli)?;
         self.ui.debug(&format!(

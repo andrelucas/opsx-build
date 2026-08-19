@@ -60,18 +60,8 @@ pub struct SkillCommands {
 impl SkillCommands {
     pub fn discover(repo: &Path, cli: &Cli) -> Result<Self> {
         Ok(Self {
-            explore: resolve_command(
-                repo,
-                cli.explore_command.as_deref(),
-                &[SkillCandidate::skill("explore-unattended")],
-                "explore",
-            )?,
-            propose: resolve_command(
-                repo,
-                cli.propose_command.as_deref(),
-                &[SkillCandidate::skill("propose-unattended")],
-                "propose",
-            )?,
+            explore: resolve_bundled_command(cli.explore_command.as_deref(), "explore-unattended"),
+            propose: resolve_bundled_command(cli.propose_command.as_deref(), "propose-unattended"),
             apply: resolve_command(
                 repo,
                 cli.apply_command.as_deref(),
@@ -104,6 +94,12 @@ impl SkillCommands {
             )?,
         })
     }
+}
+
+fn resolve_bundled_command(explicit: Option<&str>, bundled_name: &str) -> String {
+    explicit
+        .map(normalize_command)
+        .unwrap_or_else(|| format!("/{bundled_name}"))
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1134,18 @@ mod tests {
         assert_eq!(launcher.program, "/Applications/oMLX Preview.app/omlx");
         assert_eq!(launcher.prefix_args, ["launch", "claude code"]);
         assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn bundled_commands_have_stable_defaults_and_allow_overrides() {
+        assert_eq!(
+            resolve_bundled_command(None, "explore-unattended"),
+            "/explore-unattended"
+        );
+        assert_eq!(
+            resolve_bundled_command(Some("custom-propose"), "propose-unattended"),
+            "/custom-propose"
+        );
     }
 
     #[test]
