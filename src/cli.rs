@@ -19,6 +19,9 @@ pub struct Cli {
     pub resume: bool,
     pub forget: bool,
     pub continue_existing: bool,
+    pub loop_workflow: bool,
+    pub no_loop: bool,
+    pub max_iterations: Option<u32>,
     pub change: Option<String>,
     pub direction: Option<String>,
     pub interactive_args: Vec<String>,
@@ -48,8 +51,16 @@ impl Cli {
     }
 
     fn resolve(args: CliArgs) -> Result<Self> {
+        let command_line_max_iterations = args.max_iterations.is_some();
         let (config, config_path) = load_config(&args)?;
-        Ok(resolve_values(args, config, config_path))
+        let cli = resolve_values(args, config, config_path);
+        if command_line_max_iterations && !cli.loop_workflow {
+            anyhow::bail!("--max-iterations requires --loop (or `loop = true` in config)");
+        }
+        if cli.loop_workflow && cli.continue_existing {
+            anyhow::bail!("--loop cannot be combined with --continue-existing");
+        }
+        Ok(cli)
     }
 }
 
@@ -86,6 +97,22 @@ struct CliArgs {
         conflicts_with_all = ["interactive", "resume", "forget"]
     )]
     continue_existing: bool,
+
+    /// Repeat complete OpenSpec changes until Propose returns DONE.
+    #[arg(
+        long = "loop",
+        env = "OSPX_BUILD_LOOP",
+        conflicts_with_all = ["interactive", "forget", "continue_existing"]
+    )]
+    loop_workflow: bool,
+
+    /// Disable a campaign loop enabled by the config file.
+    #[arg(long, conflicts_with = "loop_workflow")]
+    no_loop: bool,
+
+    /// Stop with an incomplete-campaign error after this many completed changes.
+    #[arg(long, env = "OSPX_BUILD_MAX_ITERATIONS", value_name = "N")]
+    max_iterations: Option<std::num::NonZeroU32>,
 
     /// Select the OpenSpec change used by --continue-existing when several are active.
     #[arg(
@@ -194,6 +221,9 @@ struct CliArgs {
 struct FileConfig {
     max_verify_retries: Option<u32>,
     max_output_retries: Option<u32>,
+    #[serde(rename = "loop")]
+    loop_workflow: Option<bool>,
+    max_iterations: Option<std::num::NonZeroU32>,
     permission_mode: Option<String>,
     claude_command: Option<String>,
     claude_model: Option<String>,
@@ -249,6 +279,13 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         resume: args.resume,
         forget: args.forget,
         continue_existing: args.continue_existing,
+        loop_workflow: !args.no_loop
+            && (args.loop_workflow || config.loop_workflow.unwrap_or(false)),
+        no_loop: args.no_loop,
+        max_iterations: args
+            .max_iterations
+            .or(config.max_iterations)
+            .map(std::num::NonZeroU32::get),
         change: args.change,
         direction: args.direction,
         interactive_args: args.interactive_args,
@@ -411,6 +448,8 @@ mod tests {
             r#"
                 max_verify_retries = 5
                 max_output_retries = 7
+                loop = true
+                max_iterations = 12
                 permission_mode = "dontAsk"
                 claude_command = "omlx launch claude"
                 claude_model = "local-model"
@@ -430,6 +469,8 @@ mod tests {
 
         assert_eq!(cli.max_verify_retries, 5);
         assert_eq!(cli.max_output_retries, 7);
+        assert!(cli.loop_workflow);
+        assert_eq!(cli.max_iterations, Some(12));
         assert_eq!(cli.permission_mode, "dontAsk");
         assert_eq!(cli.claude_command, "omlx launch claude");
         assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
@@ -497,6 +538,8 @@ mod tests {
         );
         assert_eq!(cli.max_verify_retries, DEFAULT_MAX_VERIFY_RETRIES);
         assert_eq!(cli.max_output_retries, DEFAULT_MAX_OUTPUT_RETRIES);
+        assert!(!cli.loop_workflow);
+        assert_eq!(cli.max_iterations, None);
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
         assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
         assert_eq!(cli.auto_compact_window, None);
@@ -529,6 +572,60 @@ mod tests {
             CliArgs::try_parse_from(["ospx-build", "--max-output-tokens", "0", "build something"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_campaign_loop_and_positive_iteration_limit() {
+        let cli = Cli::resolve(args([
+            "ospx-build",
+            "--loop",
+            "--max-iterations",
+            "8",
+            "finish the compiler",
+        ]))
+        .unwrap();
+        assert!(cli.loop_workflow);
+        assert_eq!(cli.max_iterations, Some(8));
+
+        assert!(
+            CliArgs::try_parse_from([
+                "ospx-build",
+                "--loop",
+                "--max-iterations",
+                "0",
+                "finish the compiler",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::resolve(args([
+                "ospx-build",
+                "--max-iterations",
+                "2",
+                "finish the compiler",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn no_loop_overrides_a_configured_campaign_without_losing_other_defaults() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                loop = true
+                max_iterations = 12
+                claude_model = "configured-model"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args(["ospx-build", "--no-loop", "one change"]),
+            config,
+            None,
+        );
+        assert!(!cli.loop_workflow);
+        assert_eq!(cli.max_iterations, Some(12));
+        assert_eq!(cli.claude_model.as_deref(), Some("configured-model"));
     }
 
     #[test]

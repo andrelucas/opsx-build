@@ -29,6 +29,21 @@ pub(crate) struct StageView {
     pub started_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CampaignDashboardView {
+    pub iteration: u32,
+    pub max_iterations: Option<u32>,
+    pub completed: Vec<CampaignIterationDashboardView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CampaignIterationDashboardView {
+    pub iteration: u32,
+    pub change: String,
+    pub final_head: Option<String>,
+    pub elapsed_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct DisplayLine {
     text: String,
@@ -62,9 +77,25 @@ struct RenderLine {
     panel: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollbarGeometry {
+    column: u16,
+    top: u16,
+    height: u16,
+    thumb_top: u16,
+    thumb_height: u16,
+    max_position: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollbarDrag {
+    grab_offset: u16,
+}
+
 pub(crate) struct StreamDashboard {
     repo: String,
     change_name: Option<String>,
+    campaign: Option<CampaignDashboardView>,
     activity: String,
     panels: Vec<PhasePanel>,
     selected_panel: usize,
@@ -72,6 +103,8 @@ pub(crate) struct StreamDashboard {
     follow_latest: bool,
     ensure_selected: bool,
     heading_rows: Vec<(u16, usize)>,
+    scrollbar: Option<ScrollbarGeometry>,
+    scrollbar_drag: Option<ScrollbarDrag>,
     retained_lines: usize,
     spinner_index: usize,
     last_tick: Instant,
@@ -81,10 +114,15 @@ pub(crate) struct StreamDashboard {
     compact_requested: bool,
     context_requested: bool,
     injection_input: Option<String>,
+    stop_after_iteration: bool,
 }
 
 impl StreamDashboard {
-    pub(crate) fn enter(repo: String, change_name: Option<String>) -> io::Result<Self> {
+    pub(crate) fn enter(
+        repo: String,
+        change_name: Option<String>,
+        campaign: Option<CampaignDashboardView>,
+    ) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut output = io::stderr().lock();
         if let Err(error) = execute!(
@@ -102,6 +140,7 @@ impl StreamDashboard {
         let mut dashboard = Self {
             repo,
             change_name,
+            campaign,
             activity: "Preparing workflow".to_owned(),
             panels: Vec::new(),
             selected_panel: 0,
@@ -109,6 +148,8 @@ impl StreamDashboard {
             follow_latest: true,
             ensure_selected: false,
             heading_rows: Vec::new(),
+            scrollbar: None,
+            scrollbar_drag: None,
             retained_lines: 0,
             spinner_index: 0,
             last_tick: now,
@@ -118,9 +159,35 @@ impl StreamDashboard {
             compact_requested: false,
             context_requested: false,
             injection_input: None,
+            stop_after_iteration: false,
         };
         dashboard.draw()?;
         Ok(dashboard)
+    }
+
+    pub(crate) fn set_campaign(&mut self, campaign: Option<CampaignDashboardView>) {
+        let changed_iteration = self.campaign.as_ref().map(|campaign| campaign.iteration)
+            != campaign.as_ref().map(|campaign| campaign.iteration);
+        self.campaign = campaign;
+        if changed_iteration {
+            self.panels.clear();
+            self.selected_panel = 0;
+            self.viewport_start = 0;
+            self.follow_latest = true;
+            self.ensure_selected = false;
+            self.heading_rows.clear();
+            self.retained_lines = 0;
+            self.change_name = None;
+            self.stop_after_iteration = false;
+        }
+        self.dirty = true;
+        if self.active {
+            let _ = self.draw();
+        }
+    }
+
+    pub(crate) fn stop_after_iteration_requested(&self) -> bool {
+        self.stop_after_iteration
     }
 
     pub(crate) fn set_change_name(&mut self, change_name: Option<String>) {
@@ -132,9 +199,19 @@ impl StreamDashboard {
     }
 
     fn header_text(&self) -> String {
-        match &self.change_name {
-            Some(change) => format!("ospx-build  change: {change}  {}", self.repo),
-            None => format!("ospx-build  {}", self.repo),
+        let campaign = self.campaign.as_ref().map(|campaign| {
+            campaign.max_iterations.map_or_else(
+                || format!("iteration {}", campaign.iteration),
+                |maximum| format!("iteration {}/{}", campaign.iteration, maximum),
+            )
+        });
+        match (&campaign, &self.change_name) {
+            (Some(campaign), Some(change)) => {
+                format!("ospx-build  {campaign}  change: {change}  {}", self.repo)
+            }
+            (Some(campaign), None) => format!("ospx-build  {campaign}  {}", self.repo),
+            (None, Some(change)) => format!("ospx-build  change: {change}  {}", self.repo),
+            (None, None) => format!("ospx-build  {}", self.repo),
         }
     }
 
@@ -308,8 +385,22 @@ impl StreamDashboard {
             return self.handle_injection_event(event);
         }
 
+        if let Event::Mouse(mouse) = &event
+            && self.handle_scrollbar_mouse(*mouse)
+        {
+            return StreamControl::None;
+        }
+
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') if self.campaign.is_some() => {
+                    self.stop_after_iteration = true;
+                    self.push_message(
+                        "campaign",
+                        Color::Magenta,
+                        "Will pause after the current OpenSpec change completes",
+                    );
+                }
                 KeyCode::Char('c') if !self.compact_requested => {
                     self.compact_requested = true;
                     self.push_message(
@@ -460,9 +551,74 @@ impl StreamDashboard {
     }
 
     fn scroll_down(&mut self, amount: usize) {
-        self.viewport_start = self.viewport_start.saturating_add(amount);
-        self.follow_latest = false;
+        self.viewport_start = self
+            .viewport_start
+            .saturating_add(amount)
+            .min(self.scrollbar.map_or(usize::MAX, |bar| bar.max_position));
+        self.follow_latest = self
+            .scrollbar
+            .is_some_and(|bar| self.viewport_start == bar.max_position);
         self.dirty = true;
+    }
+
+    fn set_scrollbar_position(&mut self, position: usize) {
+        let Some(scrollbar) = self.scrollbar else {
+            return;
+        };
+        self.viewport_start = position.min(scrollbar.max_position);
+        self.follow_latest = self.viewport_start == scrollbar.max_position;
+        self.dirty = true;
+    }
+
+    fn handle_scrollbar_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        let Some(scrollbar) = self.scrollbar else {
+            self.scrollbar_drag = None;
+            return false;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.column == scrollbar.column
+                    && mouse.row >= scrollbar.top
+                    && mouse.row < scrollbar.top.saturating_add(scrollbar.height) =>
+            {
+                if mouse.row == scrollbar.top {
+                    self.set_scrollbar_position(self.viewport_start.saturating_sub(1));
+                } else if mouse.row == scrollbar.top.saturating_add(scrollbar.height - 1) {
+                    self.set_scrollbar_position(self.viewport_start.saturating_add(1));
+                } else if mouse.row >= scrollbar.thumb_top
+                    && mouse.row < scrollbar.thumb_top.saturating_add(scrollbar.thumb_height)
+                {
+                    self.scrollbar_drag = Some(ScrollbarDrag {
+                        grab_offset: mouse.row.saturating_sub(scrollbar.thumb_top),
+                    });
+                } else {
+                    let grab_offset = scrollbar.thumb_height / 2;
+                    self.scrollbar_drag = Some(ScrollbarDrag { grab_offset });
+                    self.set_scrollbar_position(scrollbar_position_for_row(
+                        scrollbar,
+                        mouse.row,
+                        grab_offset,
+                    ));
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = self.scrollbar_drag else {
+                    return false;
+                };
+                self.set_scrollbar_position(scrollbar_position_for_row(
+                    scrollbar,
+                    mouse.row,
+                    drag.grab_offset,
+                ));
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_drag.is_some() => {
+                self.scrollbar_drag = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn body_height(&self) -> usize {
@@ -473,6 +629,29 @@ impl StreamDashboard {
 
     fn render_lines_at(&self, now: Instant) -> Vec<RenderLine> {
         let mut lines = Vec::new();
+        if let Some(campaign) = &self.campaign {
+            lines.extend(campaign.completed.iter().map(|iteration| {
+                let elapsed = iteration
+                    .elapsed_seconds
+                    .map(Duration::from_secs)
+                    .map(format_duration)
+                    .map_or_else(String::new, |elapsed| format!(" · {elapsed}"));
+                let head = iteration
+                    .final_head
+                    .as_deref()
+                    .map(short_hash)
+                    .map_or_else(String::new, |head| format!(" · {head}"));
+                RenderLine {
+                    text: format!(
+                        "  ✓ iteration {} · {}{elapsed}{head}",
+                        iteration.iteration, iteration.change
+                    ),
+                    color: Color::Green,
+                    bold: true,
+                    panel: None,
+                }
+            }));
+        }
         for (index, panel) in self.panels.iter().enumerate() {
             let selected = if index == self.selected_panel {
                 "›"
@@ -599,6 +778,18 @@ impl StreamDashboard {
             self.ensure_selected = false;
         }
 
+        self.scrollbar = (maximum_start > 0 && body_height >= 3 && width > 0).then(|| {
+            scrollbar_geometry(
+                width,
+                3,
+                height.saturating_sub(4),
+                maximum_start,
+                self.viewport_start,
+                body_height,
+            )
+        });
+        let body_width = width.saturating_sub(u16::from(self.scrollbar.is_some()));
+
         self.heading_rows.clear();
         for (index, line) in lines
             .iter()
@@ -607,17 +798,31 @@ impl StreamDashboard {
             .enumerate()
         {
             let row = 3 + index as u16;
-            draw_row(&mut output, row, width, &line.text, line.color, line.bold)?;
+            draw_row(
+                &mut output,
+                row,
+                body_width,
+                &line.text,
+                line.color,
+                line.bold,
+            )?;
             if let Some(panel) = line.panel {
                 self.heading_rows.push((row, panel));
             }
+        }
+        if let Some(scrollbar) = self.scrollbar {
+            draw_scrollbar(&mut output, scrollbar)?;
         }
 
         if height > 3 {
             let footer = self.injection_input.as_ref().map_or_else(
                 || {
-                    "c compact · C context · i steer · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop"
-                        .to_owned()
+                    let campaign = if self.campaign.is_some() {
+                        " · q pause after slice"
+                    } else {
+                        ""
+                    };
+                    format!("c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
                 |input| format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop"),
             );
@@ -700,6 +905,102 @@ fn draw_row<W: Write>(
     Ok(())
 }
 
+fn scrollbar_geometry(
+    width: u16,
+    top: u16,
+    height: u16,
+    max_position: usize,
+    position: usize,
+    viewport: usize,
+) -> ScrollbarGeometry {
+    let track_length = usize::from(height.saturating_sub(2));
+    let denominator = max_position.saturating_add(viewport.max(1));
+    let thumb_length = rounded_divide(viewport.saturating_mul(track_length), denominator)
+        .clamp(1, track_length.max(1));
+    let draggable = track_length.saturating_sub(thumb_length);
+    let thumb_offset = rounded_divide(
+        position.min(max_position).saturating_mul(draggable),
+        max_position.max(1),
+    )
+    .min(draggable);
+    ScrollbarGeometry {
+        column: width.saturating_sub(1),
+        top,
+        height,
+        thumb_top: top
+            .saturating_add(1)
+            .saturating_add(thumb_offset.min(usize::from(u16::MAX)) as u16),
+        thumb_height: thumb_length.min(usize::from(u16::MAX)) as u16,
+        max_position,
+    }
+}
+
+fn scrollbar_position_for_row(scrollbar: ScrollbarGeometry, row: u16, grab_offset: u16) -> usize {
+    let track_start = scrollbar.top.saturating_add(1);
+    let track_length = scrollbar.height.saturating_sub(2);
+    let draggable = track_length.saturating_sub(scrollbar.thumb_height);
+    if draggable == 0 {
+        return 0;
+    }
+    let thumb_offset = row
+        .saturating_sub(track_start)
+        .saturating_sub(grab_offset)
+        .min(draggable);
+    rounded_divide(
+        usize::from(thumb_offset).saturating_mul(scrollbar.max_position),
+        usize::from(draggable),
+    )
+}
+
+fn rounded_divide(numerator: usize, denominator: usize) -> usize {
+    numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or(0)
+}
+
+fn draw_scrollbar<W: Write>(output: &mut W, scrollbar: ScrollbarGeometry) -> io::Result<()> {
+    let bottom = scrollbar.top.saturating_add(scrollbar.height - 1);
+    queue!(
+        output,
+        SetForegroundColor(Color::DarkGrey),
+        MoveTo(scrollbar.column, scrollbar.top),
+        Print("↑")
+    )?;
+    for row in scrollbar.top.saturating_add(1)..bottom {
+        let symbol = if row >= scrollbar.thumb_top
+            && row < scrollbar.thumb_top.saturating_add(scrollbar.thumb_height)
+        {
+            "█"
+        } else {
+            "│"
+        };
+        let color = if symbol == "█" {
+            Color::Cyan
+        } else {
+            Color::DarkGrey
+        };
+        queue!(
+            output,
+            SetForegroundColor(color),
+            MoveTo(scrollbar.column, row),
+            Print(symbol)
+        )?;
+    }
+    queue!(
+        output,
+        SetForegroundColor(Color::DarkGrey),
+        MoveTo(scrollbar.column, bottom),
+        Print("↓"),
+        ResetColor
+    )?;
+    Ok(())
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
 fn sanitize(text: &str) -> String {
     text.chars()
         .filter_map(|character| match character {
@@ -732,6 +1033,7 @@ mod tests {
         let mut dashboard = StreamDashboard {
             repo: "/repo".to_owned(),
             change_name: None,
+            campaign: None,
             activity: "working".to_owned(),
             panels: Vec::new(),
             selected_panel: 0,
@@ -739,6 +1041,8 @@ mod tests {
             follow_latest: true,
             ensure_selected: false,
             heading_rows: Vec::new(),
+            scrollbar: None,
+            scrollbar_drag: None,
             retained_lines: 0,
             spinner_index: 0,
             last_tick: now,
@@ -748,6 +1052,7 @@ mod tests {
             compact_requested: false,
             context_requested: false,
             injection_input: None,
+            stop_after_iteration: false,
         };
         dashboard.set_stage(StageView {
             current: 1,
@@ -788,6 +1093,91 @@ mod tests {
             dashboard.header_text(),
             "ospx-build  change: slice-m-test-infrastructure  /repo"
         );
+    }
+
+    #[test]
+    fn campaign_header_and_summary_survive_iteration_reset() {
+        let mut dashboard = dashboard();
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 2,
+            max_iterations: Some(10),
+            completed: vec![CampaignIterationDashboardView {
+                iteration: 1,
+                change: "slice-a".to_owned(),
+                final_head: Some("1234567890abcdef".to_owned()),
+                elapsed_seconds: Some(65),
+            }],
+        }));
+
+        assert_eq!(dashboard.header_text(), "ospx-build  iteration 2/10  /repo");
+        assert!(dashboard.panels.is_empty());
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert!(lines[0].text.contains("iteration 1 · slice-a"));
+        assert!(lines[0].text.contains("1m 05s"));
+        assert!(lines[0].text.contains("1234567890ab"));
+    }
+
+    #[test]
+    fn campaign_q_requests_a_stop_after_the_current_iteration() {
+        let mut dashboard = dashboard();
+        dashboard.campaign = Some(CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: Vec::new(),
+        });
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert!(dashboard.stop_after_iteration_requested());
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("pause after")
+        );
+    }
+
+    #[test]
+    fn scrollbar_buttons_track_and_drag_control_the_viewport() {
+        let mut dashboard = dashboard();
+        let scrollbar = scrollbar_geometry(80, 3, 12, 90, 0, 10);
+        dashboard.scrollbar = Some(scrollbar);
+
+        let mouse = |kind, row| {
+            Event::Mouse(event::MouseEvent {
+                kind,
+                column: scrollbar.column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        dashboard.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            scrollbar.top + scrollbar.height - 1,
+        ));
+        assert_eq!(dashboard.viewport_start, 1);
+
+        dashboard.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            scrollbar.top + scrollbar.height - 2,
+        ));
+        dashboard.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            scrollbar.top + scrollbar.height - 2,
+        ));
+        dashboard.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            scrollbar.top + scrollbar.height - 2,
+        ));
+        assert_eq!(dashboard.viewport_start, scrollbar.max_position);
+        assert!(dashboard.follow_latest);
+        assert_eq!(dashboard.scrollbar_drag, None);
     }
 
     #[test]
@@ -963,9 +1353,12 @@ mod tests {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             return;
         }
-        let mut dashboard =
-            StreamDashboard::enter("/tmp/example".to_owned(), Some("example-change".to_owned()))
-                .unwrap();
+        let mut dashboard = StreamDashboard::enter(
+            "/tmp/example".to_owned(),
+            Some("example-change".to_owned()),
+            None,
+        )
+        .unwrap();
         dashboard.set_stage(StageView {
             current: 4,
             total: 7,
@@ -973,7 +1366,13 @@ mod tests {
             started_at: Instant::now(),
         });
         dashboard.start_stream("Claude is applying the OpenSpec change");
-        dashboard.push(&StreamItem::Assistant("Dashboard smoke test".to_owned()));
+        for index in 0..200 {
+            dashboard.push(&StreamItem::Assistant(format!(
+                "Dashboard scrollbar smoke test line {index}"
+            )));
+        }
+        dashboard.draw().unwrap();
+        assert!(dashboard.scrollbar.is_some());
         dashboard.set_stage(StageView {
             current: 5,
             total: 7,

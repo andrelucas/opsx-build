@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +23,7 @@ use crate::{
     process::{ProcessRunner, prerequisite_exists},
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
-    ui::Ui,
+    ui::{CampaignIterationView, CampaignView, Ui},
 };
 
 const TOTAL_STAGES: usize = 7;
@@ -46,6 +47,31 @@ struct RunState {
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
+    #[serde(default)]
+    terminal_summary: Option<String>,
+    #[serde(default)]
+    campaign: Option<CampaignState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CampaignState {
+    iteration: u32,
+    max_iterations: Option<u32>,
+    completed: Vec<CompletedIteration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompletedIteration {
+    iteration: u32,
+    change: String,
+    proposal_head: Option<String>,
+    final_head: Option<String>,
+    elapsed_seconds: Option<u64>,
+}
+
+enum WorkflowOutcome {
+    Complete(RunState),
+    Done(RunState),
 }
 
 impl RunState {
@@ -62,7 +88,23 @@ impl RunState {
             pending_direction: None,
             proposal_head: None,
             final_head: None,
+            terminal_summary: None,
+            campaign: None,
         }
+    }
+
+    fn new_campaign(
+        request: String,
+        before_changes: ChangeSnapshot,
+        max_iterations: Option<u32>,
+    ) -> Self {
+        let mut state = Self::new(request, before_changes);
+        state.campaign = Some(CampaignState {
+            iteration: 1,
+            max_iterations,
+            completed: Vec::new(),
+        });
+        state
     }
 
     fn continue_existing(change: String, active_changes: ChangeSnapshot) -> Self {
@@ -78,6 +120,8 @@ impl RunState {
             pending_direction: None,
             proposal_head: None,
             final_head: None,
+            terminal_summary: None,
+            campaign: None,
         }
     }
 
@@ -157,13 +201,15 @@ impl<U: Ui> App<U> {
             return self.resume(&repo, &launcher, &commands);
         }
 
-        if let Some(existing) = try_load_state(&repo, &self.ui)?
-            && existing.stage != Stage::Complete
-        {
-            bail!(
-                "an unfinished ospx-build run is recorded at {}; use `--resume` or `--forget`",
-                existing.stage.title()
-            );
+        if let Some(existing) = try_load_state(&repo, &self.ui)? {
+            let requires_resume = !matches!(existing.stage, Stage::Complete | Stage::Done)
+                || (existing.stage == Stage::Complete && existing.campaign.is_some());
+            if requires_resume {
+                bail!(
+                    "an unfinished ospx-build run is recorded at {}; use `--resume` or `--forget`",
+                    existing.stage.title()
+                );
+            }
         }
 
         if self.cli.continue_existing {
@@ -175,9 +221,17 @@ impl<U: Ui> App<U> {
         }
 
         let before_changes = openspec_snapshot(&repo, &self.ui)?;
-        let state = RunState::new(self.cli.request.clone(), before_changes);
+        let state = if self.cli.loop_workflow {
+            RunState::new_campaign(
+                self.cli.request.clone(),
+                before_changes,
+                self.cli.max_iterations,
+            )
+        } else {
+            RunState::new(self.cli.request.clone(), before_changes)
+        };
         persist_state(&repo, &state, &self.ui)?;
-        self.execute(&repo, &launcher, &commands, state)
+        self.run_workflows(&repo, &launcher, &commands, state)
     }
 
     fn continue_existing(
@@ -197,7 +251,7 @@ impl<U: Ui> App<U> {
             return self.print_resume_dry_run(&state, commands);
         }
         persist_state(repo, &state, &self.ui)?;
-        self.execute(repo, launcher, commands, state)
+        self.run_workflows(repo, launcher, commands, state)
     }
 
     fn forget_checkpoint(&self, repo: &Path) -> Result<()> {
@@ -225,8 +279,23 @@ impl<U: Ui> App<U> {
         if !self.cli.request.is_empty() && self.cli.request != state.request {
             bail!("the supplied request does not match the saved run request");
         }
-        if state.stage == Stage::Complete {
+        if state.stage == Stage::Complete && state.campaign.is_none() {
             bail!("the saved run is already complete; start a new run or use `--forget`");
+        }
+        if state.stage == Stage::Done && state.campaign.is_none() {
+            bail!("the saved run is already done; start a new run or use `--forget`");
+        }
+
+        if self.cli.loop_workflow && state.campaign.is_none() {
+            state.campaign = Some(CampaignState {
+                iteration: 1,
+                max_iterations: self.cli.max_iterations,
+                completed: Vec::new(),
+            });
+        } else if let Some(campaign) = state.campaign.as_mut()
+            && self.cli.max_iterations.is_some()
+        {
+            campaign.max_iterations = self.cli.max_iterations;
         }
 
         if let Some(direction) = &self.cli.direction {
@@ -258,7 +327,122 @@ impl<U: Ui> App<U> {
         }
 
         persist_state(repo, &state, &self.ui)?;
-        self.execute(repo, launcher, commands, state)
+        self.run_workflows(repo, launcher, commands, state)
+    }
+
+    fn run_workflows(
+        &self,
+        repo: &Path,
+        launcher: &ClaudeLauncher,
+        commands: &SkillCommands,
+        mut state: RunState,
+    ) -> Result<()> {
+        loop {
+            self.present_campaign(&state);
+            let iteration_started = (state.stage == Stage::Explore
+                && state.planning_session.is_none())
+            .then(Instant::now);
+            match self.execute(repo, launcher, commands, state)? {
+                WorkflowOutcome::Done(state) => {
+                    self.ui.finish_dashboard();
+                    let summary = state
+                        .terminal_summary
+                        .as_deref()
+                        .unwrap_or("the requested objective is already satisfied");
+                    self.ui.success(&format!("DONE — {summary}"));
+                    return Ok(());
+                }
+                WorkflowOutcome::Complete(mut completed_state) => {
+                    let Some(campaign) = completed_state.campaign.as_ref() else {
+                        let change = completed_state.change.as_deref().unwrap_or("change");
+                        let head = completed_state
+                            .final_head
+                            .as_deref()
+                            .unwrap_or("unknown HEAD");
+                        self.ui.finish_dashboard();
+                        self.ui
+                            .success(&format!("COMPLETE `{change}` — final {}", short_hash(head)));
+                        return Ok(());
+                    };
+
+                    let iteration = campaign.iteration;
+                    let max_iterations = campaign.max_iterations;
+                    let change = require_change(&completed_state)?.to_owned();
+                    if !campaign
+                        .completed
+                        .iter()
+                        .any(|entry| entry.iteration == iteration)
+                    {
+                        completed_state
+                            .campaign
+                            .as_mut()
+                            .expect("campaign was checked above")
+                            .completed
+                            .push(CompletedIteration {
+                                iteration,
+                                change: change.clone(),
+                                proposal_head: completed_state.proposal_head.clone(),
+                                final_head: completed_state.final_head.clone(),
+                                elapsed_seconds: iteration_started
+                                    .map(|started| started.elapsed().as_secs()),
+                            });
+                        persist_state(repo, &completed_state, &self.ui)?;
+                    }
+                    self.present_campaign(&completed_state);
+                    self.ui.success(&format!(
+                        "Campaign iteration {iteration} complete: `{change}`"
+                    ));
+
+                    if self.cli.no_loop || self.ui.stop_after_iteration_requested() {
+                        self.ui.finish_dashboard();
+                        self.ui.success(&format!(
+                            "PAUSED after campaign iteration {iteration}: `{change}` is complete"
+                        ));
+                        return Ok(());
+                    }
+                    if max_iterations.is_some_and(|maximum| iteration >= maximum) {
+                        self.ui.finish_dashboard();
+                        bail!(
+                            "campaign reached its configured limit of {iteration} completed iteration(s) before Propose returned DONE"
+                        );
+                    }
+
+                    let request = completed_state.request.clone();
+                    let pending_direction = completed_state.pending_direction.take();
+                    let mut campaign = completed_state
+                        .campaign
+                        .take()
+                        .expect("campaign was checked above");
+                    campaign.iteration += 1;
+                    let before_changes = openspec_snapshot(repo, &self.ui)?;
+                    state = RunState::new(request, before_changes);
+                    state.campaign = Some(campaign);
+                    state.pending_direction = pending_direction;
+                    persist_state(repo, &state, &self.ui)?;
+                }
+            }
+        }
+    }
+
+    fn present_campaign(&self, state: &RunState) {
+        let Some(campaign) = &state.campaign else {
+            self.ui.campaign(None);
+            return;
+        };
+        self.ui.campaign(Some(CampaignView {
+            iteration: campaign.iteration,
+            max_iterations: campaign.max_iterations,
+            completed: campaign
+                .completed
+                .iter()
+                .map(|entry| CampaignIterationView {
+                    iteration: entry.iteration,
+                    change: entry.change.clone(),
+                    final_head: entry.final_head.clone(),
+                    elapsed_seconds: entry.elapsed_seconds,
+                })
+                .collect(),
+        }));
     }
 
     fn execute(
@@ -267,7 +451,7 @@ impl<U: Ui> App<U> {
         launcher: &ClaudeLauncher,
         commands: &SkillCommands,
         mut state: RunState,
-    ) -> Result<()> {
+    ) -> Result<WorkflowOutcome> {
         let claude = ClaudeClient::new(
             repo,
             launcher,
@@ -281,12 +465,10 @@ impl<U: Ui> App<U> {
 
         loop {
             if state.stage == Stage::Complete {
-                let change = state.change.as_deref().unwrap_or("change");
-                let head = state.final_head.as_deref().unwrap_or("unknown HEAD");
-                self.ui.finish_dashboard();
-                self.ui
-                    .success(&format!("COMPLETE `{change}` — final {}", short_hash(head)));
-                return Ok(());
+                return Ok(WorkflowOutcome::Complete(state));
+            }
+            if state.stage == Stage::Done {
+                return Ok(WorkflowOutcome::Done(state));
             }
 
             self.ui
@@ -300,7 +482,7 @@ impl<U: Ui> App<U> {
                 Stage::Repair => self.run_repair(repo, &claude, commands, &mut state)?,
                 Stage::Archive => self.run_archive(repo, &claude, commands, &mut state)?,
                 Stage::FinalCommit => self.run_final_commit(repo, &claude, &mut state)?,
-                Stage::Complete => unreachable!(),
+                Stage::Complete | Stage::Done => unreachable!(),
             }
         }
     }
@@ -314,9 +496,10 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
+        let subject = campaign_subject(state);
         let result = claude.invoke(
             session_mode(session, is_new, "ospx-build-planning"),
-            &stage_prompt(&commands.explore, &state.request, StageProtocol::Ready),
+            &stage_prompt(&commands.explore, &subject, StageProtocol::Ready),
             "Claude is exploring the change",
             StageProtocol::Ready,
         )?;
@@ -337,18 +520,32 @@ impl<U: Ui> App<U> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
         let base = format!(
-            "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt.",
-            state.request
+            "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE.",
+            campaign_subject(state)
         );
         let result = claude.invoke(
             session_mode(session, is_new, "ospx-build-planning"),
-            &stage_prompt(&commands.propose, &base, StageProtocol::Ready),
+            &stage_prompt(&commands.propose, &base, StageProtocol::Propose),
             "Claude is creating OpenSpec artifacts",
-            StageProtocol::Ready,
+            StageProtocol::Propose,
         )?;
-        require_ready("propose", &result.text, result.signal)?;
 
         let after = openspec_snapshot(repo, &self.ui)?;
+        match result.signal {
+            StageSignal::Done => {
+                if after != state.before_changes {
+                    bail!(
+                        "Propose returned DONE after changing OpenSpec state; preserving the repository for inspection"
+                    );
+                }
+                state.terminal_summary = Some(result.text);
+                state.stage = Stage::Done;
+                return persist_state(repo, state, &self.ui);
+            }
+            StageSignal::Ready => {}
+            StageSignal::Blocked => return blocked("propose", &result.text),
+            other => bail!("propose returned unexpected terminal status {other:?}"),
+        }
         let change = identify_change(&state.before_changes, &after)?;
         validate_change_name(&change)?;
         state.change = Some(change.clone());
@@ -460,8 +657,10 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             StageSignal::Blocked => blocked("verify", &result.text),
-            StageSignal::Ready => {
-                bail!("verify returned READY instead of VERIFIED, RETRY, or BLOCKED")
+            StageSignal::Ready | StageSignal::Done => {
+                bail!(
+                    "verify returned an invalid terminal status instead of VERIFIED, RETRY, or BLOCKED"
+                )
             }
         }
     }
@@ -575,7 +774,20 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         self.ui
             .warn("DRY RUN — no workflow state or subprocesses will be created");
-        let prompt = stage_prompt(&commands.explore, &self.cli.request, StageProtocol::Ready);
+        let dry_state = if self.cli.loop_workflow {
+            RunState::new_campaign(
+                self.cli.request.clone(),
+                ChangeSnapshot::default(),
+                self.cli.max_iterations,
+            )
+        } else {
+            RunState::new(self.cli.request.clone(), ChangeSnapshot::default())
+        };
+        let prompt = stage_prompt(
+            &commands.explore,
+            &campaign_subject(&dry_state),
+            StageProtocol::Ready,
+        );
         let command = build_claude_command(
             repo,
             launcher,
@@ -591,8 +803,10 @@ impl<U: Ui> App<U> {
         self.ui.info(&format!("Explore: {}", command.display()));
         self.ui
             .info("Hard compact the planning session after Explore");
-        self.ui
-            .info(&format!("Propose in same session: {}", commands.propose));
+        self.ui.info(&format!(
+            "Propose in same session: {} (READY, DONE, or BLOCKED)",
+            commands.propose
+        ));
         self.ui
             .info("Hard compact the planning session after Propose");
         self.ui
@@ -605,6 +819,15 @@ impl<U: Ui> App<U> {
         self.ui.info(&format!("Archive: {}", commands.archive));
         self.ui
             .info("Ask Claude to create completion milestone commit");
+        if self.cli.loop_workflow {
+            let limit = self.cli.max_iterations.map_or_else(
+                || "until Propose returns DONE".to_owned(),
+                |maximum| format!("until DONE or {maximum} completed iterations"),
+            );
+            self.ui.info(&format!(
+                "Campaign: repeat the complete workflow {limit}; stop on any error or BLOCKED"
+            ));
+        }
         Ok(())
     }
 
@@ -613,6 +836,13 @@ impl<U: Ui> App<U> {
             .warn("DRY RUN — checkpoint and repository will not be changed");
         self.ui
             .info(&format!("Next stage: {}", state.stage.title()));
+        if let Some(campaign) = &state.campaign {
+            self.ui.info(&format!(
+                "Campaign iteration {}; {} completed change(s); continue after this workflow",
+                campaign.iteration,
+                campaign.completed.len()
+            ));
+        }
         if let Some(direction) = &state.pending_direction {
             self.ui
                 .info(&format!("Pending one-shot direction: {direction}"));
@@ -668,6 +898,10 @@ impl<U: Ui> App<U> {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
         ));
+        self.ui.debug(&format!(
+            "campaign loop: {}, max iterations: {:?}",
+            self.cli.loop_workflow, self.cli.max_iterations
+        ));
     }
 }
 
@@ -716,6 +950,16 @@ fn require_ready(stage: &str, response: &str, signal: StageSignal) -> Result<()>
         StageSignal::Ready => Ok(()),
         StageSignal::Blocked => blocked(stage, response),
         other => bail!("{stage} returned unexpected terminal status {other:?}"),
+    }
+}
+
+fn campaign_subject(state: &RunState) -> String {
+    match &state.campaign {
+        Some(campaign) => format!(
+            "{}\n\nThis is campaign iteration {}. Select and pursue exactly one coherent, bounded remaining slice toward the objective. Use the repository and archived OpenSpec history as durable evidence of earlier iterations. If the overall objective is already satisfied and no meaningful slice remains, carry that conclusion into Propose so it can return DONE without creating artifacts.",
+            state.request, campaign.iteration
+        ),
+        None => state.request.clone(),
     }
 }
 
@@ -869,6 +1113,8 @@ fn migrate_v2(value: Value) -> Result<RunState> {
             .get("final_commit")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        terminal_summary: None,
+        campaign: None,
     })
 }
 
@@ -885,6 +1131,49 @@ mod tests {
         let prompt = with_direction("apply slice-m", Some("keep the AST unchanged"));
         assert!(prompt.contains("User direction for this iteration"));
         assert!(prompt.contains("keep the AST unchanged"));
+    }
+
+    #[test]
+    fn campaign_subject_preserves_the_goal_and_bounds_one_iteration() {
+        let mut state = RunState::new_campaign(
+            "finish the compiler".to_owned(),
+            ChangeSnapshot::default(),
+            Some(20),
+        );
+        state.campaign.as_mut().unwrap().iteration = 7;
+        let subject = campaign_subject(&state);
+        assert!(subject.contains("finish the compiler"));
+        assert!(subject.contains("campaign iteration 7"));
+        assert!(subject.contains("exactly one coherent, bounded remaining slice"));
+        assert!(subject.contains("return DONE"));
+    }
+
+    #[test]
+    fn campaign_checkpoint_round_trips_completed_iterations() {
+        let mut state = RunState::new_campaign(
+            "finish the compiler".to_owned(),
+            ChangeSnapshot::default(),
+            Some(10),
+        );
+        state
+            .campaign
+            .as_mut()
+            .unwrap()
+            .completed
+            .push(CompletedIteration {
+                iteration: 1,
+                change: "slice-a".to_owned(),
+                proposal_head: Some("proposal".to_owned()),
+                final_head: Some("complete".to_owned()),
+                elapsed_seconds: Some(90),
+            });
+        let decoded: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let campaign = decoded.campaign.unwrap();
+        assert_eq!(campaign.iteration, 1);
+        assert_eq!(campaign.max_iterations, Some(10));
+        assert_eq!(campaign.completed[0].change, "slice-a");
+        assert_eq!(campaign.completed[0].elapsed_seconds, Some(90));
     }
 
     #[test]

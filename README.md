@@ -20,7 +20,9 @@ installed because orchestration belongs in this process.
 
 1. Run `/explore-unattended` in a new Claude planning session.
 2. Explicitly `/compact` that session.
-3. Run `/propose-unattended` in the compacted planning session.
+3. Run `/propose-unattended` in the compacted planning session. If the
+   requested objective is already satisfied and no meaningful change remains,
+   Propose returns `DONE` without creating artifacts.
 4. Determine the OpenSpec change name from `openspec list --json`, then
    explicitly `/compact` the planning session again.
 5. Ask Claude to commit the proposal as `openspec: propose <change>`.
@@ -54,6 +56,42 @@ rather than failed. It best-effort compacts that same Claude session and asks it
 to continue the current phase from durable repository state. This recovery is
 bounded by `max_output_retries` (default 3); exhausting it leaves the checkpoint
 at the current phase for an ordinary `--resume`.
+
+## Campaign loop
+
+Repeat the complete, unchanged workflow with the same objective:
+
+```sh
+ospx-build --repo ~/git/my-project --loop \
+  "Select and implement the next coherent slice toward a complete C compiler"
+```
+
+Each iteration gets a fresh planning session and otherwise follows the normal
+seven-stage workflow. The campaign ends successfully when
+`propose-unattended` returns `DONE`, or stops immediately on `BLOCKED`,
+interruption, or an ordinary error. There is no additional whole-workflow retry
+policy around the existing stages.
+
+An optional circuit breaker reports an incomplete-campaign error after a fixed
+number of completed changes:
+
+```sh
+ospx-build --loop --max-iterations 20 "finish the compiler"
+```
+
+Campaign metadata is stored with the normal checkpoint: current iteration,
+completed change names and milestone commits, available elapsed iteration
+times, and the optional limit. `--resume` continues the interrupted inner
+workflow and then continues its campaign. A crash after a completion commit but
+before the next Explore is reconciled without repeating the completed change.
+
+In the TTY dashboard, press `q` to finish the current change and then pause the
+campaign cleanly. Ctrl-C still interrupts the active phase immediately and
+leaves it resumable.
+
+If `loop = true` is configured as a default, `--no-loop` runs one change while
+preserving the rest of that configuration. On `--resume`, it finishes the
+current campaign change and pauses before the following iteration.
 
 ## Installation
 
@@ -168,6 +206,9 @@ The default launcher is `claude`. oMLX Claude mode can be configured with:
 # ~/.config/ospx-build/config.toml
 max_verify_retries = 3
 max_output_retries = 3
+# Optional campaign defaults:
+# loop = true
+# max_iterations = 20
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
@@ -237,6 +278,9 @@ ospx-build \
 The corresponding environment variables are:
 
 - `OSPX_BUILD_MAX_VERIFY_RETRIES`
+- `OSPX_BUILD_MAX_OUTPUT_RETRIES`
+- `OSPX_BUILD_LOOP`
+- `OSPX_BUILD_MAX_ITERATIONS`
 - `OSPX_BUILD_PERMISSION_MODE`
 - `OSPX_BUILD_CLAUDE_COMMAND`
 - `OSPX_BUILD_CLAUDE_MODEL`
@@ -357,6 +401,16 @@ The change name appears as soon as proposal discovery records it in the
 ospx-build checkpoint. Resumed and `--continue-existing` runs show it from the
 start.
 
+When content exceeds the terminal height, a scrollbar appears on the right.
+Its arrow buttons move one line, its track is clickable, and its thumb can be
+dragged. Mouse-wheel and keyboard scrolling continue to work; reaching the
+bottom resumes tail-following.
+
+Campaign mode adds the iteration number to the header and retains a compact
+summary row for every completed change. The active iteration continues to use
+the existing phase disclosures; starting the next iteration clears the old
+phase chatter while preserving its summary.
+
 Controls:
 
 - `c` sends Claude's interrupt control request—the streaming equivalent of
@@ -366,6 +420,7 @@ Controls:
   Claude's context report in the phase disclosure for debugging;
 - `i` opens a steering prompt; Enter interrupts the active Claude turn and
   delivers the entered instruction as its continuation;
+- `q` in campaign mode pauses cleanly after the current change completes;
 - Escape cancels the injection prompt;
 - Tab or Left/Right selects a phase disclosure;
 - Enter, Space, `o`, or a click on a heading expands/collapses that phase;
@@ -438,13 +493,17 @@ ospx-build falls back to final-line markers:
 
 ```text
 OSPX_STATUS: READY
+OSPX_STATUS: DONE
 OSPX_STATUS: VERIFIED
 OSPX_STATUS: RETRY
 OSPX_STATUS: BLOCKED
 ```
 
-Explore, Propose, Apply, Repair, Archive, and commit stages use `READY` or
-`BLOCKED`. Verify uses `VERIFIED`, `RETRY`, or `BLOCKED`.
+Explore, Apply, Repair, Archive, and commit stages use `READY` or `BLOCKED`.
+Propose additionally accepts `DONE`. Verify uses `VERIFIED`, `RETRY`, or
+`BLOCKED`. `DONE` means no OpenSpec change was created or modified because the
+requested objective is already satisfied; in campaign mode it terminates the
+outer loop successfully.
 
 If the Claude process exits successfully but returns neither structured output
 nor a fallback marker, ospx-build does not rerun that potentially mutating
@@ -460,7 +519,8 @@ archive is not repeated merely because its acknowledgement was malformed.
 - Apply, Verify, and Archive workflow names must be discoverable or configured.
 - Change discovery requires one new change, one uniquely modified change, or
   only one active change.
-- The process is synchronous and single-run; there is no daemon or web UI.
+- The process is synchronous; campaign mode repeats complete runs in the same
+  foreground process. There is no daemon or web UI.
 - Claude is responsible for the quality and scope of Git commits. The runner
   intentionally does not second-guess them.
 

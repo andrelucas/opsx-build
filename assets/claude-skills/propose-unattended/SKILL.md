@@ -1,6 +1,6 @@
 ---
 name: propose-unattended
-description: Create a complete OpenSpec proposal autonomously from an already-understood change, without routine user interaction.
+description: Autonomously create a complete OpenSpec proposal or report that no meaningful change remains.
 ---
 
 Create a complete OpenSpec proposal for $ARGUMENTS.
@@ -39,6 +39,12 @@ Do not ask merely for:
 ## OpenSpec workflow
 
 Follow OpenSpec's artifact workflow.
+
+Before creating or modifying a change, decide whether the requested objective
+is already satisfied and no coherent implementation work remains. If so, do
+not create or modify OpenSpec artifacts; finish with DONE.
+
+Otherwise:
 
 1. Determine an appropriate kebab-case change name.
 
@@ -114,6 +120,14 @@ Do not implement production code during this skill.
 ## Terminal outcomes
 
 Continue until exactly one of these outcomes applies.
+
+DONE:
+The requested objective is already satisfied and no meaningful OpenSpec change
+remains to propose.
+
+Return DONE only before creating or modifying any OpenSpec change artifacts.
+Report the repository and specification evidence showing why no change is
+warranted.
 
 READY:
 The OpenSpec change exists and every artifact required before implementation

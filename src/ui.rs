@@ -9,9 +9,26 @@ use crossterm::style::Color;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::{
-    dashboard::{StageView, StreamDashboard},
+    dashboard::{
+        CampaignDashboardView, CampaignIterationDashboardView, StageView, StreamDashboard,
+    },
     stream::{StreamControl, StreamItem},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignView {
+    pub iteration: u32,
+    pub max_iterations: Option<u32>,
+    pub completed: Vec<CampaignIterationView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignIterationView {
+    pub iteration: u32,
+    pub change: String,
+    pub final_head: Option<String>,
+    pub elapsed_seconds: Option<u64>,
+}
 
 pub trait Ui {
     /// Whether Claude stages should use persistent bidirectional stream input.
@@ -20,6 +37,10 @@ pub trait Ui {
     }
     fn banner(&self, repo: &str);
     fn change_name(&self, change: Option<&str>);
+    fn campaign(&self, _campaign: Option<CampaignView>) {}
+    fn stop_after_iteration_requested(&self) -> bool {
+        false
+    }
     fn stage(&self, current: usize, total: usize, title: &str);
     fn info(&self, message: &str);
     fn warn(&self, message: &str);
@@ -54,6 +75,7 @@ struct TerminalState {
     repo: String,
     change_name: Option<String>,
     stage: Option<StageView>,
+    campaign: Option<CampaignView>,
     dashboard: Option<StreamDashboard>,
 }
 
@@ -105,6 +127,40 @@ impl Ui for TerminalUi {
         }
     }
 
+    fn campaign(&self, campaign: Option<CampaignView>) {
+        let dashboard_campaign = campaign.as_ref().map(campaign_dashboard_view);
+        let mut state = self.state.lock().unwrap();
+        let previous_iteration = state.campaign.as_ref().map(|campaign| campaign.iteration);
+        state.campaign = campaign;
+        if let Some(dashboard) = state.dashboard.as_mut() {
+            dashboard.set_campaign(dashboard_campaign);
+            return;
+        }
+        let campaign = state.campaign.clone();
+        drop(state);
+        if let Some(campaign) = campaign
+            && previous_iteration != Some(campaign.iteration)
+        {
+            let position = campaign.max_iterations.map_or_else(
+                || campaign.iteration.to_string(),
+                |maximum| format!("{}/{maximum}", campaign.iteration),
+            );
+            self.write_line(&format!(
+                "{} Campaign iteration {position}",
+                Style::new().bold().cyan().apply_to("◆")
+            ));
+        }
+    }
+
+    fn stop_after_iteration_requested(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .dashboard
+            .as_ref()
+            .is_some_and(StreamDashboard::stop_after_iteration_requested)
+    }
+
     fn stage(&self, current: usize, total: usize, title: &str) {
         let stage = StageView {
             current,
@@ -121,8 +177,9 @@ impl Ui for TerminalUi {
         if self.dashboard_enabled {
             let repo = state.repo.clone();
             let change_name = state.change_name.clone();
+            let campaign = state.campaign.as_ref().map(campaign_dashboard_view);
             drop(state);
-            match StreamDashboard::enter(repo, change_name) {
+            match StreamDashboard::enter(repo, change_name, campaign) {
                 Ok(mut dashboard) => {
                     dashboard.set_stage(stage);
                     self.state.lock().unwrap().dashboard = Some(dashboard);
@@ -210,7 +267,7 @@ impl Ui for TerminalUi {
             self.info(message);
             return;
         }
-        let (repo, change_name, stage) = {
+        let (repo, change_name, stage, campaign) = {
             let mut state = self.state.lock().unwrap();
             if let Some(dashboard) = state.dashboard.as_mut() {
                 dashboard.start_stream(message);
@@ -220,9 +277,10 @@ impl Ui for TerminalUi {
                 state.repo.clone(),
                 state.change_name.clone(),
                 state.stage.clone(),
+                state.campaign.as_ref().map(campaign_dashboard_view),
             )
         };
-        match StreamDashboard::enter(repo, change_name) {
+        match StreamDashboard::enter(repo, change_name, campaign) {
             Ok(mut dashboard) => {
                 if let Some(stage) = stage {
                     dashboard.set_stage(stage);
@@ -347,5 +405,22 @@ impl Ui for TerminalUi {
         } else {
             self.failure(message);
         }
+    }
+}
+
+fn campaign_dashboard_view(campaign: &CampaignView) -> CampaignDashboardView {
+    CampaignDashboardView {
+        iteration: campaign.iteration,
+        max_iterations: campaign.max_iterations,
+        completed: campaign
+            .completed
+            .iter()
+            .map(|entry| CampaignIterationDashboardView {
+                iteration: entry.iteration,
+                change: entry.change.clone(),
+                final_head: entry.final_head.clone(),
+                elapsed_seconds: entry.elapsed_seconds,
+            })
+            .collect(),
     }
 }

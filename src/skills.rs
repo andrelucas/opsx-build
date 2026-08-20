@@ -98,6 +98,13 @@ mod tests {
             assert!(skill.contents.contains("\ndescription: "));
             assert!(!skill.contents.starts_with("```"));
         }
+        let propose = BUNDLED_SKILLS
+            .iter()
+            .find(|skill| skill.name == "propose-unattended")
+            .unwrap();
+        assert!(propose.contents.contains("DONE:"));
+        assert!(propose.contents.contains("finish with DONE"));
+        assert!(propose.contents.contains("Return DONE only before"));
     }
 
     #[test]

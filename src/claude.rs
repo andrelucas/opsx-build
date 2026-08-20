@@ -157,6 +157,7 @@ fn normalize_command(command: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageSignal {
     Ready,
+    Done,
     Verified,
     Retry,
     Blocked,
@@ -165,6 +166,7 @@ pub enum StageSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageProtocol {
     Ready,
+    Propose,
     Verify,
 }
 
@@ -172,6 +174,7 @@ impl StageProtocol {
     fn terminal_values(self) -> &'static str {
         match self {
             Self::Ready => "READY or BLOCKED",
+            Self::Propose => "READY, DONE, or BLOCKED",
             Self::Verify => "VERIFIED, RETRY, or BLOCKED",
         }
     }
@@ -180,6 +183,9 @@ impl StageProtocol {
         match self {
             Self::Ready => {
                 r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["READY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+            }
+            Self::Propose => {
+                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["READY","DONE","BLOCKED"]},"summary":{"type":"string","description":"Concise proposal result. DONE means the requested objective is already satisfied and no OpenSpec artifacts were created or modified. For BLOCKED, include the exact blocker."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
             }
             Self::Verify => {
                 r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
@@ -790,21 +796,9 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
 
 pub fn parse_signal(text: &str) -> Option<StageSignal> {
     text.lines().rev().find_map(|line| {
-        let line = line.trim().to_ascii_uppercase();
-        if !line.contains("OSPX_STATUS") {
-            return None;
-        }
-        if line.contains("BLOCKED") {
-            Some(StageSignal::Blocked)
-        } else if line.contains("VERIFIED") {
-            Some(StageSignal::Verified)
-        } else if line.contains("RETRY") {
-            Some(StageSignal::Retry)
-        } else if line.contains("READY") {
-            Some(StageSignal::Ready)
-        } else {
-            None
-        }
+        line.trim()
+            .strip_prefix("OSPX_STATUS:")
+            .and_then(parse_status_value)
     })
 }
 
@@ -840,6 +834,7 @@ fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String
 fn parse_status_value(status: &str) -> Option<StageSignal> {
     match status.trim().to_ascii_uppercase().as_str() {
         "READY" => Some(StageSignal::Ready),
+        "DONE" => Some(StageSignal::Done),
         "VERIFIED" => Some(StageSignal::Verified),
         "RETRY" => Some(StageSignal::Retry),
         "BLOCKED" => Some(StageSignal::Blocked),
@@ -1216,6 +1211,15 @@ mod tests {
     }
 
     #[test]
+    fn proposal_protocol_accepts_done_without_weakening_other_stages() {
+        let schema = StageProtocol::Propose.json_schema();
+        assert!(schema.contains(r#"["READY","DONE","BLOCKED"]"#));
+        assert!(!StageProtocol::Ready.json_schema().contains("DONE"));
+        let prompt = stage_prompt("/propose-unattended", "finish it", StageProtocol::Propose);
+        assert!(prompt.contains("READY, DONE, or BLOCKED"));
+    }
+
+    #[test]
     fn parses_terminal_markers_from_last_matching_line() {
         assert_eq!(
             parse_signal("details\nOSPX_STATUS: RETRY"),
@@ -1226,6 +1230,12 @@ mod tests {
             Some(StageSignal::Blocked)
         );
         assert_eq!(parse_signal("ordinary prose"), None);
+        assert_eq!(
+            parse_signal("No work remains\nOSPX_STATUS: DONE"),
+            Some(StageSignal::Done)
+        );
+        assert_eq!(parse_signal("OSPX_STATUS: NOT_DONE"), None);
+        assert_eq!(parse_signal("`OSPX_STATUS: DONE`"), None);
     }
 
     #[test]
@@ -1247,6 +1257,14 @@ mod tests {
         assert_eq!(parsed.signal, StageSignal::Ready);
         assert_eq!(parsed.text, "Proposal complete");
         assert_eq!(parsed.session_id.as_deref(), Some("session-2"));
+    }
+
+    #[test]
+    fn parses_structured_done_result() {
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-done","result":"structured response","structured_output":{"ospx_status":"DONE","summary":"No remaining slice"}}"#;
+        let parsed = parse_claude_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::Done);
+        assert_eq!(parsed.text, "No remaining slice");
     }
 
     #[test]

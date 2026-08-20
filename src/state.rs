@@ -13,6 +13,7 @@ pub enum Stage {
     Archive,
     FinalCommit,
     Complete,
+    Done,
 }
 
 impl Stage {
@@ -25,6 +26,7 @@ impl Stage {
             Self::Verify | Self::Repair => 5,
             Self::Archive => 6,
             Self::FinalCommit | Self::Complete => 7,
+            Self::Done => 2,
         }
     }
 
@@ -39,6 +41,7 @@ impl Stage {
             Self::Archive => "Archive",
             Self::FinalCommit => "Completion commit",
             Self::Complete => "Complete",
+            Self::Done => "Done",
         }
     }
 
@@ -80,6 +83,7 @@ mod tests {
         assert_eq!(stage, Stage::Complete);
         assert_eq!(Stage::Repair.number(), 5);
         assert_eq!(Stage::FinalCommit.number(), 7);
+        assert_eq!(Stage::Done.number(), 2);
     }
 
     #[test]
