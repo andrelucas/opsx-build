@@ -401,6 +401,14 @@ impl StreamDashboard {
                         "Will pause after the current OpenSpec change completes",
                     );
                 }
+                KeyCode::Char('p') => {
+                    self.push_message(
+                        "pause",
+                        Color::Magenta,
+                        "Pausing now; the current phase checkpoint will be preserved",
+                    );
+                    return StreamControl::Pause;
+                }
                 KeyCode::Char('c') if !self.compact_requested => {
                     self.compact_requested = true;
                     self.push_message(
@@ -822,7 +830,7 @@ impl StreamDashboard {
                     } else {
                         ""
                     };
-                    format!("c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
+                    format!("p pause · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
                 |input| format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop"),
             );
@@ -1251,6 +1259,26 @@ mod tests {
                 KeyModifiers::CONTROL,
             ))),
             StreamControl::Interrupt
+        );
+    }
+
+    #[test]
+    fn plain_p_requests_an_immediate_pause() {
+        let mut dashboard = dashboard();
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::Pause
+        );
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("checkpoint will be preserved")
         );
     }
 

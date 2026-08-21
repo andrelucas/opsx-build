@@ -89,6 +89,13 @@ In the TTY dashboard, press `q` to finish the current change and then pause the
 campaign cleanly. Ctrl-C still interrupts the active phase immediately and
 leaves it resumable.
 
+Press `p` to pause immediately during any streamed Claude phase. ospx-build
+interrupts the complete Claude process group, restores the terminal, preserves
+the current phase checkpoint and partial repository work, and exits
+successfully with the exact `--resume` command. This is the preferred way to
+stop work before suspending or repurposing the machine; unlike `q`, it does not
+wait for the current OpenSpec change to finish.
+
 If `loop = true` is configured as a default, `--no-loop` runs one change while
 preserving the rest of that configuration. On `--resume`, it finishes the
 current campaign change and pauses before the following iteration.
@@ -413,6 +420,8 @@ phase chatter while preserving its summary.
 
 Controls:
 
+- `p` immediately stops the active Claude subprocess and exits successfully,
+  preserving the current phase checkpoint for `--resume`;
 - `c` sends Claude's interrupt control request—the streaming equivalent of
   Escape—then runs `/compact` and reissues the interrupted stage command (once
   per invocation);
@@ -428,7 +437,7 @@ Controls:
 - End returns to the newest output;
 - Escape collapses the selected phase;
 - Ctrl-C interrupts the current subprocess while preserving its ospx-build
-  checkpoint.
+  checkpoint, but reports an interruption rather than a deliberate pause.
 
 All three injection controls interrupt the active turn first. `i` delivers the
 entered text as the continuation, which lets it steer the work already in

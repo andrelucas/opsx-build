@@ -12,6 +12,32 @@ use anyhow::{Context, Result, bail};
 
 use crate::{stream::StreamControl, ui::Ui};
 
+#[derive(Debug)]
+pub struct PauseRequested {
+    repo: PathBuf,
+}
+
+impl PauseRequested {
+    fn new(repo: PathBuf) -> Self {
+        Self { repo }
+    }
+
+    pub fn resume_command(&self) -> String {
+        format!(
+            "ospx-build --repo {} --resume",
+            shell_quote(&self.repo.to_string_lossy())
+        )
+    }
+}
+
+impl std::fmt::Display for PauseRequested {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "workflow pause requested")
+    }
+}
+
+impl std::error::Error for PauseRequested {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: String,
@@ -213,6 +239,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut captured_stderr = String::new();
         let mut read_error: Option<std::io::Error> = None;
         let mut cancelled = false;
+        let mut pause_requested = false;
         let mut cancel_started = None;
         let mut forced_stop = false;
         let mut child_stdin = child.stdin.take();
@@ -355,6 +382,15 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                             read_error.get_or_insert(error);
                         }
                     }
+                    StreamControl::Pause => {
+                        child_stdin.take();
+                        cancelled = true;
+                        pause_requested = true;
+                        cancel_started = Some(std::time::Instant::now());
+                        if let Err(error) = interrupt_stream_process(&mut child) {
+                            read_error.get_or_insert(error);
+                        }
+                    }
                     control @ (StreamControl::Compact
                     | StreamControl::Context
                     | StreamControl::Inject(_)) => {
@@ -423,6 +459,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
             stderr: captured_stderr,
         };
         self.ui.output(&output.stdout, &output.stderr);
+        if pause_requested {
+            return Err(PauseRequested::new(spec.cwd.clone()).into());
+        }
         if cancelled {
             bail!("streamed command interrupted by user");
         }
@@ -889,6 +928,22 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 2);
         assert!(messages.contains("Steering instruction written after interrupt"));
         assert!(!messages.contains("Interrupted command reissued"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pause_stops_the_process_group_and_returns_a_resume_command() {
+        let ui = InterruptingUi::new(StreamControl::Pause);
+        let runner = ProcessRunner::new(&ui);
+        let spec = CommandSpec::new("sh", "/tmp").args(["-c", "sleep 30"]);
+
+        let error = runner
+            .run_streaming(&spec, "Apply", |_| {})
+            .expect_err("pause should stop the subprocess and unwind the workflow");
+        let pause = error
+            .downcast_ref::<PauseRequested>()
+            .expect("pause should remain a typed outcome");
+        assert_eq!(pause.resume_command(), "ospx-build --repo /tmp --resume");
     }
 
     #[cfg(unix)]

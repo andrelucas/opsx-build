@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     cli::Cli,
-    process::{CommandSpec, ProcessOutput, ProcessRunner, diagnostic_text, stream_user_message},
+    process::{
+        CommandSpec, PauseRequested, ProcessOutput, ProcessRunner, diagnostic_text,
+        stream_user_message,
+    },
     stream::{StreamFilter, context_report_items, filter_line},
     ui::Ui,
 };
@@ -369,7 +372,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                         "Claude reached its output token limit; compacting and continuing the same phase ({recoveries}/{})",
                         self.max_output_retries
                     ));
-                    self.compact_session(session_id, "an output-limit interruption");
+                    self.compact_session(session_id, "an output-limit interruption")?;
                     current_session = SessionMode::Resume { id: session_id };
                     current_prompt = output_limit_continuation_prompt(protocol);
                     current_activity = format!(
@@ -512,7 +515,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         Ok(())
     }
 
-    pub fn compact_session(&self, session_id: Uuid, completed_phase: &str) {
+    pub fn compact_session(&self, session_id: Uuid, completed_phase: &str) -> Result<()> {
         let activity = format!("Hard-compacting context after {completed_phase}");
         self.ui.debug(&format!(
             "Claude session: resume {session_id} for explicit /compact"
@@ -536,14 +539,21 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             self.runner.run(&spec, &activity)
         };
         match result {
-            Ok(output) if output.success => {}
-            Ok(output) => self.ui.warn(&format!(
-                "Could not compact Claude context after {completed_phase}; continuing with the existing session: {}",
-                diagnostic_text(&output)
-            )),
-            Err(error) => self.ui.warn(&format!(
-                "Could not compact Claude context after {completed_phase}; continuing with the existing session: {error}"
-            )),
+            Ok(output) if output.success => Ok(()),
+            Ok(output) => {
+                self.ui.warn(&format!(
+                    "Could not compact Claude context after {completed_phase}; continuing with the existing session: {}",
+                    diagnostic_text(&output)
+                ));
+                Ok(())
+            }
+            Err(error) if error.downcast_ref::<PauseRequested>().is_some() => Err(error),
+            Err(error) => {
+                self.ui.warn(&format!(
+                    "Could not compact Claude context after {completed_phase}; continuing with the existing session: {error}"
+                ));
+                Ok(())
+            }
         }
     }
 }

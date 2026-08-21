@@ -10,6 +10,7 @@ pub enum StreamControl {
     Context,
     Inject(String),
     Interrupt,
+    Pause,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]

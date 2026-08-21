@@ -20,7 +20,7 @@ use crate::{
     openspec::{
         ChangeSnapshot, identify_change, select_existing_change, snapshot as openspec_snapshot,
     },
-    process::{ProcessRunner, prerequisite_exists},
+    process::{PauseRequested, ProcessRunner, prerequisite_exists},
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::{CampaignIterationView, CampaignView, Ui},
@@ -136,6 +136,23 @@ impl<U: Ui> App<U> {
     }
 
     pub fn run(self) -> Result<()> {
+        match self.run_inner() {
+            Err(error) if error.downcast_ref::<PauseRequested>().is_some() => {
+                let pause = error
+                    .downcast_ref::<PauseRequested>()
+                    .expect("pause error was checked above");
+                self.ui.finish_dashboard();
+                self.ui
+                    .success("PAUSED — the current phase checkpoint was preserved");
+                self.ui
+                    .info(&format!("Resume with: {}", pause.resume_command()));
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn run_inner(&self) -> Result<()> {
         let requested_repo = self.cli.repo.canonicalize().with_context(|| {
             format!(
                 "repository path `{}` does not exist",
@@ -506,7 +523,7 @@ impl<U: Ui> App<U> {
         require_ready("explore", &result.text, result.signal)?;
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)?;
-        claude.compact_session(session, "Explore");
+        claude.compact_session(session, "Explore")?;
         Ok(())
     }
 
@@ -552,7 +569,7 @@ impl<U: Ui> App<U> {
         self.ui.change_name(Some(&change));
         self.ui
             .info(&format!("Selected OpenSpec change `{change}`"));
-        claude.compact_session(session, "Propose");
+        claude.compact_session(session, "Propose")?;
         if let Err(error) = claude.rename_session(session, &change) {
             self.ui
                 .warn(&format!("Could not rename planning session: {error}"));
@@ -722,6 +739,7 @@ impl<U: Ui> App<U> {
         );
         let result = match result {
             Ok(result) => result,
+            Err(error) if error.downcast_ref::<PauseRequested>().is_some() => return Err(error),
             Err(error) => match openspec_snapshot(repo, &self.ui) {
                 Ok(changes) if archive_is_absent(&changes, &change) => {
                     self.ui.warn(
