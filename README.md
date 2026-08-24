@@ -128,6 +128,18 @@ cargo install --path . --force
 opsx-build --repo ~/git/my-project "add function pointer support"
 ```
 
+Install or refresh the bundled unattended skills without starting Claude or a
+workflow:
+
+```sh
+opsx-build --repo ~/git/my-project --update-skills
+```
+
+This is useful when the skill files are committed: review and commit the
+result as an explicit workflow-policy update. Preview it without writing with
+`--update-skills --dry-run`. Normal workflows continue to synchronize the
+bundled copies at startup for compatibility.
+
 Resume after interruption or an ordinary command error:
 
 ```sh

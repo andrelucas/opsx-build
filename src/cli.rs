@@ -16,6 +16,7 @@ pub struct Cli {
     pub request: String,
     pub repo: PathBuf,
     pub interactive: bool,
+    pub update_skills: bool,
     pub resume: bool,
     pub forget: bool,
     pub continue_existing: bool,
@@ -73,7 +74,7 @@ impl Cli {
 )]
 struct CliArgs {
     /// Change request, or an optional initial prompt in interactive mode.
-    #[arg(required_unless_present_any = ["interactive", "resume", "forget", "continue_existing"])]
+    #[arg(required_unless_present_any = ["interactive", "update_skills", "resume", "forget", "continue_existing"])]
     request: Option<String>,
 
     /// Repository containing .git, openspec/, and Claude skills.
@@ -83,6 +84,24 @@ struct CliArgs {
     /// Open an interactive Claude session instead of running the OpenSpec workflow.
     #[arg(long)]
     interactive: bool,
+
+    /// Install or refresh the bundled unattended skills, then exit.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "request",
+            "interactive",
+            "resume",
+            "forget",
+            "continue_existing",
+            "loop_workflow",
+            "no_loop",
+            "max_iterations",
+            "change",
+            "direction"
+        ]
+    )]
+    update_skills: bool,
 
     /// Resume the last durable opsx-build run from its first incomplete phase.
     #[arg(long, conflicts_with = "interactive")]
@@ -367,6 +386,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         request: args.request.unwrap_or_default(),
         repo: args.repo,
         interactive: args.interactive,
+        update_skills: args.update_skills,
         resume: args.resume,
         forget: args.forget,
         continue_existing: args.continue_existing,
@@ -839,6 +859,17 @@ mod tests {
     #[test]
     fn workflow_still_requires_a_request() {
         assert!(CliArgs::try_parse_from(["opsx-build"]).is_err());
+    }
+
+    #[test]
+    fn update_skills_is_a_standalone_mode() {
+        let cli = Cli::resolve(args(["opsx-build", "--update-skills"])).unwrap();
+        assert!(cli.update_skills);
+        assert!(cli.request.is_empty());
+        assert!(
+            CliArgs::try_parse_from(["opsx-build", "--update-skills", "build something"]).is_err()
+        );
+        assert!(CliArgs::try_parse_from(["opsx-build", "--update-skills", "--resume"]).is_err());
     }
 
     #[test]

@@ -179,6 +179,22 @@ impl<U: Ui> App<U> {
         if self.cli.forget {
             return self.forget_checkpoint(&repo);
         }
+        if self.cli.update_skills {
+            let changed = self.synchronize_skills(&repo)?;
+            if self.cli.dry_run {
+                self.ui.success(&format!(
+                    "DRY RUN — {changed} bundled skill file(s) would change"
+                ));
+            } else if changed == 0 {
+                self.ui
+                    .success("Bundled unattended skills are already current");
+            } else {
+                self.ui.success(&format!(
+                    "Updated {changed} bundled unattended skill file(s)"
+                ));
+            }
+            return Ok(());
+        }
 
         let launcher = ClaudeLauncher::parse(
             &self.cli.claude_command,
@@ -208,18 +224,7 @@ impl<U: Ui> App<U> {
                 repo.display()
             );
         }
-        for installed in ensure_unattended_skills(&repo, self.cli.dry_run)? {
-            let action = match installed.action {
-                SkillInstallAction::Installed => "Installed",
-                SkillInstallAction::Updated => "Updated",
-                SkillInstallAction::WouldInstall => "Would install",
-                SkillInstallAction::WouldUpdate => "Would update",
-            };
-            self.ui.info(&format!(
-                "{action} bundled Claude skill `{}` in target repository",
-                installed.name
-            ));
-        }
+        self.synchronize_skills(&repo)?;
         let commands = SkillCommands::discover(&repo, &self.cli)?;
         self.ui.debug(&format!(
             "workflow commands: explore=`{}`, propose=`{}`, apply=`{}`, verify=`{}`, archive=`{}`",
@@ -261,6 +266,23 @@ impl<U: Ui> App<U> {
         };
         persist_state(&repo, &state, &self.ui)?;
         self.run_workflows(&repo, &launcher, &commands, state)
+    }
+
+    fn synchronize_skills(&self, repo: &Path) -> Result<usize> {
+        let changes = ensure_unattended_skills(repo, self.cli.dry_run)?;
+        for installed in &changes {
+            let action = match installed.action {
+                SkillInstallAction::Installed => "Installed",
+                SkillInstallAction::Updated => "Updated",
+                SkillInstallAction::WouldInstall => "Would install",
+                SkillInstallAction::WouldUpdate => "Would update",
+            };
+            self.ui.info(&format!(
+                "{action} bundled Claude skill `{}` in target repository",
+                installed.name
+            ));
+        }
+        Ok(changes.len())
     }
 
     fn continue_existing(
