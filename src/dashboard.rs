@@ -19,6 +19,7 @@ use crossterm::{
 use crate::stream::{StreamControl, StreamItem};
 
 const MAX_DISPLAY_LINES: usize = 20_000;
+const SOURCE_LABEL_WIDTH: usize = 8;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,13 @@ pub(crate) struct CampaignIterationDashboardView {
 struct DisplayLine {
     text: String,
     color: Color,
+    source: Option<SourceLabel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLabel {
+    text: String,
+    color: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +83,7 @@ struct RenderLine {
     color: Color,
     bold: bool,
     panel: Option<usize>,
+    source: Option<SourceLabel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +296,7 @@ impl StreamDashboard {
         self.push_line(DisplayLine {
             text: format!("  event {marker} {}", sanitize(message)),
             color,
+            source: None,
         });
         self.activity = message.to_owned();
         if !success && let Some(panel) = self.panels.last_mut() {
@@ -297,14 +307,17 @@ impl StreamDashboard {
 
     pub(crate) fn push_message(&mut self, label: &str, color: Color, text: &str) {
         for (index, line) in text.lines().enumerate() {
-            let prefix = if index == 0 {
-                format!("{label:>7} ")
-            } else {
-                "        ".to_owned()
-            };
             self.push_line(DisplayLine {
-                text: format!("{prefix}{}", sanitize(line)),
-                color,
+                text: sanitize(line),
+                color: Color::White,
+                source: Some(SourceLabel {
+                    text: if index == 0 {
+                        label.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    color,
+                }),
             });
         }
     }
@@ -657,6 +670,7 @@ impl StreamDashboard {
                     color: Color::Green,
                     bold: true,
                     panel: None,
+                    source: None,
                 }
             }));
         }
@@ -696,6 +710,7 @@ impl StreamDashboard {
                 color,
                 bold: true,
                 panel: Some(index),
+                source: None,
             });
             if panel.expanded {
                 lines.extend(panel.lines.iter().cloned().map(|line| RenderLine {
@@ -703,6 +718,7 @@ impl StreamDashboard {
                     color: line.color,
                     bold: false,
                     panel: None,
+                    source: line.source,
                 }));
             }
         }
@@ -806,14 +822,7 @@ impl StreamDashboard {
             .enumerate()
         {
             let row = 3 + index as u16;
-            draw_row(
-                &mut output,
-                row,
-                body_width,
-                &line.text,
-                line.color,
-                line.bold,
-            )?;
+            draw_render_row(&mut output, row, body_width, line)?;
             if let Some(panel) = line.panel {
                 self.heading_rows.push((row, panel));
             }
@@ -908,6 +917,36 @@ fn draw_row<W: Write>(
         output,
         Print(text),
         SetAttribute(Attribute::Reset),
+        ResetColor
+    )?;
+    Ok(())
+}
+
+fn draw_render_row<W: Write>(
+    output: &mut W,
+    row: u16,
+    width: u16,
+    line: &RenderLine,
+) -> io::Result<()> {
+    let Some(source) = &line.source else {
+        return draw_row(output, row, width, &line.text, line.color, line.bold);
+    };
+
+    let label = truncate_str(&source.text, SOURCE_LABEL_WIDTH, "…");
+    let prefix = format!("{label:>SOURCE_LABEL_WIDTH$} ");
+    let prefix = truncate_str(&prefix, width as usize, "…");
+    let message_width = usize::from(width).saturating_sub(SOURCE_LABEL_WIDTH + 1);
+    let message = truncate_str(&line.text, message_width, "…");
+    queue!(
+        output,
+        MoveTo(0, row),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(source.color),
+        SetAttribute(Attribute::Bold),
+        Print(prefix),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(line.color),
+        Print(message),
         ResetColor
     )?;
     Ok(())
@@ -1087,8 +1126,15 @@ mod tests {
         assert!(!dashboard.panels[0].expanded);
         assert_eq!(dashboard.panels[0].status, PhaseStatus::Complete);
         assert!(dashboard.panels[1].expanded);
-        assert_eq!(dashboard.panels[0].lines[0].text, " claude exploring");
-        assert_eq!(dashboard.panels[1].lines[0].text, " claude proposing");
+        assert_eq!(dashboard.panels[0].lines[0].text, "exploring");
+        assert_eq!(dashboard.panels[1].lines[0].text, "proposing");
+        assert_eq!(
+            dashboard.panels[0].lines[0].source,
+            Some(SourceLabel {
+                text: "claude".to_owned(),
+                color: Color::Cyan,
+            })
+        );
     }
 
     #[test]

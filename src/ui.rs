@@ -326,7 +326,7 @@ impl Ui for TerminalUi {
             StreamItem::Lifecycle(text) => ("event", Style::new().magenta(), text),
             StreamItem::Raw(text) => ("json", Style::new().dim(), text),
         };
-        let label = style.apply_to(label);
+        let label = style.bold().apply_to(label);
         for (index, line) in text.lines().enumerate() {
             if index == 0 {
                 self.write_line(&format!("  {label} {line}"));
