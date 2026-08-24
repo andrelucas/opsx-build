@@ -281,7 +281,9 @@ impl<U: Ui> App<U> {
         }
         match discover_agenda(repo, &state.before_changes)? {
             AgendaSelection::Absent => {
-                bail!("`advance` requires an ordered agenda under `automation/slices/NNN-slug.md`")
+                bail!(
+                    "`advance` requires an ordered agenda under `automation/slices/<number>-slug.md`"
+                )
             }
             AgendaSelection::Complete => {
                 state.change = None;
@@ -798,11 +800,11 @@ impl<U: Ui> App<U> {
             self.ui.change_name(Some(&change));
             self.ui
                 .info(&format!("Selected OpenSpec change `{change}`"));
-            claude.compact_session(session, "Propose")?;
             if let Err(error) = claude.rename_session(session, &change) {
                 self.ui
                     .warn(&format!("Could not rename planning session: {error}"));
             }
+            state.planning_session = None;
             state.stage = state.stage.after_ready()?;
             persist_state(repo, state, &self.ui)?;
             return Ok(());
@@ -816,13 +818,12 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let (session, is_new) = planning_session(state);
-        persist_state(repo, state, &self.ui)?;
         let task = format!(
             "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
         );
-        let result = claude.invoke(
-            session_mode(session, is_new, &format!("{change}-proposal-commit")),
+        let result = invoke_fresh(
+            claude,
+            &format!("{change}-proposal-commit"),
             &stage_prompt("", &task, StageProtocol::Ready),
             "Claude is committing the proposal",
             StageProtocol::Ready,
@@ -1068,9 +1069,7 @@ impl<U: Ui> App<U> {
             ));
         }
         self.ui
-            .info("Hard compact the planning session after Propose");
-        self.ui
-            .info("Ask Claude to create proposal milestone commit");
+            .info("Ask Claude in a fresh session to create proposal milestone commit");
         self.ui.info(&format!("Apply: {}", commands.apply));
         self.ui.info(&format!(
             "Verify/repair: {} / {}",
@@ -1257,7 +1256,7 @@ fn campaign_subject(state: &RunState) -> String {
             .campaign
             .as_ref()
             .map(|campaign| format!("campaign iteration {}", campaign.iteration))
-            .unwrap_or_else(|| "this advance operation".to_owned());
+            .unwrap_or_else(|| "an advance operation".to_owned());
         return format!(
             "Advance the repository by implementing the exact ordered agenda assignment below. This is {iteration}. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The agenda content is authoritative; use repository inspection only to elaborate its implementation details.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
             change = assignment.change,

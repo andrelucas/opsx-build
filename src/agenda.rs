@@ -112,7 +112,7 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
 fn parse_slice_name(file_name: &str) -> Option<(u32, String)> {
     let stem = file_name.strip_suffix(".md")?;
     let (number, slug) = stem.split_once('-')?;
-    if number.len() != 3
+    if number.is_empty()
         || !number.bytes().all(|byte| byte.is_ascii_digit())
         || slug.is_empty()
         || !slug
@@ -239,5 +239,18 @@ mod tests {
             AgendaSelection::Absent
         );
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn accepts_four_digit_and_variable_width_slice_numbers() {
+        assert_eq!(
+            parse_slice_name("0001-repo-cli-scaffold.md"),
+            Some((1, "0001-repo-cli-scaffold".to_owned()))
+        );
+        assert_eq!(
+            parse_slice_name("12-parser.md"),
+            Some((12, "12-parser".to_owned()))
+        );
+        assert_eq!(parse_slice_name("README.md"), None);
     }
 }

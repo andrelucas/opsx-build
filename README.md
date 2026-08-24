@@ -20,7 +20,8 @@ installed because orchestration belongs in this process.
 
 `advance` is the well-known ordered-agenda operation and the default when no
 request is supplied. If the repository contains files named
-`automation/slices/NNN-slug.md`, opsx-build sorts them numerically, treats a
+`automation/slices/<number>-slug.md` (for example `001-lexer.md` or
+`0001-lexer.md`), opsx-build sorts them by numeric prefix, treats a
 slice as complete only when a matching OpenSpec change has been archived, and
 assigns the earliest unarchived slice. A date-prefixed archived or active
 change still matches when its name ends with the complete slice stem.
@@ -45,9 +46,10 @@ Free-form requests retain the exploratory workflow:
    corrective Propose turn once in that same session before reporting a failed
    postcondition. The bundled skills forbid background commands and detached
    subagents so READY cannot race unfinished proposal work.
-4. Determine the OpenSpec change name from `openspec list --json`, then
-   explicitly `/compact` the planning session again.
-5. Ask Claude to commit the proposal as `openspec: propose <change>`.
+4. Determine the OpenSpec change name from `openspec list --json`, then retire
+   the planning session.
+5. Ask Claude in a fresh session to commit the proposal as
+   `openspec: propose <change>`.
 6. Run the installed OpenSpec Apply workflow in a fresh session. Worker stages
    may return `TOO_LARGE` when a frontier-assigned slice cannot reliably fit
    one bounded local-model change.
@@ -77,11 +79,11 @@ finish. This allows terminal input to enqueue a slash command or ordinary
 follow-up without turning the workflow into an asynchronous marker-file
 protocol.
 
-Only Explore, Propose, and the proposal commit reuse the planning session.
-Apply, Verify, Repair, Archive, and completion work already use disposable
-fresh sessions, so there is no carried context to compact at those boundaries.
-Explicit planning compaction is best-effort: a launcher incompatibility is
-reported as a warning and does not block otherwise valid repository work.
+For free-form requests, only Explore and Propose reuse the planning session;
+the explicit compact between them is best-effort. Agenda-driven `advance`
+starts directly at Propose. Proposal commit, Apply, Verify, Repair, Archive,
+and completion work all use disposable fresh sessions, so there is no carried
+context to compact at those boundaries.
 
 If a Claude result reports `stop_reason: max_tokens` or a
 `max_output_tokens` API failure, opsx-build treats the turn as interrupted
