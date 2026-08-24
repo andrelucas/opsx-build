@@ -13,6 +13,10 @@ question-and-answer unless progress is genuinely blocked.
 
 Do not ask the user routine questions.
 
+Run every command and delegated task synchronously. Never background or detach
+a command or subagent. Do not return a terminal outcome while any command or
+delegated task is still running.
+
 Resolve questions using, in order:
 
 1. information already established in the conversation;

@@ -18,7 +18,8 @@ use crate::{
     cli::Cli,
     git::{current_head, legacy_metadata_dir, metadata_dir, remove_metadata, repository_root},
     openspec::{
-        ChangeSnapshot, identify_change, select_existing_change, snapshot as openspec_snapshot,
+        ChangeSnapshot, identify_change, planning_status, select_existing_change,
+        snapshot as openspec_snapshot,
     },
     process::{PauseRequested, ProcessRunner, prerequisite_exists},
     skills::{SkillInstallAction, ensure_unattended_skills},
@@ -581,13 +582,16 @@ impl<U: Ui> App<U> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
         let base = format!(
-            "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE.",
+            "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE. Run every OpenSpec command synchronously: never background or detach commands, and do not return while a command or subagent is still working.",
             campaign_subject(state)
         );
         let mut retrying_postcondition = false;
         loop {
             let subject = if retrying_postcondition {
-                proposal_postcondition_repair(&base)
+                proposal_postcondition_repair(
+                    &base,
+                    "The preceding READY result did not satisfy the deterministic OpenSpec postcondition.",
+                )
             } else {
                 base.clone()
             };
@@ -631,12 +635,18 @@ impl<U: Ui> App<U> {
                 other => bail!("propose returned unexpected terminal status {other:?}"),
             }
 
-            if after == state.before_changes && !retrying_postcondition {
-                self.ui.warn(
-                    "Propose reported READY without creating or modifying an active OpenSpec change; retrying the same planning session once",
+            if after == state.before_changes {
+                if !retrying_postcondition {
+                    self.ui.warn(
+                        "Propose reported READY without creating or modifying an active OpenSpec change; retrying the same planning session once",
+                    );
+                    retrying_postcondition = true;
+                    continue;
+                }
+                bail!(
+                    "Propose still created or modified no active OpenSpec change after one corrective turn. Last Claude summary: {}",
+                    result.text.trim()
                 );
-                retrying_postcondition = true;
-                continue;
             }
 
             let change = identify_change(&state.before_changes, &after).with_context(|| {
@@ -650,6 +660,25 @@ impl<U: Ui> App<U> {
                 }
             })?;
             validate_change_name(&change)?;
+            let status = planning_status(repo, &change, &self.ui)?;
+            if !status.is_complete {
+                let next_steps = if status.next_steps.is_empty() {
+                    "OpenSpec reported no next-step detail".to_owned()
+                } else {
+                    status.next_steps.join("; ")
+                };
+                if !retrying_postcondition {
+                    self.ui.warn(&format!(
+                        "Propose reported READY for `{change}`, but OpenSpec planning is incomplete ({next_steps}); retrying the same planning session once"
+                    ));
+                    retrying_postcondition = true;
+                    continue;
+                }
+                bail!(
+                    "Propose still left OpenSpec change `{change}` planning-incomplete after one corrective turn. Remaining work: {next_steps}. Last Claude summary: {}",
+                    result.text.trim()
+                );
+            }
             state.change = Some(change.clone());
             self.ui.change_name(Some(&change));
             self.ui
@@ -1093,9 +1122,9 @@ fn record_too_large<U: Ui>(
     persist_state(repo, state, ui)
 }
 
-fn proposal_postcondition_repair(subject: &str) -> String {
+fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     format!(
-        "{subject}\n\nPOSTCONDITION REPAIR: The preceding Propose turn returned READY, but a deterministic `openspec list --json` check found no new or modified active change. Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed. Use the completed exploration and repository's durable slice plan to select the intended next slice. Return READY only after the active OpenSpec change exists and every artifact required before implementation is complete. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
+        "{subject}\n\nPOSTCONDITION REPAIR: {failure} Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed and do not create a duplicate change. Inspect active OpenSpec changes first and continue the intended existing scaffold when one is present. Use the completed exploration and repository's durable slice plan to select the intended next slice. Run all commands synchronously and wait for every command and subagent to finish. Return READY only after `openspec status --change <name> --json` reports `isPlanningComplete: true`. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
     )
 }
 
@@ -1344,11 +1373,12 @@ mod tests {
 
     #[test]
     fn proposal_postcondition_repair_preserves_the_campaign_rubric() {
-        let prompt = proposal_postcondition_repair("next slice");
+        let prompt = proposal_postcondition_repair("next slice", "No change exists.");
         assert!(prompt.starts_with("next slice"));
         assert!(prompt.contains("same planning session"));
         assert!(prompt.contains("do not merely describe"));
-        assert!(prompt.contains("Return READY only after"));
+        assert!(prompt.contains("isPlanningComplete: true"));
+        assert!(prompt.contains("do not create a duplicate change"));
         assert!(prompt.contains("return TOO_LARGE"));
     }
 

@@ -17,6 +17,12 @@ pub struct ChangeSnapshot {
     pub changes: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningStatus {
+    pub is_complete: bool,
+    pub next_steps: Vec<String>,
+}
+
 impl ChangeSnapshot {
     pub fn names(&self) -> BTreeSet<&str> {
         self.changes.keys().map(String::as_str).collect()
@@ -30,6 +36,33 @@ pub fn list_command(repo: &Path) -> CommandSpec {
 pub fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<ChangeSnapshot> {
     let output = ProcessRunner::new(ui).checked(&list_command(repo), "Reading OpenSpec changes")?;
     parse_list_json(&output.stdout)
+}
+
+pub fn planning_status<U: Ui>(repo: &Path, change: &str, ui: &U) -> Result<PlanningStatus> {
+    let spec = CommandSpec::new("openspec", repo).args(["status", "--change", change, "--json"]);
+    let output = ProcessRunner::new(ui).checked(&spec, "Checking proposal completeness")?;
+    parse_planning_status_json(&output.stdout)
+}
+
+pub fn parse_planning_status_json(json: &str) -> Result<PlanningStatus> {
+    let value: Value = serde_json::from_str(json)
+        .context("invalid JSON from `openspec status --change NAME --json`")?;
+    let is_complete = value
+        .get("isPlanningComplete")
+        .and_then(Value::as_bool)
+        .context("OpenSpec status JSON omitted boolean `isPlanningComplete`")?;
+    let next_steps = value
+        .get("nextSteps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok(PlanningStatus {
+        is_complete,
+        next_steps,
+    })
 }
 
 pub fn parse_list_json(json: &str) -> Result<ChangeSnapshot> {
@@ -169,6 +202,22 @@ mod tests {
         let after =
             parse_list_json(r#"{"changes":[{"name":"new-slice"},{"name":"old"}]}"#).unwrap();
         assert_eq!(identify_change(&before, &after).unwrap(), "new-slice");
+    }
+
+    #[test]
+    fn parses_planning_completeness_and_next_steps() {
+        let incomplete = parse_planning_status_json(
+            r#"{"isPlanningComplete":false,"nextSteps":["Create proposal","Create tasks"]}"#,
+        )
+        .unwrap();
+        assert!(!incomplete.is_complete);
+        assert_eq!(incomplete.next_steps, ["Create proposal", "Create tasks"]);
+
+        let complete =
+            parse_planning_status_json(r#"{"isPlanningComplete":true,"nextSteps":[]}"#).unwrap();
+        assert!(complete.is_complete);
+        assert!(complete.next_steps.is_empty());
+        assert!(parse_planning_status_json(r#"{"nextSteps":[]}"#).is_err());
     }
 
     #[test]

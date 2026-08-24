@@ -13,6 +13,10 @@ inventing a parallel planning process.
 
 Operate autonomously.
 
+Run every command and delegated task synchronously. Never background or detach
+an OpenSpec command or subagent. Do not return a terminal outcome while any
+command or delegated task is still running.
+
 Do not ask the user to choose between reasonable technical alternatives.
 
 Resolve ambiguity using, in order:
@@ -100,6 +104,9 @@ Otherwise:
 10. Finish with:
 
        openspec status --change "<name>"
+
+    Do not return READY unless the JSON status reports
+    `isPlanningComplete: true`.
 
 Do not bypass OpenSpec's dependency structure.
 
