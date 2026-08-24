@@ -16,7 +16,7 @@ use crate::{
         stage_prompt,
     },
     cli::Cli,
-    git::{current_head, metadata_dir, remove_metadata, repository_root},
+    git::{current_head, legacy_metadata_dir, metadata_dir, remove_metadata, repository_root},
     openspec::{
         ChangeSnapshot, identify_change, select_existing_change, snapshot as openspec_snapshot,
     },
@@ -50,7 +50,15 @@ struct RunState {
     #[serde(default)]
     terminal_summary: Option<String>,
     #[serde(default)]
+    too_large: Option<TooLargeOutcome>,
+    #[serde(default)]
     campaign: Option<CampaignState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TooLargeOutcome {
+    stage: Stage,
+    summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +80,7 @@ struct CompletedIteration {
 enum WorkflowOutcome {
     Complete(RunState),
     Done(RunState),
+    TooLarge(RunState),
 }
 
 impl RunState {
@@ -89,6 +98,7 @@ impl RunState {
             proposal_head: None,
             final_head: None,
             terminal_summary: None,
+            too_large: None,
             campaign: None,
         }
     }
@@ -121,6 +131,7 @@ impl RunState {
             proposal_head: None,
             final_head: None,
             terminal_summary: None,
+            too_large: None,
             campaign: None,
         }
     }
@@ -223,7 +234,7 @@ impl<U: Ui> App<U> {
                 || (existing.stage == Stage::Complete && existing.campaign.is_some());
             if requires_resume {
                 bail!(
-                    "an unfinished ospx-build run is recorded at {}; use `--resume` or `--forget`",
+                    "an unfinished opsx-build run is recorded at {}; use `--resume` or `--forget`",
                     existing.stage.title()
                 );
             }
@@ -278,10 +289,10 @@ impl<U: Ui> App<U> {
         }
         if remove_metadata(repo, &self.ui)? {
             self.ui.success(
-                "Forgot ospx-build checkpoint; repository files and Git history were untouched",
+                "Forgot opsx-build checkpoint; repository files and Git history were untouched",
             );
         } else {
-            self.ui.info("No ospx-build checkpoint exists");
+            self.ui.info("No opsx-build checkpoint exists");
         }
         Ok(())
     }
@@ -301,6 +312,14 @@ impl<U: Ui> App<U> {
         }
         if state.stage == Stage::Done && state.campaign.is_none() {
             bail!("the saved run is already done; start a new run or use `--forget`");
+        }
+
+        if let Some(outcome) = state.too_large.take() {
+            self.ui.warn(&format!(
+                "Retrying {} after previous TOO_LARGE outcome: {}",
+                outcome.stage.title(),
+                outcome.summary.trim()
+            ));
         }
 
         if self.cli.loop_workflow && state.campaign.is_none() {
@@ -360,6 +379,19 @@ impl<U: Ui> App<U> {
                 && state.planning_session.is_none())
             .then(Instant::now);
             match self.execute(repo, launcher, commands, state)? {
+                WorkflowOutcome::TooLarge(state) => {
+                    self.ui.finish_dashboard();
+                    let outcome = state
+                        .too_large
+                        .as_ref()
+                        .context("worker returned TOO_LARGE without durable outcome details")?;
+                    bail!(
+                        "TOO_LARGE during {}:\n{}\n\nAutomatic frontier decomposition is not implemented yet. Decompose or revise the assigned slice, then resume the preserved {} checkpoint.",
+                        outcome.stage.title(),
+                        outcome.summary.trim(),
+                        outcome.stage.title()
+                    );
+                }
                 WorkflowOutcome::Done(state) => {
                     self.ui.finish_dashboard();
                     let summary = state
@@ -481,6 +513,9 @@ impl<U: Ui> App<U> {
         self.ui.change_name(state.change.as_deref());
 
         loop {
+            if state.too_large.is_some() {
+                return Ok(WorkflowOutcome::TooLarge(state));
+            }
             if state.stage == Stage::Complete {
                 return Ok(WorkflowOutcome::Complete(state));
             }
@@ -515,12 +550,21 @@ impl<U: Ui> App<U> {
         persist_state(repo, state, &self.ui)?;
         let subject = campaign_subject(state);
         let result = claude.invoke(
-            session_mode(session, is_new, "ospx-build-planning"),
-            &stage_prompt(&commands.explore, &subject, StageProtocol::Ready),
+            session_mode(session, is_new, "opsx-build-planning"),
+            &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
             "Claude is exploring the change",
-            StageProtocol::Ready,
+            StageProtocol::Worker,
         )?;
-        require_ready("explore", &result.text, result.signal)?;
+        if !handle_worker_result(
+            repo,
+            state,
+            "explore",
+            &result.text,
+            result.signal,
+            &self.ui,
+        )? {
+            return Ok(());
+        }
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)?;
         claude.compact_session(session, "Explore")?;
@@ -541,7 +585,7 @@ impl<U: Ui> App<U> {
             campaign_subject(state)
         );
         let result = claude.invoke(
-            session_mode(session, is_new, "ospx-build-planning"),
+            session_mode(session, is_new, "opsx-build-planning"),
             &stage_prompt(&commands.propose, &base, StageProtocol::Propose),
             "Claude is creating OpenSpec artifacts",
             StageProtocol::Propose,
@@ -558,6 +602,14 @@ impl<U: Ui> App<U> {
                 state.terminal_summary = Some(result.text);
                 state.stage = Stage::Done;
                 return persist_state(repo, state, &self.ui);
+            }
+            StageSignal::TooLarge => {
+                if after != state.before_changes {
+                    bail!(
+                        "Propose returned TOO_LARGE after changing OpenSpec state; preserving the repository for inspection"
+                    );
+                }
+                return record_too_large(repo, state, result.text, &self.ui);
             }
             StageSignal::Ready => {}
             StageSignal::Blocked => return blocked("propose", &result.text),
@@ -612,17 +664,19 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         let base = format!(
-            "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change."
+            "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
         );
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let result = invoke_fresh(
             claude,
             &format!("{change}-apply"),
-            &stage_prompt(&commands.apply, &subject, StageProtocol::Ready),
+            &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
             "Claude is applying the OpenSpec change",
-            StageProtocol::Ready,
+            StageProtocol::Worker,
         )?;
-        require_ready("apply", &result.text, result.signal)?;
+        if !handle_worker_result(repo, state, "apply", &result.text, result.signal, &self.ui)? {
+            return Ok(());
+        }
         state.consume_direction();
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)
@@ -674,7 +728,7 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             StageSignal::Blocked => blocked("verify", &result.text),
-            StageSignal::Ready | StageSignal::Done => {
+            StageSignal::Ready | StageSignal::Done | StageSignal::TooLarge => {
                 bail!(
                     "verify returned an invalid terminal status instead of VERIFIED, RETRY, or BLOCKED"
                 )
@@ -699,17 +753,19 @@ impl<U: Ui> App<U> {
             "No verifier finding was supplied; apply the user's direction and re-run relevant checks.",
         );
         let base = format!(
-            "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks.\n\nVerifier context:\n{finding}"
+            "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. If the verifier has exposed that the assigned slice cannot reliably fit one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition. Do not use TOO_LARGE for an ordinary correctable verification failure.\n\nVerifier context:\n{finding}"
         );
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let result = invoke_fresh(
             claude,
             &format!("{change}-repair-{}", state.verify_retries),
-            &stage_prompt(&commands.apply, &subject, StageProtocol::Ready),
+            &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
             "Claude is repairing the implementation",
-            StageProtocol::Ready,
+            StageProtocol::Worker,
         )?;
-        require_ready("repair", &result.text, result.signal)?;
+        if !handle_worker_result(repo, state, "repair", &result.text, result.signal, &self.ui)? {
+            return Ok(());
+        }
         state.pending_repair = None;
         state.consume_direction();
         state.stage = state.stage.after_ready()?;
@@ -804,7 +860,7 @@ impl<U: Ui> App<U> {
         let prompt = stage_prompt(
             &commands.explore,
             &campaign_subject(&dry_state),
-            StageProtocol::Ready,
+            StageProtocol::Worker,
         );
         let command = build_claude_command(
             repo,
@@ -812,17 +868,17 @@ impl<U: Ui> App<U> {
             &self.cli.permission_mode,
             &SessionMode::New {
                 id: Uuid::nil(),
-                name: Some("ospx-build-planning".to_owned()),
+                name: Some("opsx-build-planning".to_owned()),
             },
             &prompt,
             ClaudeOutputFormat::Json,
-            Some(StageProtocol::Ready.json_schema()),
+            Some(StageProtocol::Worker.json_schema()),
         );
         self.ui.info(&format!("Explore: {}", command.display()));
         self.ui
             .info("Hard compact the planning session after Explore");
         self.ui.info(&format!(
-            "Propose in same session: {} (READY, DONE, or BLOCKED)",
+            "Propose in same session: {} (READY, DONE, TOO_LARGE, or BLOCKED)",
             commands.propose
         ));
         self.ui
@@ -843,7 +899,7 @@ impl<U: Ui> App<U> {
                 |maximum| format!("until DONE or {maximum} completed iterations"),
             );
             self.ui.info(&format!(
-                "Campaign: repeat the complete workflow {limit}; stop on any error or BLOCKED"
+                "Campaign: repeat the complete workflow {limit}; stop on any error, TOO_LARGE, or BLOCKED"
             ));
         }
         Ok(())
@@ -971,6 +1027,38 @@ fn require_ready(stage: &str, response: &str, signal: StageSignal) -> Result<()>
     }
 }
 
+fn handle_worker_result<U: Ui>(
+    repo: &Path,
+    state: &mut RunState,
+    stage: &str,
+    response: &str,
+    signal: StageSignal,
+    ui: &U,
+) -> Result<bool> {
+    match signal {
+        StageSignal::Ready => Ok(true),
+        StageSignal::TooLarge => {
+            record_too_large(repo, state, response.to_owned(), ui)?;
+            Ok(false)
+        }
+        StageSignal::Blocked => blocked(stage, response),
+        other => bail!("{stage} returned unexpected terminal status {other:?}"),
+    }
+}
+
+fn record_too_large<U: Ui>(
+    repo: &Path,
+    state: &mut RunState,
+    summary: String,
+    ui: &U,
+) -> Result<()> {
+    state.too_large = Some(TooLargeOutcome {
+        stage: state.stage,
+        summary,
+    });
+    persist_state(repo, state, ui)
+}
+
 fn campaign_subject(state: &RunState) -> String {
     match &state.campaign {
         Some(campaign) => format!(
@@ -1045,14 +1133,18 @@ fn persist_state<U: Ui>(repo: &Path, state: &RunState, ui: &U) -> Result<()> {
 
 fn try_load_state<U: Ui>(repo: &Path, ui: &U) -> Result<Option<RunState>> {
     let path = state_path(repo, ui)?;
-    if !path.exists() {
-        return Ok(None);
+    if path.exists() {
+        return load_state_file(&path).map(Some);
     }
-    load_state_file(&path).map(Some)
+    let legacy_path = legacy_metadata_dir(repo, ui)?.join("last-run.json");
+    if legacy_path.exists() {
+        return load_state_file(&legacy_path).map(Some);
+    }
+    Ok(None)
 }
 
 fn load_state<U: Ui>(repo: &Path, ui: &U) -> Result<RunState> {
-    try_load_state(repo, ui)?.context("no ospx-build checkpoint exists; start a new run")
+    try_load_state(repo, ui)?.context("no opsx-build checkpoint exists; start a new run")
 }
 
 fn load_state_file(path: &Path) -> Result<RunState> {
@@ -1132,6 +1224,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         terminal_summary: None,
+        too_large: None,
         campaign: None,
     })
 }
@@ -1192,6 +1285,21 @@ mod tests {
         assert_eq!(campaign.max_iterations, Some(10));
         assert_eq!(campaign.completed[0].change, "slice-a");
         assert_eq!(campaign.completed[0].elapsed_seconds, Some(90));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_too_large_worker_outcome() {
+        let mut state = RunState::new("finish the compiler".to_owned(), ChangeSnapshot::default());
+        state.stage = Stage::Apply;
+        state.too_large = Some(TooLargeOutcome {
+            stage: Stage::Apply,
+            summary: "Split parser semantics from backend lowering".to_owned(),
+        });
+
+        let decoded: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(decoded.stage, Stage::Apply);
+        assert_eq!(decoded.too_large, state.too_large);
     }
 
     #[test]

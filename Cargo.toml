@@ -1,6 +1,6 @@
 [package]
-name = "ospx-build"
-version = "0.15.0"
+name = "opsx-build"
+version = "0.16.0"
 edition = "2024"
 description = "Unattended OpenSpec build orchestrator for Claude Code"
 license = "MIT"

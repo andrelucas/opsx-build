@@ -40,9 +40,30 @@ Do not ask merely for:
 
 Follow OpenSpec's artifact workflow.
 
-Before creating or modifying a change, decide whether the requested objective
-is already satisfied and no coherent implementation work remains. If so, do
-not create or modify OpenSpec artifacts; finish with DONE.
+Before creating or modifying a change, decide:
+
+1. Whether the requested objective is already satisfied and no coherent
+   implementation work remains. If so, do not create or modify OpenSpec
+   artifacts; finish with DONE.
+2. Whether the assigned slice can reliably be implemented, tested, and
+   verified as one bounded change by a substantially smaller local worker
+   model. If not, do not create or modify OpenSpec artifacts; finish with
+   TOO_LARGE.
+
+A slice is TOO_LARGE when it requires substantial coordinated work across
+several subsystems or compiler stages, contains multiple independently
+testable behaviours, requires major architectural discovery, has an obvious
+independently verifiable intermediate state, or otherwise exceeds one reliable
+worker-model workflow.
+
+Do not use TOO_LARGE merely because the work is difficult or unfamiliar.
+
+For TOO_LARGE, report:
+
+- why the assigned slice exceeds a reliable worker-sized change;
+- the independently verifiable boundaries causing the problem;
+- a suggested ordered decomposition into smaller slices;
+- prerequisites and acceptance criteria for each suggested slice.
 
 Otherwise:
 
@@ -120,6 +141,13 @@ Do not implement production code during this skill.
 ## Terminal outcomes
 
 Continue until exactly one of these outcomes applies.
+
+TOO_LARGE:
+The assigned slice requires decomposition before a local worker can reliably
+implement and verify it as one OpenSpec change.
+
+Return TOO_LARGE only before creating or modifying any OpenSpec change
+artifacts. Report the evidence and suggested decomposition described above.
 
 DONE:
 The requested objective is already satisfied and no meaningful OpenSpec change

@@ -1,4 +1,4 @@
-# Copy to ~/.config/ospx-build/config.toml and adjust for your environment.
+# Copy to ~/.config/opsx-build/config.toml and adjust for your environment.
 
 max_verify_retries = 3
 max_output_retries = 3

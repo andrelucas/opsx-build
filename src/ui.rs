@@ -114,7 +114,7 @@ impl Ui for TerminalUi {
 
     fn banner(&self, repo: &str) {
         self.state.lock().unwrap().repo = repo.to_owned();
-        let title = Style::new().bold().cyan().apply_to("ospx-build");
+        let title = Style::new().bold().cyan().apply_to("opsx-build");
         self.write_line(&format!("{title}  {repo}"));
     }
 

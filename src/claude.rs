@@ -161,6 +161,7 @@ fn normalize_command(command: &str) -> String {
 pub enum StageSignal {
     Ready,
     Done,
+    TooLarge,
     Verified,
     Retry,
     Blocked,
@@ -169,6 +170,7 @@ pub enum StageSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageProtocol {
     Ready,
+    Worker,
     Propose,
     Verify,
 }
@@ -177,7 +179,8 @@ impl StageProtocol {
     fn terminal_values(self) -> &'static str {
         match self {
             Self::Ready => "READY or BLOCKED",
-            Self::Propose => "READY, DONE, or BLOCKED",
+            Self::Worker => "READY, TOO_LARGE, or BLOCKED",
+            Self::Propose => "READY, DONE, TOO_LARGE, or BLOCKED",
             Self::Verify => "VERIFIED, RETRY, or BLOCKED",
         }
     }
@@ -185,13 +188,16 @@ impl StageProtocol {
     pub(crate) fn json_schema(self) -> &'static str {
         match self {
             Self::Ready => {
-                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["READY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
+            }
+            Self::Worker => {
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","TOO_LARGE","BLOCKED"]},"summary":{"type":"string","description":"Concise worker-stage result. TOO_LARGE means the assigned slice cannot reliably fit one bounded worker-model change; explain why and propose an ordered decomposition. For BLOCKED, include the exact external decision or unavailable input."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
             Self::Propose => {
-                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["READY","DONE","BLOCKED"]},"summary":{"type":"string","description":"Concise proposal result. DONE means the requested objective is already satisfied and no OpenSpec artifacts were created or modified. For BLOCKED, include the exact blocker."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","DONE","TOO_LARGE","BLOCKED"]},"summary":{"type":"string","description":"Concise proposal result. DONE means the requested objective is already satisfied. TOO_LARGE means the assigned slice requires decomposition before a local worker can reliably implement it. Neither outcome may create or modify OpenSpec artifacts. Include decomposition advice for TOO_LARGE and the exact external blocker for BLOCKED."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
             Self::Verify => {
-                r#"{"type":"object","properties":{"ospx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["ospx_status","summary"],"additionalProperties":false}"#
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
         }
     }
@@ -604,7 +610,7 @@ fn session_id(session: &SessionMode) -> Uuid {
 fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
     stage_prompt(
         "",
-        "The preceding Claude turn reached its output token limit before this ospx-build phase produced a terminal result. Continue the same phase from the existing Claude session and durable repository state. Preserve correct completed work, do not restart the phase, and finish the outstanding work now.",
+        "The preceding Claude turn reached its output token limit before this opsx-build phase produced a terminal result. Continue the same phase from the existing Claude session and durable repository state. Preserve correct completed work, do not restart the phase, and finish the outstanding work now.",
         protocol,
     )
 }
@@ -683,7 +689,11 @@ fn value_has_stage_terminal(value: &Value) -> bool {
     });
     structured
         .as_ref()
-        .and_then(|output| output.get("ospx_status"))
+        .and_then(|output| {
+            output
+                .get("opsx_status")
+                .or_else(|| output.get("ospx_status"))
+        })
         .and_then(Value::as_str)
         .and_then(parse_status_value)
         .is_some()
@@ -740,7 +750,7 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
             });
         }
         None => parse_signal(&text).with_context(|| {
-            "Claude response contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --verbose to inspect it"
+            "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it"
         })?,
     };
 
@@ -800,14 +810,15 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
         bail!("Claude reported an error: {text}");
     }
     bail!(
-        "Claude stream results contained neither structured `ospx_status` output nor an `OSPX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them"
+        "Claude stream results contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them"
     )
 }
 
 pub fn parse_signal(text: &str) -> Option<StageSignal> {
     text.lines().rev().find_map(|line| {
         line.trim()
-            .strip_prefix("OSPX_STATUS:")
+            .strip_prefix("OPSX_STATUS:")
+            .or_else(|| line.trim().strip_prefix("OSPX_STATUS:"))
             .and_then(parse_status_value)
     })
 }
@@ -828,9 +839,10 @@ fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String
         output
     };
     let status = output
-        .get("ospx_status")
+        .get("opsx_status")
+        .or_else(|| output.get("ospx_status"))
         .and_then(Value::as_str)
-        .context("Claude structured output omitted string field `ospx_status`")?;
+        .context("Claude structured output omitted string field `opsx_status`")?;
     let signal = parse_status_value(status)
         .with_context(|| format!("Claude returned unknown structured status `{status}`"))?;
     let summary = output
@@ -845,6 +857,7 @@ fn parse_status_value(status: &str) -> Option<StageSignal> {
     match status.trim().to_ascii_uppercase().as_str() {
         "READY" => Some(StageSignal::Ready),
         "DONE" => Some(StageSignal::Done),
+        "TOO_LARGE" => Some(StageSignal::TooLarge),
         "VERIFIED" => Some(StageSignal::Verified),
         "RETRY" => Some(StageSignal::Retry),
         "BLOCKED" => Some(StageSignal::Blocked),
@@ -939,7 +952,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
     };
     let terminal_values = protocol.terminal_values();
     format!(
-        "{task}\n\nThis invocation is controlled by ospx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `ospx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OSPX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -1221,31 +1234,50 @@ mod tests {
     }
 
     #[test]
-    fn proposal_protocol_accepts_done_without_weakening_other_stages() {
+    fn worker_protocol_accepts_too_large_without_weakening_strict_stages() {
+        let schema = StageProtocol::Worker.json_schema();
+        assert!(schema.contains(r#"["READY","TOO_LARGE","BLOCKED"]"#));
+        assert!(!StageProtocol::Ready.json_schema().contains("TOO_LARGE"));
+        assert!(!StageProtocol::Verify.json_schema().contains("TOO_LARGE"));
+        let prompt = stage_prompt("/explore-unattended", "inspect it", StageProtocol::Worker);
+        assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+    }
+
+    #[test]
+    fn proposal_protocol_accepts_done_and_too_large_without_weakening_other_stages() {
         let schema = StageProtocol::Propose.json_schema();
-        assert!(schema.contains(r#"["READY","DONE","BLOCKED"]"#));
+        assert!(schema.contains(r#"["READY","DONE","TOO_LARGE","BLOCKED"]"#));
         assert!(!StageProtocol::Ready.json_schema().contains("DONE"));
         let prompt = stage_prompt("/propose-unattended", "finish it", StageProtocol::Propose);
-        assert!(prompt.contains("READY, DONE, or BLOCKED"));
+        assert!(prompt.contains("READY, DONE, TOO_LARGE, or BLOCKED"));
     }
 
     #[test]
     fn parses_terminal_markers_from_last_matching_line() {
         assert_eq!(
-            parse_signal("details\nOSPX_STATUS: RETRY"),
+            parse_signal("details\nOPSX_STATUS: RETRY"),
             Some(StageSignal::Retry)
         );
         assert_eq!(
-            parse_signal("OSPX_STATUS: READY\nmore\nOSPX_STATUS: BLOCKED"),
+            parse_signal("OPSX_STATUS: READY\nmore\nOPSX_STATUS: BLOCKED"),
             Some(StageSignal::Blocked)
         );
         assert_eq!(parse_signal("ordinary prose"), None);
         assert_eq!(
-            parse_signal("No work remains\nOSPX_STATUS: DONE"),
+            parse_signal("No work remains\nOPSX_STATUS: DONE"),
             Some(StageSignal::Done)
         );
-        assert_eq!(parse_signal("OSPX_STATUS: NOT_DONE"), None);
-        assert_eq!(parse_signal("`OSPX_STATUS: DONE`"), None);
+        assert_eq!(
+            parse_signal("Needs decomposition\nOPSX_STATUS: TOO_LARGE"),
+            Some(StageSignal::TooLarge)
+        );
+        assert_eq!(parse_signal("OPSX_STATUS: NOT_DONE"), None);
+        assert_eq!(parse_signal("`OPSX_STATUS: DONE`"), None);
+        assert_eq!(
+            parse_signal("OSPX_STATUS: READY"),
+            Some(StageSignal::Ready),
+            "legacy status spelling remains readable"
+        );
     }
 
     #[test]
@@ -1253,7 +1285,7 @@ mod tests {
         let stdout = concat!(
             "{\"type\":\"system\",\"subtype\":\"init\"}\n",
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Working\"}]}}\n",
-            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-1\",\"result\":\"Done\\nOSPX_STATUS: VERIFIED\"}\n"
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-1\",\"result\":\"Done\\nOPSX_STATUS: VERIFIED\"}\n"
         );
         let parsed = parse_claude_stream_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::Verified);
@@ -1262,7 +1294,7 @@ mod tests {
 
     #[test]
     fn parses_structured_result_without_terminal_marker() {
-        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-2","result":"{\"ospx_status\":\"READY\",\"summary\":\"Proposal complete\"}","structured_output":{"ospx_status":"READY","summary":"Proposal complete"}}"#;
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-2","result":"{\"opsx_status\":\"READY\",\"summary\":\"Proposal complete\"}","structured_output":{"opsx_status":"READY","summary":"Proposal complete"}}"#;
         let parsed = parse_claude_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::Ready);
         assert_eq!(parsed.text, "Proposal complete");
@@ -1271,17 +1303,33 @@ mod tests {
 
     #[test]
     fn parses_structured_done_result() {
-        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-done","result":"structured response","structured_output":{"ospx_status":"DONE","summary":"No remaining slice"}}"#;
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-done","result":"structured response","structured_output":{"opsx_status":"DONE","summary":"No remaining slice"}}"#;
         let parsed = parse_claude_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::Done);
         assert_eq!(parsed.text, "No remaining slice");
     }
 
     #[test]
+    fn parses_structured_too_large_result() {
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"session-large","result":"structured response","structured_output":{"opsx_status":"TOO_LARGE","summary":"Split parser and backend work"}}"#;
+        let parsed = parse_claude_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::TooLarge);
+        assert_eq!(parsed.text, "Split parser and backend work");
+    }
+
+    #[test]
+    fn parses_legacy_structured_status_spelling() {
+        let stdout = r#"{"type":"result","subtype":"success","session_id":"legacy","result":"structured response","structured_output":{"ospx_status":"READY","summary":"Compatible"}}"#;
+        let parsed = parse_claude_output(stdout).unwrap();
+        assert_eq!(parsed.signal, StageSignal::Ready);
+        assert_eq!(parsed.text, "Compatible");
+    }
+
+    #[test]
     fn parses_structured_result_from_jsonl_stream() {
         let stdout = concat!(
             "{\"type\":\"system\",\"subtype\":\"init\"}\n",
-            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-3\",\"result\":\"structured response\",\"structured_output\":{\"ospx_status\":\"VERIFIED\",\"summary\":\"Checks passed\"}}\n"
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-3\",\"result\":\"structured response\",\"structured_output\":{\"opsx_status\":\"VERIFIED\",\"summary\":\"Checks passed\"}}\n"
         );
         let parsed = parse_claude_stream_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::Verified);
@@ -1292,7 +1340,7 @@ mod tests {
     #[test]
     fn ignores_a_later_compact_result_when_parsing_the_stage_result() {
         let stdout = concat!(
-            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-4\",\"result\":\"stage response\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"Proposal complete\"}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-4\",\"result\":\"stage response\",\"structured_output\":{\"opsx_status\":\"READY\",\"summary\":\"Proposal complete\"}}\n",
             "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"manual\",\"pre_tokens\":24000}}\n",
             "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-4\",\"result\":\"Compacted\",\"structured_output\":null}\n"
         );
@@ -1342,7 +1390,7 @@ mod tests {
             code: Some(0),
             stdout: concat!(
                 "{\"type\":\"system\",\"subtype\":\"api_retry\",\"error\":\"max_output_tokens\"}\n",
-                "{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"done\"}}\n"
+                "{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\",\"structured_output\":{\"opsx_status\":\"READY\",\"summary\":\"done\"}}\n"
             )
             .to_owned(),
             stderr: String::new(),
@@ -1356,7 +1404,7 @@ mod tests {
             success: true,
             code: Some(0),
             stdout: concat!(
-                "{\"type\":\"result\",\"subtype\":\"success\",\"structured_output\":{\"ospx_status\":\"READY\",\"summary\":\"initial turn\"}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"structured_output\":{\"opsx_status\":\"READY\",\"summary\":\"initial turn\"}}\n",
                 "{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"max_tokens\",\"result\":\"unfinished follow-up\"}\n"
             )
             .to_owned(),
@@ -1385,7 +1433,7 @@ if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
 case "$count" in
   0) printf '%s\n' '{"is_error":false,"stop_reason":"max_tokens","session_id":"00000000-0000-0000-0000-000000000000","result":"unfinished"}' ;;
   1) printf '%s\n' 'compacted' ;;
-  *) printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","result":"done","structured_output":{"ospx_status":"READY","summary":"continued successfully"}}' ;;
+  *) printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","result":"done","structured_output":{"opsx_status":"READY","summary":"continued successfully"}}' ;;
 esac
 printf '%s\n' "$((count + 1))" > "$state"
 "#

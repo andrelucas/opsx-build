@@ -207,11 +207,11 @@ impl StreamDashboard {
         });
         match (&campaign, &self.change_name) {
             (Some(campaign), Some(change)) => {
-                format!("ospx-build  {campaign}  change: {change}  {}", self.repo)
+                format!("opsx-build  {campaign}  change: {change}  {}", self.repo)
             }
-            (Some(campaign), None) => format!("ospx-build  {campaign}  {}", self.repo),
-            (None, Some(change)) => format!("ospx-build  change: {change}  {}", self.repo),
-            (None, None) => format!("ospx-build  {}", self.repo),
+            (Some(campaign), None) => format!("opsx-build  {campaign}  {}", self.repo),
+            (None, Some(change)) => format!("opsx-build  change: {change}  {}", self.repo),
+            (None, None) => format!("opsx-build  {}", self.repo),
         }
     }
 
@@ -1094,12 +1094,12 @@ mod tests {
     #[test]
     fn header_shows_change_name_when_known() {
         let mut dashboard = dashboard();
-        assert_eq!(dashboard.header_text(), "ospx-build  /repo");
+        assert_eq!(dashboard.header_text(), "opsx-build  /repo");
 
         dashboard.set_change_name(Some("slice-m-test-infrastructure".to_owned()));
         assert_eq!(
             dashboard.header_text(),
-            "ospx-build  change: slice-m-test-infrastructure  /repo"
+            "opsx-build  change: slice-m-test-infrastructure  /repo"
         );
     }
 
@@ -1117,7 +1117,7 @@ mod tests {
             }],
         }));
 
-        assert_eq!(dashboard.header_text(), "ospx-build  iteration 2/10  /repo");
+        assert_eq!(dashboard.header_text(), "opsx-build  iteration 2/10  /repo");
         assert!(dashboard.panels.is_empty());
         let lines = dashboard.render_lines_at(Instant::now());
         assert!(lines[0].text.contains("iteration 1 · slice-a"));

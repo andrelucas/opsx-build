@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fmt::Display, fs, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -52,7 +52,8 @@ impl Cli {
 
     fn resolve(args: CliArgs) -> Result<Self> {
         let command_line_max_iterations = args.max_iterations.is_some();
-        let (config, config_path) = load_config(&args)?;
+        let (mut config, config_path) = load_config(&args)?;
+        apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path);
         if command_line_max_iterations && !cli.loop_workflow {
             anyhow::bail!("--max-iterations requires --loop (or `loop = true` in config)");
@@ -66,7 +67,7 @@ impl Cli {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "ospx-build",
+    name = "opsx-build",
     version,
     about = "Build an OpenSpec change through synchronous Claude stages"
 )]
@@ -83,7 +84,7 @@ struct CliArgs {
     #[arg(long)]
     interactive: bool,
 
-    /// Resume the last durable ospx-build run from its first incomplete phase.
+    /// Resume the last durable opsx-build run from its first incomplete phase.
     #[arg(long, conflicts_with = "interactive")]
     resume: bool,
 
@@ -101,7 +102,7 @@ struct CliArgs {
     /// Repeat complete OpenSpec changes until Propose returns DONE.
     #[arg(
         long = "loop",
-        env = "OSPX_BUILD_LOOP",
+        env = "OPSX_BUILD_LOOP",
         conflicts_with_all = ["interactive", "forget", "continue_existing"]
     )]
     loop_workflow: bool,
@@ -111,7 +112,7 @@ struct CliArgs {
     no_loop: bool,
 
     /// Stop with an incomplete-campaign error after this many completed changes.
-    #[arg(long, env = "OSPX_BUILD_MAX_ITERATIONS", value_name = "N")]
+    #[arg(long, env = "OPSX_BUILD_MAX_ITERATIONS", value_name = "N")]
     max_iterations: Option<std::num::NonZeroU32>,
 
     /// Select the OpenSpec change used by --continue-existing when several are active.
@@ -132,7 +133,7 @@ struct CliArgs {
     interactive_args: Vec<String>,
 
     /// Load defaults from this TOML file.
-    #[arg(long, env = "OSPX_BUILD_CONFIG", value_name = "PATH")]
+    #[arg(long, env = "OPSX_BUILD_CONFIG", value_name = "PATH")]
     config: Option<PathBuf>,
 
     /// Do not load the default or environment-selected config file.
@@ -140,11 +141,11 @@ struct CliArgs {
     no_config: bool,
 
     /// Maximum repair/verify cycles after the first verification attempt.
-    #[arg(long, env = "OSPX_BUILD_MAX_VERIFY_RETRIES", value_name = "N")]
+    #[arg(long, env = "OPSX_BUILD_MAX_VERIFY_RETRIES", value_name = "N")]
     max_verify_retries: Option<u32>,
 
     /// Maximum same-session continuations after Claude reaches its output token limit.
-    #[arg(long, env = "OSPX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
+    #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
     max_output_retries: Option<u32>,
 
     /// Print commands and captured subprocess output.
@@ -158,7 +159,7 @@ struct CliArgs {
     /// Stream Claude activity; optionally select activity, full, or raw filtering.
     #[arg(
         long,
-        env = "OSPX_BUILD_STREAM_CLAUDE",
+        env = "OPSX_BUILD_STREAM_CLAUDE",
         value_enum,
         value_name = "FILTER",
         num_args = 0..=1,
@@ -172,47 +173,47 @@ struct CliArgs {
     dry_run: bool,
 
     /// Claude permission mode used for unattended subprocesses.
-    #[arg(long, env = "OSPX_BUILD_PERMISSION_MODE", value_name = "MODE")]
+    #[arg(long, env = "OPSX_BUILD_PERMISSION_MODE", value_name = "MODE")]
     permission_mode: Option<String>,
 
     /// Command prefix used to launch Claude (for example, "omlx launch claude").
-    #[arg(long, env = "OSPX_BUILD_CLAUDE_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_CLAUDE_COMMAND", value_name = "COMMAND")]
     claude_command: Option<String>,
 
     /// Model passed to the configured Claude launcher as `--model MODEL`.
-    #[arg(long, env = "OSPX_BUILD_CLAUDE_MODEL", value_name = "MODEL")]
+    #[arg(long, env = "OPSX_BUILD_CLAUDE_MODEL", value_name = "MODEL")]
     claude_model: Option<String>,
 
     /// Context capacity used for Claude auto-compaction (supports binary k/m suffixes).
-    #[arg(long, env = "OSPX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
+    #[arg(long, env = "OPSX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
     auto_compact_window: Option<TokenCount>,
 
     /// Percentage of the effective context capacity at which Claude auto-compacts.
-    #[arg(long, env = "OSPX_BUILD_AUTO_COMPACT_PERCENT", value_name = "PERCENT")]
+    #[arg(long, env = "OPSX_BUILD_AUTO_COMPACT_PERCENT", value_name = "PERCENT")]
     auto_compact_percent: Option<Percentage>,
 
     /// Maximum Claude output tokens per request (supports binary k/m suffixes).
-    #[arg(long, env = "OSPX_BUILD_MAX_OUTPUT_TOKENS", value_name = "TOKENS")]
+    #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_TOKENS", value_name = "TOKENS")]
     max_output_tokens: Option<TokenCount>,
 
     /// Override the exploration slash command.
-    #[arg(long, env = "OSPX_BUILD_EXPLORE_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_EXPLORE_COMMAND", value_name = "COMMAND")]
     explore_command: Option<String>,
 
     /// Override the proposal slash command.
-    #[arg(long, env = "OSPX_BUILD_PROPOSE_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_PROPOSE_COMMAND", value_name = "COMMAND")]
     propose_command: Option<String>,
 
     /// Override the OpenSpec apply slash command.
-    #[arg(long, env = "OSPX_BUILD_APPLY_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_APPLY_COMMAND", value_name = "COMMAND")]
     apply_command: Option<String>,
 
     /// Override the OpenSpec verify slash command.
-    #[arg(long, env = "OSPX_BUILD_VERIFY_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_VERIFY_COMMAND", value_name = "COMMAND")]
     verify_command: Option<String>,
 
     /// Override the OpenSpec archive slash command.
-    #[arg(long, env = "OSPX_BUILD_ARCHIVE_COMMAND", value_name = "COMMAND")]
+    #[arg(long, env = "OPSX_BUILD_ARCHIVE_COMMAND", value_name = "COMMAND")]
     archive_command: Option<String>,
 }
 
@@ -247,6 +248,10 @@ fn load_config(args: &CliArgs) -> Result<(FileConfig, Option<PathBuf>)> {
         return read_config(path).map(|config| (config, Some(path.clone())));
     }
 
+    if let Some(path) = legacy_env::<PathBuf>("OSPX_BUILD_CONFIG")? {
+        return read_config(&path).map(|config| (config, Some(path)));
+    }
+
     let Some(path) = default_config_path() else {
         return Ok((FileConfig::default(), None));
     };
@@ -263,12 +268,98 @@ fn read_config(path: &PathBuf) -> Result<FileConfig> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    if let Some(root) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(root).join("ospx-build/config.toml"));
+    let root = if let Some(root) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+    {
+        PathBuf::from(root)
+    } else {
+        env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(|home| PathBuf::from(home).join(".config"))?
+    };
+    Some(config_path_under(&root))
+}
+
+fn config_path_under(root: &std::path::Path) -> PathBuf {
+    let canonical = root.join("opsx-build/config.toml");
+    let legacy = root.join("ospx-build/config.toml");
+    if !canonical.exists() && legacy.exists() {
+        legacy
+    } else {
+        canonical
     }
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join(".config/ospx-build/config.toml"))
+}
+
+fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
+    macro_rules! override_from_legacy {
+        ($field:ident, $name:literal, $kind:ty) => {
+            if let Some(value) = legacy_env::<$kind>($name)? {
+                config.$field = Some(value);
+            }
+        };
+    }
+
+    override_from_legacy!(max_verify_retries, "OSPX_BUILD_MAX_VERIFY_RETRIES", u32);
+    override_from_legacy!(max_output_retries, "OSPX_BUILD_MAX_OUTPUT_RETRIES", u32);
+    override_from_legacy!(loop_workflow, "OSPX_BUILD_LOOP", bool);
+    override_from_legacy!(
+        max_iterations,
+        "OSPX_BUILD_MAX_ITERATIONS",
+        std::num::NonZeroU32
+    );
+    override_from_legacy!(permission_mode, "OSPX_BUILD_PERMISSION_MODE", String);
+    override_from_legacy!(claude_command, "OSPX_BUILD_CLAUDE_COMMAND", String);
+    override_from_legacy!(claude_model, "OSPX_BUILD_CLAUDE_MODEL", String);
+    override_from_legacy!(
+        auto_compact_window,
+        "OSPX_BUILD_AUTO_COMPACT_WINDOW",
+        TokenCount
+    );
+    override_from_legacy!(
+        auto_compact_percent,
+        "OSPX_BUILD_AUTO_COMPACT_PERCENT",
+        Percentage
+    );
+    override_from_legacy!(
+        max_output_tokens,
+        "OSPX_BUILD_MAX_OUTPUT_TOKENS",
+        TokenCount
+    );
+    override_from_legacy!(explore_command, "OSPX_BUILD_EXPLORE_COMMAND", String);
+    override_from_legacy!(propose_command, "OSPX_BUILD_PROPOSE_COMMAND", String);
+    override_from_legacy!(apply_command, "OSPX_BUILD_APPLY_COMMAND", String);
+    override_from_legacy!(verify_command, "OSPX_BUILD_VERIFY_COMMAND", String);
+    override_from_legacy!(archive_command, "OSPX_BUILD_ARCHIVE_COMMAND", String);
+
+    if let Some(value) = env::var_os("OSPX_BUILD_STREAM_CLAUDE") {
+        let value = value.into_string().map_err(|_| {
+            anyhow::anyhow!("legacy environment variable OSPX_BUILD_STREAM_CLAUDE is not UTF-8")
+        })?;
+        config.stream_claude = Some(match value.as_str() {
+            "activity" => StreamFilter::Activity,
+            "full" => StreamFilter::Full,
+            "raw" => StreamFilter::Raw,
+            _ => anyhow::bail!(
+                "invalid legacy environment variable OSPX_BUILD_STREAM_CLAUDE={value:?}; expected activity, full, or raw"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn legacy_env<T>(name: &str) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("legacy environment variable {name} is not UTF-8"))?;
+    value.parse().map(Some).map_err(|error| {
+        anyhow::anyhow!("invalid legacy environment variable {name}={value:?}: {error}")
+    })
 }
 
 fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Cli {
@@ -436,10 +527,31 @@ mod tests {
     use std::{ffi::OsString, fs};
 
     use super::*;
+    use clap::CommandFactory;
     use uuid::Uuid;
 
     fn args(values: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> CliArgs {
         CliArgs::try_parse_from(values).unwrap()
+    }
+
+    #[test]
+    fn uses_the_corrected_program_name() {
+        assert_eq!(CliArgs::command().get_name(), "opsx-build");
+    }
+
+    #[test]
+    fn canonical_config_path_falls_back_to_the_legacy_location() {
+        let directory = env::temp_dir().join(format!("opsx-config-test-{}", Uuid::new_v4()));
+        let legacy = directory.join("ospx-build/config.toml");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "").unwrap();
+        assert_eq!(config_path_under(&directory), legacy);
+
+        let canonical = directory.join("opsx-build/config.toml");
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, "").unwrap();
+        assert_eq!(config_path_under(&directory), canonical);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -462,7 +574,7 @@ mod tests {
         )
         .unwrap();
         let cli = resolve_values(
-            args(["ospx-build", "build something"]),
+            args(["opsx-build", "build something"]),
             config,
             Some(PathBuf::from("config.toml")),
         );
@@ -496,7 +608,7 @@ mod tests {
         .unwrap();
         let cli = resolve_values(
             args([
-                "ospx-build",
+                "opsx-build",
                 "--max-verify-retries",
                 "2",
                 "--max-output-retries",
@@ -532,7 +644,7 @@ mod tests {
     #[test]
     fn uses_builtin_defaults_without_a_file() {
         let cli = resolve_values(
-            args(["ospx-build", "build something"]),
+            args(["opsx-build", "build something"]),
             FileConfig::default(),
             None,
         );
@@ -561,7 +673,7 @@ mod tests {
         assert!(parse_percentage("101").is_err());
         assert!(
             CliArgs::try_parse_from([
-                "ospx-build",
+                "opsx-build",
                 "--auto-compact-window",
                 "0",
                 "build something"
@@ -569,7 +681,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            CliArgs::try_parse_from(["ospx-build", "--max-output-tokens", "0", "build something"])
+            CliArgs::try_parse_from(["opsx-build", "--max-output-tokens", "0", "build something"])
                 .is_err()
         );
     }
@@ -577,7 +689,7 @@ mod tests {
     #[test]
     fn parses_campaign_loop_and_positive_iteration_limit() {
         let cli = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--loop",
             "--max-iterations",
             "8",
@@ -589,7 +701,7 @@ mod tests {
 
         assert!(
             CliArgs::try_parse_from([
-                "ospx-build",
+                "opsx-build",
                 "--loop",
                 "--max-iterations",
                 "0",
@@ -599,7 +711,7 @@ mod tests {
         );
         assert!(
             Cli::resolve(args([
-                "ospx-build",
+                "opsx-build",
                 "--max-iterations",
                 "2",
                 "finish the compiler",
@@ -619,7 +731,7 @@ mod tests {
         )
         .unwrap();
         let cli = resolve_values(
-            args(["ospx-build", "--no-loop", "one change"]),
+            args(["opsx-build", "--no-loop", "one change"]),
             config,
             None,
         );
@@ -630,7 +742,7 @@ mod tests {
 
     #[test]
     fn loads_an_explicit_file_and_records_its_path() {
-        let directory = env::temp_dir().join(format!("ospx-build-test-{}", Uuid::new_v4()));
+        let directory = env::temp_dir().join(format!("opsx-build-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
         fs::write(
@@ -639,7 +751,7 @@ mod tests {
         )
         .unwrap();
         let cli = Cli::resolve(args(vec![
-            OsString::from("ospx-build"),
+            OsString::from("opsx-build"),
             OsString::from("--config"),
             path.clone().into_os_string(),
             OsString::from("build something"),
@@ -655,7 +767,7 @@ mod tests {
     #[test]
     fn no_config_skips_even_an_explicit_missing_file() {
         let cli = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--config",
             "/definitely/missing/config.toml",
             "--no-config",
@@ -669,7 +781,7 @@ mod tests {
     #[test]
     fn interactive_mode_allows_no_initial_prompt_and_passthrough_args() {
         let cli = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--interactive",
             "--",
             "--effort",
@@ -683,7 +795,7 @@ mod tests {
 
     #[test]
     fn debug_is_an_explicit_transient_switch() {
-        let cli = Cli::resolve(args(["ospx-build", "--debug", "build something"])).unwrap();
+        let cli = Cli::resolve(args(["opsx-build", "--debug", "build something"])).unwrap();
         assert!(cli.debug);
         assert!(!cli.verbose);
     }
@@ -691,7 +803,7 @@ mod tests {
     #[test]
     fn direction_is_one_shot_resume_input() {
         let cli = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--resume",
             "--direction",
             "keep the AST unchanged",
@@ -700,7 +812,7 @@ mod tests {
         assert_eq!(cli.direction.as_deref(), Some("keep the AST unchanged"));
         assert!(
             CliArgs::try_parse_from([
-                "ospx-build",
+                "opsx-build",
                 "--direction",
                 "orphaned direction",
                 "build something"
@@ -712,11 +824,11 @@ mod tests {
     #[test]
     fn streaming_defaults_to_activity_and_accepts_profiles() {
         let activity =
-            Cli::resolve(args(["ospx-build", "--stream-claude", "build something"])).unwrap();
+            Cli::resolve(args(["opsx-build", "--stream-claude", "build something"])).unwrap();
         assert_eq!(activity.stream_claude, Some(StreamFilter::Activity));
 
         let raw = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--stream-claude=raw",
             "build something",
         ]))
@@ -726,21 +838,21 @@ mod tests {
 
     #[test]
     fn workflow_still_requires_a_request() {
-        assert!(CliArgs::try_parse_from(["ospx-build"]).is_err());
+        assert!(CliArgs::try_parse_from(["opsx-build"]).is_err());
     }
 
     #[test]
     fn resume_allows_no_request_and_conflicts_with_interactive() {
-        let cli = Cli::resolve(args(["ospx-build", "--resume"])).unwrap();
+        let cli = Cli::resolve(args(["opsx-build", "--resume"])).unwrap();
         assert!(cli.resume);
         assert!(cli.request.is_empty());
-        assert!(CliArgs::try_parse_from(["ospx-build", "--resume", "--interactive"]).is_err());
+        assert!(CliArgs::try_parse_from(["opsx-build", "--resume", "--interactive"]).is_err());
     }
 
     #[test]
     fn continues_existing_change_without_request() {
         let cli = Cli::resolve(args([
-            "ospx-build",
+            "opsx-build",
             "--continue-existing",
             "--change",
             "fix-test-harness",
@@ -753,10 +865,10 @@ mod tests {
 
     #[test]
     fn change_selection_requires_continue_existing() {
-        assert!(CliArgs::try_parse_from(["ospx-build", "--change", "fix-test-harness"]).is_err());
+        assert!(CliArgs::try_parse_from(["opsx-build", "--change", "fix-test-harness"]).is_err());
         assert!(
             CliArgs::try_parse_from([
-                "ospx-build",
+                "opsx-build",
                 "--resume",
                 "--continue-existing",
                 "--change",
@@ -768,16 +880,16 @@ mod tests {
 
     #[test]
     fn forget_allows_no_request_and_conflicts_with_resume() {
-        let cli = Cli::resolve(args(["ospx-build", "--forget"])).unwrap();
+        let cli = Cli::resolve(args(["opsx-build", "--forget"])).unwrap();
         assert!(cli.forget);
         assert!(cli.request.is_empty());
-        assert!(CliArgs::try_parse_from(["ospx-build", "--forget", "--resume"]).is_err());
+        assert!(CliArgs::try_parse_from(["opsx-build", "--forget", "--resume"]).is_err());
     }
 
     #[test]
     fn passthrough_args_require_interactive_mode() {
         assert!(
-            CliArgs::try_parse_from(["ospx-build", "build something", "--", "--effort", "xhigh",])
+            CliArgs::try_parse_from(["opsx-build", "build something", "--", "--effort", "xhigh",])
                 .is_err()
         );
     }

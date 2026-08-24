@@ -24,7 +24,7 @@ impl PauseRequested {
 
     pub fn resume_command(&self) -> String {
         format!(
-            "ospx-build --repo {} --resume",
+            "opsx-build --repo {} --resume",
             shell_quote(&self.repo.to_string_lossy())
         )
     }
@@ -406,7 +406,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                                     .warn("Another interrupting command is already in progress");
                                 continue;
                             }
-                            let request_id = format!("ospx_interrupt_{}", uuid::Uuid::new_v4());
+                            let request_id = format!("opsx_interrupt_{}", uuid::Uuid::new_v4());
                             if let Err(error) =
                                 queue_stream_interrupt(&mut child_stdin, &request_id)
                             {
@@ -879,13 +879,13 @@ if [ "${expected#/}" != "$expected" ]; then
   IFS= read -r resumed
   test "$resumed" = "$initial" || exit 12
 fi
-printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"ospx_status":"APPLIED","summary":"resumed"}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"opsx_status":"APPLIED","summary":"resumed"}}'
 "#;
         let ui = InterruptingUi::new(control);
         let runner = ProcessRunner::new(&ui);
         let initial = stream_user_message("/opsx:apply slice-a");
         let spec = CommandSpec::new("sh", "/tmp")
-            .args(["-c", script, "ospx-test", expected_command])
+            .args(["-c", script, "opsx-test", expected_command])
             .stream_input(initial);
 
         let output = runner
@@ -943,15 +943,15 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         let pause = error
             .downcast_ref::<PauseRequested>()
             .expect("pause should remain a typed outcome");
-        assert_eq!(pause.resume_command(), "ospx-build --repo /tmp --resume");
+        assert_eq!(pause.resume_command(), "opsx-build --repo /tmp --resume");
     }
 
     #[cfg(unix)]
     #[test]
     fn passes_explicit_environment_to_subprocesses() {
         let spec = CommandSpec::new("sh", "/tmp")
-            .args(["-c", "printf %s \"$OSPX_BUILD_TEST_WINDOW\""])
-            .env("OSPX_BUILD_TEST_WINDOW", "196608");
+            .args(["-c", "printf %s \"$OPSX_BUILD_TEST_WINDOW\""])
+            .env("OPSX_BUILD_TEST_WINDOW", "196608");
         let output = command_for(&spec).output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "196608");

@@ -105,6 +105,10 @@ mod tests {
         assert!(propose.contents.contains("DONE:"));
         assert!(propose.contents.contains("finish with DONE"));
         assert!(propose.contents.contains("Return DONE only before"));
+        for skill in BUNDLED_SKILLS {
+            assert!(skill.contents.contains("TOO_LARGE:"));
+            assert!(skill.contents.contains("decomposition"));
+        }
     }
 
     #[test]

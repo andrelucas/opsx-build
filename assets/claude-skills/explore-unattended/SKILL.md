@@ -27,6 +27,34 @@ Ask only when a material product requirement or externally observable
 behaviour is genuinely ambiguous, cannot be inferred from available
 evidence, and choosing incorrectly would materially change what is built.
 
+## Worker capacity and decomposition
+
+This skill may be running on a substantially smaller local model after a
+frontier model assigned the requested slice.
+
+Before broad investigation, assess whether the slice can reliably be proposed,
+implemented, tested, and verified as one bounded OpenSpec change.
+
+Return TOO_LARGE when the slice requires decomposition because it:
+
+- coordinates substantial changes across several subsystems or compiler stages;
+- contains multiple independently testable behaviours;
+- requires major architectural discovery before implementation;
+- has an obvious intermediate state that can be verified independently; or
+- cannot reasonably be completed within one worker-model workflow.
+
+Do not use TOO_LARGE merely because the work is difficult, unfamiliar, or
+requires ordinary targeted investigation. Prefer reasonable engineering
+judgement for a bounded slice.
+
+When returning TOO_LARGE, stop before creating or modifying OpenSpec change
+artifacts. Report:
+
+- why the assigned slice exceeds a reliable worker-sized change;
+- the independently verifiable boundaries causing the problem;
+- a suggested ordered decomposition into smaller slices;
+- prerequisites and acceptance criteria for each suggested slice.
+
 ## Exploration strategy
 
 Do not attempt to understand the repository exhaustively.
@@ -68,6 +96,13 @@ asked to do so separately.
 ## Terminal outcomes
 
 Continue investigating until exactly one of these outcomes applies.
+
+TOO_LARGE:
+The assigned slice cannot reliably be completed as one bounded worker-model
+OpenSpec change and should be decomposed by the planning model.
+
+Report the evidence and suggested decomposition required by the worker-capacity
+policy above.
 
 READY:
 There is enough evidence to formulate a coherent OpenSpec proposal without

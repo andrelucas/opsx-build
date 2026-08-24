@@ -1,6 +1,6 @@
-# ospx-build
+# opsx-build
 
-`ospx-build` is a small synchronous runner for unattended OpenSpec builds. It
+`opsx-build` is a small synchronous runner for unattended OpenSpec builds. It
 runs each Claude/OpenSpec phase, records the next phase in local metadata, and
 lets the repository, OpenSpec artifacts, and Claude do their own jobs.
 
@@ -8,7 +8,7 @@ It deliberately does **not** infer file ownership, fingerprint dirty files,
 police Git HEAD, reset the repository, or clean up work. Claude creates the two
 milestone commits under explicit non-destructive instructions.
 
-`ospx-build` bundles the canonical `explore-unattended` and
+`opsx-build` bundles the canonical `explore-unattended` and
 `propose-unattended` Claude skills. Before a workflow starts, it installs
 missing copies and replaces stale copies in the repository selected by
 `--repo`, under `.claude/skills`. This keeps the target project's local Claude
@@ -26,7 +26,9 @@ installed because orchestration belongs in this process.
 4. Determine the OpenSpec change name from `openspec list --json`, then
    explicitly `/compact` the planning session again.
 5. Ask Claude to commit the proposal as `openspec: propose <change>`.
-6. Run the installed OpenSpec Apply workflow in a fresh session.
+6. Run the installed OpenSpec Apply workflow in a fresh session. Worker stages
+   may return `TOO_LARGE` when a frontier-assigned slice cannot reliably fit
+   one bounded local-model change.
 7. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
    Repair/Apply session and then verifies again.
 8. Run Archive in a fresh session after verification succeeds.
@@ -35,9 +37,18 @@ installed because orchestration belongs in this process.
 
 Every Claude invocation is a blocking subprocess. The checkpoint records only
 workflow facts: request, change name, next stage, planning session, retry count,
-pending verifier finding, pending user direction, and milestone HEADs.
+pending verifier finding, pending user direction, milestone HEADs, and any
+`TOO_LARGE` decomposition report.
 
-With live streaming enabled, ospx-build uses Claude Code's documented
+`TOO_LARGE` is a normal worker-routing outcome, distinct from `BLOCKED` and
+ordinary failure. It is accepted from Explore, Propose, Apply, and Repair. The
+checkpoint stays at the current stage and records the model's explanation and
+suggested ordered decomposition. This version stops there; automatic handoff
+to a frontier planner and model switching are deliberately deferred to the
+next routing layer. After the slice has been decomposed or revised, `--resume`
+explicitly retries the preserved stage.
+
+With live streaming enabled, opsx-build uses Claude Code's documented
 [bidirectional `stream-json` transport][claude-streaming]. It keeps the current
 Claude process's stdin open until the phase and any interactively queued turns
 finish. This allows terminal input to enqueue a slash command or ordinary
@@ -51,7 +62,7 @@ Explicit planning compaction is best-effort: a launcher incompatibility is
 reported as a warning and does not block otherwise valid repository work.
 
 If a Claude result reports `stop_reason: max_tokens` or a
-`max_output_tokens` API failure, ospx-build treats the turn as interrupted
+`max_output_tokens` API failure, opsx-build treats the turn as interrupted
 rather than failed. It best-effort compacts that same Claude session and asks it
 to continue the current phase from durable repository state. This recovery is
 bounded by `max_output_retries` (default 3); exhausting it leaves the checkpoint
@@ -62,21 +73,21 @@ at the current phase for an ordinary `--resume`.
 Repeat the complete, unchanged workflow with the same objective:
 
 ```sh
-ospx-build --repo ~/git/my-project --loop \
+opsx-build --repo ~/git/my-project --loop \
   "Select and implement the next coherent slice toward a complete C compiler"
 ```
 
 Each iteration gets a fresh planning session and otherwise follows the normal
 seven-stage workflow. The campaign ends successfully when
-`propose-unattended` returns `DONE`, or stops immediately on `BLOCKED`,
-interruption, or an ordinary error. There is no additional whole-workflow retry
-policy around the existing stages.
+`propose-unattended` returns `DONE`, or stops immediately on `TOO_LARGE`,
+`BLOCKED`, interruption, or an ordinary error. There is no additional
+whole-workflow retry policy around the existing stages.
 
 An optional circuit breaker reports an incomplete-campaign error after a fixed
 number of completed changes:
 
 ```sh
-ospx-build --loop --max-iterations 20 "finish the compiler"
+opsx-build --loop --max-iterations 20 "finish the compiler"
 ```
 
 Campaign metadata is stored with the normal checkpoint: current iteration,
@@ -89,7 +100,7 @@ In the TTY dashboard, press `q` to finish the current change and then pause the
 campaign cleanly. Ctrl-C still interrupts the active phase immediately and
 leaves it resumable.
 
-Press `p` to pause immediately during any streamed Claude phase. ospx-build
+Press `p` to pause immediately during any streamed Claude phase. opsx-build
 interrupts the complete Claude process group, restores the terminal, preserves
 the current phase checkpoint and partial repository work, and exits
 successfully with the exact `--resume` command. This is the preferred way to
@@ -103,40 +114,40 @@ current campaign change and pauses before the following iteration.
 ## Installation
 
 ```sh
-cargo install --path /Users/andre/git/ospx-build --force
+cargo install --path . --force
 ```
 
 ## Basic usage
 
 ```sh
-ospx-build --repo ~/git/my-project "add function pointer support"
+opsx-build --repo ~/git/my-project "add function pointer support"
 ```
 
 Resume after interruption or an ordinary command error:
 
 ```sh
-ospx-build --repo ~/git/my-project --resume
+opsx-build --repo ~/git/my-project --resume
 ```
 
 Inspect what resume would do without changing the checkpoint or repository:
 
 ```sh
-ospx-build --repo ~/git/my-project --resume --dry-run
+opsx-build --repo ~/git/my-project --resume --dry-run
 ```
 
 ## Continuing an existing OpenSpec change
 
-When Explore and Propose were performed outside ospx-build, continue the sole
+When Explore and Propose were performed outside opsx-build, continue the sole
 active OpenSpec change with:
 
 ```sh
-ospx-build --repo ~/git/my-project --continue-existing
+opsx-build --repo ~/git/my-project --continue-existing
 ```
 
 If several changes are active, select one explicitly:
 
 ```sh
-ospx-build --repo ~/git/my-project --continue-existing \
+opsx-build --repo ~/git/my-project --continue-existing \
   --change fix-test-infrastructure
 ```
 
@@ -148,7 +159,7 @@ completion commit. Each stage inspects durable repository/OpenSpec state, so a
 separate model call does not have to guess which stages are safe to skip.
 
 `--continue-existing --dry-run` shows the selected change and entry stage
-without writing a checkpoint. An unfinished ospx-build checkpoint must still be
+without writing a checkpoint. An unfinished opsx-build checkpoint must still be
 resumed or forgotten before adopting another change; a completed checkpoint is
 replaced by the adopted run.
 
@@ -157,7 +168,7 @@ replaced by the adopted run.
 Supply durable, one-shot implementation guidance while resuming:
 
 ```sh
-ospx-build --repo ~/git/my-project --resume \
+opsx-build --repo ~/git/my-project --resume \
   --direction "Keep the AST representation; fix lowering instead."
 ```
 
@@ -172,22 +183,24 @@ approved requirements themselves must change.
 
 ## Forgetting a checkpoint
 
-Discard only ospx-build's local workflow pointer with:
+Discard only opsx-build's local workflow pointer with:
 
 ```sh
-ospx-build --repo ~/git/my-project --forget
+opsx-build --repo ~/git/my-project --forget
 ```
 
 This does not inspect, restore, reset, stash, delete, or otherwise modify
 repository files or Git history. A dry run is also available:
 
 ```sh
-ospx-build --repo ~/git/my-project --forget --dry-run
+opsx-build --repo ~/git/my-project --forget --dry-run
 ```
 
-Checkpoints are stored at `.git/ospx-build/last-run.json`. Schema-2 checkpoints
+Checkpoints are stored at `.git/opsx-build/last-run.json`. Schema-2 checkpoints
 from the original implementation are migrated in memory and written in the new
-schema when a real resume proceeds.
+schema when a real resume proceeds. A checkpoint at the old
+`.git/ospx-build/last-run.json` location remains readable and migrates to the
+canonical location on the next write.
 
 ## Git behavior
 
@@ -210,7 +223,7 @@ errors. Their checkpoint remains at the unfinished stage for resume.
 The default launcher is `claude`. oMLX Claude mode can be configured with:
 
 ```toml
-# ~/.config/ospx-build/config.toml
+# ~/.config/opsx-build/config.toml
 max_verify_retries = 3
 max_output_retries = 3
 # Optional campaign defaults:
@@ -230,20 +243,20 @@ max_output_tokens = "8k"
 Set the same limits for one invocation with:
 
 ```sh
-ospx-build --auto-compact-window 128k --max-output-tokens 8k \
+opsx-build --auto-compact-window 128k --max-output-tokens 8k \
   "add function pointer support"
 ```
 
 Output-limit recovery can likewise be adjusted for one run:
 
 ```sh
-ospx-build --max-output-retries 5 "add function pointer support"
+opsx-build --max-output-retries 5 "add function pointer support"
 ```
 
 Token counts may be plain integers (`8192`) or use binary `k`/`m` suffixes;
 `8k` therefore means 8,192 tokens. `auto_compact_percent` accepts an integer
 from 1 to 100 and applies to the effective capacity selected by Claude or its
-launcher, so ospx-build does not need model visibility. The configured values
+launcher, so opsx-build does not need model visibility. The configured values
 are exported to every Claude subprocess as
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, including interactive launcher tests, without
@@ -262,7 +275,7 @@ Configuration precedence is:
 
 ```text
 command-line flags
-  > OSPX_BUILD_* environment variables
+  > OPSX_BUILD_* environment variables
   > config file
   > built-in defaults
 ```
@@ -270,12 +283,18 @@ command-line flags
 Use `--config PATH` to select another file or `--no-config` to disable config
 loading. Unknown TOML keys are errors.
 
+For rename compatibility, if the canonical config is absent,
+`~/.config/ospx-build/config.toml` is still loaded. Legacy `OSPX_BUILD_*`
+environment variables are also accepted below their `OPSX_BUILD_*`
+counterparts in precedence. New configuration should use the corrected
+spelling.
+
 Explore and Propose default to the two bundled skills. Apply, Verify, and
 Archive command names are discovered from common Claude skill and command
 locations. Override any command when needed:
 
 ```sh
-ospx-build \
+opsx-build \
   --apply-command /opsx:apply \
   --verify-command /opsx:verify \
   --archive-command /opsx:archive \
@@ -284,26 +303,26 @@ ospx-build \
 
 The corresponding environment variables are:
 
-- `OSPX_BUILD_MAX_VERIFY_RETRIES`
-- `OSPX_BUILD_MAX_OUTPUT_RETRIES`
-- `OSPX_BUILD_LOOP`
-- `OSPX_BUILD_MAX_ITERATIONS`
-- `OSPX_BUILD_PERMISSION_MODE`
-- `OSPX_BUILD_CLAUDE_COMMAND`
-- `OSPX_BUILD_CLAUDE_MODEL`
-- `OSPX_BUILD_AUTO_COMPACT_WINDOW`
-- `OSPX_BUILD_AUTO_COMPACT_PERCENT`
-- `OSPX_BUILD_MAX_OUTPUT_TOKENS`
-- `OSPX_BUILD_EXPLORE_COMMAND`
-- `OSPX_BUILD_PROPOSE_COMMAND`
-- `OSPX_BUILD_APPLY_COMMAND`
-- `OSPX_BUILD_VERIFY_COMMAND`
-- `OSPX_BUILD_ARCHIVE_COMMAND`
-- `OSPX_BUILD_STREAM_CLAUDE`
+- `OPSX_BUILD_MAX_VERIFY_RETRIES`
+- `OPSX_BUILD_MAX_OUTPUT_RETRIES`
+- `OPSX_BUILD_LOOP`
+- `OPSX_BUILD_MAX_ITERATIONS`
+- `OPSX_BUILD_PERMISSION_MODE`
+- `OPSX_BUILD_CLAUDE_COMMAND`
+- `OPSX_BUILD_CLAUDE_MODEL`
+- `OPSX_BUILD_AUTO_COMPACT_WINDOW`
+- `OPSX_BUILD_AUTO_COMPACT_PERCENT`
+- `OPSX_BUILD_MAX_OUTPUT_TOKENS`
+- `OPSX_BUILD_EXPLORE_COMMAND`
+- `OPSX_BUILD_PROPOSE_COMMAND`
+- `OPSX_BUILD_APPLY_COMMAND`
+- `OPSX_BUILD_VERIFY_COMMAND`
+- `OPSX_BUILD_ARCHIVE_COMMAND`
+- `OPSX_BUILD_STREAM_CLAUDE`
 
 ## Claude launcher compatibility
 
-`ospx-build` does not call an oMLX API. It starts the configured launcher as a
+`opsx-build` does not call an oMLX API. It starts the configured launcher as a
 synchronous subprocess and appends ordinary Claude Code CLI arguments. The
 launcher command is split into an executable and literal prefix arguments; it
 is not evaluated by a shell.
@@ -350,7 +369,7 @@ When token policies are configured, the launcher must preserve
 choices. The output limit is Claude Code's documented
 [maximum-output environment variable][claude-env-vars].
 
-For JSON output, ospx-build reads `is_error`, `result`, `session_id`, and
+For JSON output, opsx-build reads `is_error`, `result`, `session_id`, and
 `structured_output`. For streaming output it finds the most recent JSONL result
 carrying a valid OpenSpec stage status; later slash-command results such as
 `/compact` do not replace the stage result. A launcher may write diagnostics to
@@ -358,8 +377,8 @@ stderr, but should not mix banners or unrelated prose into non-streaming JSON
 stdout.
 
 `--json-schema` is optional for compatibility: if the launcher clearly rejects
-that option before execution, ospx-build retries once using the documented
-`OSPX_STATUS` marker protocol. It similarly degrades from streaming JSON to
+that option before execution, opsx-build retries once using the documented
+`OPSX_STATUS` marker protocol. It similarly degrades from streaming JSON to
 ordinary JSON or text when an older Claude CLI clearly rejects `--input-format`
 or `--output-format`. It never retries merely because a successful, potentially
 mutating invocation returned malformed terminal data.
@@ -368,7 +387,7 @@ mutating invocation returned malformed terminal data.
 
 The only oMLX-specific configuration is the launcher prefix and model name.
 The oMLX server must already be listening, normally on its default local port;
-ospx-build does not start, stop, configure, or query that server. `omlx launch
+opsx-build does not start, stop, configure, or query that server. `omlx launch
 claude` must forward the Claude Code options above and preserve the streaming
 stdin pipe. Structured and streaming output were tested through this launcher
 with Claude Code 2.1.224 and
@@ -386,7 +405,7 @@ times, and explicit diagnostics such as `/context`, while suppressing Claude's
 ordinary assistant/tool chatter. Show that additional activity with:
 
 ```sh
-ospx-build --stream-claude "add function pointer support"
+opsx-build --stream-claude "add function pointer support"
 ```
 
 Each workflow phase has its own disclosure, headed by status, stage position,
@@ -395,7 +414,7 @@ captured line count. The current phase starts expanded; completed phases
 collapse but remain available with their elapsed time frozen:
 
 ```text
-ospx-build  change: add-function-pointers  /path/to/repository
+opsx-build  change: add-function-pointers  /path/to/repository
 [4/7] Apply · 14m 07s  ⠴ Claude is applying the OpenSpec change
 ──────────────────────────────────────────────────────
   ▶ ✓ [1/7] Explore · 3m 12s · 48 lines
@@ -405,7 +424,7 @@ ospx-build  change: add-function-pointers  /path/to/repository
 ```
 
 The change name appears as soon as proposal discovery records it in the
-ospx-build checkpoint. Resumed and `--continue-existing` runs show it from the
+opsx-build checkpoint. Resumed and `--continue-existing` runs show it from the
 start.
 
 When content exceeds the terminal height, a scrollbar appears on the right.
@@ -436,7 +455,7 @@ Controls:
 - Up/Down and Page Up/Page Down scroll expanded output;
 - End returns to the newest output;
 - Escape collapses the selected phase;
-- Ctrl-C interrupts the current subprocess while preserving its ospx-build
+- Ctrl-C interrupts the current subprocess while preserving its opsx-build
   checkpoint, but reports an interruption rather than a deliberate pause.
 
 All three injection controls interrupt the active turn first. `i` delivers the
@@ -449,7 +468,7 @@ which Claude continues.
 The dashboard records each step. A write or interrupt acknowledgement is not a
 compaction acknowledgement; successful compaction is reported by Claude's
 `compact_boundary` event, which is shown by the `activity` filter. If the
-launcher rejects interrupt controls, ospx-build degrades to
+launcher rejects interrupt controls, opsx-build degrades to
 queuing the requested command after the current turn. These controls are
 available in the TTY dashboard; linear non-TTY streaming remains output-only.
 
@@ -457,7 +476,7 @@ Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when
 the workflow completes or stops.
 When either stdin or stderr is not a TTY—for example under CI, redirection, or
-a pipe—ospx-build uses ordinary linear output and does not write cursor-control
+a pipe—opsx-build uses ordinary linear output and does not write cursor-control
 sequences. If `--stream-claude` is enabled there, its selected filtered stream
 is emitted as linear text.
 
@@ -484,7 +503,7 @@ Open an ordinary interactive Claude session using the configured launcher,
 model, and permission mode:
 
 ```sh
-ospx-build --interactive -- --effort xhigh
+opsx-build --interactive -- --effort xhigh
 ```
 
 An optional positional argument becomes the initial prompt. Arguments after
@@ -494,28 +513,34 @@ OpenSpec workflow checkpoint.
 ## Terminal protocol
 
 Each unattended stage asks Claude Code for schema-validated structured output.
-The result contains an `ospx_status` and a concise `summary`; Claude Code can
+The result contains an `opsx_status` and a concise `summary`; Claude Code can
 re-prompt the model when its first result does not satisfy the schema.
 
 For older or compatibility-layer Claude CLIs that reject `--json-schema`,
-ospx-build falls back to final-line markers:
+opsx-build falls back to final-line markers:
 
 ```text
-OSPX_STATUS: READY
-OSPX_STATUS: DONE
-OSPX_STATUS: VERIFIED
-OSPX_STATUS: RETRY
-OSPX_STATUS: BLOCKED
+OPSX_STATUS: READY
+OPSX_STATUS: DONE
+OPSX_STATUS: TOO_LARGE
+OPSX_STATUS: VERIFIED
+OPSX_STATUS: RETRY
+OPSX_STATUS: BLOCKED
 ```
 
-Explore, Apply, Repair, Archive, and commit stages use `READY` or `BLOCKED`.
-Propose additionally accepts `DONE`. Verify uses `VERIFIED`, `RETRY`, or
-`BLOCKED`. `DONE` means no OpenSpec change was created or modified because the
-requested objective is already satisfied; in campaign mode it terminates the
-outer loop successfully.
+Explore, Apply, and Repair use `READY`, `TOO_LARGE`, or `BLOCKED`. Propose also
+accepts `DONE`. Archive and commit stages use `READY` or `BLOCKED`; Verify uses
+`VERIFIED`, `RETRY`, or `BLOCKED`. `DONE` means no OpenSpec change was created
+or modified because the requested objective is already satisfied; in campaign
+mode it terminates the outer loop successfully. `TOO_LARGE` means the assigned
+worker slice needs decomposition before another local attempt.
+
+The corrected structured field and fallback marker are `opsx_status` and
+`OPSX_STATUS`. Results using the old `ospx_status` or `OSPX_STATUS` spellings
+remain readable for compatibility.
 
 If the Claude process exits successfully but returns neither structured output
-nor a fallback marker, ospx-build does not rerun that potentially mutating
+nor a fallback marker, opsx-build does not rerun that potentially mutating
 stage. Archive additionally checks durable OpenSpec state so a completed
 archive is not repeated merely because its acknowledgement was malformed.
 
