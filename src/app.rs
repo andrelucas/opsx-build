@@ -584,51 +584,85 @@ impl<U: Ui> App<U> {
             "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE.",
             campaign_subject(state)
         );
-        let result = claude.invoke(
-            session_mode(session, is_new, "opsx-build-planning"),
-            &stage_prompt(&commands.propose, &base, StageProtocol::Propose),
-            "Claude is creating OpenSpec artifacts",
-            StageProtocol::Propose,
-        )?;
+        let mut retrying_postcondition = false;
+        loop {
+            let subject = if retrying_postcondition {
+                proposal_postcondition_repair(&base)
+            } else {
+                base.clone()
+            };
+            let result = claude.invoke(
+                session_mode(
+                    session,
+                    is_new && !retrying_postcondition,
+                    "opsx-build-planning",
+                ),
+                &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
+                if retrying_postcondition {
+                    "Claude is correcting the incomplete proposal"
+                } else {
+                    "Claude is creating OpenSpec artifacts"
+                },
+                StageProtocol::Propose,
+            )?;
 
-        let after = openspec_snapshot(repo, &self.ui)?;
-        match result.signal {
-            StageSignal::Done => {
-                if after != state.before_changes {
-                    bail!(
-                        "Propose returned DONE after changing OpenSpec state; preserving the repository for inspection"
-                    );
+            let after = openspec_snapshot(repo, &self.ui)?;
+            match result.signal {
+                StageSignal::Done => {
+                    if after != state.before_changes {
+                        bail!(
+                            "Propose returned DONE after changing OpenSpec state; preserving the repository for inspection"
+                        );
+                    }
+                    state.terminal_summary = Some(result.text);
+                    state.stage = Stage::Done;
+                    return persist_state(repo, state, &self.ui);
                 }
-                state.terminal_summary = Some(result.text);
-                state.stage = Stage::Done;
-                return persist_state(repo, state, &self.ui);
-            }
-            StageSignal::TooLarge => {
-                if after != state.before_changes {
-                    bail!(
-                        "Propose returned TOO_LARGE after changing OpenSpec state; preserving the repository for inspection"
-                    );
+                StageSignal::TooLarge => {
+                    if after != state.before_changes {
+                        bail!(
+                            "Propose returned TOO_LARGE after changing OpenSpec state; preserving the repository for inspection"
+                        );
+                    }
+                    return record_too_large(repo, state, result.text, &self.ui);
                 }
-                return record_too_large(repo, state, result.text, &self.ui);
+                StageSignal::Ready => {}
+                StageSignal::Blocked => return blocked("propose", &result.text),
+                other => bail!("propose returned unexpected terminal status {other:?}"),
             }
-            StageSignal::Ready => {}
-            StageSignal::Blocked => return blocked("propose", &result.text),
-            other => bail!("propose returned unexpected terminal status {other:?}"),
-        }
-        let change = identify_change(&state.before_changes, &after)?;
-        validate_change_name(&change)?;
-        state.change = Some(change.clone());
-        self.ui.change_name(Some(&change));
-        self.ui
-            .info(&format!("Selected OpenSpec change `{change}`"));
-        claude.compact_session(session, "Propose")?;
-        if let Err(error) = claude.rename_session(session, &change) {
+
+            if after == state.before_changes && !retrying_postcondition {
+                self.ui.warn(
+                    "Propose reported READY without creating or modifying an active OpenSpec change; retrying the same planning session once",
+                );
+                retrying_postcondition = true;
+                continue;
+            }
+
+            let change = identify_change(&state.before_changes, &after).with_context(|| {
+                if retrying_postcondition {
+                    format!(
+                        "Propose still did not satisfy its READY postcondition after one corrective turn. Last Claude summary: {}",
+                        result.text.trim()
+                    )
+                } else {
+                    format!("Propose reported READY. Last Claude summary: {}", result.text.trim())
+                }
+            })?;
+            validate_change_name(&change)?;
+            state.change = Some(change.clone());
+            self.ui.change_name(Some(&change));
             self.ui
-                .warn(&format!("Could not rename planning session: {error}"));
+                .info(&format!("Selected OpenSpec change `{change}`"));
+            claude.compact_session(session, "Propose")?;
+            if let Err(error) = claude.rename_session(session, &change) {
+                self.ui
+                    .warn(&format!("Could not rename planning session: {error}"));
+            }
+            state.stage = state.stage.after_ready()?;
+            persist_state(repo, state, &self.ui)?;
+            return Ok(());
         }
-        state.stage = state.stage.after_ready()?;
-        persist_state(repo, state, &self.ui)?;
-        Ok(())
     }
 
     fn run_proposal_commit(
@@ -1059,6 +1093,12 @@ fn record_too_large<U: Ui>(
     persist_state(repo, state, ui)
 }
 
+fn proposal_postcondition_repair(subject: &str) -> String {
+    format!(
+        "{subject}\n\nPOSTCONDITION REPAIR: The preceding Propose turn returned READY, but a deterministic `openspec list --json` check found no new or modified active change. Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed. Use the completed exploration and repository's durable slice plan to select the intended next slice. Return READY only after the active OpenSpec change exists and every artifact required before implementation is complete. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
+    )
+}
+
 fn campaign_subject(state: &RunState) -> String {
     match &state.campaign {
         Some(campaign) => format!(
@@ -1300,6 +1340,16 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(decoded.stage, Stage::Apply);
         assert_eq!(decoded.too_large, state.too_large);
+    }
+
+    #[test]
+    fn proposal_postcondition_repair_preserves_the_campaign_rubric() {
+        let prompt = proposal_postcondition_repair("next slice");
+        assert!(prompt.starts_with("next slice"));
+        assert!(prompt.contains("same planning session"));
+        assert!(prompt.contains("do not merely describe"));
+        assert!(prompt.contains("Return READY only after"));
+        assert!(prompt.contains("return TOO_LARGE"));
     }
 
     #[test]

@@ -22,7 +22,10 @@ installed because orchestration belongs in this process.
 2. Explicitly `/compact` that session.
 3. Run `/propose-unattended` in the compacted planning session. If the
    requested objective is already satisfied and no meaningful change remains,
-   Propose returns `DONE` without creating artifacts.
+   Propose returns `DONE` without creating artifacts. If it instead reports
+   `READY` while OpenSpec still has no new or modified active change, retry a
+   corrective Propose turn once in that same session before reporting a failed
+   postcondition.
 4. Determine the OpenSpec change name from `openspec list --json`, then
    explicitly `/compact` the planning session again.
 5. Ask Claude to commit the proposal as `openspec: propose <change>`.
