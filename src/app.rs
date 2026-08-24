@@ -10,6 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
+    agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda},
     claude::{
         ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode, SkillCommands,
         StageProtocol, StageSignal, build_claude_command, build_interactive_claude_command,
@@ -18,8 +19,8 @@ use crate::{
     cli::Cli,
     git::{current_head, legacy_metadata_dir, metadata_dir, remove_metadata, repository_root},
     openspec::{
-        ChangeSnapshot, identify_change, planning_status, select_existing_change,
-        snapshot as openspec_snapshot,
+        ChangeSnapshot, identify_assigned_change, identify_change, planning_status,
+        select_existing_change, snapshot as openspec_snapshot,
     },
     process::{PauseRequested, ProcessRunner, prerequisite_exists},
     skills::{SkillInstallAction, ensure_unattended_skills},
@@ -28,7 +29,8 @@ use crate::{
 };
 
 const TOTAL_STAGES: usize = 7;
-const STATE_SCHEMA_VERSION: u32 = 3;
+const AGENDA_TOTAL_STAGES: usize = 6;
+const STATE_SCHEMA_VERSION: u32 = 4;
 
 pub struct App<U: Ui> {
     cli: Cli,
@@ -54,6 +56,8 @@ struct RunState {
     too_large: Option<TooLargeOutcome>,
     #[serde(default)]
     campaign: Option<CampaignState>,
+    #[serde(default)]
+    agenda: Option<AgendaAssignment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +105,7 @@ impl RunState {
             terminal_summary: None,
             too_large: None,
             campaign: None,
+            agenda: None,
         }
     }
 
@@ -134,6 +139,7 @@ impl RunState {
             terminal_summary: None,
             too_large: None,
             campaign: None,
+            agenda: None,
         }
     }
 
@@ -255,7 +261,7 @@ impl<U: Ui> App<U> {
         }
 
         let before_changes = openspec_snapshot(&repo, &self.ui)?;
-        let state = if self.cli.loop_workflow {
+        let mut state = if self.cli.loop_workflow {
             RunState::new_campaign(
                 self.cli.request.clone(),
                 before_changes,
@@ -264,8 +270,50 @@ impl<U: Ui> App<U> {
         } else {
             RunState::new(self.cli.request.clone(), before_changes)
         };
+        self.assign_agenda(&repo, &mut state)?;
         persist_state(&repo, &state, &self.ui)?;
         self.run_workflows(&repo, &launcher, &commands, state)
+    }
+
+    fn assign_agenda(&self, repo: &Path, state: &mut RunState) -> Result<()> {
+        if state.request != "advance" {
+            return Ok(());
+        }
+        match discover_agenda(repo, &state.before_changes)? {
+            AgendaSelection::Absent => {
+                bail!("`advance` requires an ordered agenda under `automation/slices/NNN-slug.md`")
+            }
+            AgendaSelection::Complete => {
+                state.change = None;
+                state.agenda = None;
+                state.stage = Stage::Done;
+                state.terminal_summary = Some("every ordered agenda slice is archived".to_owned());
+                self.ui.info("Ordered agenda is complete");
+            }
+            AgendaSelection::Next(assignment) => {
+                self.ui.info(&format!(
+                    "Advancing agenda with `{}` — {}",
+                    assignment.path, assignment.title
+                ));
+                state.change = Some(assignment.change.clone());
+                state.stage = if state
+                    .before_changes
+                    .changes
+                    .contains_key(&assignment.change)
+                    && planning_status(repo, &assignment.change, &self.ui)?.is_complete
+                {
+                    self.ui.info(&format!(
+                        "Assigned change `{}` already has complete planning; continuing at proposal commit",
+                        assignment.change
+                    ));
+                    Stage::ProposalCommit
+                } else {
+                    Stage::Propose
+                };
+                state.agenda = Some(assignment);
+            }
+        }
+        Ok(())
     }
 
     fn synchronize_skills(&self, repo: &Path) -> Result<usize> {
@@ -357,6 +405,14 @@ impl<U: Ui> App<U> {
             campaign.max_iterations = self.cli.max_iterations;
         }
 
+        if state.request == "advance"
+            && state.agenda.is_none()
+            && state.stage == Stage::Explore
+            && state.planning_session.is_none()
+        {
+            self.assign_agenda(repo, &mut state)?;
+        }
+
         if let Some(direction) = &self.cli.direction {
             queue_direction(&mut state, direction);
             self.ui
@@ -398,7 +454,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         loop {
             self.present_campaign(&state);
-            let iteration_started = (state.stage == Stage::Explore
+            let iteration_started = (matches!(state.stage, Stage::Explore | Stage::Propose)
                 && state.planning_session.is_none())
             .then(Instant::now);
             match self.execute(repo, launcher, commands, state)? {
@@ -472,13 +528,6 @@ impl<U: Ui> App<U> {
                         ));
                         return Ok(());
                     }
-                    if max_iterations.is_some_and(|maximum| iteration >= maximum) {
-                        self.ui.finish_dashboard();
-                        bail!(
-                            "campaign reached its configured limit of {iteration} completed iteration(s) before Propose returned DONE"
-                        );
-                    }
-
                     let request = completed_state.request.clone();
                     let pending_direction = completed_state.pending_direction.take();
                     let mut campaign = completed_state
@@ -490,6 +539,15 @@ impl<U: Ui> App<U> {
                     state = RunState::new(request, before_changes);
                     state.campaign = Some(campaign);
                     state.pending_direction = pending_direction;
+                    self.assign_agenda(repo, &mut state)?;
+                    if state.stage != Stage::Done
+                        && max_iterations.is_some_and(|maximum| iteration >= maximum)
+                    {
+                        self.ui.finish_dashboard();
+                        bail!(
+                            "campaign reached its configured limit of {iteration} completed iteration(s) before the objective was complete"
+                        );
+                    }
                     persist_state(repo, &state, &self.ui)?;
                 }
             }
@@ -546,8 +604,13 @@ impl<U: Ui> App<U> {
                 return Ok(WorkflowOutcome::Done(state));
             }
 
+            let (stage_number, total_stages) = if state.agenda.is_some() {
+                (state.stage.number() - 1, AGENDA_TOTAL_STAGES)
+            } else {
+                (state.stage.number(), TOTAL_STAGES)
+            };
             self.ui
-                .stage(state.stage.number(), TOTAL_STAGES, state.stage.title());
+                .stage(stage_number, total_stages, state.stage.title());
             match state.stage {
                 Stage::Explore => self.run_explore(repo, &claude, commands, &mut state)?,
                 Stage::Propose => self.run_propose(repo, &claude, commands, &mut state)?,
@@ -603,8 +666,13 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
+        let planning_context = if state.agenda.is_some() {
+            "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
+        } else {
+            "Use conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE."
+        };
         let base = format!(
-            "{}\n\nUse conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE. Run every OpenSpec command synchronously: never background or detach commands, and do not return while a command or subagent is still working.",
+            "{}\n\n{planning_context} Run every OpenSpec command synchronously: never background or detach commands, and do not return while a command or subagent is still working.",
             campaign_subject(state)
         );
         let mut retrying_postcondition = false;
@@ -635,6 +703,12 @@ impl<U: Ui> App<U> {
             let after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
                 StageSignal::Done => {
+                    if let Some(assignment) = &state.agenda {
+                        bail!(
+                            "Propose returned DONE despite assigned agenda slice `{}`; the assignment remains preserved in the checkpoint",
+                            assignment.path
+                        );
+                    }
                     if after != state.before_changes {
                         bail!(
                             "Propose returned DONE after changing OpenSpec state; preserving the repository for inspection"
@@ -657,7 +731,17 @@ impl<U: Ui> App<U> {
                 other => bail!("propose returned unexpected terminal status {other:?}"),
             }
 
-            if after == state.before_changes {
+            let assigned_complete_without_list_change = state
+                .agenda
+                .as_ref()
+                .filter(|assignment| after.changes.contains_key(&assignment.change))
+                .map(|assignment| {
+                    planning_status(repo, &assignment.change, &self.ui)
+                        .map(|status| status.is_complete)
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if after == state.before_changes && !assigned_complete_without_list_change {
                 if !retrying_postcondition {
                     self.ui.warn(
                         "Propose reported READY without creating or modifying an active OpenSpec change; retrying the same planning session once",
@@ -671,7 +755,16 @@ impl<U: Ui> App<U> {
                 );
             }
 
-            let change = identify_change(&state.before_changes, &after).with_context(|| {
+            let change_result = match &state.agenda {
+                Some(assignment) if assigned_complete_without_list_change => {
+                    Ok(assignment.change.clone())
+                }
+                Some(assignment) => {
+                    identify_assigned_change(&state.before_changes, &after, &assignment.change)
+                }
+                None => identify_change(&state.before_changes, &after),
+            };
+            let change = change_result.with_context(|| {
                 if retrying_postcondition {
                     format!(
                         "Propose still did not satisfy its READY postcondition after one corrective turn. Last Claude summary: {}",
@@ -933,7 +1026,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         self.ui
             .warn("DRY RUN — no workflow state or subprocesses will be created");
-        let dry_state = if self.cli.loop_workflow {
+        let mut dry_state = if self.cli.loop_workflow {
             RunState::new_campaign(
                 self.cli.request.clone(),
                 ChangeSnapshot::default(),
@@ -942,11 +1035,17 @@ impl<U: Ui> App<U> {
         } else {
             RunState::new(self.cli.request.clone(), ChangeSnapshot::default())
         };
-        let prompt = stage_prompt(
-            &commands.explore,
-            &campaign_subject(&dry_state),
-            StageProtocol::Worker,
-        );
+        self.assign_agenda(repo, &mut dry_state)?;
+        if dry_state.stage == Stage::Done {
+            self.ui.info("Advance: the ordered agenda is complete");
+            return Ok(());
+        }
+        let (planning_command, protocol, label) = if dry_state.stage == Stage::Propose {
+            (&commands.propose, StageProtocol::Propose, "Propose")
+        } else {
+            (&commands.explore, StageProtocol::Worker, "Explore")
+        };
+        let prompt = stage_prompt(planning_command, &campaign_subject(&dry_state), protocol);
         let command = build_claude_command(
             repo,
             launcher,
@@ -957,15 +1056,17 @@ impl<U: Ui> App<U> {
             },
             &prompt,
             ClaudeOutputFormat::Json,
-            Some(StageProtocol::Worker.json_schema()),
+            Some(protocol.json_schema()),
         );
-        self.ui.info(&format!("Explore: {}", command.display()));
-        self.ui
-            .info("Hard compact the planning session after Explore");
-        self.ui.info(&format!(
-            "Propose in same session: {} (READY, DONE, TOO_LARGE, or BLOCKED)",
-            commands.propose
-        ));
+        self.ui.info(&format!("{label}: {}", command.display()));
+        if dry_state.stage == Stage::Explore {
+            self.ui
+                .info("Hard compact the planning session after Explore");
+            self.ui.info(&format!(
+                "Propose in same session: {} (READY, DONE, TOO_LARGE, or BLOCKED)",
+                commands.propose
+            ));
+        }
         self.ui
             .info("Hard compact the planning session after Propose");
         self.ui
@@ -980,8 +1081,8 @@ impl<U: Ui> App<U> {
             .info("Ask Claude to create completion milestone commit");
         if self.cli.loop_workflow {
             let limit = self.cli.max_iterations.map_or_else(
-                || "until Propose returns DONE".to_owned(),
-                |maximum| format!("until DONE or {maximum} completed iterations"),
+                || "until the agenda or objective is complete".to_owned(),
+                |maximum| format!("until completion or {maximum} completed iterations"),
             );
             self.ui.info(&format!(
                 "Campaign: repeat the complete workflow {limit}; stop on any error, TOO_LARGE, or BLOCKED"
@@ -1146,11 +1247,24 @@ fn record_too_large<U: Ui>(
 
 fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     format!(
-        "{subject}\n\nPOSTCONDITION REPAIR: {failure} Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed and do not create a duplicate change. Inspect active OpenSpec changes first and continue the intended existing scaffold when one is present. Use the completed exploration and repository's durable slice plan to select the intended next slice. Run all commands synchronously and wait for every command and subagent to finish. Return READY only after `openspec status --change <name> --json` reports `isPlanningComplete: true`. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
+        "{subject}\n\nPOSTCONDITION REPAIR: {failure} Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed and do not create a duplicate change. Inspect active OpenSpec changes first and continue the intended existing scaffold when one is present. Follow any exact agenda assignment above; otherwise use the completed exploration and repository's durable planning evidence. Run all commands synchronously and wait for every command and subagent to finish. Return READY only after `openspec status --change <name> --json` reports `isPlanningComplete: true`. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
     )
 }
 
 fn campaign_subject(state: &RunState) -> String {
+    if let Some(assignment) = &state.agenda {
+        let iteration = state
+            .campaign
+            .as_ref()
+            .map(|campaign| format!("campaign iteration {}", campaign.iteration))
+            .unwrap_or_else(|| "this advance operation".to_owned());
+        return format!(
+            "Advance the repository by implementing the exact ordered agenda assignment below. This is {iteration}. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The agenda content is authoritative; use repository inspection only to elaborate its implementation details.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
+            change = assignment.change,
+            path = assignment.path,
+            content = assignment.content.trim()
+        );
+    }
     match &state.campaign {
         Some(campaign) => format!(
             "{}\n\nThis is campaign iteration {}. Select and pursue exactly one coherent, bounded remaining slice toward the objective. Use the repository and archived OpenSpec history as durable evidence of earlier iterations. If the overall objective is already satisfied and no meaningful slice remains, carry that conclusion into Propose so it can return DONE without creating artifacts.",
@@ -1249,11 +1363,18 @@ fn load_state_file(path: &Path) -> Result<RunState> {
         .unwrap_or(0) as u32;
     match schema {
         STATE_SCHEMA_VERSION => serde_json::from_value(value).context("invalid current checkpoint"),
+        3 => migrate_v3(value),
         2 => migrate_v2(value),
         other => bail!(
             "unsupported checkpoint schema {other}; use `--forget` to leave repository state untouched and start over"
         ),
     }
+}
+
+fn migrate_v3(mut value: Value) -> Result<RunState> {
+    value["schema_version"] = Value::from(STATE_SCHEMA_VERSION);
+    value["agenda"] = Value::Null;
+    serde_json::from_value(value).context("invalid version 3 checkpoint")
 }
 
 fn migrate_v2(value: Value) -> Result<RunState> {
@@ -1317,6 +1438,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         terminal_summary: None,
         too_large: None,
         campaign: None,
+        agenda: None,
     })
 }
 
@@ -1348,6 +1470,22 @@ mod tests {
         assert!(subject.contains("campaign iteration 7"));
         assert!(subject.contains("exactly one coherent, bounded remaining slice"));
         assert!(subject.contains("return DONE"));
+    }
+
+    #[test]
+    fn agenda_subject_assigns_one_exact_change_without_exploration() {
+        let mut state = RunState::new("advance".to_owned(), ChangeSnapshot::default());
+        state.agenda = Some(AgendaAssignment {
+            path: "automation/slices/002-test-harness.md".to_owned(),
+            change: "002-test-harness".to_owned(),
+            title: "002 - Test harness".to_owned(),
+            content: "# 002 - Test harness\n\n## Objective\n\nBuild it.".to_owned(),
+        });
+        let subject = campaign_subject(&state);
+        assert!(subject.contains("exact name `002-test-harness`"));
+        assert!(subject.contains("automation/slices/002-test-harness.md"));
+        assert!(subject.contains("## Objective"));
+        assert!(subject.contains("Do not select, create, or modify a different slice"));
     }
 
     #[test]
@@ -1460,6 +1598,21 @@ mod tests {
         assert_eq!(state.change.as_deref(), Some("slice-m"));
         assert_eq!(state.planning_session, Some(Uuid::nil()));
         assert_eq!(state.pending_repair.as_deref(), Some("fix lowering"));
+    }
+
+    #[test]
+    fn migrates_schema_three_checkpoint_without_an_agenda_assignment() {
+        let mut value = serde_json::to_value(RunState::new(
+            "build it".to_owned(),
+            ChangeSnapshot::default(),
+        ))
+        .unwrap();
+        value["schema_version"] = Value::from(3);
+        value.as_object_mut().unwrap().remove("agenda");
+        let state = migrate_v3(value).unwrap();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert!(state.agenda.is_none());
+        assert_eq!(state.stage, Stage::Explore);
     }
 
     #[test]

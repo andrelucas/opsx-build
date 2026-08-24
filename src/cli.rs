@@ -73,8 +73,7 @@ impl Cli {
     about = "Build an OpenSpec change through synchronous Claude stages"
 )]
 struct CliArgs {
-    /// Change request, or an optional initial prompt in interactive mode.
-    #[arg(required_unless_present_any = ["interactive", "update_skills", "resume", "forget", "continue_existing"])]
+    /// Change request. Defaults to `advance`, which follows automation/slices in order.
     request: Option<String>,
 
     /// Repository containing .git, openspec/, and Claude skills.
@@ -118,7 +117,7 @@ struct CliArgs {
     )]
     continue_existing: bool,
 
-    /// Repeat complete OpenSpec changes until Propose returns DONE.
+    /// Repeat complete OpenSpec changes until the agenda or objective is complete.
     #[arg(
         long = "loop",
         env = "OPSX_BUILD_LOOP",
@@ -382,8 +381,21 @@ where
 }
 
 fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Cli {
+    let request = match args.request.as_deref() {
+        Some(value) if value.trim().eq_ignore_ascii_case("next slice") => "advance".to_owned(),
+        Some(value) => value.to_owned(),
+        None if args.interactive
+            || args.update_skills
+            || args.resume
+            || args.forget
+            || args.continue_existing =>
+        {
+            String::new()
+        }
+        None => "advance".to_owned(),
+    };
     Cli {
-        request: args.request.unwrap_or_default(),
+        request,
         repo: args.repo,
         interactive: args.interactive,
         update_skills: args.update_skills,
@@ -857,8 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn workflow_still_requires_a_request() {
-        assert!(CliArgs::try_parse_from(["opsx-build"]).is_err());
+    fn workflow_defaults_to_advance_and_accepts_next_slice_alias() {
+        let default = Cli::resolve(args(["opsx-build"])).unwrap();
+        assert_eq!(default.request, "advance");
+
+        let alias = Cli::resolve(args(["opsx-build", "next slice"])).unwrap();
+        assert_eq!(alias.request, "advance");
     }
 
     #[test]

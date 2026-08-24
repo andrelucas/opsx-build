@@ -1,3 +1,4 @@
+pub mod agenda;
 pub mod app;
 pub mod claude;
 pub mod cli;

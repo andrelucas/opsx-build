@@ -144,6 +144,45 @@ pub fn identify_change(before: &ChangeSnapshot, after: &ChangeSnapshot) -> Resul
     )
 }
 
+pub fn identify_assigned_change(
+    before: &ChangeSnapshot,
+    after: &ChangeSnapshot,
+    assigned: &str,
+) -> Result<String> {
+    let changed = before
+        .changes
+        .keys()
+        .chain(after.changes.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| before.changes.get(*name) != after.changes.get(*name))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    if !after.changes.contains_key(assigned) {
+        let detail = if changed.is_empty() {
+            "no active change was created or updated".to_owned()
+        } else {
+            format!("instead changed {}", changed.join(", "))
+        };
+        bail!("Propose did not create or continue assigned OpenSpec change `{assigned}`; {detail}")
+    }
+    if !changed.contains(&assigned) {
+        bail!("Propose left assigned OpenSpec change `{assigned}` unchanged")
+    }
+    let unexpected = changed
+        .into_iter()
+        .filter(|name| *name != assigned)
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        bail!(
+            "Propose changed unassigned OpenSpec change(s) while working on `{assigned}`: {}",
+            unexpected.join(", ")
+        )
+    }
+    Ok(assigned.to_owned())
+}
+
 pub fn select_existing_change(active: &ChangeSnapshot, requested: Option<&str>) -> Result<String> {
     if let Some(change) = requested {
         if active.changes.contains_key(change) {
@@ -238,6 +277,29 @@ mod tests {
         let before = ChangeSnapshot::default();
         let after = parse_list_json(r#"{"changes":[{"name":"one"},{"name":"two"}]}"#).unwrap();
         assert!(identify_change(&before, &after).is_err());
+    }
+
+    #[test]
+    fn assigned_change_must_be_the_only_changed_openspec_change() {
+        let before = parse_list_json(r#"{"changes":[{"name":"unrelated"}]}"#).unwrap();
+        let after = parse_list_json(
+            r#"{"changes":[{"name":"002-next","lastModified":"now"},{"name":"unrelated"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            identify_assigned_change(&before, &after, "002-next").unwrap(),
+            "002-next"
+        );
+
+        let extra = parse_list_json(
+            r#"{"changes":[{"name":"002-next"},{"name":"003-wrong"},{"name":"unrelated"}]}"#,
+        )
+        .unwrap();
+        assert!(identify_assigned_change(&before, &extra, "002-next").is_err());
+        assert!(identify_assigned_change(&before, &after, "003-wrong").is_err());
+
+        let removed_unrelated = parse_list_json(r#"{"changes":[{"name":"002-next"}]}"#).unwrap();
+        assert!(identify_assigned_change(&before, &removed_unrelated, "002-next").is_err());
     }
 
     #[test]

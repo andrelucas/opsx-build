@@ -18,6 +18,23 @@ installed because orchestration belongs in this process.
 
 ## Workflow
 
+`advance` is the well-known ordered-agenda operation and the default when no
+request is supplied. If the repository contains files named
+`automation/slices/NNN-slug.md`, opsx-build sorts them numerically, treats a
+slice as complete only when a matching OpenSpec change has been archived, and
+assigns the earliest unarchived slice. A date-prefixed archived or active
+change still matches when its name ends with the complete slice stem.
+
+An advance operation persists the exact slice path, contents, and required
+OpenSpec change name before Claude starts. It skips Explore because the
+frontier-authored slice is already the exploration result, then gives Propose
+the complete slice contents. Propose must create or continue only the assigned
+change; opsx-build never infers intent from Claude's prose or silently adopts a
+different slice. When every agenda entry is archived, advance returns `DONE`
+without invoking Claude.
+
+Free-form requests retain the exploratory workflow:
+
 1. Run `/explore-unattended` in a new Claude planning session.
 2. Explicitly `/compact` that session.
 3. Run `/propose-unattended` in the compacted planning session. If the
@@ -41,9 +58,9 @@ installed because orchestration belongs in this process.
    `openspec: complete <change>`.
 
 Every Claude invocation is a blocking subprocess. The checkpoint records only
-workflow facts: request, change name, next stage, planning session, retry count,
-pending verifier finding, pending user direction, milestone HEADs, and any
-`TOO_LARGE` decomposition report.
+workflow facts: request, assigned agenda slice when advancing, change name,
+next stage, planning session, retry count, pending verifier finding, pending
+user direction, milestone HEADs, and any `TOO_LARGE` decomposition report.
 
 `TOO_LARGE` is a normal worker-routing outcome, distinct from `BLOCKED` and
 ordinary failure. It is accepted from Explore, Propose, Apply, and Repair. The
@@ -75,18 +92,26 @@ at the current phase for an ordinary `--resume`.
 
 ## Campaign loop
 
-Repeat the complete, unchanged workflow with the same objective:
+Advance repeatedly through an ordered agenda:
 
 ```sh
-opsx-build --repo ~/git/my-project --loop \
-  "Select and implement the next coherent slice toward a complete C compiler"
+opsx-build --repo ~/git/my-project --loop advance
 ```
 
-Each iteration gets a fresh planning session and otherwise follows the normal
-seven-stage workflow. The campaign ends successfully when
-`propose-unattended` returns `DONE`, or stops immediately on `TOO_LARGE`,
-`BLOCKED`, interruption, or an ordinary error. There is no additional
-whole-workflow retry policy around the existing stages.
+Because `advance` is the default, this is equivalent to
+`opsx-build --repo ~/git/my-project --loop`. The former phrase `next slice` is
+accepted as an alias and normalized to `advance`.
+
+Campaigns with an explicit free-form objective still use Explore and let
+Claude identify one bounded change per iteration.
+
+Each iteration gets a fresh planning session. Agenda-driven iterations use the
+six stages from Propose through completion; free-form campaigns use the normal
+seven-stage workflow beginning with Explore. An agenda campaign ends when
+every slice is archived. A free-form campaign ends when `propose-unattended`
+returns `DONE`. Either stops immediately on `TOO_LARGE`, `BLOCKED`,
+interruption, or an ordinary error. There is no additional whole-workflow retry
+policy around the existing stages.
 
 An optional circuit breaker reports an incomplete-campaign error after a fixed
 number of completed changes:
@@ -126,6 +151,13 @@ cargo install --path . --force
 
 ```sh
 opsx-build --repo ~/git/my-project "add function pointer support"
+```
+
+Advance one item from an ordered slice agenda (both forms are equivalent):
+
+```sh
+opsx-build --repo ~/git/my-project
+opsx-build --repo ~/git/my-project advance
 ```
 
 Install or refresh the bundled unattended skills without starting Claude or a
