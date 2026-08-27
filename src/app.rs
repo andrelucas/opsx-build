@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::{
     agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision},
     claude::{
-        ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode, SkillCommands,
-        StageProtocol, StageSignal, build_claude_command, build_interactive_claude_command,
-        stage_prompt,
+        CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode,
+        SkillCommands, StageProtocol, StageSignal, build_claude_command,
+        build_connection_test_command, build_interactive_claude_command,
+        parse_connection_test_output, stage_prompt,
     },
     cli::Cli,
     git::{
@@ -192,6 +193,20 @@ impl<U: Ui> App<U> {
                 self.cli.repo.display()
             )
         })?;
+
+        if self.cli.test_connection.is_some() {
+            self.ui.banner(&requested_repo.display().to_string());
+            let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
+            if launcher.program != "claude" {
+                prerequisite_exists(&launcher.program, &requested_repo, &self.ui)?;
+            }
+            prerequisite_exists("claude", &requested_repo, &self.ui)?;
+            self.debug_configuration(&requested_repo, &launcher);
+            if let Some(path) = &self.cli.config_path {
+                self.ui.info(&format!("Using config `{}`", path.display()));
+            }
+            return self.run_connection_test(&requested_repo, &launcher);
+        }
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let repo = repository_root(&requested_repo, &self.ui)?;
@@ -1411,6 +1426,36 @@ impl<U: Ui> App<U> {
             return Ok(());
         }
         ProcessRunner::new(&self.ui).run_interactive(&command)
+    }
+
+    fn run_connection_test(&self, repo: &Path, launcher: &ClaudeLauncher) -> Result<()> {
+        let connection = connection_description(launcher);
+        let command = build_connection_test_command(repo, launcher, &self.cli.permission_mode);
+        self.ui
+            .info(&format!("Testing Claude connection {connection}"));
+        self.ui
+            .debug(&format!("connection test command: {}", command.display()));
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — the connection test will not contact the model");
+            self.ui.info(&command.display());
+            return Ok(());
+        }
+
+        let output = ProcessRunner::new(&self.ui).run(&command, "Waiting for model response")?;
+        let response = parse_connection_test_output(&output)?;
+        if response.contains(CONNECTION_TEST_MARKER) {
+            self.ui
+                .success(&format!("Connection {connection} responded successfully"));
+        } else {
+            self.ui.warn(&format!(
+                "Connection {connection} responded successfully but did not reproduce the requested marker"
+            ));
+        }
+        if self.cli.verbose {
+            self.ui.info(&format!("Model response: {response}"));
+        }
+        Ok(())
     }
 
     fn debug_configuration(&self, repo: &Path, launcher: &ClaudeLauncher) {

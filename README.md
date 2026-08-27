@@ -182,6 +182,19 @@ cargo install --path . --force
 opsx-build --repo ~/git/my-project "add function pointer support"
 ```
 
+Test one named Claude connection without starting an OpenSpec build:
+
+```sh
+opsx-build --test-connection openrouter-kimi
+opsx-build --test-connection openrouter-gemini --verbose
+```
+
+This sends a minimal no-tools prompt through the profile's configured command,
+environment, and model, verifies Claude's machine-readable result, and exits.
+It requires neither Git nor OpenSpec; `--repo` merely selects an existing
+working directory for the subprocess. `--dry-run` resolves the profile and
+prints its redacted command without contacting the model.
+
 Advance one item from an ordered slice agenda (both forms are equivalent):
 
 ```sh

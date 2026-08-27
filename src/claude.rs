@@ -20,6 +20,7 @@ use crate::{
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AWS_BASE_URL",
@@ -415,6 +416,69 @@ pub fn build_interactive_claude_command(
         CommandSpec::new(&launcher.program, repo).args(args),
         launcher,
     )
+}
+
+pub fn build_connection_test_command(
+    repo: &Path,
+    launcher: &ClaudeLauncher,
+    permission_mode: &str,
+) -> CommandSpec {
+    let mut args = launcher.prefix_args.clone();
+    if let Some(model) = &launcher.model {
+        args.extend(["--model".to_owned(), model.clone()]);
+    }
+    args.extend([
+        "--print".to_owned(),
+        "--output-format".to_owned(),
+        "json".to_owned(),
+        "--no-session-persistence".to_owned(),
+        "--permission-mode".to_owned(),
+        permission_mode.to_owned(),
+        format!(
+            "Connectivity test only. Do not inspect files, invoke tools, or perform any other work. Reply with exactly {CONNECTION_TEST_MARKER}."
+        ),
+    ]);
+    with_launcher_environment(
+        CommandSpec::new(&launcher.program, repo).args(args),
+        launcher,
+    )
+}
+
+pub fn parse_connection_test_output(output: &ProcessOutput) -> Result<String> {
+    if !output.success {
+        bail!(
+            "Claude connection test failed (exit {}): {}",
+            output
+                .code
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+            diagnostic_text(output)
+        );
+    }
+    let result = parse_output_values(&output.stdout)
+        .into_iter()
+        .rev()
+        .find(|value| {
+            value.get("type").is_none()
+                || value.get("type").and_then(Value::as_str) == Some("result")
+        })
+        .with_context(|| "Claude connection test returned no machine-readable result")?;
+    let text = result
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if result
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("Claude connection test reported an error: {text}");
+    }
+    if text.is_empty() {
+        bail!("Claude connection test returned an empty model response");
+    }
+    Ok(text)
 }
 
 fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
@@ -1457,6 +1521,69 @@ mod tests {
                 (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
             ]
+        );
+    }
+
+    #[test]
+    fn constructs_a_minimal_non_persistent_connection_test() {
+        let launcher = ClaudeLauncher::parse(
+            "omlx launch claude",
+            Some("test-model".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let command = build_connection_test_command(Path::new("/repo"), &launcher, "auto");
+
+        assert_eq!(command.program, "omlx");
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "test-model"])
+        );
+        assert!(command.args.iter().any(|arg| arg == "--print"));
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "--no-session-persistence")
+        );
+        assert!(
+            command
+                .args
+                .last()
+                .is_some_and(|prompt| prompt.contains(CONNECTION_TEST_MARKER))
+        );
+        assert!(!command.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!command.accepts_stream_messages);
+    }
+
+    #[test]
+    fn parses_a_machine_readable_connection_test_response() {
+        let output = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: format!(r#"{{"is_error":false,"result":"{CONNECTION_TEST_MARKER}"}}"#),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            parse_connection_test_output(&output).unwrap(),
+            CONNECTION_TEST_MARKER
+        );
+
+        let error = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: r#"{"is_error":true,"result":"authentication failed"}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(
+            parse_connection_test_output(&error)
+                .unwrap_err()
+                .to_string()
+                .contains("authentication failed")
         );
     }
 

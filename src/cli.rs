@@ -18,6 +18,7 @@ pub struct Cli {
     pub request: String,
     pub repo: PathBuf,
     pub interactive: bool,
+    pub test_connection: Option<String>,
     pub update_skills: bool,
     pub resume: bool,
     pub forget: bool,
@@ -111,12 +112,34 @@ struct CliArgs {
     #[arg(long)]
     interactive: bool,
 
+    /// Send one minimal prompt through a named Claude connection and exit.
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with_all = [
+            "request",
+            "interactive",
+            "update_skills",
+            "resume",
+            "forget",
+            "continue_existing",
+            "loop_workflow",
+            "no_loop",
+            "max_iterations",
+            "change",
+            "direction",
+            "worker_connection"
+        ]
+    )]
+    test_connection: Option<String>,
+
     /// Install or refresh the bundled unattended skills, then exit.
     #[arg(
         long,
         conflicts_with_all = [
             "request",
             "interactive",
+            "test_connection",
             "resume",
             "forget",
             "continue_existing",
@@ -475,9 +498,10 @@ where
 
 fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Result<Cli> {
     let worker_profile = selected_connection(
-        args.worker_connection
+        args.test_connection.as_deref().or(args
+            .worker_connection
             .as_deref()
-            .or(config.worker_connection.as_deref()),
+            .or(config.worker_connection.as_deref())),
         &config.connections,
     )?;
     let frontier_profile = selected_connection(
@@ -520,6 +544,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         Some(value) if value.trim().eq_ignore_ascii_case("next slice") => "advance".to_owned(),
         Some(value) => value.to_owned(),
         None if args.interactive
+            || args.test_connection.is_some()
             || args.update_skills
             || args.resume
             || args.forget
@@ -533,6 +558,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         request,
         repo: args.repo,
         interactive: args.interactive,
+        test_connection: args.test_connection,
         update_skills: args.update_skills,
         resume: args.resume,
         forget: args.forget,
@@ -1332,6 +1358,48 @@ mod tests {
         assert!(cli.interactive);
         assert!(cli.request.is_empty());
         assert_eq!(cli.interactive_args, ["--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn connection_test_selects_one_profile_without_a_build_request() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "local"
+
+                [connections.local]
+                model = "local-model"
+
+                [connections.openrouter-kimi]
+                model = "moonshotai/kimi-k3"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args(["opsx-build", "--test-connection", "openrouter-kimi"]),
+            config,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cli.test_connection.as_deref(), Some("openrouter-kimi"));
+        assert!(cli.request.is_empty());
+        assert_eq!(
+            cli.worker_connection.name.as_deref(),
+            Some("openrouter-kimi")
+        );
+        assert_eq!(
+            cli.worker_connection.model.as_deref(),
+            Some("moonshotai/kimi-k3")
+        );
+        assert!(
+            CliArgs::try_parse_from([
+                "opsx-build",
+                "--test-connection",
+                "openrouter-kimi",
+                "build something",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
