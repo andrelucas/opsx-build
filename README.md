@@ -115,6 +115,17 @@ without invoking Claude.
 
 Free-form requests retain the exploratory workflow:
 
+```sh
+opsx-build --change remote-path-prefix \
+  "Implement optional remote base-URI path prefixes"
+```
+
+`--change NAME` prescribes the exact OpenSpec change name for a free-form
+request. Propose must create only that change; opsx-build validates it directly
+rather than inferring the name from the set of active changes. Omit `--change`
+to retain automatic naming. A prescribed name cannot be combined with a
+multi-change campaign.
+
 1. Run `/explore-unattended` in a new Claude planning session.
 2. Explicitly `/compact` that session.
 3. Run `/propose-unattended` in the compacted planning session. If the
@@ -137,6 +148,11 @@ Free-form requests retain the exploratory workflow:
 8. Run Archive in a fresh session after verification succeeds.
 9. Ask Claude in another fresh session to commit the completed change as
    `openspec: complete <change>`.
+
+Before each Claude milestone-commit session, opsx-build records the current
+Git commit. It proceeds only if that commit remains an ancestor of the result.
+This catches rewritten or displaced committed history without imposing rules
+about paths, dirty files, commit count, merges, or other working-tree shape.
 
 Every Claude invocation is a blocking subprocess. The checkpoint records only
 workflow facts: request, assigned agenda slice when advancing, change name,

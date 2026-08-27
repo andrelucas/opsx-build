@@ -360,6 +360,7 @@ impl<U: Ui> App<U> {
         } else {
             RunState::new(self.cli.request.clone(), before_changes)
         };
+        self.assign_requested_change(&mut state)?;
         self.assign_agenda(&repo, &mut state)?;
         arm_slice_baseline(&repo, &mut state, &self.ui)?;
         persist_state(&repo, &state, &self.ui)?;
@@ -406,6 +407,22 @@ impl<U: Ui> App<U> {
                 state.agenda = Some(assignment);
             }
         }
+        Ok(())
+    }
+
+    fn assign_requested_change(&self, state: &mut RunState) -> Result<()> {
+        let Some(change) = self.cli.change.as_deref() else {
+            return Ok(());
+        };
+        validate_change_name(change)?;
+        if state.before_changes.changes.contains_key(change) {
+            bail!(
+                "OpenSpec change `{change}` is already active; continue it with `--continue-existing --change {change}`"
+            );
+        }
+        state.change = Some(change.to_owned());
+        self.ui
+            .info(&format!("Prescribing OpenSpec change `{change}`"));
         Ok(())
     }
 
@@ -1039,6 +1056,8 @@ impl<U: Ui> App<U> {
             "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change."
         } else if state.agenda.is_some() {
             "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
+        } else if state.change.is_some() {
+            "Use the exact prescribed change name and create or continue only that OpenSpec change. Do not substitute a generated name or modify another active change."
         } else {
             "Use conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE."
         };
@@ -1105,13 +1124,15 @@ impl<U: Ui> App<U> {
                 other => bail!("propose returned unexpected terminal status {other:?}"),
             }
 
-            let assigned_complete_without_list_change = state
+            let assigned_change = state
                 .agenda
                 .as_ref()
-                .filter(|assignment| after.changes.contains_key(&assignment.change))
-                .map(|assignment| {
-                    planning_status(repo, &assignment.change, &self.ui)
-                        .map(|status| status.is_complete)
+                .map(|assignment| assignment.change.as_str())
+                .or(state.change.as_deref());
+            let assigned_complete_without_list_change = assigned_change
+                .filter(|change| after.changes.contains_key(*change))
+                .map(|change| {
+                    planning_status(repo, change, &self.ui).map(|status| status.is_complete)
                 })
                 .transpose()?
                 .unwrap_or(false);
@@ -1129,13 +1150,9 @@ impl<U: Ui> App<U> {
                 );
             }
 
-            let change_result = match &state.agenda {
-                Some(assignment) if assigned_complete_without_list_change => {
-                    Ok(assignment.change.clone())
-                }
-                Some(assignment) => {
-                    identify_assigned_change(&state.before_changes, &after, &assignment.change)
-                }
+            let change_result = match assigned_change {
+                Some(change) if assigned_complete_without_list_change => Ok(change.to_owned()),
+                Some(change) => identify_assigned_change(&state.before_changes, &after, change),
                 None => identify_change(&state.before_changes, &after),
             };
             let change = change_result.with_context(|| {
@@ -1199,13 +1216,16 @@ impl<U: Ui> App<U> {
                 "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
         };
+        let baseline = current_head(repo, &self.ui)?;
         let result = invoke_fresh(
             claude,
             &format!("{change}-proposal-commit"),
             &stage_prompt("", &task, StageProtocol::Ready),
             "Claude is committing the proposal",
             StageProtocol::Ready,
-        )?;
+        );
+        verify_milestone_ancestry(repo, baseline.as_deref(), "proposal", &self.ui)?;
+        let result = result?;
         require_ready("proposal commit", &result.text, result.signal)?;
         state.proposal_head = current_head(repo, &self.ui)?;
         state.stage = state.stage.after_ready()?;
@@ -1460,6 +1480,7 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
+        let baseline = current_head(repo, &self.ui)?;
         let task = if state.bootstrap {
             format!(
                 "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
@@ -1475,7 +1496,9 @@ impl<U: Ui> App<U> {
             &stage_prompt("", &task, StageProtocol::Ready),
             "Claude is committing the completed change",
             StageProtocol::Ready,
-        )?;
+        );
+        verify_milestone_ancestry(repo, baseline.as_deref(), "completion", &self.ui)?;
+        let result = result?;
         require_ready("completion commit", &result.text, result.signal)?;
         state.final_head = current_head(repo, &self.ui)?;
         state.stage = state.stage.after_ready()?;
@@ -1500,6 +1523,7 @@ impl<U: Ui> App<U> {
         } else {
             RunState::new(self.cli.request.clone(), ChangeSnapshot::default())
         };
+        self.assign_requested_change(&mut dry_state)?;
         self.assign_agenda(repo, &mut dry_state)?;
         if dry_state.stage == Stage::Done {
             self.ui.info("Advance: the ordered agenda is complete");
@@ -1825,6 +1849,12 @@ fn campaign_subject(state: &RunState) -> String {
             content = assignment.content.trim()
         );
     }
+    if let Some(change) = &state.change {
+        return format!(
+            "{}\n\nUse the exact OpenSpec change name `{change}`. During exploration, investigate without creating artifacts. During proposal, create or continue only `{change}` and do not select or modify a differently named change.",
+            state.request
+        );
+    }
     match &state.campaign {
         Some(campaign) => format!(
             "{}\n\nThis is campaign iteration {}. Select and pursue exactly one coherent, bounded remaining slice toward the objective. Use the repository and archived OpenSpec history as durable evidence of earlier iterations. If the overall objective is already satisfied and no meaningful slice remains, carry that conclusion into Propose so it can return DONE without creating artifacts.",
@@ -1932,6 +1962,23 @@ fn require_change(state: &RunState) -> Result<String> {
         .change
         .clone()
         .context("workflow state has no OpenSpec change name")
+}
+
+fn verify_milestone_ancestry<U: Ui>(
+    repo: &Path,
+    baseline: Option<&str>,
+    milestone: &str,
+    ui: &U,
+) -> Result<()> {
+    let Some(baseline) = baseline else {
+        return Ok(());
+    };
+    if head_descends_from(repo, baseline, ui)? {
+        return Ok(());
+    }
+    bail!(
+        "the {milestone} milestone replaced previously committed Git history: starting commit `{baseline}` is no longer an ancestor of HEAD. The repository has been left untouched for recovery through Git's reflog"
+    )
 }
 
 fn archive_is_absent(changes: &ChangeSnapshot, change: &str) -> bool {
@@ -2128,6 +2175,21 @@ mod tests {
         assert!(subject.contains("automation/slices/002-test-harness.md"));
         assert!(subject.contains("## Objective"));
         assert!(subject.contains("Do not select, create, or modify a different slice"));
+    }
+
+    #[test]
+    fn prescribed_change_subject_forbids_automatic_renaming() {
+        let mut state = RunState::new(
+            "support remote URI path prefixes".to_owned(),
+            ChangeSnapshot::default(),
+        );
+        state.change = Some("remote-path-prefix".to_owned());
+
+        let subject = campaign_subject(&state);
+
+        assert!(subject.contains("support remote URI path prefixes"));
+        assert!(subject.contains("exact OpenSpec change name `remote-path-prefix`"));
+        assert!(subject.contains("do not select or modify a differently named change"));
     }
 
     #[test]

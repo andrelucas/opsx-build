@@ -83,6 +83,7 @@ impl Cli {
     }
 
     fn resolve(args: CliArgs) -> Result<Self> {
+        let request_was_supplied = args.request.is_some();
         let command_line_max_iterations = args.max_iterations.is_some();
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
@@ -98,6 +99,16 @@ impl Cli {
         }
         if !cli.bootstrap_defines.is_empty() && cli.request != "bootstrap" {
             anyhow::bail!("--define is only valid with `opsx-build bootstrap`");
+        }
+        if cli.change.is_some() && !cli.continue_existing {
+            if !request_was_supplied || cli.request == "advance" {
+                anyhow::bail!(
+                    "--change requires an explicit free-form request or --continue-existing"
+                );
+            }
+            if cli.loop_workflow {
+                anyhow::bail!("--change cannot prescribe one name for a multi-change campaign");
+            }
         }
         if cli.request == "bootstrap" {
             if cli.bootstrap_context.is_none() {
@@ -221,11 +232,10 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_MAX_ITERATIONS", value_name = "N")]
     max_iterations: Option<std::num::NonZeroU32>,
 
-    /// Select the OpenSpec change used by --continue-existing when several are active.
+    /// Prescribe a new change name, or select one used by --continue-existing.
     #[arg(
         long,
         value_name = "NAME",
-        requires = "continue_existing",
         conflicts_with_all = ["interactive", "resume", "forget"]
     )]
     change: Option<String>,
@@ -1614,8 +1624,28 @@ mod tests {
     }
 
     #[test]
-    fn change_selection_requires_continue_existing() {
-        assert!(CliArgs::try_parse_from(["opsx-build", "--change", "fix-test-harness"]).is_err());
+    fn change_prescribes_a_free_form_request_or_selects_an_existing_change() {
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--change",
+            "remote-path-prefix",
+            "support remote URI path prefixes",
+        ]))
+        .unwrap();
+        assert_eq!(cli.change.as_deref(), Some("remote-path-prefix"));
+        assert_eq!(cli.request, "support remote URI path prefixes");
+
+        assert!(Cli::resolve(args(["opsx-build", "--change", "fix-test-harness"])).is_err());
+        assert!(
+            Cli::resolve(args([
+                "opsx-build",
+                "--change",
+                "fix-test-harness",
+                "--loop",
+                "build something",
+            ]))
+            .is_err()
+        );
         assert!(
             CliArgs::try_parse_from([
                 "opsx-build",

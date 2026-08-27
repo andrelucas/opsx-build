@@ -136,7 +136,7 @@ pub fn committed_paths_since<U: Ui>(repo: &Path, baseline: &str, ui: &U) -> Resu
 pub fn head_descends_from<U: Ui>(repo: &Path, baseline: &str, ui: &U) -> Result<bool> {
     let output = ProcessRunner::new(ui).run(
         &CommandSpec::new("git", repo).args(["merge-base", "--is-ancestor", baseline, "HEAD"]),
-        "Checking frontier commit ancestry",
+        "Checking Git commit ancestry",
     )?;
     match output.code {
         Some(0) => Ok(true),
@@ -573,6 +573,26 @@ mod tests {
         assert!(
             !baseline_matches_except(&repo, &baseline, Some("automation/slices/"), &ui).unwrap()
         );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn ancestry_check_accepts_descendants_and_rejects_replaced_history() {
+        let repo = fixture();
+        let ui = TerminalUi::new(false, false, false);
+        let baseline = current_head(&repo, &ui).unwrap().unwrap();
+
+        fs::write(repo.join("next.txt"), "next\n").unwrap();
+        git(&repo, &["add", "next.txt"]);
+        git(&repo, &["commit", "-qm", "descendant"]);
+        assert!(head_descends_from(&repo, &baseline, &ui).unwrap());
+
+        git(&repo, &["checkout", "-q", "--orphan", "replacement"]);
+        fs::write(repo.join("replacement.txt"), "replacement\n").unwrap();
+        git(&repo, &["add", "replacement.txt"]);
+        git(&repo, &["commit", "-qm", "replacement history"]);
+        assert!(!head_descends_from(&repo, &baseline, &ui).unwrap());
+
         fs::remove_dir_all(repo).unwrap();
     }
 }
