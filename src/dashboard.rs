@@ -19,6 +19,9 @@ use crossterm::{
 use crate::stream::{StreamControl, StreamItem};
 
 const MAX_DISPLAY_LINES: usize = 20_000;
+const MAX_CLAUDE_MESSAGE_LINES: usize = 200;
+const CLAUDE_MESSAGE_HEAD_LINES: usize = 120;
+const CLAUDE_MESSAGE_TAIL_LINES: usize = MAX_CLAUDE_MESSAGE_LINES - CLAUDE_MESSAGE_HEAD_LINES;
 const SOURCE_LABEL_WIDTH: usize = 8;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -347,8 +350,12 @@ impl StreamDashboard {
     }
 
     pub(crate) fn push(&mut self, item: &StreamItem) {
+        if let StreamItem::Assistant(text) = item {
+            self.push_claude_message(text);
+            return;
+        }
         let (label, color, text) = match item {
-            StreamItem::Assistant(text) => ("claude", Color::Cyan, text),
+            StreamItem::Assistant(_) => unreachable!("assistant messages returned above"),
             StreamItem::Subagent(text) => ("agent", Color::Blue, text),
             StreamItem::Tool(text) => ("tool", Color::Yellow, text),
             StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
@@ -356,6 +363,21 @@ impl StreamDashboard {
             StreamItem::Raw(text) => ("json", Color::DarkGrey, text),
         };
         self.push_message(label, color, text);
+    }
+
+    fn push_claude_message(&mut self, text: &str) {
+        let lines = text.lines().collect::<Vec<_>>();
+        if lines.len() <= MAX_CLAUDE_MESSAGE_LINES {
+            self.push_message("claude", Color::Cyan, text);
+            return;
+        }
+
+        let omitted = lines.len() - MAX_CLAUDE_MESSAGE_LINES;
+        let mut displayed = lines[..CLAUDE_MESSAGE_HEAD_LINES].to_vec();
+        let marker = format!("… {omitted} lines omitted from this Claude message …");
+        displayed.push(&marker);
+        displayed.extend_from_slice(&lines[lines.len() - CLAUDE_MESSAGE_TAIL_LINES..]);
+        self.push_message("claude", Color::Cyan, &displayed.join("\n"));
     }
 
     fn push_line(&mut self, line: DisplayLine) {
@@ -1245,6 +1267,28 @@ mod tests {
                 color: Color::Cyan,
             })
         );
+    }
+
+    #[test]
+    fn long_claude_messages_keep_their_beginning_and_conclusion() {
+        let mut dashboard = dashboard();
+        let message = (0..250)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        dashboard.push(&StreamItem::Assistant(message));
+
+        let lines = &dashboard.panels[0].lines;
+        assert_eq!(lines.len(), MAX_CLAUDE_MESSAGE_LINES + 1);
+        assert_eq!(lines[0].text, "line 0");
+        assert_eq!(lines[CLAUDE_MESSAGE_HEAD_LINES - 1].text, "line 119");
+        assert_eq!(
+            lines[CLAUDE_MESSAGE_HEAD_LINES].text,
+            "… 50 lines omitted from this Claude message …"
+        );
+        assert_eq!(lines[CLAUDE_MESSAGE_HEAD_LINES + 1].text, "line 170");
+        assert_eq!(lines.back().unwrap().text, "line 249");
     }
 
     #[test]

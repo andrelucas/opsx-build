@@ -720,6 +720,12 @@ Its arrow buttons move one line, its track is clickable, and its thumb can be
 dragged. Mouse-wheel and keyboard scrolling continue to work; reaching the
 bottom resumes tail-following.
 
+An individual Claude message is limited to 200 displayed lines in the
+dashboard. Longer messages retain their first 120 and final 80 lines with an
+omission marker showing the number of hidden lines. This affects presentation
+only; subprocess capture and workflow result parsing retain the complete
+message.
+
 Campaign mode adds the iteration number to the header and retains a compact
 summary row for every completed change. The active iteration continues to use
 the existing phase disclosures; starting the next iteration clears the old
