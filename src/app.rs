@@ -1444,13 +1444,13 @@ impl<U: Ui> App<U> {
 
         let output = ProcessRunner::new(&self.ui).run(&command, "Waiting for model response")?;
         let response = parse_connection_test_output(&output)?;
-        if response.contains(CONNECTION_TEST_MARKER) {
+        if response == CONNECTION_TEST_MARKER {
             self.ui
                 .success(&format!("Connection {connection} responded successfully"));
         } else {
-            self.ui.warn(&format!(
-                "Connection {connection} responded successfully but did not reproduce the requested marker"
-            ));
+            bail!(
+                "Claude transport succeeded, but response compatibility failed: expected exactly `{CONNECTION_TEST_MARKER}`, received {response:?}"
+            );
         }
         if self.cli.verbose {
             self.ui.info(&format!("Model response: {response}"));

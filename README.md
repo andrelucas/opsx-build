@@ -195,6 +195,12 @@ It requires neither Git nor OpenSpec; `--repo` merely selects an existing
 working directory for the subprocess. `--dry-run` resolves the profile and
 prints its redacted command without contacting the model.
 
+The probe distinguishes transport from usable response compatibility. A model
+turn may reach the provider and complete successfully yet emit no visible text,
+for example after producing only hidden thinking tokens. That confirms the
+route but still fails the command because the model did not return the required
+marker. A non-marker response likewise fails with a compatibility diagnostic.
+
 Advance one item from an ordered slice agenda (both forms are equivalent):
 
 ```sh

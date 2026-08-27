@@ -480,8 +480,19 @@ pub fn parse_connection_test_output(output: &ProcessOutput) -> Result<String> {
     {
         bail!("Claude connection test reported an error: {text}");
     }
+    let completed_without_text = text.is_empty()
+        && result.get("subtype").and_then(Value::as_str) == Some("success")
+        && result.get("terminal_reason").and_then(Value::as_str) == Some("completed")
+        && result.get("stop_reason").and_then(Value::as_str) == Some("end_turn");
+    if completed_without_text {
+        bail!(
+            "Claude transport succeeded, but response compatibility failed: the model completed normally without visible text instead of returning `{CONNECTION_TEST_MARKER}`"
+        );
+    }
     if text.is_empty() {
-        bail!("Claude connection test returned an empty model response");
+        bail!(
+            "Claude transport succeeded, but response compatibility failed: Claude returned an unexplained empty model response"
+        );
     }
     Ok(text)
 }
@@ -1594,6 +1605,33 @@ mod tests {
         assert_eq!(
             parse_connection_test_output(&output).unwrap(),
             CONNECTION_TEST_MARKER
+        );
+
+        let completed_without_text = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: r#"{"is_error":false,"subtype":"success","terminal_reason":"completed","stop_reason":"end_turn","result":""}"#.to_owned(),
+            stderr: String::new(),
+        };
+        let completed_error = parse_connection_test_output(&completed_without_text).unwrap_err();
+        assert!(
+            completed_error
+                .to_string()
+                .contains("transport succeeded, but response compatibility failed")
+        );
+        assert!(completed_error.to_string().contains(CONNECTION_TEST_MARKER));
+
+        let unexplained_empty = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: r#"{"is_error":false,"result":""}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(
+            parse_connection_test_output(&unexplained_empty)
+                .unwrap_err()
+                .to_string()
+                .contains("unexplained empty model response")
         );
 
         let error = ProcessOutput {
