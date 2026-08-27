@@ -16,6 +16,7 @@ const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub request: String,
+    pub bootstrap_context: Option<PathBuf>,
     pub repo: PathBuf,
     pub interactive: bool,
     pub test_connection: Option<String>,
@@ -91,6 +92,30 @@ impl Cli {
         if cli.loop_workflow && cli.continue_existing {
             anyhow::bail!("--loop cannot be combined with --continue-existing");
         }
+        if cli.bootstrap_context.is_some() && cli.request != "bootstrap" {
+            anyhow::bail!("--context is only valid with `opsx-build bootstrap`");
+        }
+        if cli.request == "bootstrap" {
+            if cli.bootstrap_context.is_none() {
+                anyhow::bail!("`opsx-build bootstrap` requires --context PATH");
+            }
+            if cli.interactive
+                || cli.test_connection.is_some()
+                || cli.update_skills
+                || cli.resume
+                || cli.forget
+                || cli.continue_existing
+                || cli.loop_workflow
+                || cli.no_loop
+                || cli.max_iterations.is_some()
+                || cli.change.is_some()
+                || cli.direction.is_some()
+            {
+                anyhow::bail!(
+                    "`opsx-build bootstrap` cannot be combined with another workflow mode"
+                );
+            }
+        }
         Ok(cli)
     }
 }
@@ -102,8 +127,12 @@ impl Cli {
     about = "Build an OpenSpec change through synchronous Claude stages"
 )]
 struct CliArgs {
-    /// Change request. Defaults to `advance`, which follows automation/slices in order.
+    /// Change request, `advance`, or `bootstrap`. Defaults to `advance`.
     request: Option<String>,
+
+    /// Markdown project context used by `opsx-build bootstrap`.
+    #[arg(long, value_name = "PATH")]
+    context: Option<PathBuf>,
 
     /// Repository containing .git, openspec/, and Claude skills.
     #[arg(long, default_value = ".", value_name = "PATH")]
@@ -265,7 +294,7 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_WORKER_CONNECTION", value_name = "NAME")]
     worker_connection: Option<String>,
 
-    /// Command prefix used to launch the frontier planner after local escalation.
+    /// Command prefix used for bootstrap, frontier planning, and local escalation.
     #[arg(long, env = "OPSX_BUILD_FRONTIER_COMMAND", value_name = "COMMAND")]
     frontier_command: Option<String>,
 
@@ -273,7 +302,7 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_FRONTIER_MODEL", value_name = "MODEL")]
     frontier_model: Option<String>,
 
-    /// Named connection profile used for frontier replanning.
+    /// Named connection profile used for bootstrap and frontier replanning.
     #[arg(long, env = "OPSX_BUILD_FRONTIER_CONNECTION", value_name = "NAME")]
     frontier_connection: Option<String>,
 
@@ -558,6 +587,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
     };
     Ok(Cli {
         request,
+        bootstrap_context: args.context,
         repo: args.repo,
         interactive: args.interactive,
         test_connection: args.test_connection,
@@ -1460,6 +1490,30 @@ mod tests {
 
         let alias = Cli::resolve(args(["opsx-build", "next slice"])).unwrap();
         assert_eq!(alias.request, "advance");
+    }
+
+    #[test]
+    fn bootstrap_requires_an_explicit_markdown_context() {
+        let cli =
+            Cli::resolve(args(["opsx-build", "bootstrap", "--context", "project.md"])).unwrap();
+        assert_eq!(cli.request, "bootstrap");
+        assert_eq!(
+            cli.bootstrap_context.as_deref(),
+            Some(std::path::Path::new("project.md"))
+        );
+
+        assert!(Cli::resolve(args(["opsx-build", "bootstrap"])).is_err());
+        assert!(Cli::resolve(args(["opsx-build", "advance", "--context", "project.md"])).is_err());
+        assert!(
+            Cli::resolve(args([
+                "opsx-build",
+                "bootstrap",
+                "--context",
+                "project.md",
+                "--loop"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

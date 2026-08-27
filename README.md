@@ -19,6 +19,61 @@ configuration self-contained. `--dry-run` reports the installation or update
 without writing it. The retired monolithic `build-unattended` skill is not
 installed because orchestration belongs in this process.
 
+## Bootstrap a new project
+
+Create a Markdown file that states the project goal, technology choices,
+constraints, and a concrete definition of done, then run:
+
+```sh
+opsx-build --repo ~/git/my-project \
+  --frontier-connection openrouter-kimi \
+  bootstrap --context project.md
+```
+
+Bootstrap requires an existing Git repository but no existing OpenSpec setup.
+It uses the configured **frontier** connection for the complete one-time
+planning workflow; the worker connection is not used. The context path is an
+input source and may live inside or outside the target repository. opsx-build
+embeds its contents into `openspec/config.yaml` but does not assume the source
+file itself should be committed.
+
+The command:
+
+1. initializes OpenSpec non-interactively for Claude;
+2. creates `openspec/config.yaml` from the supplied context;
+3. installs the reusable planning brief at `automation/bootstrap.md`;
+4. adds or refreshes only the marked `opsx-build` fragment in `CLAUDE.md`,
+   preserving all user-owned text outside its markers;
+5. runs the planning-only `bootstrap-implementation-slices` change through the
+   existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
+   commit stages; and
+6. checks that the result is a parseable ordered agenda with a README, bounded
+   slice contracts, and the terminal whole-project gate
+   `automation/slices/9999-project-acceptance.md`.
+
+The bootstrap planner is explicitly told to use the OpenSpec project context
+rather than rediscovering the source tree, to create no product code, and to
+cover the complete goal rather than stopping at an attractive early milestone.
+Once the final `9999` slice is archived, `advance` has a concrete definition of
+DONE.
+
+Bootstrap uses the same durable checkpoint and fresh-session stage engine as a
+normal build. If it is interrupted after initialization, continue with:
+
+```sh
+opsx-build --repo ~/git/my-project --resume
+```
+
+The checkpoint remembers that this is a frontier bootstrap; resume will not
+silently move it onto the local worker. Use `--dry-run` to inspect the planned
+initialization and generated paths without writing or invoking Claude.
+
+This first version intentionally does not merge into an existing OpenSpec
+configuration or replace an existing agenda. It stops before initialization if
+either already exists. The selected OpenSpec profile must expose Propose,
+Apply, Verify, and Archive actions; if it does not, enable those actions and run
+`openspec update` before resuming.
+
 ## Workflow
 
 `advance` is the well-known ordered-agenda operation and the default when no

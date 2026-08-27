@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision},
+    bootstrap::{
+        BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, init_command,
+        instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
+    },
     claude::{
         CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode,
         SkillCommands, StageProtocol, StageSignal, build_claude_command,
@@ -70,6 +74,8 @@ struct RunState {
     slice_baseline: Option<SliceBaseline>,
     #[serde(default)]
     frontier_replans: u32,
+    #[serde(default)]
+    bootstrap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +126,7 @@ impl RunState {
             agenda: None,
             slice_baseline: None,
             frontier_replans: 0,
+            bootstrap: false,
         }
     }
 
@@ -156,7 +163,22 @@ impl RunState {
             agenda: None,
             slice_baseline: None,
             frontier_replans: 0,
+            bootstrap: false,
         }
+    }
+
+    fn bootstrap(before_changes: ChangeSnapshot) -> Self {
+        let mut state = Self::new("bootstrap".to_owned(), before_changes);
+        state.change = Some(BOOTSTRAP_CHANGE.to_owned());
+        state.stage = Stage::Propose;
+        state.agenda = Some(AgendaAssignment {
+            path: BOOTSTRAP_PATH.to_owned(),
+            change: BOOTSTRAP_CHANGE.to_owned(),
+            title: "Bootstrap implementation agenda".to_owned(),
+            content: bootstrap_instructions().to_owned(),
+        });
+        state.bootstrap = true;
+        state
     }
 
     fn consume_direction(&mut self) {
@@ -230,6 +252,24 @@ impl<U: Ui> App<U> {
                 ));
             }
             return Ok(());
+        }
+
+        if self.cli.bootstrap_context.is_some() {
+            let frontier_launcher = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
+            if frontier_launcher.program != "claude" {
+                prerequisite_exists(&frontier_launcher.program, &repo, &self.ui)?;
+            }
+            prerequisite_exists("claude", &repo, &self.ui)?;
+            prerequisite_exists("openspec", &repo, &self.ui)?;
+            self.debug_configuration(&repo, &frontier_launcher);
+            if let Some(path) = &self.cli.config_path {
+                self.ui.info(&format!("Using config `{}`", path.display()));
+            }
+            self.ui.info(&format!(
+                "Bootstrap planner: {}",
+                connection_description(&frontier_launcher)
+            ));
+            return self.run_bootstrap(&repo, &frontier_launcher);
         }
 
         let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
@@ -386,6 +426,52 @@ impl<U: Ui> App<U> {
         Ok(changes.len())
     }
 
+    fn run_bootstrap(&self, repo: &Path, frontier_launcher: &ClaudeLauncher) -> Result<()> {
+        let context_path = self
+            .cli
+            .bootstrap_context
+            .as_deref()
+            .context("bootstrap context path was not resolved")?;
+        let scaffold = BootstrapScaffold::plan(repo, context_path)?;
+        let init = init_command(repo);
+
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — bootstrap files and subprocesses will not be created");
+            self.ui
+                .info(&format!("Project context: `{}`", context_path.display()));
+            self.ui
+                .info(&format!("Initialize OpenSpec: {}", init.display()));
+            for path in BootstrapScaffold::paths() {
+                self.ui.info(&format!("Create or update `{path}`"));
+            }
+            self.ui.info(&format!(
+                "Run `{BOOTSTRAP_CHANGE}` through Propose, proposal commit, Apply, Verify/repair, Archive, and completion commit on the frontier connection"
+            ));
+            self.ui.info(
+                "Require an ordered agenda ending at `automation/slices/9999-project-acceptance.md`",
+            );
+            return Ok(());
+        }
+
+        ProcessRunner::new(&self.ui).checked(&init, "Initializing OpenSpec")?;
+        scaffold.write(repo)?;
+        self.ui.success("Created bootstrap planning inputs");
+        self.synchronize_skills(repo)?;
+        let before_changes = openspec_snapshot(repo, &self.ui)?;
+        let state = RunState::bootstrap(before_changes);
+        persist_state(repo, &state, &self.ui)?;
+        let commands = SkillCommands::discover(repo, &self.cli).with_context(|| {
+            "OpenSpec initialization did not install the complete Propose/Apply/Verify/Archive workflow; enable the required OpenSpec actions and run `openspec update`"
+        })?;
+        self.ui.debug(&format!(
+            "bootstrap workflow commands: propose=`{}`, apply=`{}`, verify=`{}`, archive=`{}`",
+            commands.propose, commands.apply, commands.verify, commands.archive
+        ));
+
+        self.run_workflows(repo, frontier_launcher, frontier_launcher, &commands, state)
+    }
+
     fn continue_existing(
         &self,
         repo: &Path,
@@ -472,7 +558,9 @@ impl<U: Ui> App<U> {
             self.assign_agenda(repo, &mut state)?;
         }
 
-        if state.slice_baseline.is_none() && matches!(state.stage, Stage::Explore | Stage::Propose)
+        if !state.bootstrap
+            && state.slice_baseline.is_none()
+            && matches!(state.stage, Stage::Explore | Stage::Propose)
         {
             arm_slice_baseline(repo, &mut state, &self.ui)?;
         }
@@ -506,7 +594,12 @@ impl<U: Ui> App<U> {
         }
 
         persist_state(repo, &state, &self.ui)?;
-        self.run_workflows(repo, launcher, frontier_launcher, commands, state)
+        let workflow_launcher = if state.bootstrap {
+            frontier_launcher
+        } else {
+            launcher
+        };
+        self.run_workflows(repo, workflow_launcher, frontier_launcher, commands, state)
     }
 
     fn run_workflows(
@@ -524,6 +617,18 @@ impl<U: Ui> App<U> {
             .then(Instant::now);
             match self.execute(repo, launcher, commands, state)? {
                 WorkflowOutcome::TooLarge(escalated) => {
+                    if escalated.bootstrap {
+                        let summary = escalated
+                            .too_large
+                            .as_ref()
+                            .map(|outcome| outcome.summary.trim())
+                            .unwrap_or(
+                                "the frontier planner could not complete bootstrap planning",
+                            );
+                        bail!(
+                            "bootstrap planning did not fit the configured frontier model: {summary}. The checkpoint and repository work were preserved; resume with a more capable frontier connection or refine the project context"
+                        );
+                    }
                     state = self.run_frontier_replan(repo, frontier_launcher, escalated)?;
                     persist_state(repo, &state, &self.ui)?;
                 }
@@ -824,10 +929,14 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,
-        )
-        .with_stage_timeout(Duration::from_secs(
-            u64::from(self.cli.local_worker_timeout_minutes) * 60,
-        ));
+        );
+        let worker_claude = if state.bootstrap {
+            worker_claude
+        } else {
+            worker_claude.with_stage_timeout(Duration::from_secs(
+                u64::from(self.cli.local_worker_timeout_minutes) * 60,
+            ))
+        };
         self.ui.change_name(state.change.as_deref());
 
         loop {
@@ -915,7 +1024,9 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
-        let planning_context = if state.agenda.is_some() {
+        let planning_context = if state.bootstrap {
+            "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change."
+        } else if state.agenda.is_some() {
             "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
         } else {
             "Use conclusions from exploration and preserve correct partial proposal artifacts from any interrupted attempt. If the requested objective is already satisfied and no coherent implementation work remains, do not create or modify OpenSpec artifacts; report DONE."
@@ -1068,9 +1179,15 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let task = format!(
-            "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
-        );
+        let task = if state.bootstrap {
+            format!(
+                "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragment in `CLAUDE.md`, and OpenSpec's project-local Claude integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. Use commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+            )
+        } else {
+            format!(
+                "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+            )
+        };
         let result = invoke_fresh(
             claude,
             &format!("{change}-proposal-commit"),
@@ -1092,9 +1209,15 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let base = format!(
-            "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
-        );
+        let base = if state.bootstrap {
+            format!(
+                "{change}\n\nApply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, using `openspec/config.yaml` as the project authority. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Do not archive the bootstrap change."
+            )
+        } else {
+            format!(
+                "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
+            )
+        };
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let Some(result) = worker_result(
             invoke_fresh(
@@ -1127,17 +1250,20 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
+        let verify_subject = if state.bootstrap {
+            format!(
+                "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md` and the complete project goal in `openspec/config.yaml`. Confirm that no product code was implemented, every material goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with all concrete corrections when it is not."
+            )
+        } else {
+            format!(
+                "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
+            )
+        };
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
                 &format!("{change}-verify-{}", state.verify_retries + 1),
-                &stage_prompt(
-                    &commands.verify,
-                    &format!(
-                        "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
-                    ),
-                    StageProtocol::Verify,
-                ),
+                &stage_prompt(&commands.verify, &verify_subject, StageProtocol::Verify),
                 "Claude is verifying specification compliance",
                 StageProtocol::Verify,
             ),
@@ -1150,6 +1276,32 @@ impl<U: Ui> App<U> {
         };
         match result.signal {
             StageSignal::Verified => {
+                if state.bootstrap {
+                    match validate_bootstrap_agenda(repo) {
+                        Ok(count) => self.ui.success(&format!(
+                            "Bootstrap agenda passed structural checks ({count} slices)"
+                        )),
+                        Err(error) => {
+                            state.verify_retries += 1;
+                            if state.verify_retries > self.cli.max_verify_retries {
+                                bail!(
+                                    "bootstrap agenda still failed its structural postcondition after {} repair cycle(s): {error}",
+                                    self.cli.max_verify_retries
+                                );
+                            }
+                            state.pending_repair = Some(format!(
+                                "OpenSpec verification reported success, but the deterministic bootstrap agenda check failed: {error}. Correct the agenda without implementing product code."
+                            ));
+                            state.stage = Stage::Repair;
+                            persist_state(repo, state, &self.ui)?;
+                            self.ui.warn(&format!(
+                                "Bootstrap agenda requires structural repair {}/{}: {error}",
+                                state.verify_retries, self.cli.max_verify_retries
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
                 self.ui.success("Verification passed");
                 state.pending_repair = None;
                 state.stage = state.stage.after_verified()?;
@@ -1211,9 +1363,15 @@ impl<U: Ui> App<U> {
         let finding = state.pending_repair.as_deref().unwrap_or(
             "No verifier finding was supplied; apply the user's direction and re-run relevant checks.",
         );
-        let base = format!(
-            "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. If the verifier has exposed that the assigned slice cannot reliably fit one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition. Do not use TOO_LARGE for an ordinary correctable verification failure.\n\nVerifier context:\n{finding}"
-        );
+        let base = if state.bootstrap {
+            format!(
+                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts. Do not implement product code and do not create implementation OpenSpec changes. Re-check the complete goal in `openspec/config.yaml`.\n\nVerifier context:\n{finding}"
+            )
+        } else {
+            format!(
+                "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. If the verifier has exposed that the assigned slice cannot reliably fit one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition. Do not use TOO_LARGE for an ordinary correctable verification failure.\n\nVerifier context:\n{finding}"
+            )
+        };
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let Some(result) = worker_result(
             invoke_fresh(
@@ -1291,9 +1449,15 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let task = format!(
-            "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
-        );
+        let task = if state.bootstrap {
+            format!(
+                "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+            )
+        } else {
+            format!(
+                "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+            )
+        };
         let result = invoke_fresh(
             claude,
             &format!("{change}-completion-commit"),
@@ -1631,6 +1795,12 @@ fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
 }
 
 fn campaign_subject(state: &RunState) -> String {
+    if state.bootstrap {
+        return format!(
+            "Bootstrap this repository by carrying out the exact planning assignment below. Create or continue only the OpenSpec change `{BOOTSTRAP_CHANGE}`. This change decomposes the complete project goal into a durable agenda for later worker-model runs; it does not implement product functionality. Treat `openspec/config.yaml` as the project authority and do not survey the product source tree.\n\nAssigned bootstrap file: `{BOOTSTRAP_PATH}`\n\n--- BEGIN BOOTSTRAP ASSIGNMENT ---\n{}\n--- END BOOTSTRAP ASSIGNMENT ---",
+            bootstrap_instructions().trim()
+        );
+    }
     if let Some(assignment) = &state.agenda {
         let iteration = state
             .campaign
@@ -1889,6 +2059,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         agenda: None,
         slice_baseline: None,
         frontier_replans: 0,
+        bootstrap: false,
     })
 }
 

@@ -139,7 +139,7 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
     Ok(AgendaSelection::Complete)
 }
 
-fn parse_slice_name(file_name: &str) -> Option<(Vec<u32>, String, String)> {
+pub(crate) fn parse_slice_name(file_name: &str) -> Option<(Vec<u32>, String, String)> {
     let stem = file_name.strip_suffix(".md")?;
     let (ordinal_text, slug) = stem.split_once('-')?;
     let ordinal = ordinal_text

@@ -1,5 +1,6 @@
 pub mod agenda;
 pub mod app;
+pub mod bootstrap;
 pub mod claude;
 pub mod cli;
 mod dashboard;
