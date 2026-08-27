@@ -422,6 +422,22 @@ impl StreamDashboard {
                     );
                     return StreamControl::Pause;
                 }
+                KeyCode::Char('f') => {
+                    if !self.frontier_available() {
+                        self.push_message(
+                            "frontier",
+                            Color::Yellow,
+                            "Frontier replanning is available only during Explore, Propose, Apply, Verify, or Repair",
+                        );
+                        return StreamControl::None;
+                    }
+                    self.push_message(
+                        "frontier",
+                        Color::Magenta,
+                        "Stopping the local worker and requesting frontier replanning",
+                    );
+                    return StreamControl::Escalate;
+                }
                 KeyCode::Char('c') if !self.compact_requested => {
                     self.compact_requested = true;
                     self.push_message(
@@ -480,6 +496,19 @@ impl StreamDashboard {
             _ => {}
         }
         StreamControl::None
+    }
+
+    fn frontier_available(&self) -> bool {
+        self.panels
+            .iter()
+            .rev()
+            .find(|panel| panel.status == PhaseStatus::Running)
+            .is_some_and(|panel| {
+                matches!(
+                    panel.stage.title.as_str(),
+                    "Explore" | "Propose" | "Apply" | "Verify" | "Repair"
+                )
+            })
     }
 
     fn handle_injection_event(&mut self, event: Event) -> StreamControl {
@@ -839,7 +868,7 @@ impl StreamDashboard {
                     } else {
                         ""
                     };
-                    format!("p pause · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
+                    format!("p pause · f frontier · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
                 |input| format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop"),
             );
@@ -1325,6 +1354,55 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("checkpoint will be preserved")
+        );
+    }
+
+    #[test]
+    fn plain_f_requests_frontier_escalation() {
+        let mut dashboard = dashboard();
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::Escalate
+        );
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("frontier replanning")
+        );
+    }
+
+    #[test]
+    fn frontier_escalation_does_not_interrupt_a_milestone_phase() {
+        let mut dashboard = dashboard();
+        dashboard.set_stage(StageView {
+            current: 3,
+            total: 7,
+            title: "Proposal commit".to_owned(),
+            started_at: Instant::now(),
+        });
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert!(
+            dashboard
+                .panels
+                .last()
+                .unwrap()
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("available only")
         );
     }
 

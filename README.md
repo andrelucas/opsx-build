@@ -4,9 +4,12 @@
 runs each Claude/OpenSpec phase, records the next phase in local metadata, and
 lets the repository, OpenSpec artifacts, and Claude do their own jobs.
 
-It deliberately does **not** infer file ownership, fingerprint dirty files,
-police Git HEAD, reset the repository, or clean up work. Claude creates the two
-milestone commits under explicit non-destructive instructions.
+During an ordinary run it deliberately does **not** infer file ownership,
+fingerprint dirty files, or police Git HEAD. Claude creates the two milestone
+commits under explicit non-destructive instructions. The one deliberate
+exception is frontier escalation: before Propose, opsx-build records a private
+rollback baseline so a failed oversized local attempt can be discarded without
+rejecting or losing pre-existing staged, unstaged, or untracked work.
 
 `opsx-build` bundles the canonical `explore-unattended` and
 `propose-unattended` Claude skills. Before a workflow starts, it installs
@@ -25,6 +28,9 @@ request is supplied. If the repository contains files named
 slice as complete only when a matching OpenSpec change has been archived, and
 assigns the earliest unarchived slice. A date-prefixed archived or active
 change still matches when its name ends with the complete slice stem.
+Hierarchical ordinals such as `0009.1-short-circuit.md` are sorted numerically
+(`0009.2` precedes `0009.10`) and map to kebab-case OpenSpec names such as
+`0009-1-short-circuit`.
 
 An advance operation persists the exact slice path, contents, and required
 OpenSpec change name before Claude starts. It skips Explore because the
@@ -65,12 +71,22 @@ next stage, planning session, retry count, pending verifier finding, pending
 user direction, milestone HEADs, and any `TOO_LARGE` decomposition report.
 
 `TOO_LARGE` is a normal worker-routing outcome, distinct from `BLOCKED` and
-ordinary failure. It is accepted from Explore, Propose, Apply, and Repair. The
-checkpoint stays at the current stage and records the model's explanation and
-suggested ordered decomposition. This version stops there; automatic handoff
-to a frontier planner and model switching are deliberately deferred to the
-next routing layer. After the slice has been decomposed or revised, `--resume`
-explicitly retries the preserved stage.
+ordinary failure. It is accepted from Explore, Propose, Apply, and Repair.
+Agenda runs also escalate when a bounded worker stage exceeds
+`local_worker_timeout_minutes`, exhausts output-limit recovery, exhausts the
+Verify/Repair allowance, or receives the dashboard's `f` command.
+
+On escalation, opsx-build retains a diagnostic and any failed commits under
+private Git metadata, then restores the exact pre-Propose Git-visible state. A
+fresh frontier Claude process narrows the original agenda file, adds one or
+more hierarchical child slices, and commits only `automation/slices/`.
+Deterministic postconditions require the original first slice to remain next,
+at least one child to exist, OpenSpec state to be unchanged, all frontier
+commits to be agenda-only, and the pre-existing dirty state to be identical.
+The local workflow then restarts at Propose for the smaller first slice.
+Recursive fallback is capped at three successful frontier replans for one
+in-progress slice; reaching the cap restores the baseline and stops as an
+ordinary error rather than looping forever.
 
 With live streaming enabled, opsx-build uses Claude Code's documented
 [bidirectional `stream-json` transport][claude-streaming]. It keeps the current
@@ -89,8 +105,10 @@ If a Claude result reports `stop_reason: max_tokens` or a
 `max_output_tokens` API failure, opsx-build treats the turn as interrupted
 rather than failed. It best-effort compacts that same Claude session and asks it
 to continue the current phase from durable repository state. This recovery is
-bounded by `max_output_retries` (default 3); exhausting it leaves the checkpoint
-at the current phase for an ordinary `--resume`.
+bounded by `max_output_retries` (default 3). Exhausting it in a bounded worker
+phase requests the same frontier replan; narrow milestone and archive phases
+still fail normally rather than treating protocol trouble as a slice-sizing
+decision.
 
 ## Campaign loop
 
@@ -111,15 +129,24 @@ Each iteration gets a fresh planning session. Agenda-driven iterations use the
 six stages from Propose through completion; free-form campaigns use the normal
 seven-stage workflow beginning with Explore. An agenda campaign ends when
 every slice is archived. A free-form campaign ends when `propose-unattended`
-returns `DONE`. Either stops immediately on `TOO_LARGE`, `BLOCKED`,
-interruption, or an ordinary error. There is no additional whole-workflow retry
-policy around the existing stages.
+returns `DONE`. Agenda `TOO_LARGE` outcomes are subdivided and retried; either
+kind of campaign stops on `BLOCKED`, interruption, or an unrecoverable ordinary
+error. There is no additional whole-workflow retry policy around the existing
+stages.
 
-An optional circuit breaker reports an incomplete-campaign error after a fixed
-number of completed changes:
+An optional cumulative circuit breaker pauses the campaign cleanly after a
+fixed total number of completed changes:
 
 ```sh
 opsx-build --loop --max-iterations 20 "finish the compiler"
+```
+
+The completed checkpoint and campaign history are preserved. If work remains,
+opsx-build explains that the ceiling is cumulative and prints a concrete
+resume command with a higher total, for example:
+
+```sh
+opsx-build --repo ~/git/my-project --resume --loop --max-iterations 40
 ```
 
 Campaign metadata is stored with the normal checkpoint: current iteration,
@@ -255,8 +282,18 @@ canonical location on the next write.
 
 ## Git behavior
 
-The orchestrator never runs destructive Git operations and never decides which
-working-tree paths belong to whom.
+Normal workflow stages never reset, clean, stash, or infer ownership of the
+working tree. Frontier escalation is an explicit transactional exception: at
+the start of a slice, opsx-build records HEAD, index/worktree state, and
+Git-visible untracked files without changing them. If the local worker
+escalates, its commits are anchored under `refs/opsx-build/recovery/`, its
+status and binary diff are retained under the repository's private Git
+metadata, and the recorded state is restored before frontier planning.
+
+This rollback is intentionally not a clean-tree requirement. A slice may begin
+with user edits, and the rollback test requires those staged, unstaged, and
+untracked edits to return exactly. Ignored files are outside Git's visible
+baseline and are not copied or cleaned.
 
 At proposal and completion milestones, Claude is instructed to inspect status,
 history, and diffs; commit only work belonging to the OpenSpec change; preserve
@@ -266,8 +303,9 @@ without manufacturing an empty commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
-terminal results, missing prerequisites, and retry-limit exhaustion are normal
-errors. Their checkpoint remains at the unfinished stage for resume.
+terminal results, missing prerequisites, and rejected frontier postconditions
+are normal errors. Their checkpoint remains at the unfinished stage for
+resume.
 
 ## Claude launcher and configuration
 
@@ -277,12 +315,16 @@ The default launcher is `claude`. oMLX Claude mode can be configured with:
 # ~/.config/opsx-build/config.toml
 max_verify_retries = 3
 max_output_retries = 3
+local_worker_timeout_minutes = 60
 # Optional campaign defaults:
 # loop = true
 # max_iterations = 20
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
+# Frontier planning defaults to plain `claude` and that harness's default model.
+frontier_command = "claude"
+# frontier_model = "opus"
 auto_compact_window = "128k"
 # Alternatively, compact at a percentage of the launcher's effective capacity.
 # auto_compact_percent = 50
@@ -290,6 +332,66 @@ max_output_tokens = "8k"
 # Optional: reveal Claude's normal assistant/tool activity in the dashboard.
 # stream_claude = "activity"
 ```
+
+The flat launcher fields remain supported for existing configurations. Named
+Claude connection profiles are recommended when worker and frontier use
+different models, endpoints, or credentials:
+
+```toml
+worker_connection = "local"
+frontier_connection = "kimi"
+
+[connections.local]
+command = "omlx launch claude"
+model = "qwen3.6-35b-a3b"
+auto_compact_window = "128k"
+max_output_tokens = "8k"
+
+[connections.kimi]
+command = "claude"
+model = "kimi-k3"
+
+[connections.kimi.env]
+ANTHROPIC_BASE_URL = "https://provider.example/anthropic"
+ANTHROPIC_AUTH_TOKEN = { from_env = "KIMI_API_KEY" }
+```
+
+Select a configured connection for one invocation with:
+
+```sh
+opsx-build --worker-connection local --frontier-connection kimi --loop advance
+```
+
+`--claude-command`, `--claude-model`, and the worker token-policy flags override
+the selected worker profile. `--frontier-command` and `--frontier-model`
+override the selected frontier profile. A profile may also set its own
+`auto_compact_window`, `auto_compact_percent`, and `max_output_tokens`; frontier
+profiles therefore do not accidentally inherit worker policy.
+
+Profile `env` values may be literal strings or `{ from_env = "NAME" }`
+references. References keep credentials out of the TOML file, are resolved only
+when that profile is selected, and are redacted from displayed commands and
+debug output. Literal variables with names containing `TOKEN`, `KEY`, `SECRET`,
+or `PASSWORD` are also redacted, but storing credentials literally is not
+recommended.
+
+Named profiles are isolated by default: inherited Claude endpoint,
+authentication, and provider-selection variables are removed before the
+profile's own environment is applied. Add `isolate = false` only when a profile
+intentionally depends on ambient Claude connection variables. `unset_env`
+removes additional named variables:
+
+```toml
+[connections.slow-local]
+command = "omlx launch claude"
+model = "larger-model"
+unset_env = ["HTTP_PROXY"]
+```
+
+A hosted connection must still be usable by Claude Code. Direct endpoints or
+gateways should implement the Anthropic Messages interface expected by
+[Claude Code's LLM gateway support][claude-gateway]; opsx-build does not adapt
+an OpenAI-only chat endpoint into Claude's agent protocol.
 
 Set the same limits for one invocation with:
 
@@ -304,13 +406,27 @@ Output-limit recovery can likewise be adjusted for one run:
 opsx-build --max-output-retries 5 "add function pointer support"
 ```
 
+Select another frontier harness/model or worker-stage timeout with:
+
+```sh
+opsx-build --frontier-command claude --frontier-model opus \
+  --local-worker-timeout-minutes 45 --loop advance
+```
+
+The frontier launcher deliberately does not inherit the worker launcher's
+model or token policy. With no frontier profile or model override, plain
+`claude` uses the harness default. Frontier replanning provides the
+configured command with repository planning context and permission to edit and
+commit `automation/slices/`; configure it only to a destination permitted to
+receive that repository content.
+
 Token counts may be plain integers (`8192`) or use binary `k`/`m` suffixes;
 `8k` therefore means 8,192 tokens. `auto_compact_percent` accepts an integer
 from 1 to 100 and applies to the effective capacity selected by Claude or its
 launcher, so opsx-build does not need model visibility. The configured values
-are exported to every Claude subprocess as
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
-`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, including interactive launcher tests, without
+are exported to every Claude subprocess selected by that connection, including
+interactive worker-launcher tests, through `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, without
 changing the parent shell. Leaving a setting absent preserves Claude's or the
 launcher's default.
 
@@ -325,9 +441,9 @@ turns.
 Configuration precedence is:
 
 ```text
-command-line flags
-  > OPSX_BUILD_* environment variables
-  > config file
+command-line or OPSX_BUILD_* field override
+  > selected named connection profile
+  > legacy flat config field
   > built-in defaults
 ```
 
@@ -356,11 +472,16 @@ The corresponding environment variables are:
 
 - `OPSX_BUILD_MAX_VERIFY_RETRIES`
 - `OPSX_BUILD_MAX_OUTPUT_RETRIES`
+- `OPSX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES`
 - `OPSX_BUILD_LOOP`
 - `OPSX_BUILD_MAX_ITERATIONS`
 - `OPSX_BUILD_PERMISSION_MODE`
 - `OPSX_BUILD_CLAUDE_COMMAND`
 - `OPSX_BUILD_CLAUDE_MODEL`
+- `OPSX_BUILD_WORKER_CONNECTION`
+- `OPSX_BUILD_FRONTIER_COMMAND`
+- `OPSX_BUILD_FRONTIER_MODEL`
+- `OPSX_BUILD_FRONTIER_CONNECTION`
 - `OPSX_BUILD_AUTO_COMPACT_WINDOW`
 - `OPSX_BUILD_AUTO_COMPACT_PERCENT`
 - `OPSX_BUILD_MAX_OUTPUT_TOKENS`
@@ -397,7 +518,7 @@ options:
 
 - `--print` and `--permission-mode`;
 - `--session-id`, `--resume`, and `--name`;
-- `--model` when `claude_model` is configured;
+- `--model` when the selected connection configures a model;
 - `--output-format json` for normal unattended operation;
 - `--input-format stream-json --output-format stream-json --verbose
   --forward-subagent-text` when live streaming is enabled;
@@ -492,6 +613,8 @@ Controls:
 
 - `p` immediately stops the active Claude subprocess and exits successfully,
   preserving the current phase checkpoint for `--resume`;
+- `f` during Explore, Propose, Apply, Verify, or Repair stops the local worker
+  and requests frontier subdivision at the next orchestration opportunity;
 - `c` sends Claude's interrupt control request—the streaming equivalent of
   Escape—then runs `/compact` and reissues the interrupted stage command (once
   per invocation);
@@ -547,6 +670,7 @@ flags and are not read from the config file.
 [claude-streaming]: https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode
 [claude-slash-commands]: https://code.claude.com/docs/en/agent-sdk/slash-commands
 [claude-env-vars]: https://code.claude.com/docs/en/env-vars
+[claude-gateway]: https://code.claude.com/docs/en/llm-gateway
 
 ## Interactive launcher testing
 
@@ -577,6 +701,7 @@ OPSX_STATUS: TOO_LARGE
 OPSX_STATUS: VERIFIED
 OPSX_STATUS: RETRY
 OPSX_STATUS: BLOCKED
+OPSX_STATUS: REPLANNED
 ```
 
 Explore, Apply, and Repair use `READY`, `TOO_LARGE`, or `BLOCKED`. Propose also
@@ -584,7 +709,8 @@ accepts `DONE`. Archive and commit stages use `READY` or `BLOCKED`; Verify uses
 `VERIFIED`, `RETRY`, or `BLOCKED`. `DONE` means no OpenSpec change was created
 or modified because the requested objective is already satisfied; in campaign
 mode it terminates the outer loop successfully. `TOO_LARGE` means the assigned
-worker slice needs decomposition before another local attempt.
+worker slice needs decomposition before another local attempt. The frontier
+planner uses `REPLANNED` only after committing a valid agenda subdivision.
 
 The corrected structured field and fallback marker are `opsx_status` and
 `OPSX_STATUS`. Results using the old `ospx_status` or `OSPX_STATUS` spellings
@@ -606,8 +732,12 @@ archive is not repeated merely because its acknowledgement was malformed.
   only one active change.
 - The process is synchronous; campaign mode repeats complete runs in the same
   foreground process. There is no daemon or web UI.
-- Claude is responsible for the quality and scope of Git commits. The runner
-  intentionally does not second-guess them.
+- Automatic frontier subdivision currently requires an ordered
+  `automation/slices/` assignment. Free-form work can report `TOO_LARGE`, but
+  cannot yet be subdivided automatically.
+- Claude remains responsible for normal proposal/completion commit scope. The
+  runner applies deterministic path and state checks only to the special
+  frontier agenda commit.
 
 ## Development
 

@@ -11,6 +11,7 @@ pub enum StreamControl {
     Inject(String),
     Interrupt,
     Pause,
+    Escalate,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]

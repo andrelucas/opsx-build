@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -38,11 +38,42 @@ impl std::fmt::Display for PauseRequested {
 
 impl std::error::Error for PauseRequested {}
 
+#[derive(Debug)]
+pub struct WorkerEscalationRequested {
+    reason: String,
+}
+
+impl WorkerEscalationRequested {
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for WorkerEscalationRequested {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "local worker escalation requested: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for WorkerEscalationRequested {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
+    redacted_env: BTreeSet<String>,
     pub cwd: PathBuf,
     pub initial_stdin: Option<String>,
     pub accepts_stream_messages: bool,
@@ -54,6 +85,8 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            env_remove: Vec::new(),
+            redacted_env: BTreeSet::new(),
             cwd: cwd.into(),
             initial_stdin: None,
             accepts_stream_messages: false,
@@ -66,8 +99,34 @@ impl CommandSpec {
     }
 
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push((name.into(), value.into()));
+        self.set_env(name.into(), value.into(), false);
         self
+    }
+
+    pub fn secret_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.set_env(name.into(), value.into(), true);
+        self
+    }
+
+    pub fn remove_env(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        if !self.env_remove.contains(&name) {
+            self.env_remove.push(name);
+        }
+        self
+    }
+
+    fn set_env(&mut self, name: String, value: String, redacted: bool) {
+        if let Some((_, existing)) = self.env.iter_mut().find(|(key, _)| key == &name) {
+            *existing = value;
+        } else {
+            self.env.push((name.clone(), value));
+        }
+        if redacted {
+            self.redacted_env.insert(name);
+        } else {
+            self.redacted_env.remove(&name);
+        }
     }
 
     pub fn stream_input(mut self, initial: impl Into<String>) -> Self {
@@ -82,11 +141,20 @@ impl CommandSpec {
     }
 
     pub fn display(&self) -> String {
-        let mut parts = self
-            .env
-            .iter()
-            .map(|(name, value)| format!("{name}={}", shell_quote(value)))
-            .collect::<Vec<_>>();
+        let mut parts = Vec::new();
+        if !self.env_remove.is_empty() {
+            parts.push("env".to_owned());
+            for name in &self.env_remove {
+                parts.extend(["-u".to_owned(), shell_quote(name)]);
+            }
+        }
+        parts.extend(self.env.iter().map(|(name, value)| {
+            if self.redacted_env.contains(name) {
+                format!("{name}=<redacted>")
+            } else {
+                format!("{name}={}", shell_quote(value))
+            }
+        }));
         parts.push(shell_quote(&self.program));
         parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
         parts.join(" ")
@@ -205,6 +273,19 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         &self,
         spec: &CommandSpec,
         activity: &str,
+        on_stdout_line: F,
+    ) -> Result<ProcessOutput>
+    where
+        F: FnMut(&str),
+    {
+        self.run_streaming_with_timeout(spec, activity, None, on_stdout_line)
+    }
+
+    pub fn run_streaming_with_timeout<F>(
+        &self,
+        spec: &CommandSpec,
+        activity: &str,
+        timeout: Option<Duration>,
         mut on_stdout_line: F,
     ) -> Result<ProcessOutput>
     where
@@ -240,8 +321,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut read_error: Option<std::io::Error> = None;
         let mut cancelled = false;
         let mut pause_requested = false;
+        let mut escalation_reason = None;
         let mut cancel_started = None;
         let mut forced_stop = false;
+        let started_at = std::time::Instant::now();
         let mut child_stdin = child.stdin.take();
         let mut sent_messages = usize::from(spec.initial_stdin.is_some());
         let mut completed_messages = 0usize;
@@ -372,6 +455,23 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             if !cancelled {
+                if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
+                    let limit = timeout.expect("timeout was checked above");
+                    let reason = format!(
+                        "local worker exceeded its {} minute stage timeout",
+                        limit.as_secs() / 60
+                    );
+                    self.ui
+                        .warn(&format!("{reason}; stopping it before frontier replanning"));
+                    child_stdin.take();
+                    cancelled = true;
+                    escalation_reason = Some(reason);
+                    cancel_started = Some(std::time::Instant::now());
+                    if let Err(error) = interrupt_stream_process(&mut child) {
+                        read_error.get_or_insert(error);
+                    }
+                    continue;
+                }
                 match self.ui.poll_stream() {
                     StreamControl::None => {}
                     StreamControl::Interrupt => {
@@ -386,6 +486,16 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                         child_stdin.take();
                         cancelled = true;
                         pause_requested = true;
+                        cancel_started = Some(std::time::Instant::now());
+                        if let Err(error) = interrupt_stream_process(&mut child) {
+                            read_error.get_or_insert(error);
+                        }
+                    }
+                    StreamControl::Escalate => {
+                        child_stdin.take();
+                        cancelled = true;
+                        escalation_reason =
+                            Some("frontier assistance requested from the terminal".to_owned());
                         cancel_started = Some(std::time::Instant::now());
                         if let Err(error) = interrupt_stream_process(&mut child) {
                             read_error.get_or_insert(error);
@@ -461,6 +571,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         self.ui.output(&output.stdout, &output.stderr);
         if pause_requested {
             return Err(PauseRequested::new(spec.cwd.clone()).into());
+        }
+        if let Some(reason) = escalation_reason {
+            return Err(WorkerEscalationRequested::new(reason).into());
         }
         if cancelled {
             bail!("streamed command interrupted by user");
@@ -605,8 +718,11 @@ fn control_response(line: &str, request_id: &str) -> Option<Result<(), String>> 
 
 fn command_for(spec: &CommandSpec) -> Command {
     let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    for name in &spec.env_remove {
+        command.env_remove(name);
+    }
     command
-        .args(&spec.args)
         .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .current_dir(&spec.cwd);
     command
@@ -719,7 +835,7 @@ pub fn diagnostic_text(output: &ProcessOutput) -> String {
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "-._/:=".contains(character))
@@ -748,6 +864,20 @@ mod tests {
             spec.display(),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW=196608 claude --name 'my change' simple"
         );
+    }
+
+    #[test]
+    fn redacts_secrets_and_displays_environment_removals() {
+        let spec = CommandSpec::new("claude", "/tmp/repo")
+            .remove_env("ANTHROPIC_API_KEY")
+            .env("ANTHROPIC_BASE_URL", "https://provider.example")
+            .secret_env("ANTHROPIC_AUTH_TOKEN", "do-not-print-me");
+        let display = spec.display();
+
+        assert!(display.starts_with("env -u ANTHROPIC_API_KEY "));
+        assert!(display.contains("ANTHROPIC_BASE_URL=https://provider.example"));
+        assert!(display.contains("ANTHROPIC_AUTH_TOKEN=<redacted>"));
+        assert!(!display.contains("do-not-print-me"));
     }
 
     #[test]
@@ -948,6 +1078,41 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
 
     #[cfg(unix)]
     #[test]
+    fn frontier_key_stops_the_worker_with_a_typed_escalation() {
+        let ui = InterruptingUi::new(StreamControl::Escalate);
+        let runner = ProcessRunner::new(&ui);
+        let spec = CommandSpec::new("sh", "/tmp").args(["-c", "sleep 30"]);
+
+        let error = runner
+            .run_streaming(&spec, "Apply", |_| {})
+            .expect_err("frontier escalation should stop the subprocess");
+        let escalation = error
+            .downcast_ref::<WorkerEscalationRequested>()
+            .expect("frontier escalation should remain a typed outcome");
+        assert!(escalation.reason().contains("terminal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_timeout_stops_the_worker_with_a_typed_escalation() {
+        let ui = InterruptingUi {
+            control: Mutex::new(None),
+            messages: Mutex::new(Vec::new()),
+        };
+        let runner = ProcessRunner::new(&ui);
+        let spec = CommandSpec::new("sh", "/tmp").args(["-c", "sleep 30"]);
+
+        let error = runner
+            .run_streaming_with_timeout(&spec, "Apply", Some(Duration::from_millis(25)), |_| {})
+            .expect_err("worker timeout should stop the subprocess");
+        let escalation = error
+            .downcast_ref::<WorkerEscalationRequested>()
+            .expect("worker timeout should remain a typed outcome");
+        assert!(escalation.reason().contains("stage timeout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn passes_explicit_environment_to_subprocesses() {
         let spec = CommandSpec::new("sh", "/tmp")
             .args(["-c", "printf %s \"$OPSX_BUILD_TEST_WINDOW\""])
@@ -955,6 +1120,20 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         let output = command_for(&spec).output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "196608");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_inherited_environment_from_subprocesses() {
+        let spec = CommandSpec::new("sh", "/tmp")
+            .args([
+                "-c",
+                "if [ -z \"${HOME+x}\" ]; then printf removed; else printf inherited; fi",
+            ])
+            .remove_env("HOME");
+        let output = command_for(&spec).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "removed");
     }
 
     #[cfg(unix)]

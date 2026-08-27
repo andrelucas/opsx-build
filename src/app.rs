@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,19 +10,25 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda},
+    agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision},
     claude::{
         ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode, SkillCommands,
         StageProtocol, StageSignal, build_claude_command, build_interactive_claude_command,
         stage_prompt,
     },
     cli::Cli,
-    git::{current_head, legacy_metadata_dir, metadata_dir, remove_metadata, repository_root},
+    git::{
+        SliceBaseline, baseline_matches_except, capture_slice_baseline, committed_paths_since,
+        current_head, head_descends_from, legacy_metadata_dir, metadata_dir,
+        release_slice_baseline, remove_metadata, repository_root, reset_to_slice_baseline,
+    },
     openspec::{
         ChangeSnapshot, identify_assigned_change, identify_change, planning_status,
         select_existing_change, snapshot as openspec_snapshot,
     },
-    process::{PauseRequested, ProcessRunner, prerequisite_exists},
+    process::{
+        PauseRequested, ProcessRunner, WorkerEscalationRequested, prerequisite_exists, shell_quote,
+    },
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::{CampaignIterationView, CampaignView, Ui},
@@ -31,6 +37,7 @@ use crate::{
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 4;
+const MAX_FRONTIER_REPLANS: u32 = 3;
 
 pub struct App<U: Ui> {
     cli: Cli,
@@ -58,6 +65,10 @@ struct RunState {
     campaign: Option<CampaignState>,
     #[serde(default)]
     agenda: Option<AgendaAssignment>,
+    #[serde(default)]
+    slice_baseline: Option<SliceBaseline>,
+    #[serde(default)]
+    frontier_replans: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +117,8 @@ impl RunState {
             too_large: None,
             campaign: None,
             agenda: None,
+            slice_baseline: None,
+            frontier_replans: 0,
         }
     }
 
@@ -140,6 +153,8 @@ impl RunState {
             too_large: None,
             campaign: None,
             agenda: None,
+            slice_baseline: None,
+            frontier_replans: 0,
         }
     }
 
@@ -202,13 +217,7 @@ impl<U: Ui> App<U> {
             return Ok(());
         }
 
-        let launcher = ClaudeLauncher::parse(
-            &self.cli.claude_command,
-            self.cli.claude_model.clone(),
-            self.cli.auto_compact_window,
-            self.cli.auto_compact_percent,
-            self.cli.max_output_tokens,
-        )?;
+        let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
         if launcher.program != "claude" {
             prerequisite_exists(&launcher.program, &repo, &self.ui)?;
         }
@@ -222,6 +231,31 @@ impl<U: Ui> App<U> {
         if self.cli.interactive {
             return self.run_interactive(&repo, &launcher);
         }
+
+        let frontier_launcher = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
+        if frontier_launcher.program != "claude" {
+            prerequisite_exists(&frontier_launcher.program, &repo, &self.ui)?;
+        }
+        if launcher.connection_name.is_some() || frontier_launcher.connection_name.is_some() {
+            self.ui.info(&format!(
+                "Connections: worker {}, frontier {}",
+                connection_description(&launcher),
+                connection_description(&frontier_launcher)
+            ));
+        }
+        self.ui.debug(&format!(
+            "frontier launcher: connection={:?}, program=`{}`, prefix args={:?}, model={:?}, environment={:?}, unset environment={:?}",
+            frontier_launcher.connection_name,
+            frontier_launcher.program,
+            frontier_launcher.prefix_args,
+            frontier_launcher.model,
+            frontier_launcher
+                .environment
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect::<Vec<_>>(),
+            frontier_launcher.unset_environment
+        ));
 
         prerequisite_exists("openspec", &repo, &self.ui)?;
         if !repo.join("openspec/config.yaml").is_file() {
@@ -238,7 +272,7 @@ impl<U: Ui> App<U> {
         ));
 
         if self.cli.resume {
-            return self.resume(&repo, &launcher, &commands);
+            return self.resume(&repo, &launcher, &frontier_launcher, &commands);
         }
 
         if let Some(existing) = try_load_state(&repo, &self.ui)? {
@@ -253,11 +287,11 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.continue_existing {
-            return self.continue_existing(&repo, &launcher, &commands);
+            return self.continue_existing(&repo, &launcher, &frontier_launcher, &commands);
         }
 
         if self.cli.dry_run {
-            return self.print_new_dry_run(&repo, &launcher, &commands);
+            return self.print_new_dry_run(&repo, &launcher, &frontier_launcher, &commands);
         }
 
         let before_changes = openspec_snapshot(&repo, &self.ui)?;
@@ -271,8 +305,9 @@ impl<U: Ui> App<U> {
             RunState::new(self.cli.request.clone(), before_changes)
         };
         self.assign_agenda(&repo, &mut state)?;
+        arm_slice_baseline(&repo, &mut state, &self.ui)?;
         persist_state(&repo, &state, &self.ui)?;
-        self.run_workflows(&repo, &launcher, &commands, state)
+        self.run_workflows(&repo, &launcher, &frontier_launcher, &commands, state)
     }
 
     fn assign_agenda(&self, repo: &Path, state: &mut RunState) -> Result<()> {
@@ -339,26 +374,31 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
+        frontier_launcher: &ClaudeLauncher,
         commands: &SkillCommands,
     ) -> Result<()> {
         let active_changes = openspec_snapshot(repo, &self.ui)?;
         let change = select_existing_change(&active_changes, self.cli.change.as_deref())?;
         validate_change_name(&change)?;
-        let state = RunState::continue_existing(change.clone(), active_changes);
+        let mut state = RunState::continue_existing(change.clone(), active_changes);
         self.ui.info(&format!(
             "Continuing OpenSpec change `{change}`; planning work will be committed if necessary"
         ));
         if self.cli.dry_run {
             return self.print_resume_dry_run(&state, commands);
         }
+        arm_slice_baseline(repo, &mut state, &self.ui)?;
         persist_state(repo, &state, &self.ui)?;
-        self.run_workflows(repo, launcher, commands, state)
+        self.run_workflows(repo, launcher, frontier_launcher, commands, state)
     }
 
     fn forget_checkpoint(&self, repo: &Path) -> Result<()> {
         if self.cli.dry_run {
             self.ui.warn("DRY RUN — the checkpoint would be forgotten");
             return Ok(());
+        }
+        if let Ok(Some(mut state)) = try_load_state(repo, &self.ui) {
+            release_state_baseline(repo, &mut state, &self.ui);
         }
         if remove_metadata(repo, &self.ui)? {
             self.ui.success(
@@ -374,6 +414,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
+        frontier_launcher: &ClaudeLauncher,
         commands: &SkillCommands,
     ) -> Result<()> {
         let mut state = load_state(repo, &self.ui)?;
@@ -387,9 +428,9 @@ impl<U: Ui> App<U> {
             bail!("the saved run is already done; start a new run or use `--forget`");
         }
 
-        if let Some(outcome) = state.too_large.take() {
+        if let Some(outcome) = state.too_large.as_ref() {
             self.ui.warn(&format!(
-                "Retrying {} after previous TOO_LARGE outcome: {}",
+                "Resuming frontier recovery after {} escalation: {}",
                 outcome.stage.title(),
                 outcome.summary.trim()
             ));
@@ -413,6 +454,11 @@ impl<U: Ui> App<U> {
             && state.planning_session.is_none()
         {
             self.assign_agenda(repo, &mut state)?;
+        }
+
+        if state.slice_baseline.is_none() && matches!(state.stage, Stage::Explore | Stage::Propose)
+        {
+            arm_slice_baseline(repo, &mut state, &self.ui)?;
         }
 
         if let Some(direction) = &self.cli.direction {
@@ -444,13 +490,14 @@ impl<U: Ui> App<U> {
         }
 
         persist_state(repo, &state, &self.ui)?;
-        self.run_workflows(repo, launcher, commands, state)
+        self.run_workflows(repo, launcher, frontier_launcher, commands, state)
     }
 
     fn run_workflows(
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
+        frontier_launcher: &ClaudeLauncher,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
@@ -460,18 +507,9 @@ impl<U: Ui> App<U> {
                 && state.planning_session.is_none())
             .then(Instant::now);
             match self.execute(repo, launcher, commands, state)? {
-                WorkflowOutcome::TooLarge(state) => {
-                    self.ui.finish_dashboard();
-                    let outcome = state
-                        .too_large
-                        .as_ref()
-                        .context("worker returned TOO_LARGE without durable outcome details")?;
-                    bail!(
-                        "TOO_LARGE during {}:\n{}\n\nAutomatic frontier decomposition is not implemented yet. Decompose or revise the assigned slice, then resume the preserved {} checkpoint.",
-                        outcome.stage.title(),
-                        outcome.summary.trim(),
-                        outcome.stage.title()
-                    );
+                WorkflowOutcome::TooLarge(escalated) => {
+                    state = self.run_frontier_replan(repo, frontier_launcher, escalated)?;
+                    persist_state(repo, &state, &self.ui)?;
                 }
                 WorkflowOutcome::Done(state) => {
                     self.ui.finish_dashboard();
@@ -542,18 +580,187 @@ impl<U: Ui> App<U> {
                     state.campaign = Some(campaign);
                     state.pending_direction = pending_direction;
                     self.assign_agenda(repo, &mut state)?;
+                    arm_slice_baseline(repo, &mut state, &self.ui)?;
                     if state.stage != Stage::Done
                         && max_iterations.is_some_and(|maximum| iteration >= maximum)
                     {
+                        let maximum = max_iterations.expect("campaign limit was checked above");
                         self.ui.finish_dashboard();
-                        bail!(
-                            "campaign reached its configured limit of {iteration} completed iteration(s) before the objective was complete"
+                        self.ui.success(&format!(
+                            "PAUSED — cumulative campaign limit reached after {iteration} completed iteration(s); `{change}` is complete"
+                        ));
+                        self.ui.info(
+                            "The campaign checkpoint and all completed iteration history were preserved.",
                         );
+                        self.ui.info(&format!(
+                            "Resume with a higher cumulative limit: {}",
+                            campaign_limit_resume_command(repo, maximum)
+                        ));
+                        return Ok(());
                     }
                     persist_state(repo, &state, &self.ui)?;
                 }
             }
         }
+    }
+
+    fn run_frontier_replan(
+        &self,
+        repo: &Path,
+        frontier_launcher: &ClaudeLauncher,
+        mut state: RunState,
+    ) -> Result<RunState> {
+        let outcome = state
+            .too_large
+            .clone()
+            .context("worker escalation omitted its durable outcome")?;
+        let assignment = state
+            .agenda
+            .clone()
+            .context("frontier subdivision currently requires an ordered agenda assignment")?;
+        let baseline = state
+            .slice_baseline
+            .clone()
+            .context("worker escalation has no recorded pre-Propose rollback baseline")?;
+        if state.frontier_replans >= MAX_FRONTIER_REPLANS {
+            reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+            bail!(
+                "frontier subdivision reached its limit of {MAX_FRONTIER_REPLANS} successful replans for `{}` after restoring the pre-Propose baseline; the latest worker report was: {}",
+                assignment.change,
+                outcome.summary.trim()
+            );
+        }
+
+        let rollback = reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+        self.ui.warn(&format!(
+            "Abandoned the local {} attempt and restored pre-Propose HEAD {}",
+            outcome.stage.title(),
+            short_hash(&baseline.head)
+        ));
+        self.ui.info(&format!(
+            "Failed-attempt diagnostic retained at `{}`",
+            rollback.diagnostic_path.display()
+        ));
+        if let Some(reference) = &rollback.recovery_ref {
+            self.ui
+                .info(&format!("Failed-attempt commits retained at `{reference}`"));
+        }
+        let restored_changes = openspec_snapshot(repo, &self.ui)?;
+        if restored_changes != state.before_changes {
+            bail!(
+                "pre-Propose rollback did not restore the recorded OpenSpec state; recovery data remains at `{}`",
+                rollback.diagnostic_path.display()
+            );
+        }
+
+        let frontier = ClaudeClient::new(
+            repo,
+            frontier_launcher,
+            &self.cli.permission_mode,
+            self.ui.supports_stream_input(),
+            self.cli.stream_claude,
+            self.cli.max_output_retries,
+            &self.ui,
+        );
+        let session = Uuid::new_v4();
+        let stage_number = outcome.stage.number().saturating_sub(1).max(1);
+        self.ui
+            .stage(stage_number, AGENDA_TOTAL_STAGES, "Frontier replan");
+        let base_prompt = frontier_replan_prompt(&assignment, &outcome);
+        let mut failure = None;
+        for attempt in 0..2 {
+            let prompt = match &failure {
+                None => base_prompt.clone(),
+                Some(failure) => format!(
+                    "{base_prompt}\n\nPOSTCONDITION REPAIR: The preceding frontier attempt was rejected: {failure}\nThe repository has again been restored to the recorded pre-Propose baseline, including any pre-existing user edits. Perform and commit the required agenda-only subdivision now."
+                ),
+            };
+            let result = match frontier.invoke(
+                if attempt == 0 {
+                    SessionMode::New {
+                        id: session,
+                        name: Some(format!("{}-frontier-replan", assignment.change)),
+                    }
+                } else {
+                    SessionMode::Resume { id: session }
+                },
+                &stage_prompt("", &prompt, StageProtocol::Frontier),
+                if attempt == 0 {
+                    "Frontier Claude is subdividing the oversized agenda slice"
+                } else {
+                    "Frontier Claude is correcting the agenda subdivision"
+                },
+                StageProtocol::Frontier,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return Err(error.context(
+                        "frontier replan invocation failed; the pre-Propose baseline was restored",
+                    ));
+                }
+            };
+            match result.signal {
+                StageSignal::Blocked => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return blocked("frontier replan", &result.text);
+                }
+                StageSignal::Replanned => {}
+                other => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    bail!("frontier replan returned unexpected terminal status {other:?}");
+                }
+            }
+
+            match frontier_replan_postcondition(
+                repo,
+                &baseline,
+                &assignment,
+                &state.before_changes,
+                &self.ui,
+            ) {
+                Ok(refreshed) => {
+                    state.frontier_replans += 1;
+                    state.too_large = None;
+                    state.change = Some(refreshed.change.clone());
+                    state.agenda = Some(refreshed);
+                    state.stage = Stage::Propose;
+                    state.planning_session = None;
+                    state.verify_retries = 0;
+                    state.pending_repair = None;
+                    state.proposal_head = None;
+                    state.final_head = None;
+                    state.before_changes = openspec_snapshot(repo, &self.ui)?;
+                    arm_slice_baseline(repo, &mut state, &self.ui)?;
+                    persist_state(repo, &state, &self.ui)?;
+                    if let Err(error) = release_slice_baseline(repo, &baseline, &self.ui) {
+                        self.ui.warn(&format!(
+                            "Could not release superseded rollback metadata; workflow state is unaffected: {error}"
+                        ));
+                    }
+                    self.ui.success(&format!(
+                        "Frontier replanned `{}` into smaller ordered slices; restarting at Propose",
+                        assignment.change
+                    ));
+                    return Ok(state);
+                }
+                Err(error) if attempt == 0 => {
+                    failure = Some(error.to_string());
+                    self.ui.warn(&format!(
+                        "Frontier replan did not satisfy its repository postcondition: {}",
+                        failure.as_deref().unwrap_or_default()
+                    ));
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                }
+                Err(error) => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return Err(error.context(
+                        "frontier replan failed its repository postcondition twice; the pre-Propose baseline was restored",
+                    ));
+                }
+            }
+        }
+        unreachable!("frontier retry loop always returns")
     }
 
     fn present_campaign(&self, state: &RunState) {
@@ -593,6 +800,18 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         );
+        let worker_claude = ClaudeClient::new(
+            repo,
+            launcher,
+            &self.cli.permission_mode,
+            true,
+            self.cli.stream_claude,
+            self.cli.max_output_retries,
+            &self.ui,
+        )
+        .with_stage_timeout(Duration::from_secs(
+            u64::from(self.cli.local_worker_timeout_minutes) * 60,
+        ));
         self.ui.change_name(state.change.as_deref());
 
         loop {
@@ -600,9 +819,13 @@ impl<U: Ui> App<U> {
                 return Ok(WorkflowOutcome::TooLarge(state));
             }
             if state.stage == Stage::Complete {
+                release_state_baseline(repo, &mut state, &self.ui);
+                persist_state(repo, &state, &self.ui)?;
                 return Ok(WorkflowOutcome::Complete(state));
             }
             if state.stage == Stage::Done {
+                release_state_baseline(repo, &mut state, &self.ui);
+                persist_state(repo, &state, &self.ui)?;
                 return Ok(WorkflowOutcome::Done(state));
             }
 
@@ -614,12 +837,12 @@ impl<U: Ui> App<U> {
             self.ui
                 .stage(stage_number, total_stages, state.stage.title());
             match state.stage {
-                Stage::Explore => self.run_explore(repo, &claude, commands, &mut state)?,
-                Stage::Propose => self.run_propose(repo, &claude, commands, &mut state)?,
+                Stage::Explore => self.run_explore(repo, &worker_claude, commands, &mut state)?,
+                Stage::Propose => self.run_propose(repo, &worker_claude, commands, &mut state)?,
                 Stage::ProposalCommit => self.run_proposal_commit(repo, &claude, &mut state)?,
-                Stage::Apply => self.run_apply(repo, &claude, commands, &mut state)?,
-                Stage::Verify => self.run_verify(repo, &claude, commands, &mut state)?,
-                Stage::Repair => self.run_repair(repo, &claude, commands, &mut state)?,
+                Stage::Apply => self.run_apply(repo, &worker_claude, commands, &mut state)?,
+                Stage::Verify => self.run_verify(repo, &worker_claude, commands, &mut state)?,
+                Stage::Repair => self.run_repair(repo, &worker_claude, commands, &mut state)?,
                 Stage::Archive => self.run_archive(repo, &claude, commands, &mut state)?,
                 Stage::FinalCommit => self.run_final_commit(repo, &claude, &mut state)?,
                 Stage::Complete | Stage::Done => unreachable!(),
@@ -637,12 +860,20 @@ impl<U: Ui> App<U> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
         let subject = campaign_subject(state);
-        let result = claude.invoke(
-            session_mode(session, is_new, "opsx-build-planning"),
-            &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
-            "Claude is exploring the change",
-            StageProtocol::Worker,
-        )?;
+        let Some(result) = worker_result(
+            claude.invoke(
+                session_mode(session, is_new, "opsx-build-planning"),
+                &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
+                "Claude is exploring the change",
+                StageProtocol::Worker,
+            ),
+            repo,
+            state,
+            &self.ui,
+        )?
+        else {
+            return Ok(());
+        };
         if !handle_worker_result(
             repo,
             state,
@@ -687,20 +918,28 @@ impl<U: Ui> App<U> {
             } else {
                 base.clone()
             };
-            let result = claude.invoke(
-                session_mode(
-                    session,
-                    is_new && !retrying_postcondition,
-                    "opsx-build-planning",
+            let Some(result) = worker_result(
+                claude.invoke(
+                    session_mode(
+                        session,
+                        is_new && !retrying_postcondition,
+                        "opsx-build-planning",
+                    ),
+                    &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
+                    if retrying_postcondition {
+                        "Claude is correcting the incomplete proposal"
+                    } else {
+                        "Claude is creating OpenSpec artifacts"
+                    },
+                    StageProtocol::Propose,
                 ),
-                &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
-                if retrying_postcondition {
-                    "Claude is correcting the incomplete proposal"
-                } else {
-                    "Claude is creating OpenSpec artifacts"
-                },
-                StageProtocol::Propose,
-            )?;
+                repo,
+                state,
+                &self.ui,
+            )?
+            else {
+                return Ok(());
+            };
 
             let after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
@@ -721,11 +960,6 @@ impl<U: Ui> App<U> {
                     return persist_state(repo, state, &self.ui);
                 }
                 StageSignal::TooLarge => {
-                    if after != state.before_changes {
-                        bail!(
-                            "Propose returned TOO_LARGE after changing OpenSpec state; preserving the repository for inspection"
-                        );
-                    }
                     return record_too_large(repo, state, result.text, &self.ui);
                 }
                 StageSignal::Ready => {}
@@ -846,13 +1080,21 @@ impl<U: Ui> App<U> {
             "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
         );
         let subject = with_direction(&base, state.pending_direction.as_deref());
-        let result = invoke_fresh(
-            claude,
-            &format!("{change}-apply"),
-            &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-            "Claude is applying the OpenSpec change",
-            StageProtocol::Worker,
-        )?;
+        let Some(result) = worker_result(
+            invoke_fresh(
+                claude,
+                &format!("{change}-apply"),
+                &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
+                "Claude is applying the OpenSpec change",
+                StageProtocol::Worker,
+            ),
+            repo,
+            state,
+            &self.ui,
+        )?
+        else {
+            return Ok(());
+        };
         if !handle_worker_result(repo, state, "apply", &result.text, result.signal, &self.ui)? {
             return Ok(());
         }
@@ -869,19 +1111,27 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let result = invoke_fresh(
-            claude,
-            &format!("{change}-verify-{}", state.verify_retries + 1),
-            &stage_prompt(
-                &commands.verify,
-                &format!(
-                    "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
+        let Some(result) = worker_result(
+            invoke_fresh(
+                claude,
+                &format!("{change}-verify-{}", state.verify_retries + 1),
+                &stage_prompt(
+                    &commands.verify,
+                    &format!(
+                        "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
+                    ),
+                    StageProtocol::Verify,
                 ),
+                "Claude is verifying specification compliance",
                 StageProtocol::Verify,
             ),
-            "Claude is verifying specification compliance",
-            StageProtocol::Verify,
-        )?;
+            repo,
+            state,
+            &self.ui,
+        )?
+        else {
+            return Ok(());
+        };
         match result.signal {
             StageSignal::Verified => {
                 self.ui.success("Verification passed");
@@ -892,14 +1142,19 @@ impl<U: Ui> App<U> {
             StageSignal::Retry => {
                 state.verify_retries += 1;
                 state.pending_repair = Some(result.text);
-                state.stage = Stage::Repair;
-                persist_state(repo, state, &self.ui)?;
                 if state.verify_retries > self.cli.max_verify_retries {
-                    bail!(
-                        "verification reached the configured retry limit of {}; resume with `--direction`, or raise `--max-verify-retries`",
-                        self.cli.max_verify_retries
+                    return record_too_large(
+                        repo,
+                        state,
+                        format!(
+                            "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
+                            self.cli.max_verify_retries
+                        ),
+                        &self.ui,
                     );
                 }
+                state.stage = Stage::Repair;
+                persist_state(repo, state, &self.ui)?;
                 self.ui.warn(&format!(
                     "Verification requested repair {}/{}",
                     state.verify_retries, self.cli.max_verify_retries
@@ -907,7 +1162,10 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             StageSignal::Blocked => blocked("verify", &result.text),
-            StageSignal::Ready | StageSignal::Done | StageSignal::TooLarge => {
+            StageSignal::Ready
+            | StageSignal::Done
+            | StageSignal::TooLarge
+            | StageSignal::Replanned => {
                 bail!(
                     "verify returned an invalid terminal status instead of VERIFIED, RETRY, or BLOCKED"
                 )
@@ -923,8 +1181,14 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         if state.verify_retries > self.cli.max_verify_retries && state.pending_direction.is_none() {
-            bail!(
-                "verification retry limit reached; resume with `--direction` or raise `--max-verify-retries`"
+            return record_too_large(
+                repo,
+                state,
+                format!(
+                    "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
+                    self.cli.max_verify_retries
+                ),
+                &self.ui,
             );
         }
         let change = require_change(state)?;
@@ -935,13 +1199,21 @@ impl<U: Ui> App<U> {
             "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. If the verifier has exposed that the assigned slice cannot reliably fit one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition. Do not use TOO_LARGE for an ordinary correctable verification failure.\n\nVerifier context:\n{finding}"
         );
         let subject = with_direction(&base, state.pending_direction.as_deref());
-        let result = invoke_fresh(
-            claude,
-            &format!("{change}-repair-{}", state.verify_retries),
-            &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-            "Claude is repairing the implementation",
-            StageProtocol::Worker,
-        )?;
+        let Some(result) = worker_result(
+            invoke_fresh(
+                claude,
+                &format!("{change}-repair-{}", state.verify_retries),
+                &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
+                "Claude is repairing the implementation",
+                StageProtocol::Worker,
+            ),
+            repo,
+            state,
+            &self.ui,
+        )?
+        else {
+            return Ok(());
+        };
         if !handle_worker_result(repo, state, "repair", &result.text, result.signal, &self.ui)? {
             return Ok(());
         }
@@ -1023,6 +1295,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
+        frontier_launcher: &ClaudeLauncher,
         commands: &SkillCommands,
     ) -> Result<()> {
         self.ui
@@ -1078,14 +1351,18 @@ impl<U: Ui> App<U> {
         self.ui.info(&format!("Archive: {}", commands.archive));
         self.ui
             .info("Ask Claude to create completion milestone commit");
+        self.ui.info(&format!(
+            "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
+            frontier_launcher.program, self.cli.local_worker_timeout_minutes
+        ));
         if self.cli.loop_workflow {
             let limit = self.cli.max_iterations.map_or_else(
                 || "until the agenda or objective is complete".to_owned(),
                 |maximum| format!("until completion or {maximum} completed iterations"),
             );
             self.ui.info(&format!(
-                "Campaign: repeat the complete workflow {limit}; stop on any error, TOO_LARGE, or BLOCKED"
-            ));
+            "Campaign: repeat the complete workflow {limit}; frontier-replan an oversized agenda slice, and stop on BLOCKED or an unrecoverable error"
+        ));
         }
         Ok(())
     }
@@ -1140,13 +1417,20 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: connection={:?}, program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
+            launcher.connection_name,
             launcher.program,
             launcher.prefix_args,
             launcher.model,
             launcher.auto_compact_window,
             launcher.auto_compact_percent,
             launcher.max_output_tokens,
+            launcher
+                .environment
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect::<Vec<_>>(),
+            launcher.unset_environment,
             self.cli.permission_mode,
             self.cli.stream_claude
         ));
@@ -1161,6 +1445,14 @@ impl<U: Ui> App<U> {
             "campaign loop: {}, max iterations: {:?}",
             self.cli.loop_workflow, self.cli.max_iterations
         ));
+    }
+}
+
+fn connection_description(launcher: &ClaudeLauncher) -> String {
+    let name = launcher.connection_name.as_deref().unwrap_or("default");
+    match launcher.model.as_deref() {
+        Some(model) => format!("`{name}` ({model})"),
+        None => format!("`{name}` (harness default model)"),
     }
 }
 
@@ -1244,6 +1536,45 @@ fn record_too_large<U: Ui>(
     persist_state(repo, state, ui)
 }
 
+fn worker_result<U: Ui>(
+    result: Result<crate::claude::ClaudeResult>,
+    repo: &Path,
+    state: &mut RunState,
+    ui: &U,
+) -> Result<Option<crate::claude::ClaudeResult>> {
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            let Some(escalation) = error.downcast_ref::<WorkerEscalationRequested>() else {
+                return Err(error);
+            };
+            record_too_large(repo, state, escalation.reason().to_owned(), ui)?;
+            Ok(None)
+        }
+    }
+}
+
+fn arm_slice_baseline<U: Ui>(repo: &Path, state: &mut RunState, ui: &U) -> Result<()> {
+    if matches!(state.stage, Stage::Complete | Stage::Done) {
+        state.slice_baseline = None;
+        return Ok(());
+    }
+    let baseline = capture_slice_baseline(repo, ui)?;
+    state.slice_baseline = Some(baseline);
+    Ok(())
+}
+
+fn release_state_baseline<U: Ui>(repo: &Path, state: &mut RunState, ui: &U) {
+    let Some(baseline) = state.slice_baseline.take() else {
+        return;
+    };
+    if let Err(error) = release_slice_baseline(repo, &baseline, ui) {
+        ui.warn(&format!(
+            "Could not release private rollback metadata; workflow state is unaffected: {error}"
+        ));
+    }
+}
+
 fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     format!(
         "{subject}\n\nPOSTCONDITION REPAIR: {failure} Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed and do not create a duplicate change. Inspect active OpenSpec changes first and continue the intended existing scaffold when one is present. Follow any exact agenda assignment above; otherwise use the completed exploration and repository's durable planning evidence. Run all commands synchronously and wait for every command and subagent to finish. Return READY only after `openspec status --change <name> --json` reports `isPlanningComplete: true`. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
@@ -1271,6 +1602,75 @@ fn campaign_subject(state: &RunState) -> String {
         ),
         None => state.request.clone(),
     }
+}
+
+fn frontier_replan_prompt(assignment: &AgendaAssignment, outcome: &TooLargeOutcome) -> String {
+    format!(
+        "The local worker could not reliably complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using your stronger planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nLocal failure stage: {stage}\nLocal failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Child slices may later be subdivided recursively in the same way. Choose boundaries that a local coding model can complete reliably, not merely conceptual chapter boundaries. Preserve dependencies and acceptance criteria so the sequence still delivers the original objective.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
+        path = assignment.path,
+        change = assignment.change,
+        stage = outcome.stage.title(),
+        failure = outcome.summary.trim(),
+        content = assignment.content.trim(),
+    )
+}
+
+fn frontier_replan_postcondition<U: Ui>(
+    repo: &Path,
+    baseline: &SliceBaseline,
+    original: &AgendaAssignment,
+    before_changes: &ChangeSnapshot,
+    ui: &U,
+) -> Result<AgendaAssignment> {
+    let head = current_head(repo, ui)?.context("frontier replan did not leave a Git HEAD")?;
+    if head == baseline.head {
+        bail!("frontier replan did not create a commit");
+    }
+    if !head_descends_from(repo, &baseline.head, ui)? {
+        bail!("frontier replan rewrote or replaced the pre-Propose Git history");
+    }
+
+    let committed = committed_paths_since(repo, &baseline.head, ui)?;
+    if committed.is_empty() {
+        bail!("frontier replan commit changed no files");
+    }
+    let outside_agenda = committed
+        .iter()
+        .filter(|path| !path.starts_with("automation/slices/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !outside_agenda.is_empty() {
+        bail!(
+            "frontier replan committed files outside `automation/slices/`: {}",
+            outside_agenda.join(", ")
+        );
+    }
+
+    if !baseline_matches_except(repo, baseline, Some("automation/slices/"), ui)? {
+        bail!(
+            "frontier replan did not preserve the pre-existing state outside `automation/slices/` exactly"
+        );
+    }
+    if openspec_snapshot(repo, ui)? != *before_changes {
+        bail!("frontier replan changed OpenSpec state");
+    }
+
+    let AgendaSelection::Next(refreshed) = discover_agenda(repo, before_changes)? else {
+        bail!("frontier replan left no next ordered agenda slice");
+    };
+    if refreshed.path != original.path || refreshed.change != original.change {
+        bail!(
+            "frontier replan replaced the assigned first slice instead of preserving `{}`",
+            original.path
+        );
+    }
+    if refreshed.content == original.content {
+        bail!("frontier replan did not narrow the original agenda slice");
+    }
+    if !has_subdivision(repo, original)? {
+        bail!("frontier replan did not add a hierarchical child slice");
+    }
+    Ok(refreshed)
 }
 
 fn blocked<T>(stage: &str, response: &str) -> Result<T> {
@@ -1438,11 +1838,23 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         too_large: None,
         campaign: None,
         agenda: None,
+        slice_baseline: None,
+        frontier_replans: 0,
     })
 }
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
+}
+
+fn campaign_limit_resume_command(repo: &Path, current_limit: u32) -> String {
+    let next_limit = current_limit
+        .saturating_mul(2)
+        .max(current_limit.saturating_add(1));
+    format!(
+        "opsx-build --repo {} --resume --loop --max-iterations {next_limit}",
+        shell_quote(&repo.to_string_lossy())
+    )
 }
 
 #[cfg(test)]
@@ -1528,6 +1940,29 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(decoded.stage, Stage::Apply);
         assert_eq!(decoded.too_large, state.too_large);
+    }
+
+    #[test]
+    fn frontier_prompt_preserves_the_parent_and_defines_hierarchical_children() {
+        let assignment = AgendaAssignment {
+            path: "automation/slices/0009-conditionals.md".to_owned(),
+            change: "0009-conditionals".to_owned(),
+            title: "0009 - Conditionals".to_owned(),
+            content: "# 0009 - Conditionals\n\nImplement all conditionals.".to_owned(),
+        };
+        let outcome = TooLargeOutcome {
+            stage: Stage::Apply,
+            summary: "frontend and lowering are too broad together".to_owned(),
+        };
+
+        let prompt = frontier_replan_prompt(&assignment, &outcome);
+
+        assert!(prompt.contains("Keep its current filename"));
+        assert!(prompt.contains("0009.1-next-part.md"));
+        assert!(prompt.contains("0009-1-next-part"));
+        assert!(prompt.contains("Modify only files under `automation/slices/`"));
+        assert!(prompt.contains("do not implement the slice"));
+        assert!(prompt.contains("frontend and lowering are too broad together"));
     }
 
     #[test]
@@ -1641,5 +2076,13 @@ mod tests {
             .insert("other-change".to_owned(), Value::Null);
         assert!(archive_is_absent(&changes, "slice-n"));
         assert!(!archive_is_absent(&changes, "other-change"));
+    }
+
+    #[test]
+    fn campaign_limit_resume_command_raises_the_cumulative_ceiling() {
+        assert_eq!(
+            campaign_limit_resume_command(Path::new("/tmp/compiler project"), 5),
+            "opsx-build --repo '/tmp/compiler project' --resume --loop --max-iterations 10"
+        );
     }
 }

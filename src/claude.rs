@@ -1,14 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    cli::Cli,
+    cli::{ClaudeConnection, Cli, ConnectionEnvironmentValue},
     process::{
-        CommandSpec, PauseRequested, ProcessOutput, ProcessRunner, diagnostic_text,
-        stream_user_message,
+        CommandSpec, PauseRequested, ProcessOutput, ProcessRunner, WorkerEscalationRequested,
+        diagnostic_text, stream_user_message,
     },
     stream::{StreamFilter, context_report_items, filter_line},
     ui::Ui,
@@ -17,15 +20,42 @@ use crate::{
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+const CLAUDE_CONNECTION_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherEnvironment {
+    pub name: String,
+    pub value: String,
+    pub redacted: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeLauncher {
+    pub connection_name: Option<String>,
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
     pub max_output_tokens: Option<u64>,
+    pub environment: Vec<LauncherEnvironment>,
+    pub unset_environment: Vec<String>,
 }
 
 impl ClaudeLauncher {
@@ -41,14 +71,89 @@ impl ClaudeLauncher {
             bail!("--claude-command cannot be empty");
         }
         Ok(Self {
+            connection_name: None,
             program: words.remove(0),
             prefix_args: words,
             model,
             auto_compact_window,
             auto_compact_percent,
             max_output_tokens,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
         })
     }
+
+    pub fn from_connection(connection: &ClaudeConnection) -> Result<Self> {
+        let mut launcher = Self::parse(
+            &connection.command,
+            connection.model.clone(),
+            connection.auto_compact_window,
+            connection.auto_compact_percent,
+            connection.max_output_tokens,
+        )?;
+        launcher.connection_name = connection.name.clone();
+        if connection.isolate {
+            launcher
+                .unset_environment
+                .extend(CLAUDE_CONNECTION_ENV.iter().map(|name| (*name).to_owned()));
+        }
+        for name in &connection.unset_env {
+            validate_environment_name(name)?;
+            if !launcher.unset_environment.contains(name) {
+                launcher.unset_environment.push(name.clone());
+            }
+        }
+        for (name, configured) in &connection.env {
+            validate_environment_name(name)?;
+            let (value, redacted) = match configured {
+                ConnectionEnvironmentValue::Literal(value) => {
+                    (value.clone(), environment_name_is_sensitive(name))
+                }
+                ConnectionEnvironmentValue::FromEnvironment(reference) => {
+                    validate_environment_name(&reference.from_env)?;
+                    let value = std::env::var(&reference.from_env).with_context(|| {
+                        format!(
+                            "Claude connection profile `{}` requires environment variable `{}` for `{name}`",
+                            connection.name.as_deref().unwrap_or("unnamed"),
+                            reference.from_env
+                        )
+                    })?;
+                    if reference.from_env != name.as_str()
+                        && !launcher.unset_environment.contains(&reference.from_env)
+                    {
+                        launcher.unset_environment.push(reference.from_env.clone());
+                    }
+                    (value, true)
+                }
+            };
+            launcher.environment.push(LauncherEnvironment {
+                name: name.clone(),
+                value,
+                redacted,
+            });
+        }
+        Ok(launcher)
+    }
+}
+
+fn validate_environment_name(name: &str) -> Result<()> {
+    let mut characters = name.chars();
+    let valid_start = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    if !valid_start
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        bail!("invalid environment variable name `{name}` in Claude connection profile");
+    }
+    Ok(())
+}
+
+fn environment_name_is_sensitive(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["TOKEN", "KEY", "SECRET", "PASSWORD"]
+        .iter()
+        .any(|marker| name.contains(marker))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +270,7 @@ pub enum StageSignal {
     Verified,
     Retry,
     Blocked,
+    Replanned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +279,7 @@ pub enum StageProtocol {
     Worker,
     Propose,
     Verify,
+    Frontier,
 }
 
 impl StageProtocol {
@@ -182,6 +289,7 @@ impl StageProtocol {
             Self::Worker => "READY, TOO_LARGE, or BLOCKED",
             Self::Propose => "READY, DONE, TOO_LARGE, or BLOCKED",
             Self::Verify => "VERIFIED, RETRY, or BLOCKED",
+            Self::Frontier => "REPLANNED or BLOCKED",
         }
     }
 
@@ -198,6 +306,9 @@ impl StageProtocol {
             }
             Self::Verify => {
                 r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
+            }
+            Self::Frontier => {
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["REPLANNED","BLOCKED"]},"summary":{"type":"string","description":"Concise frontier-planning result. REPLANNED means the oversized agenda slice was replaced by a smaller first slice plus one or more ordered hierarchical descendants and committed. BLOCKED means safe subdivision requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
         }
     }
@@ -304,6 +415,17 @@ pub fn build_interactive_claude_command(
 }
 
 fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
+    let spec = launcher
+        .unset_environment
+        .iter()
+        .fold(spec, |spec, name| spec.remove_env(name));
+    let spec = launcher.environment.iter().fold(spec, |spec, variable| {
+        if variable.redacted {
+            spec.secret_env(&variable.name, &variable.value)
+        } else {
+            spec.env(&variable.name, &variable.value)
+        }
+    });
     let spec = match launcher.auto_compact_window {
         Some(window) => spec.env(AUTO_COMPACT_ENV, window.to_string()),
         None => spec,
@@ -325,6 +447,7 @@ pub struct ClaudeClient<'a, U: Ui> {
     stream_transport: bool,
     stream_filter: Option<StreamFilter>,
     max_output_retries: u32,
+    stage_timeout: Option<Duration>,
     ui: &'a U,
     runner: ProcessRunner<'a, U>,
 }
@@ -346,9 +469,16 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             stream_transport: stream_transport || stream_filter.is_some(),
             stream_filter,
             max_output_retries,
+            stage_timeout: None,
             ui,
             runner: ProcessRunner::new(ui),
         }
+    }
+
+    pub fn with_stage_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_transport = true;
+        self.stage_timeout = Some(timeout);
+        self
     }
 
     pub fn invoke(
@@ -363,13 +493,22 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut recoveries = 0;
+        let deadline = self
+            .stage_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
 
         loop {
+            let remaining = deadline.map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
+            });
             match self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 protocol,
+                remaining,
             )? {
                 ClaudeAttempt::Complete(result) => return Ok(result),
                 ClaudeAttempt::OutputLimit if recoveries < self.max_output_retries => {
@@ -387,10 +526,11 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                     );
                 }
                 ClaudeAttempt::OutputLimit => {
-                    bail!(
-                        "Claude repeatedly reached its output token limit; the phase remains resumable at its current checkpoint after {} automatic continuation(s). Raise --max-output-retries or resume after reducing the requested output",
+                    return Err(WorkerEscalationRequested::new(format!(
+                        "local worker exhausted {} output-limit recovery attempt(s)",
                         self.max_output_retries
-                    );
+                    ))
+                    .into());
                 }
             }
         }
@@ -402,6 +542,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         prompt: &str,
         activity: &str,
         protocol: StageProtocol,
+        timeout: Option<Duration>,
     ) -> Result<ClaudeAttempt> {
         self.ui
             .debug(&format!("Claude session: {}", session_description(session)));
@@ -425,7 +566,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                 schema,
             );
             let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
-                self.run_stage_command(&spec, activity)?
+                self.run_stage_command(&spec, activity, timeout)?
             } else {
                 self.runner.run(
                     &spec,
@@ -485,18 +626,24 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         Ok(ClaudeAttempt::Complete(result))
     }
 
-    fn run_stage_command(&self, spec: &CommandSpec, activity: &str) -> Result<ProcessOutput> {
-        self.runner.run_streaming(spec, activity, |line| {
-            if let Some(filter) = self.stream_filter {
-                for item in filter_line(line, filter) {
-                    self.ui.stream_item(&item);
+    fn run_stage_command(
+        &self,
+        spec: &CommandSpec,
+        activity: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutput> {
+        self.runner
+            .run_streaming_with_timeout(spec, activity, timeout, |line| {
+                if let Some(filter) = self.stream_filter {
+                    for item in filter_line(line, filter) {
+                        self.ui.stream_item(&item);
+                    }
+                } else {
+                    for item in context_report_items(line) {
+                        self.ui.stream_item(&item);
+                    }
                 }
-            } else {
-                for item in context_report_items(line) {
-                    self.ui.stream_item(&item);
-                }
-            }
-        })
+            })
     }
 
     pub fn rename_session(&self, session_id: Uuid, name: &str) -> Result<()> {
@@ -540,7 +687,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             output_format,
         );
         let result = if self.stream_transport {
-            self.run_stage_command(&spec, &activity)
+            self.run_stage_command(&spec, &activity, None)
         } else {
             self.runner.run(&spec, &activity)
         };
@@ -861,6 +1008,7 @@ fn parse_status_value(status: &str) -> Option<StageSignal> {
         "VERIFIED" => Some(StageSignal::Verified),
         "RETRY" => Some(StageSignal::Retry),
         "BLOCKED" => Some(StageSignal::Blocked),
+        "REPLANNED" => Some(StageSignal::Replanned),
         _ => None,
     }
 }
@@ -1155,6 +1303,103 @@ mod tests {
     }
 
     #[test]
+    fn resolves_an_isolated_named_connection_into_commands() {
+        let connection = ClaudeConnection {
+            name: Some("hosted".to_owned()),
+            command: "claude".to_owned(),
+            model: Some("provider/model".to_owned()),
+            auto_compact_window: None,
+            auto_compact_percent: None,
+            max_output_tokens: Some(4_096),
+            env: [
+                (
+                    "ANTHROPIC_BASE_URL".to_owned(),
+                    ConnectionEnvironmentValue::Literal(
+                        "https://provider.example/anthropic".to_owned(),
+                    ),
+                ),
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                    ConnectionEnvironmentValue::Literal("secret-token".to_owned()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            isolate: true,
+            unset_env: vec!["HTTP_PROXY".to_owned()],
+        };
+        let launcher = ClaudeLauncher::from_connection(&connection).unwrap();
+        let command = build_claude_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            &SessionMode::New {
+                id: Uuid::nil(),
+                name: None,
+            },
+            "plan",
+            ClaudeOutputFormat::Json,
+            None,
+        );
+
+        assert_eq!(launcher.connection_name.as_deref(), Some("hosted"));
+        assert!(
+            launcher
+                .unset_environment
+                .iter()
+                .any(|name| name == "ANTHROPIC_API_KEY")
+        );
+        assert!(
+            launcher
+                .unset_environment
+                .iter()
+                .any(|name| name == "HTTP_PROXY")
+        );
+        assert!(
+            command
+                .display()
+                .contains("ANTHROPIC_AUTH_TOKEN=<redacted>")
+        );
+        assert!(!command.display().contains("secret-token"));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "provider/model"])
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_referenced_connection_environment_variable() {
+        let connection = ClaudeConnection {
+            name: Some("hosted".to_owned()),
+            command: "claude".to_owned(),
+            model: None,
+            auto_compact_window: None,
+            auto_compact_percent: None,
+            max_output_tokens: None,
+            env: [(
+                "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                ConnectionEnvironmentValue::FromEnvironment(crate::cli::EnvironmentReference {
+                    from_env: "OPSX_BUILD_TEST_DEFINITELY_MISSING_PROFILE_SECRET_7F9C".to_owned(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            isolate: true,
+            unset_env: Vec::new(),
+        };
+        let error = ClaudeLauncher::from_connection(&connection).unwrap_err();
+
+        assert!(error.to_string().contains("connection profile `hosted`"));
+        assert!(
+            error
+                .to_string()
+                .contains("OPSX_BUILD_TEST_DEFINITELY_MISSING_PROFILE_SECRET_7F9C")
+        );
+    }
+
+    #[test]
     fn bundled_commands_have_stable_defaults_and_allow_overrides() {
         assert_eq!(
             resolve_bundled_command(None, "explore-unattended"),
@@ -1250,6 +1495,19 @@ mod tests {
         assert!(!StageProtocol::Ready.json_schema().contains("DONE"));
         let prompt = stage_prompt("/propose-unattended", "finish it", StageProtocol::Propose);
         assert!(prompt.contains("READY, DONE, TOO_LARGE, or BLOCKED"));
+    }
+
+    #[test]
+    fn frontier_protocol_accepts_only_replanned_or_blocked() {
+        let schema = StageProtocol::Frontier.json_schema();
+        assert!(schema.contains(r#"["REPLANNED","BLOCKED"]"#));
+        assert!(!schema.contains("READY"));
+        assert_eq!(
+            parse_status_value("replanned"),
+            Some(StageSignal::Replanned)
+        );
+        let prompt = stage_prompt("", "subdivide it", StageProtocol::Frontier);
+        assert!(prompt.contains("REPLANNED or BLOCKED"));
     }
 
     #[test]
@@ -1441,12 +1699,15 @@ printf '%s\n' "$((count + 1))" > "$state"
         std::fs::write(&script, source).unwrap();
 
         let launcher = ClaudeLauncher {
+            connection_name: None,
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,
             auto_compact_window: None,
             auto_compact_percent: None,
             max_output_tokens: None,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
         };
         let ui = QuietUi;
         let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);

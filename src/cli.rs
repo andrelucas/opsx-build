@@ -1,4 +1,4 @@
-use std::{env, fmt::Display, fs, path::PathBuf, str::FromStr};
+use std::{collections::BTreeMap, env, fmt::Display, fs, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,8 +8,10 @@ use crate::stream::StreamFilter;
 
 const DEFAULT_MAX_VERIFY_RETRIES: u32 = 3;
 const DEFAULT_MAX_OUTPUT_RETRIES: u32 = 3;
+const DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES: u32 = 60;
 const DEFAULT_PERMISSION_MODE: &str = "auto";
 const DEFAULT_CLAUDE_COMMAND: &str = "claude";
+const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 
 #[derive(Debug, Clone)]
 pub struct Cli {
@@ -28,22 +30,46 @@ pub struct Cli {
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
     pub max_output_retries: u32,
+    pub local_worker_timeout_minutes: u32,
     pub verbose: bool,
     pub debug: bool,
     pub stream_claude: Option<StreamFilter>,
     pub dry_run: bool,
     pub permission_mode: String,
-    pub claude_command: String,
-    pub claude_model: Option<String>,
-    pub auto_compact_window: Option<u64>,
-    pub auto_compact_percent: Option<u8>,
-    pub max_output_tokens: Option<u64>,
+    pub worker_connection: ClaudeConnection,
+    pub frontier_connection: ClaudeConnection,
     pub explore_command: Option<String>,
     pub propose_command: Option<String>,
     pub apply_command: Option<String>,
     pub verify_command: Option<String>,
     pub archive_command: Option<String>,
     pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeConnection {
+    pub name: Option<String>,
+    pub command: String,
+    pub model: Option<String>,
+    pub auto_compact_window: Option<u64>,
+    pub auto_compact_percent: Option<u8>,
+    pub max_output_tokens: Option<u64>,
+    pub env: BTreeMap<String, ConnectionEnvironmentValue>,
+    pub isolate: bool,
+    pub unset_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ConnectionEnvironmentValue {
+    Literal(String),
+    FromEnvironment(EnvironmentReference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentReference {
+    pub from_env: String,
 }
 
 impl Cli {
@@ -55,7 +81,7 @@ impl Cli {
         let command_line_max_iterations = args.max_iterations.is_some();
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
-        let cli = resolve_values(args, config, config_path);
+        let cli = resolve_values(args, config, config_path)?;
         if command_line_max_iterations && !cli.loop_workflow {
             anyhow::bail!("--max-iterations requires --loop (or `loop = true` in config)");
         }
@@ -166,6 +192,14 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
     max_output_retries: Option<u32>,
 
+    /// Maximum minutes for one local Explore, Propose, Apply, Verify, or Repair stage.
+    #[arg(
+        long,
+        env = "OPSX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES",
+        value_name = "MINUTES"
+    )]
+    local_worker_timeout_minutes: Option<std::num::NonZeroU32>,
+
     /// Print commands and captured subprocess output.
     #[arg(long, short)]
     verbose: bool,
@@ -201,6 +235,22 @@ struct CliArgs {
     /// Model passed to the configured Claude launcher as `--model MODEL`.
     #[arg(long, env = "OPSX_BUILD_CLAUDE_MODEL", value_name = "MODEL")]
     claude_model: Option<String>,
+
+    /// Named connection profile used for ordinary worker stages.
+    #[arg(long, env = "OPSX_BUILD_WORKER_CONNECTION", value_name = "NAME")]
+    worker_connection: Option<String>,
+
+    /// Command prefix used to launch the frontier planner after local escalation.
+    #[arg(long, env = "OPSX_BUILD_FRONTIER_COMMAND", value_name = "COMMAND")]
+    frontier_command: Option<String>,
+
+    /// Optional frontier model override; omitted uses the frontier harness default.
+    #[arg(long, env = "OPSX_BUILD_FRONTIER_MODEL", value_name = "MODEL")]
+    frontier_model: Option<String>,
+
+    /// Named connection profile used for frontier replanning.
+    #[arg(long, env = "OPSX_BUILD_FRONTIER_CONNECTION", value_name = "NAME")]
+    frontier_connection: Option<String>,
 
     /// Context capacity used for Claude auto-compaction (supports binary k/m suffixes).
     #[arg(long, env = "OPSX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
@@ -240,12 +290,18 @@ struct CliArgs {
 struct FileConfig {
     max_verify_retries: Option<u32>,
     max_output_retries: Option<u32>,
+    local_worker_timeout_minutes: Option<std::num::NonZeroU32>,
     #[serde(rename = "loop")]
     loop_workflow: Option<bool>,
     max_iterations: Option<std::num::NonZeroU32>,
     permission_mode: Option<String>,
     claude_command: Option<String>,
     claude_model: Option<String>,
+    frontier_command: Option<String>,
+    frontier_model: Option<String>,
+    worker_connection: Option<String>,
+    frontier_connection: Option<String>,
+    connections: BTreeMap<String, FileConnection>,
     auto_compact_window: Option<TokenCount>,
     auto_compact_percent: Option<Percentage>,
     max_output_tokens: Option<TokenCount>,
@@ -255,6 +311,19 @@ struct FileConfig {
     verify_command: Option<String>,
     archive_command: Option<String>,
     stream_claude: Option<StreamFilter>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileConnection {
+    command: Option<String>,
+    model: Option<String>,
+    auto_compact_window: Option<TokenCount>,
+    auto_compact_percent: Option<Percentage>,
+    max_output_tokens: Option<TokenCount>,
+    env: BTreeMap<String, ConnectionEnvironmentValue>,
+    isolate: Option<bool>,
+    unset_env: Vec<String>,
 }
 
 fn load_config(args: &CliArgs) -> Result<(FileConfig, Option<PathBuf>)> {
@@ -318,6 +387,11 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
 
     override_from_legacy!(max_verify_retries, "OSPX_BUILD_MAX_VERIFY_RETRIES", u32);
     override_from_legacy!(max_output_retries, "OSPX_BUILD_MAX_OUTPUT_RETRIES", u32);
+    override_from_legacy!(
+        local_worker_timeout_minutes,
+        "OSPX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES",
+        std::num::NonZeroU32
+    );
     override_from_legacy!(loop_workflow, "OSPX_BUILD_LOOP", bool);
     override_from_legacy!(
         max_iterations,
@@ -327,6 +401,14 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
     override_from_legacy!(permission_mode, "OSPX_BUILD_PERMISSION_MODE", String);
     override_from_legacy!(claude_command, "OSPX_BUILD_CLAUDE_COMMAND", String);
     override_from_legacy!(claude_model, "OSPX_BUILD_CLAUDE_MODEL", String);
+    override_from_legacy!(frontier_command, "OSPX_BUILD_FRONTIER_COMMAND", String);
+    override_from_legacy!(frontier_model, "OSPX_BUILD_FRONTIER_MODEL", String);
+    override_from_legacy!(worker_connection, "OSPX_BUILD_WORKER_CONNECTION", String);
+    override_from_legacy!(
+        frontier_connection,
+        "OSPX_BUILD_FRONTIER_CONNECTION",
+        String
+    );
     override_from_legacy!(
         auto_compact_window,
         "OSPX_BUILD_AUTO_COMPACT_WINDOW",
@@ -380,7 +462,47 @@ where
     })
 }
 
-fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Cli {
+fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Result<Cli> {
+    let worker_profile = selected_connection(
+        args.worker_connection
+            .as_deref()
+            .or(config.worker_connection.as_deref()),
+        &config.connections,
+    )?;
+    let frontier_profile = selected_connection(
+        args.frontier_connection
+            .as_deref()
+            .or(config.frontier_connection.as_deref()),
+        &config.connections,
+    )?;
+    let worker_connection = resolve_connection(
+        worker_profile,
+        args.claude_command.clone(),
+        args.claude_model.clone(),
+        config.claude_command.clone(),
+        config.claude_model.clone(),
+        args.auto_compact_window,
+        args.auto_compact_percent,
+        args.max_output_tokens,
+        config.auto_compact_window,
+        config.auto_compact_percent,
+        config.max_output_tokens,
+        DEFAULT_CLAUDE_COMMAND,
+    );
+    let frontier_connection = resolve_connection(
+        frontier_profile,
+        args.frontier_command.clone(),
+        args.frontier_model.clone(),
+        config.frontier_command.clone(),
+        config.frontier_model.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        DEFAULT_FRONTIER_COMMAND,
+    );
     let request = match args.request.as_deref() {
         Some(value) if value.trim().eq_ignore_ascii_case("next slice") => "advance".to_owned(),
         Some(value) => value.to_owned(),
@@ -394,7 +516,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         }
         None => "advance".to_owned(),
     };
-    Cli {
+    Ok(Cli {
         request,
         repo: args.repo,
         interactive: args.interactive,
@@ -420,6 +542,11 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .max_output_retries
             .or(config.max_output_retries)
             .unwrap_or(DEFAULT_MAX_OUTPUT_RETRIES),
+        local_worker_timeout_minutes: args
+            .local_worker_timeout_minutes
+            .or(config.local_worker_timeout_minutes)
+            .map(std::num::NonZeroU32::get)
+            .unwrap_or(DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES),
         verbose: args.verbose,
         debug: args.debug,
         stream_claude: args.stream_claude.or(config.stream_claude),
@@ -428,29 +555,83 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .permission_mode
             .or(config.permission_mode)
             .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_owned()),
-        claude_command: args
-            .claude_command
-            .or(config.claude_command)
-            .unwrap_or_else(|| DEFAULT_CLAUDE_COMMAND.to_owned()),
-        claude_model: args.claude_model.or(config.claude_model),
-        auto_compact_window: args
-            .auto_compact_window
-            .or(config.auto_compact_window)
-            .map(|count| count.0),
-        auto_compact_percent: args
-            .auto_compact_percent
-            .or(config.auto_compact_percent)
-            .map(|percentage| percentage.0),
-        max_output_tokens: args
-            .max_output_tokens
-            .or(config.max_output_tokens)
-            .map(|count| count.0),
+        worker_connection,
+        frontier_connection,
         explore_command: args.explore_command.or(config.explore_command),
         propose_command: args.propose_command.or(config.propose_command),
         apply_command: args.apply_command.or(config.apply_command),
         verify_command: args.verify_command.or(config.verify_command),
         archive_command: args.archive_command.or(config.archive_command),
         config_path,
+    })
+}
+
+fn selected_connection(
+    name: Option<&str>,
+    connections: &BTreeMap<String, FileConnection>,
+) -> Result<Option<(String, FileConnection)>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("connection profile name cannot be empty");
+    }
+    let profile = connections.get(name).cloned().with_context(|| {
+        let available = if connections.is_empty() {
+            "none are configured".to_owned()
+        } else {
+            format!(
+                "available profiles: {}",
+                connections.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        format!("unknown Claude connection profile `{name}`; {available}")
+    })?;
+    Ok(Some((name.to_owned(), profile)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_connection(
+    profile: Option<(String, FileConnection)>,
+    command_line_command: Option<String>,
+    command_line_model: Option<String>,
+    legacy_command: Option<String>,
+    legacy_model: Option<String>,
+    command_line_window: Option<TokenCount>,
+    command_line_percentage: Option<Percentage>,
+    command_line_output_tokens: Option<TokenCount>,
+    legacy_window: Option<TokenCount>,
+    legacy_percentage: Option<Percentage>,
+    legacy_output_tokens: Option<TokenCount>,
+    default_command: &str,
+) -> ClaudeConnection {
+    let (name, profile) = profile
+        .map(|(name, profile)| (Some(name), profile))
+        .unwrap_or_default();
+    let isolate = name.is_some() && profile.isolate.unwrap_or(true);
+    ClaudeConnection {
+        name,
+        command: command_line_command
+            .or(profile.command)
+            .or(legacy_command)
+            .unwrap_or_else(|| default_command.to_owned()),
+        model: command_line_model.or(profile.model).or(legacy_model),
+        auto_compact_window: command_line_window
+            .or(profile.auto_compact_window)
+            .or(legacy_window)
+            .map(|count| count.0),
+        auto_compact_percent: command_line_percentage
+            .or(profile.auto_compact_percent)
+            .or(legacy_percentage)
+            .map(|percentage| percentage.0),
+        max_output_tokens: command_line_output_tokens
+            .or(profile.max_output_tokens)
+            .or(legacy_output_tokens)
+            .map(|count| count.0),
+        env: profile.env,
+        isolate,
+        unset_env: profile.unset_env,
     }
 }
 
@@ -592,11 +773,14 @@ mod tests {
             r#"
                 max_verify_retries = 5
                 max_output_retries = 7
+                local_worker_timeout_minutes = 45
                 loop = true
                 max_iterations = 12
                 permission_mode = "dontAsk"
                 claude_command = "omlx launch claude"
                 claude_model = "local-model"
+                frontier_command = "frontier-wrapper claude"
+                frontier_model = "frontier-model"
                 auto_compact_window = "192k"
                 auto_compact_percent = "75%"
                 max_output_tokens = "8k"
@@ -609,20 +793,144 @@ mod tests {
             args(["opsx-build", "build something"]),
             config,
             Some(PathBuf::from("config.toml")),
-        );
+        )
+        .unwrap();
 
         assert_eq!(cli.max_verify_retries, 5);
         assert_eq!(cli.max_output_retries, 7);
+        assert_eq!(cli.local_worker_timeout_minutes, 45);
         assert!(cli.loop_workflow);
         assert_eq!(cli.max_iterations, Some(12));
         assert_eq!(cli.permission_mode, "dontAsk");
-        assert_eq!(cli.claude_command, "omlx launch claude");
-        assert_eq!(cli.claude_model.as_deref(), Some("local-model"));
-        assert_eq!(cli.auto_compact_window, Some(196_608));
-        assert_eq!(cli.auto_compact_percent, Some(75));
-        assert_eq!(cli.max_output_tokens, Some(8_192));
+        assert_eq!(cli.worker_connection.command, "omlx launch claude");
+        assert_eq!(cli.worker_connection.model.as_deref(), Some("local-model"));
+        assert_eq!(cli.frontier_connection.command, "frontier-wrapper claude");
+        assert_eq!(
+            cli.frontier_connection.model.as_deref(),
+            Some("frontier-model")
+        );
+        assert_eq!(cli.worker_connection.auto_compact_window, Some(196_608));
+        assert_eq!(cli.worker_connection.auto_compact_percent, Some(75));
+        assert_eq!(cli.worker_connection.max_output_tokens, Some(8_192));
         assert_eq!(cli.verify_command.as_deref(), Some("/opsx:verify"));
         assert_eq!(cli.stream_claude, Some(StreamFilter::Full));
+    }
+
+    #[test]
+    fn resolves_named_worker_and_frontier_connections() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "local"
+                frontier_connection = "kimi"
+
+                [connections.local]
+                command = "omlx launch claude"
+                model = "qwen-local"
+                auto_compact_window = "192k"
+                max_output_tokens = "8k"
+
+                [connections.local.env]
+                OMLX_HOST = "http://localhost:8000"
+
+                [connections.kimi]
+                command = "claude"
+                model = "kimi-k3"
+                unset_env = ["HTTP_PROXY"]
+
+                [connections.kimi.env]
+                ANTHROPIC_BASE_URL = "https://provider.example/anthropic"
+                ANTHROPIC_AUTH_TOKEN = { from_env = "KIMI_API_KEY" }
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args(["opsx-build", "build something"]),
+            config,
+            Some(PathBuf::from("config.toml")),
+        )
+        .unwrap();
+
+        assert_eq!(cli.worker_connection.name.as_deref(), Some("local"));
+        assert_eq!(cli.worker_connection.command, "omlx launch claude");
+        assert_eq!(cli.worker_connection.model.as_deref(), Some("qwen-local"));
+        assert_eq!(cli.worker_connection.auto_compact_window, Some(196_608));
+        assert_eq!(cli.worker_connection.max_output_tokens, Some(8_192));
+        assert!(cli.worker_connection.isolate);
+        assert_eq!(
+            cli.worker_connection.env.get("OMLX_HOST"),
+            Some(&ConnectionEnvironmentValue::Literal(
+                "http://localhost:8000".to_owned()
+            ))
+        );
+
+        assert_eq!(cli.frontier_connection.name.as_deref(), Some("kimi"));
+        assert_eq!(cli.frontier_connection.model.as_deref(), Some("kimi-k3"));
+        assert_eq!(cli.frontier_connection.unset_env, ["HTTP_PROXY"]);
+        assert!(matches!(
+            cli.frontier_connection.env.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(ConnectionEnvironmentValue::FromEnvironment(reference))
+                if reference.from_env == "KIMI_API_KEY"
+        ));
+    }
+
+    #[test]
+    fn command_line_connection_and_model_override_config_selection() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                frontier_connection = "hosted"
+
+                [connections.hosted]
+                command = "hosted-claude"
+                model = "hosted-default"
+
+                [connections.local-large]
+                command = "omlx launch claude"
+                model = "large-default"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args([
+                "opsx-build",
+                "--frontier-connection",
+                "local-large",
+                "--frontier-model",
+                "specific-large-model",
+                "build something",
+            ]),
+            config,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cli.frontier_connection.name.as_deref(), Some("local-large"));
+        assert_eq!(cli.frontier_connection.command, "omlx launch claude");
+        assert_eq!(
+            cli.frontier_connection.model.as_deref(),
+            Some("specific-large-model")
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_connection_profile_with_available_names() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "missing"
+
+                [connections.local]
+                command = "claude"
+            "#,
+        )
+        .unwrap();
+        let error =
+            resolve_values(args(["opsx-build", "build something"]), config, None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Claude connection profile `missing`")
+        );
+        assert!(error.to_string().contains("available profiles: local"));
     }
 
     #[test]
@@ -631,7 +939,10 @@ mod tests {
             r#"
                 max_verify_retries = 5
                 max_output_retries = 6
+                local_worker_timeout_minutes = 90
                 claude_model = "config-model"
+                frontier_command = "configured-frontier"
+                frontier_model = "configured-frontier-model"
                 auto_compact_window = 131072
                 auto_compact_percent = 80
                 max_output_tokens = 16384
@@ -645,8 +956,14 @@ mod tests {
                 "2",
                 "--max-output-retries",
                 "4",
+                "--local-worker-timeout-minutes",
+                "30",
                 "--claude-model",
                 "cli-model",
+                "--frontier-command",
+                "cli-frontier",
+                "--frontier-model",
+                "cli-frontier-model",
                 "--auto-compact-window",
                 "200k",
                 "--auto-compact-percent",
@@ -657,14 +974,21 @@ mod tests {
             ]),
             config,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(cli.max_verify_retries, 2);
         assert_eq!(cli.max_output_retries, 4);
-        assert_eq!(cli.claude_model.as_deref(), Some("cli-model"));
-        assert_eq!(cli.auto_compact_window, Some(204_800));
-        assert_eq!(cli.auto_compact_percent, Some(50));
-        assert_eq!(cli.max_output_tokens, Some(12_288));
+        assert_eq!(cli.local_worker_timeout_minutes, 30);
+        assert_eq!(cli.worker_connection.model.as_deref(), Some("cli-model"));
+        assert_eq!(cli.frontier_connection.command, "cli-frontier");
+        assert_eq!(
+            cli.frontier_connection.model.as_deref(),
+            Some("cli-frontier-model")
+        );
+        assert_eq!(cli.worker_connection.auto_compact_window, Some(204_800));
+        assert_eq!(cli.worker_connection.auto_compact_percent, Some(50));
+        assert_eq!(cli.worker_connection.max_output_tokens, Some(12_288));
     }
 
     #[test]
@@ -679,16 +1003,23 @@ mod tests {
             args(["opsx-build", "build something"]),
             FileConfig::default(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(cli.max_verify_retries, DEFAULT_MAX_VERIFY_RETRIES);
         assert_eq!(cli.max_output_retries, DEFAULT_MAX_OUTPUT_RETRIES);
+        assert_eq!(
+            cli.local_worker_timeout_minutes,
+            DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES
+        );
         assert!(!cli.loop_workflow);
         assert_eq!(cli.max_iterations, None);
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
-        assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
-        assert_eq!(cli.auto_compact_window, None);
-        assert_eq!(cli.auto_compact_percent, None);
-        assert_eq!(cli.max_output_tokens, None);
+        assert_eq!(cli.worker_connection.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(cli.frontier_connection.command, DEFAULT_FRONTIER_COMMAND);
+        assert_eq!(cli.frontier_connection.model, None);
+        assert_eq!(cli.worker_connection.auto_compact_window, None);
+        assert_eq!(cli.worker_connection.auto_compact_percent, None);
+        assert_eq!(cli.worker_connection.max_output_tokens, None);
     }
 
     #[test]
@@ -766,10 +1097,14 @@ mod tests {
             args(["opsx-build", "--no-loop", "one change"]),
             config,
             None,
-        );
+        )
+        .unwrap();
         assert!(!cli.loop_workflow);
         assert_eq!(cli.max_iterations, Some(12));
-        assert_eq!(cli.claude_model.as_deref(), Some("configured-model"));
+        assert_eq!(
+            cli.worker_connection.model.as_deref(),
+            Some("configured-model")
+        );
     }
 
     #[test]
@@ -791,8 +1126,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.config_path.as_ref(), Some(&path));
-        assert_eq!(cli.claude_command, "omlx launch claude");
-        assert_eq!(cli.claude_model.as_deref(), Some("configured-model"));
+        assert_eq!(cli.worker_connection.command, "omlx launch claude");
+        assert_eq!(
+            cli.worker_connection.model.as_deref(),
+            Some("configured-model")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -807,7 +1145,7 @@ mod tests {
         ]))
         .unwrap();
         assert!(cli.config_path.is_none());
-        assert_eq!(cli.claude_command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(cli.worker_connection.command, DEFAULT_CLAUDE_COMMAND);
     }
 
     #[test]

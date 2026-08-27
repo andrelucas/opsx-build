@@ -22,9 +22,38 @@ pub enum AgendaSelection {
     Complete,
 }
 
+pub fn has_subdivision(repo: &Path, assignment: &AgendaAssignment) -> Result<bool> {
+    let file_name = Path::new(&assignment.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("assigned agenda path has no UTF-8 file name")?;
+    let (parent, _, _) = parse_slice_name(file_name)
+        .context("assigned agenda path does not use a supported slice ordinal")?;
+    let directory = repo.join(SLICES_DIR);
+    for entry in fs::read_dir(&directory)
+        .with_context(|| format!("could not read agenda directory `{}`", directory.display()))?
+    {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((ordinal, _, _)) = parse_slice_name(&file_name) else {
+            continue;
+        };
+        if ordinal.len() == parent.len() + 1
+            && ordinal.starts_with(&parent)
+            && ordinal.last() == Some(&1)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Debug)]
 struct SliceFile {
-    number: u32,
+    ordinal: Vec<u32>,
+    ordinal_text: String,
     stem: String,
     path: String,
     title: String,
@@ -48,7 +77,7 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some((number, stem)) = parse_slice_name(&file_name) else {
+        let Some((ordinal, ordinal_text, stem)) = parse_slice_name(&file_name) else {
             continue;
         };
         let content = fs::read_to_string(entry.path())
@@ -59,7 +88,8 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
             .unwrap_or(&stem)
             .to_owned();
         slices.push(SliceFile {
-            number,
+            ordinal,
+            ordinal_text,
             stem,
             path: format!("{SLICES_DIR}/{file_name}"),
             title,
@@ -71,15 +101,15 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
         return Ok(AgendaSelection::Absent);
     }
     slices.sort_by(|left, right| {
-        left.number
-            .cmp(&right.number)
+        left.ordinal
+            .cmp(&right.ordinal)
             .then_with(|| left.stem.cmp(&right.stem))
     });
     for pair in slices.windows(2) {
-        if pair[0].number == pair[1].number {
+        if pair[0].ordinal == pair[1].ordinal {
             bail!(
-                "agenda contains duplicate slice number {:03}: `{}` and `{}`",
-                pair[0].number,
+                "agenda contains duplicate slice ordinal {}: `{}` and `{}`",
+                pair[0].ordinal_text,
                 pair[0].path,
                 pair[1].path
             );
@@ -109,11 +139,18 @@ pub fn discover(repo: &Path, active: &ChangeSnapshot) -> Result<AgendaSelection>
     Ok(AgendaSelection::Complete)
 }
 
-fn parse_slice_name(file_name: &str) -> Option<(u32, String)> {
+fn parse_slice_name(file_name: &str) -> Option<(Vec<u32>, String, String)> {
     let stem = file_name.strip_suffix(".md")?;
-    let (number, slug) = stem.split_once('-')?;
-    if number.is_empty()
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    let (ordinal_text, slug) = stem.split_once('-')?;
+    let ordinal = ordinal_text
+        .split('.')
+        .map(|component| {
+            (!component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| component.parse().ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<u32>>>()?;
+    if ordinal.is_empty()
         || slug.is_empty()
         || !slug
             .bytes()
@@ -121,7 +158,11 @@ fn parse_slice_name(file_name: &str) -> Option<(u32, String)> {
     {
         return None;
     }
-    Some((number.parse().ok()?, stem.to_owned()))
+    Some((
+        ordinal,
+        ordinal_text.to_owned(),
+        format!("{}-{slug}", ordinal_text.replace('.', "-")),
+    ))
 }
 
 fn directory_names(directory: &Path) -> Result<Vec<String>> {
@@ -245,12 +286,52 @@ mod tests {
     fn accepts_four_digit_and_variable_width_slice_numbers() {
         assert_eq!(
             parse_slice_name("0001-repo-cli-scaffold.md"),
-            Some((1, "0001-repo-cli-scaffold".to_owned()))
+            Some((
+                vec![1],
+                "0001".to_owned(),
+                "0001-repo-cli-scaffold".to_owned()
+            ))
         );
         assert_eq!(
             parse_slice_name("12-parser.md"),
-            Some((12, "12-parser".to_owned()))
+            Some((vec![12], "12".to_owned(), "12-parser".to_owned()))
         );
         assert_eq!(parse_slice_name("README.md"), None);
+    }
+
+    #[test]
+    fn hierarchical_ordinals_sort_numerically_and_map_to_kebab_change_names() {
+        let repo = fixture();
+        write_slice(&repo, "0010-loops.md", "Loops");
+        write_slice(&repo, "0009.10-late-conditionals.md", "Late conditionals");
+        write_slice(&repo, "0009.2-early-conditionals.md", "Early conditionals");
+        write_slice(&repo, "0009.1-first-conditionals.md", "First conditionals");
+        write_slice(&repo, "0009-conditionals-core.md", "Conditionals core");
+        fs::create_dir(repo.join("openspec/changes/archive/0009-conditionals-core")).unwrap();
+        fs::create_dir(repo.join("openspec/changes/archive/0009-1-first-conditionals")).unwrap();
+
+        let AgendaSelection::Next(assignment) =
+            discover(&repo, &ChangeSnapshot::default()).unwrap()
+        else {
+            panic!("expected an agenda assignment");
+        };
+        assert_eq!(
+            assignment.path,
+            "automation/slices/0009.2-early-conditionals.md"
+        );
+        assert_eq!(assignment.change, "0009-2-early-conditionals");
+        assert!(
+            has_subdivision(
+                &repo,
+                &AgendaAssignment {
+                    path: "automation/slices/0009-conditionals-core.md".to_owned(),
+                    change: "0009-conditionals-core".to_owned(),
+                    title: "Conditionals core".to_owned(),
+                    content: "original".to_owned(),
+                }
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 }
