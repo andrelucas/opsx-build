@@ -48,6 +48,7 @@ pub struct LauncherEnvironment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeLauncher {
     pub connection_name: Option<String>,
+    pub environment_name: Option<String>,
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
@@ -72,6 +73,7 @@ impl ClaudeLauncher {
         }
         Ok(Self {
             connection_name: None,
+            environment_name: None,
             program: words.remove(0),
             prefix_args: words,
             model,
@@ -92,6 +94,7 @@ impl ClaudeLauncher {
             connection.max_output_tokens,
         )?;
         launcher.connection_name = connection.name.clone();
+        launcher.environment_name = connection.environment_name.clone();
         if connection.isolate {
             launcher
                 .unset_environment
@@ -1306,6 +1309,7 @@ mod tests {
     fn resolves_an_isolated_named_connection_into_commands() {
         let connection = ClaudeConnection {
             name: Some("hosted".to_owned()),
+            environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: Some("provider/model".to_owned()),
             auto_compact_window: None,
@@ -1343,6 +1347,7 @@ mod tests {
         );
 
         assert_eq!(launcher.connection_name.as_deref(), Some("hosted"));
+        assert_eq!(launcher.environment_name.as_deref(), Some("provider"));
         assert!(
             launcher
                 .unset_environment
@@ -1373,6 +1378,7 @@ mod tests {
     fn reports_a_missing_referenced_connection_environment_variable() {
         let connection = ClaudeConnection {
             name: Some("hosted".to_owned()),
+            environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: None,
             auto_compact_window: None,
@@ -1700,6 +1706,7 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = ClaudeLauncher {
             connection_name: None,
+            environment_name: None,
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,

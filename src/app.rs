@@ -244,8 +244,9 @@ impl<U: Ui> App<U> {
             ));
         }
         self.ui.debug(&format!(
-            "frontier launcher: connection={:?}, program=`{}`, prefix args={:?}, model={:?}, environment={:?}, unset environment={:?}",
+            "frontier launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, environment variables={:?}, unset environment={:?}",
             frontier_launcher.connection_name,
+            frontier_launcher.environment_name,
             frontier_launcher.program,
             frontier_launcher.prefix_args,
             frontier_launcher.model,
@@ -1417,8 +1418,9 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: connection={:?}, program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
             launcher.connection_name,
+            launcher.environment_name,
             launcher.program,
             launcher.prefix_args,
             launcher.model,
@@ -1450,10 +1452,11 @@ impl<U: Ui> App<U> {
 
 fn connection_description(launcher: &ClaudeLauncher) -> String {
     let name = launcher.connection_name.as_deref().unwrap_or("default");
-    match launcher.model.as_deref() {
-        Some(model) => format!("`{name}` ({model})"),
-        None => format!("`{name}` (harness default model)"),
-    }
+    let model = launcher.model.as_deref().unwrap_or("harness default model");
+    launcher.environment_name.as_deref().map_or_else(
+        || format!("`{name}` ({model})"),
+        |environment| format!("`{name}` ({model}, environment `{environment}`)"),
+    )
 }
 
 fn planning_session(state: &mut RunState) -> (Uuid, bool) {

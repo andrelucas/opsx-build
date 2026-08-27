@@ -49,6 +49,7 @@ pub struct Cli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeConnection {
     pub name: Option<String>,
+    pub environment_name: Option<String>,
     pub command: String,
     pub model: Option<String>,
     pub auto_compact_window: Option<u64>,
@@ -302,6 +303,7 @@ struct FileConfig {
     worker_connection: Option<String>,
     frontier_connection: Option<String>,
     connections: BTreeMap<String, FileConnection>,
+    environments: BTreeMap<String, FileEnvironment>,
     auto_compact_window: Option<TokenCount>,
     auto_compact_percent: Option<Percentage>,
     max_output_tokens: Option<TokenCount>,
@@ -318,9 +320,18 @@ struct FileConfig {
 struct FileConnection {
     command: Option<String>,
     model: Option<String>,
+    environment: Option<String>,
     auto_compact_window: Option<TokenCount>,
     auto_compact_percent: Option<Percentage>,
     max_output_tokens: Option<TokenCount>,
+    env: BTreeMap<String, ConnectionEnvironmentValue>,
+    isolate: Option<bool>,
+    unset_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileEnvironment {
     env: BTreeMap<String, ConnectionEnvironmentValue>,
     isolate: Option<bool>,
     unset_env: Vec<String>,
@@ -477,6 +488,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
     )?;
     let worker_connection = resolve_connection(
         worker_profile,
+        &config.environments,
         args.claude_command.clone(),
         args.claude_model.clone(),
         config.claude_command.clone(),
@@ -488,9 +500,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         config.auto_compact_percent,
         config.max_output_tokens,
         DEFAULT_CLAUDE_COMMAND,
-    );
+    )?;
     let frontier_connection = resolve_connection(
         frontier_profile,
+        &config.environments,
         args.frontier_command.clone(),
         args.frontier_model.clone(),
         config.frontier_command.clone(),
@@ -502,7 +515,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         None,
         None,
         DEFAULT_FRONTIER_COMMAND,
-    );
+    )?;
     let request = match args.request.as_deref() {
         Some(value) if value.trim().eq_ignore_ascii_case("next slice") => "advance".to_owned(),
         Some(value) => value.to_owned(),
@@ -594,6 +607,7 @@ fn selected_connection(
 #[allow(clippy::too_many_arguments)]
 fn resolve_connection(
     profile: Option<(String, FileConnection)>,
+    environments: &BTreeMap<String, FileEnvironment>,
     command_line_command: Option<String>,
     command_line_model: Option<String>,
     legacy_command: Option<String>,
@@ -605,13 +619,31 @@ fn resolve_connection(
     legacy_percentage: Option<Percentage>,
     legacy_output_tokens: Option<TokenCount>,
     default_command: &str,
-) -> ClaudeConnection {
+) -> Result<ClaudeConnection> {
     let (name, profile) = profile
         .map(|(name, profile)| (Some(name), profile))
         .unwrap_or_default();
-    let isolate = name.is_some() && profile.isolate.unwrap_or(true);
-    ClaudeConnection {
+    let (environment_name, shared_environment) = selected_environment(
+        profile.environment.as_deref(),
+        environments,
+        name.as_deref(),
+    )?;
+    let mut environment = shared_environment.env;
+    environment.extend(profile.env);
+    let isolate = name.is_some()
+        && profile
+            .isolate
+            .or(shared_environment.isolate)
+            .unwrap_or(true);
+    let mut unset_env = shared_environment.unset_env;
+    for variable in profile.unset_env {
+        if !unset_env.contains(&variable) {
+            unset_env.push(variable);
+        }
+    }
+    Ok(ClaudeConnection {
         name,
+        environment_name,
         command: command_line_command
             .or(profile.command)
             .or(legacy_command)
@@ -629,10 +661,39 @@ fn resolve_connection(
             .or(profile.max_output_tokens)
             .or(legacy_output_tokens)
             .map(|count| count.0),
-        env: profile.env,
+        env: environment,
         isolate,
-        unset_env: profile.unset_env,
+        unset_env,
+    })
+}
+
+fn selected_environment(
+    name: Option<&str>,
+    environments: &BTreeMap<String, FileEnvironment>,
+    connection_name: Option<&str>,
+) -> Result<(Option<String>, FileEnvironment)> {
+    let Some(name) = name else {
+        return Ok((None, FileEnvironment::default()));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("environment profile name cannot be empty");
     }
+    let environment = environments.get(name).cloned().with_context(|| {
+        let available = if environments.is_empty() {
+            "none are configured".to_owned()
+        } else {
+            format!(
+                "available environments: {}",
+                environments.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        format!(
+            "Claude connection profile `{}` references unknown environment profile `{name}`; {available}",
+            connection_name.unwrap_or("unnamed")
+        )
+    })?;
+    Ok((Some(name.to_owned()), environment))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,9 +896,12 @@ mod tests {
                 [connections.kimi]
                 command = "claude"
                 model = "kimi-k3"
+                environment = "openrouter"
+
+                [environments.openrouter]
                 unset_env = ["HTTP_PROXY"]
 
-                [connections.kimi.env]
+                [environments.openrouter.env]
                 ANTHROPIC_BASE_URL = "https://provider.example/anthropic"
                 ANTHROPIC_AUTH_TOKEN = { from_env = "KIMI_API_KEY" }
             "#,
@@ -864,6 +928,10 @@ mod tests {
         );
 
         assert_eq!(cli.frontier_connection.name.as_deref(), Some("kimi"));
+        assert_eq!(
+            cli.frontier_connection.environment_name.as_deref(),
+            Some("openrouter")
+        );
         assert_eq!(cli.frontier_connection.model.as_deref(), Some("kimi-k3"));
         assert_eq!(cli.frontier_connection.unset_env, ["HTTP_PROXY"]);
         assert!(matches!(
@@ -871,6 +939,109 @@ mod tests {
             Some(ConnectionEnvironmentValue::FromEnvironment(reference))
                 if reference.from_env == "KIMI_API_KEY"
         ));
+    }
+
+    #[test]
+    fn multiple_connections_share_one_environment_profile() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "openrouter-kimi"
+                frontier_connection = "openrouter-gemini"
+
+                [environments.openrouter.env]
+                ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
+                ANTHROPIC_AUTH_TOKEN = { from_env = "OPENROUTER_API_KEY" }
+                ANTHROPIC_API_KEY = ""
+
+                [connections.openrouter-kimi]
+                command = "claude"
+                model = "moonshotai/kimi-k3"
+                environment = "openrouter"
+
+                [connections.openrouter-gemini]
+                command = "claude"
+                model = "google/gemini"
+                environment = "openrouter"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(args(["opsx-build", "build something"]), config, None).unwrap();
+
+        for connection in [&cli.worker_connection, &cli.frontier_connection] {
+            assert_eq!(connection.environment_name.as_deref(), Some("openrouter"));
+            assert_eq!(
+                connection.env.get("ANTHROPIC_BASE_URL"),
+                Some(&ConnectionEnvironmentValue::Literal(
+                    "https://openrouter.ai/api".to_owned()
+                ))
+            );
+            assert_eq!(
+                connection.env.get("ANTHROPIC_API_KEY"),
+                Some(&ConnectionEnvironmentValue::Literal(String::new()))
+            );
+        }
+        assert_eq!(
+            cli.worker_connection.model.as_deref(),
+            Some("moonshotai/kimi-k3")
+        );
+        assert_eq!(
+            cli.frontier_connection.model.as_deref(),
+            Some("google/gemini")
+        );
+    }
+
+    #[test]
+    fn connection_environment_overrides_shared_environment_values() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                frontier_connection = "custom"
+
+                [environments.provider.env]
+                ROUTING_HINT = "shared"
+
+                [connections.custom]
+                environment = "provider"
+
+                [connections.custom.env]
+                ROUTING_HINT = "connection-specific"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(args(["opsx-build", "build something"]), config, None).unwrap();
+
+        assert_eq!(
+            cli.frontier_connection.env.get("ROUTING_HINT"),
+            Some(&ConnectionEnvironmentValue::Literal(
+                "connection-specific".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_shared_environment_profile() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                frontier_connection = "hosted"
+
+                [connections.hosted]
+                environment = "missing"
+
+                [environments.openrouter.env]
+                ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
+            "#,
+        )
+        .unwrap();
+        let error =
+            resolve_values(args(["opsx-build", "build something"]), config, None).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "connection profile `hosted` references unknown environment profile `missing`"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("available environments: openrouter")
+        );
     }
 
     #[test]

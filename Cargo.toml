@@ -1,6 +1,6 @@
 [package]
 name = "opsx-build"
-version = "0.18.3"
+version = "0.18.4"
 edition = "2024"
 description = "Unattended OpenSpec build orchestrator for Claude Code"
 license = "MIT"

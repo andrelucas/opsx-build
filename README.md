@@ -339,7 +339,7 @@ different models, endpoints, or credentials:
 
 ```toml
 worker_connection = "local"
-frontier_connection = "kimi"
+frontier_connection = "openrouter-kimi"
 
 [connections.local]
 command = "omlx launch claude"
@@ -347,19 +347,27 @@ model = "qwen3.6-35b-a3b"
 auto_compact_window = "128k"
 max_output_tokens = "8k"
 
-[connections.kimi]
-command = "claude"
-model = "kimi-k3"
+[environments.openrouter.env]
+ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
+ANTHROPIC_AUTH_TOKEN = { from_env = "OPENROUTER_API_KEY" }
+ANTHROPIC_API_KEY = ""
 
-[connections.kimi.env]
-ANTHROPIC_BASE_URL = "https://provider.example/anthropic"
-ANTHROPIC_AUTH_TOKEN = { from_env = "KIMI_API_KEY" }
+[connections.openrouter-kimi]
+command = "claude"
+model = "moonshotai/kimi-k3"
+environment = "openrouter"
+
+[connections.openrouter-gemini]
+command = "claude"
+model = "provider-specific-gemini-model-id"
+environment = "openrouter"
 ```
 
 Select a configured connection for one invocation with:
 
 ```sh
-opsx-build --worker-connection local --frontier-connection kimi --loop advance
+opsx-build --worker-connection local --frontier-connection openrouter-kimi \
+  --loop advance
 ```
 
 `--claude-command`, `--claude-model`, and the worker token-policy flags override
@@ -368,24 +376,32 @@ override the selected frontier profile. A profile may also set its own
 `auto_compact_window`, `auto_compact_percent`, and `max_output_tokens`; frontier
 profiles therefore do not accidentally inherit worker policy.
 
-Profile `env` values may be literal strings or `{ from_env = "NAME" }`
-references. References keep credentials out of the TOML file, are resolved only
-when that profile is selected, and are redacted from displayed commands and
+Reusable `[environments.NAME]` profiles hold endpoint, authentication, and
+other provider environment. A connection selects one with
+`environment = "NAME"`; any inline `[connections.NAME.env]` values override the
+shared environment for that model only. Both shared and inline `env` values may
+be literal strings or `{ from_env = "NAME" }` references. References keep
+credentials out of the TOML file, are resolved only when a connection using
+that environment is selected, and are redacted from displayed commands and
 debug output. Literal variables with names containing `TOKEN`, `KEY`, `SECRET`,
 or `PASSWORD` are also redacted, but storing credentials literally is not
 recommended.
 
-Named profiles are isolated by default: inherited Claude endpoint,
+Named connections are isolated by default: inherited Claude endpoint,
 authentication, and provider-selection variables are removed before the
-profile's own environment is applied. Add `isolate = false` only when a profile
-intentionally depends on ambient Claude connection variables. `unset_env`
-removes additional named variables:
+shared and inline environment is applied. `isolate` and `unset_env` may be set
+on the shared environment and overridden or extended by a connection. Add
+`isolate = false` only when a profile intentionally depends on ambient Claude
+connection variables. `unset_env` removes additional named variables:
 
 ```toml
+[environments.local-network]
+unset_env = ["HTTP_PROXY"]
+
 [connections.slow-local]
 command = "omlx launch claude"
 model = "larger-model"
-unset_env = ["HTTP_PROXY"]
+environment = "local-network"
 ```
 
 A hosted connection must still be usable by Claude Code. Direct endpoints or
