@@ -357,7 +357,8 @@ frontier_connection = "openrouter-kimi"
 [connections.local]
 command = "omlx launch claude"
 model = "qwen3.6-35b-a3b"
-auto_compact_window = "128k"
+context_window = "256k"
+auto_compact_percent = 75
 max_output_tokens = "8k"
 
 [environments.openrouter.env]
@@ -386,8 +387,10 @@ opsx-build --worker-connection local --frontier-connection openrouter-kimi \
 `--claude-command`, `--claude-model`, and the worker token-policy flags override
 the selected worker profile. `--frontier-command` and `--frontier-model`
 override the selected frontier profile. A profile may also set its own
-`auto_compact_window`, `auto_compact_percent`, and `max_output_tokens`; frontier
-profiles therefore do not accidentally inherit worker policy.
+`context_window`, `auto_compact_window`, `auto_compact_percent`, and
+`max_output_tokens`; frontier profiles therefore do not accidentally inherit
+worker policy. `context_window` is intentionally profile-only because it
+describes the selected model rather than a run-wide policy.
 
 Reusable `[environments.NAME]` profiles hold endpoint, authentication, and
 other provider environment. A connection selects one with
@@ -450,22 +453,27 @@ commit `automation/slices/`; configure it only to a destination permitted to
 receive that repository content.
 
 Token counts may be plain integers (`8192`) or use binary `k`/`m` suffixes;
-`8k` therefore means 8,192 tokens. `auto_compact_percent` accepts an integer
-from 1 to 100 and applies to the effective capacity selected by Claude or its
-launcher, so opsx-build does not need model visibility. The configured values
-are exported to every Claude subprocess selected by that connection, including
-interactive worker-launcher tests, through `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, without
-changing the parent shell. Leaving a setting absent preserves Claude's or the
-launcher's default.
+`8k` therefore means 8,192 tokens. Set `context_window = "256k"` when Claude
+Code cannot identify a local, gateway, or provider-specific model's real
+capacity. opsx-build exports it as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which tells
+Claude Code what model window to assume and makes `/context` and proactive
+compaction use that capacity where Claude Code supports custom model IDs.
 
-The oMLX launcher supplies the selected model's capacity when no explicit
-window is present. Current oMLX versions preserve an inherited absolute window
-and percentage override. As an alternative to `auto_compact_window = "128k"`,
-`auto_compact_percent = 50` against a 262,144-token capacity targets
-approximately 131,072 tokens. A lower output limit bounds slow decode latency
-but can cause more continuation turns; output-limit recovery handles those
-turns.
+`auto_compact_window` is an optional effective capacity used only for
+auto-compaction calculations. `auto_compact_percent` accepts an integer from 1
+to 100 and applies to that effective auto-compact window, or to the model's
+declared/inferred context window when no separate auto-compact window is set.
+For example, `context_window = "256k"` with `auto_compact_percent = 75` targets
+approximately 192k tokens. The configured values are exported to every Claude
+subprocess selected by that connection, including interactive worker-launcher
+tests, through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`,
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, without changing the parent shell. Leaving a
+setting absent preserves Claude's or the launcher's default. See Claude Code's
+[environment-variable contract][claude-env-vars] for custom-model caveats.
+
+A lower output limit bounds slow decode latency but can cause more continuation
+turns; output-limit recovery handles those turns.
 
 Configuration precedence is:
 

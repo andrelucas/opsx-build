@@ -53,6 +53,7 @@ pub struct ClaudeConnection {
     pub environment_name: Option<String>,
     pub command: String,
     pub model: Option<String>,
+    pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
     pub max_output_tokens: Option<u64>,
@@ -344,6 +345,7 @@ struct FileConnection {
     command: Option<String>,
     model: Option<String>,
     environment: Option<String>,
+    context_window: Option<TokenCount>,
     auto_compact_window: Option<TokenCount>,
     auto_compact_percent: Option<Percentage>,
     max_output_tokens: Option<TokenCount>,
@@ -675,6 +677,7 @@ fn resolve_connection(
             .or(legacy_command)
             .unwrap_or_else(|| default_command.to_owned()),
         model: command_line_model.or(profile.model).or(legacy_model),
+        context_window: profile.context_window.map(|count| count.0),
         auto_compact_window: command_line_window
             .or(profile.auto_compact_window)
             .or(legacy_window)
@@ -913,6 +916,7 @@ mod tests {
                 [connections.local]
                 command = "omlx launch claude"
                 model = "qwen-local"
+                context_window = "256k"
                 auto_compact_window = "192k"
                 max_output_tokens = "8k"
 
@@ -922,6 +926,7 @@ mod tests {
                 [connections.kimi]
                 command = "claude"
                 model = "kimi-k3"
+                context_window = "128k"
                 environment = "openrouter"
 
                 [environments.openrouter]
@@ -943,6 +948,7 @@ mod tests {
         assert_eq!(cli.worker_connection.name.as_deref(), Some("local"));
         assert_eq!(cli.worker_connection.command, "omlx launch claude");
         assert_eq!(cli.worker_connection.model.as_deref(), Some("qwen-local"));
+        assert_eq!(cli.worker_connection.context_window, Some(262_144));
         assert_eq!(cli.worker_connection.auto_compact_window, Some(196_608));
         assert_eq!(cli.worker_connection.max_output_tokens, Some(8_192));
         assert!(cli.worker_connection.isolate);
@@ -959,6 +965,7 @@ mod tests {
             Some("openrouter")
         );
         assert_eq!(cli.frontier_connection.model.as_deref(), Some("kimi-k3"));
+        assert_eq!(cli.frontier_connection.context_window, Some(131_072));
         assert_eq!(cli.frontier_connection.unset_env, ["HTTP_PROXY"]);
         assert!(matches!(
             cli.frontier_connection.env.get("ANTHROPIC_AUTH_TOKEN"),
@@ -1214,6 +1221,7 @@ mod tests {
         assert_eq!(cli.worker_connection.command, DEFAULT_CLAUDE_COMMAND);
         assert_eq!(cli.frontier_connection.command, DEFAULT_FRONTIER_COMMAND);
         assert_eq!(cli.frontier_connection.model, None);
+        assert_eq!(cli.worker_connection.context_window, None);
         assert_eq!(cli.worker_connection.auto_compact_window, None);
         assert_eq!(cli.worker_connection.auto_compact_percent, None);
         assert_eq!(cli.worker_connection.max_output_tokens, None);

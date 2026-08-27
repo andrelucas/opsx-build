@@ -1463,12 +1463,13 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
             launcher.connection_name,
             launcher.environment_name,
             launcher.program,
             launcher.prefix_args,
             launcher.model,
+            launcher.context_window,
             launcher.auto_compact_window,
             launcher.auto_compact_percent,
             launcher.max_output_tokens,

@@ -19,6 +19,7 @@ use crate::{
 
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
@@ -53,6 +54,7 @@ pub struct ClaudeLauncher {
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
+    pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
     pub max_output_tokens: Option<u64>,
@@ -64,6 +66,7 @@ impl ClaudeLauncher {
     pub fn parse(
         command: &str,
         model: Option<String>,
+        context_window: Option<u64>,
         auto_compact_window: Option<u64>,
         auto_compact_percent: Option<u8>,
         max_output_tokens: Option<u64>,
@@ -78,6 +81,7 @@ impl ClaudeLauncher {
             program: words.remove(0),
             prefix_args: words,
             model,
+            context_window,
             auto_compact_window,
             auto_compact_percent,
             max_output_tokens,
@@ -90,6 +94,7 @@ impl ClaudeLauncher {
         let mut launcher = Self::parse(
             &connection.command,
             connection.model.clone(),
+            connection.context_window,
             connection.auto_compact_window,
             connection.auto_compact_percent,
             connection.max_output_tokens,
@@ -493,6 +498,10 @@ fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> Co
             spec.env(&variable.name, &variable.value)
         }
     });
+    let spec = match launcher.context_window {
+        Some(tokens) => spec.env(MAX_CONTEXT_TOKENS_ENV, tokens.to_string()),
+        None => spec,
+    };
     let spec = match launcher.auto_compact_window {
         Some(window) => spec.env(AUTO_COMPACT_ENV, window.to_string()),
         None => spec,
@@ -1217,6 +1226,7 @@ mod tests {
         let launcher = ClaudeLauncher::parse(
             "omlx launch claude",
             Some("qwen3.6-35b-a3b".to_owned()),
+            Some(262_144),
             Some(196_608),
             Some(75),
             Some(8_192),
@@ -1238,6 +1248,7 @@ mod tests {
         assert_eq!(
             new.env,
             [
+                (MAX_CONTEXT_TOKENS_ENV.to_owned(), "262144".to_owned()),
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
                 (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
@@ -1297,6 +1308,7 @@ mod tests {
         assert_eq!(
             compact.env,
             [
+                (MAX_CONTEXT_TOKENS_ENV.to_owned(), "262144".to_owned()),
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
                 (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
@@ -1362,11 +1374,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(launcher.program, "/Applications/oMLX Preview.app/omlx");
         assert_eq!(launcher.prefix_args, ["launch", "claude code"]);
-        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None, None).is_err());
+        assert!(ClaudeLauncher::parse("omlx 'unterminated", None, None, None, None, None).is_err());
     }
 
     #[test]
@@ -1376,6 +1389,7 @@ mod tests {
             environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: Some("provider/model".to_owned()),
+            context_window: Some(131_072),
             auto_compact_window: None,
             auto_compact_percent: None,
             max_output_tokens: Some(4_096),
@@ -1436,6 +1450,11 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--model", "provider/model"])
         );
+        assert!(
+            command
+                .env
+                .contains(&(MAX_CONTEXT_TOKENS_ENV.to_owned(), "131072".to_owned()))
+        );
     }
 
     #[test]
@@ -1445,6 +1464,7 @@ mod tests {
             environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: None,
+            context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,
             max_output_tokens: None,
@@ -1486,6 +1506,7 @@ mod tests {
         let launcher = ClaudeLauncher::parse(
             "omlx launch claude",
             Some("local-model".to_owned()),
+            Some(262_144),
             Some(196_608),
             Some(75),
             Some(8_192),
@@ -1517,6 +1538,7 @@ mod tests {
         assert_eq!(
             command.env,
             [
+                (MAX_CONTEXT_TOKENS_ENV.to_owned(), "262144".to_owned()),
                 (AUTO_COMPACT_ENV.to_owned(), "196608".to_owned()),
                 (AUTO_COMPACT_PERCENT_ENV.to_owned(), "75".to_owned()),
                 (MAX_OUTPUT_TOKENS_ENV.to_owned(), "8192".to_owned())
@@ -1529,6 +1551,7 @@ mod tests {
         let launcher = ClaudeLauncher::parse(
             "omlx launch claude",
             Some("test-model".to_owned()),
+            None,
             None,
             None,
             None,
@@ -1589,7 +1612,7 @@ mod tests {
 
     #[test]
     fn adds_stage_schema_to_unattended_command() {
-        let launcher = ClaudeLauncher::parse("claude", None, None, None, None).unwrap();
+        let launcher = ClaudeLauncher::parse("claude", None, None, None, None, None).unwrap();
         let schema = StageProtocol::Verify.json_schema();
         let command = build_claude_command(
             Path::new("/repo"),
@@ -1837,6 +1860,7 @@ printf '%s\n' "$((count + 1))" > "$state"
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,
+            context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,
             max_output_tokens: None,
