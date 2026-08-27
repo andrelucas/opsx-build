@@ -16,4 +16,40 @@
   choices, or correctable test failures.
 - Preserve unrelated working-tree changes. Never reset, stash, restore,
   discard, amend, or rewrite user work merely to simplify a workflow stage.
+
+### Dependency selection
+
+- Treat third-party library and framework choices as revisable design decisions
+  unless the project context or specification explicitly requires them. The
+  specified observable behaviour is authoritative.
+- Validate a material dependency with the smallest end-to-end use before
+  building substantial work around it. If its public API does not naturally
+  support the required behaviour, reassess and replace it when that is simpler.
+  Do not distort specified behaviour or accumulate workarounds merely to
+  preserve an earlier dependency choice.
+
+### Language-server use
+
+- At the start of code-oriented work, verify that a language server for the
+  project's primary implementation language is actually working by making a
+  real symbol, definition, reference, hover, or diagnostic request. Plugin
+  presence alone is not proof that the integration works.
+- Strongly prefer language-server facilities for understanding code structure,
+  navigating symbols and references, and obtaining diagnostics. Use targeted
+  text search when it is intrinsically more appropriate, or as a fallback when
+  the language server is unavailable.
+- If the language server is unavailable, report that once and continue with
+  targeted repository search when the task remains safe. Do not repeatedly
+  retry it or claim that it worked when it did not.
+
+### Source formatting
+
+- Use each source language's canonical formatter as a normal part of completing
+  code changes. Format every source file changed by the current task before
+  final validation, preferring the project's documented formatting command.
+- Keep formatting scoped to task-owned files when unrelated work is present.
+  Inspect the resulting diff and do not reformat generated, vendored,
+  third-party, or unrelated source merely for consistency.
+- Report a missing formatter or unexpected formatter result clearly; do not
+  silently skip formatting or claim it succeeded without running it.
 <!-- END OPSX-BUILD MANAGED -->

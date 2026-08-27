@@ -43,7 +43,10 @@ The command:
 2. creates `openspec/config.yaml` from the supplied context;
 3. installs the reusable planning brief at `automation/bootstrap.md`;
 4. adds or refreshes only the marked `opsx-build` fragment in `CLAUDE.md`,
-   preserving all user-owned text outside its markers;
+   preserving all user-owned text outside its markers; the managed fragment
+   includes workflow safety, revisable dependency selection,
+   language-server-first navigation, and scoped canonical source-formatting
+   policy;
 5. runs the planning-only `bootstrap-implementation-slices` change through the
    existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
    commit stages; and

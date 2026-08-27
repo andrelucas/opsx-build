@@ -37,6 +37,15 @@ architectural discovery during implementation, or has an obvious independently
 testable intermediate state. When in doubt, split it. Prefer several small
 sequential slices over one ambitious slice.
 
+Treat important third-party dependency choices as hypotheses rather than
+requirements unless `openspec/config.yaml` explicitly mandates them. When later
+work depends on a library, framework, protocol implementation, or external API
+whose suitability is not already established, make the earliest relevant slice
+prove the dependency with the smallest end-to-end vertical use. Give that slice
+an observable compatibility gate and record a fallback. Do not build several
+slices on an unproven dependency or distort the project requirements around a
+library selected during planning.
+
 The agenda must cover the complete concrete project goal in
 `openspec/config.yaml`, not merely an initial milestone. Do not leave essential
 capabilities to unspecified "future work". If the supplied goal is genuinely

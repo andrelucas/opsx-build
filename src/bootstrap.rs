@@ -191,7 +191,7 @@ fn render_config(context: &str) -> String {
         rendered.push('\n');
     }
     rendered.push_str(
-        "\nrules:\n  proposal:\n    - Keep each change small enough to implement and verify independently.\n  specs:\n    - Specify observable behaviour rather than implementation details.\n  tasks:\n    - Include tests and end-to-end verification.\n    - Keep each change bounded enough for the configured worker model to complete reliably.\n\noperations:\n  apply:\n    guidance:\n      - Preserve correct partial work and keep validation summaries concise.\n  archive:\n    guidance:\n      - Summarize the archive outcome before finishing.\n",
+        "\nrules:\n  proposal:\n    - Keep each change small enough to implement and verify independently.\n  specs:\n    - Specify observable behaviour rather than implementation details.\n  design:\n    - Treat third-party dependency choices as revisable design decisions, not requirements.\n    - Validate material dependencies with a minimal end-to-end proof before building substantial work around them.\n    - Record a fallback when a dependency does not naturally support the specified behaviour.\n  tasks:\n    - Include tests and end-to-end verification.\n    - Keep each change bounded enough for the configured worker model to complete reliably.\n\noperations:\n  apply:\n    guidance:\n      - Preserve correct partial work and keep validation summaries concise.\n  archive:\n    guidance:\n      - Summarize the archive outcome before finishing.\n",
     );
     rendered
 }
@@ -234,6 +234,10 @@ mod tests {
         assert!(rendered.contains("context: |\n  # Widget\n  \n  Build a useful widget.\n"));
         assert!(rendered.contains("schema: spec-driven"));
         assert!(rendered.contains("Keep each change bounded enough"));
+        assert!(rendered.contains("Treat third-party dependency choices as revisable"));
+        assert!(
+            rendered.contains("Validate material dependencies with a minimal end-to-end proof")
+        );
     }
 
     #[test]
@@ -245,6 +249,16 @@ mod tests {
         let updated = merge_managed_fragment(&first).unwrap();
         assert_eq!(updated, first);
         assert!(merge_managed_fragment(MANAGED_START).is_err());
+    }
+
+    #[test]
+    fn managed_fragment_requires_language_server_use_and_canonical_formatting() {
+        assert!(CLAUDE_FRAGMENT.contains("verify that a language server"));
+        assert!(CLAUDE_FRAGMENT.contains("Strongly prefer language-server facilities"));
+        assert!(CLAUDE_FRAGMENT.contains("canonical formatter"));
+        assert!(CLAUDE_FRAGMENT.contains("Format every source file changed"));
+        assert!(CLAUDE_FRAGMENT.contains("Treat third-party library and framework choices"));
+        assert!(CLAUDE_FRAGMENT.contains("Do not distort specified behaviour"));
     }
 
     #[test]
