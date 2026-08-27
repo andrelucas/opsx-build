@@ -30,6 +30,21 @@ opsx-build --repo ~/git/my-project \
   bootstrap --context project.md
 ```
 
+Project contexts may contain strict `{{name}}` placeholders. Supply each value
+with a repeatable `--define NAME=VALUE` option:
+
+```sh
+opsx-build --frontier-connection openrouter-kimi \
+  --define language=Go \
+  --context proxy-context.md \
+  bootstrap
+```
+
+Substitution is deliberately textual and non-recursive. Bootstrap rejects
+missing definitions, duplicate names, malformed placeholders, and definitions
+that are not used by the context. It supports no conditionals, includes, loops,
+or executable template expressions.
+
 Bootstrap requires an existing Git repository but no existing OpenSpec setup.
 It uses the configured **frontier** connection for the complete one-time
 planning workflow; the worker connection is not used. The context path is an
@@ -712,18 +727,21 @@ phase chatter while preserving its summary.
 
 Controls:
 
-- `p` immediately stops the active Claude subprocess and exits successfully,
-  preserving the current phase checkpoint for `--resume`;
+- `p`, followed by `y`, immediately stops the active Claude subprocess and
+  exits successfully, preserving the current phase checkpoint for `--resume`;
 - `f` during Explore, Propose, Apply, Verify, or Repair stops the local worker
-  and requests frontier subdivision at the next orchestration opportunity;
+  and requests frontier subdivision at the next orchestration opportunity
+  after confirmation;
 - `c` sends Claude's interrupt control request—the streaming equivalent of
   Escape—then runs `/compact` and reissues the interrupted stage command (once
-  per invocation);
+  per invocation) after confirmation;
 - `C` follows the same interrupt/resume cycle but runs `/context`, leaving
-  Claude's context report in the phase disclosure for debugging;
+  Claude's context report in the phase disclosure for debugging, after
+  confirmation;
 - `i` opens a steering prompt; Enter interrupts the active Claude turn and
   delivers the entered instruction as its continuation;
-- `q` in campaign mode pauses cleanly after the current change completes;
+- `q` in campaign mode pauses cleanly after the current change completes after
+  confirmation;
 - Escape cancels the injection prompt;
 - Tab or Left/Right selects a phase disclosure;
 - Enter, Space, `o`, or a click on a heading expands/collapses that phase;
@@ -732,6 +750,12 @@ Controls:
 - Escape collapses the selected phase;
 - Ctrl-C interrupts the current subprocess while preserving its opsx-build
   checkpoint, but reports an interruption rather than a deliberate pause.
+
+The single-key actions `p`, `q`, `f`, `c`, and `C` require a following `y` to
+confirm; any other key cancels the pending action and is not interpreted as a
+new shortcut. Steering is already a deliberate two-step action: Escape cancels
+its input prompt and Enter sends the entered text. Ctrl-C remains an immediate
+emergency stop.
 
 All three injection controls interrupt the active turn first. `i` delivers the
 entered text as the continuation, which lets it steer the work already in

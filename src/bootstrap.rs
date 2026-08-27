@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -21,15 +25,26 @@ pub struct BootstrapScaffold {
 }
 
 impl BootstrapScaffold {
-    pub fn plan(repo: &Path, context_path: &Path) -> Result<Self> {
-        let context = fs::read_to_string(context_path).with_context(|| {
+    pub fn plan(
+        repo: &Path,
+        context_path: &Path,
+        definitions: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let context_template = fs::read_to_string(context_path).with_context(|| {
             format!(
                 "could not read bootstrap context `{}`",
                 context_path.display()
             )
         })?;
-        if context.trim().is_empty() {
+        if context_template.trim().is_empty() {
             bail!("bootstrap context `{}` is empty", context_path.display());
+        }
+        let context = render_context_template(&context_template, definitions)?;
+        if context.trim().is_empty() {
+            bail!(
+                "bootstrap context `{}` is empty after template substitution",
+                context_path.display()
+            );
         }
 
         let config_path = repo.join(CONFIG_PATH);
@@ -196,6 +211,65 @@ fn render_config(context: &str) -> String {
     rendered
 }
 
+fn render_context_template(
+    template: &str,
+    definitions: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    let mut used = BTreeSet::new();
+
+    loop {
+        let next_open = remaining.find("{{");
+        let next_close = remaining.find("}}");
+        if next_close.is_some_and(|close| next_open.is_none_or(|open| close < open)) {
+            bail!("bootstrap context contains an unmatched `}}}}`");
+        }
+        let Some(open) = next_open else {
+            rendered.push_str(remaining);
+            break;
+        };
+        rendered.push_str(&remaining[..open]);
+        let placeholder = &remaining[open + 2..];
+        let close = placeholder
+            .find("}}")
+            .context("bootstrap context contains an unclosed `{{` placeholder")?;
+        let name = placeholder[..close].trim();
+        if !valid_template_name(name) {
+            bail!(
+                "invalid bootstrap context placeholder `{{{{{name}}}}}`; names use letters, digits, and underscores and begin with a letter or underscore"
+            );
+        }
+        let value = definitions
+            .get(name)
+            .with_context(|| format!("bootstrap context requires `--define {name}=VALUE`"))?;
+        rendered.push_str(value);
+        used.insert(name.to_owned());
+        remaining = &placeholder[close + 2..];
+    }
+
+    let unused = definitions
+        .keys()
+        .filter(|name| !used.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unused.is_empty() {
+        bail!(
+            "bootstrap definition(s) have no matching context placeholder: {}",
+            unused.join(", ")
+        );
+    }
+    Ok(rendered)
+}
+
+fn valid_template_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
 fn merge_managed_fragment(existing: &str) -> Result<String> {
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
     let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
@@ -238,6 +312,36 @@ mod tests {
         assert!(
             rendered.contains("Validate material dependencies with a minimal end-to-end proof")
         );
+    }
+
+    #[test]
+    fn renders_strict_context_variables_without_recursive_expansion() {
+        let definitions = BTreeMap::from([
+            ("language".to_owned(), "Go".to_owned()),
+            (
+                "formatter".to_owned(),
+                "gofmt {{not_a_variable}}".to_owned(),
+            ),
+        ]);
+        let rendered = render_context_template(
+            "Written in {{ language }} and formatted with {{formatter}}.\n",
+            &definitions,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Written in Go and formatted with gofmt {{not_a_variable}}.\n"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_unused_and_malformed_context_variables() {
+        let language = BTreeMap::from([("language".to_owned(), "Go".to_owned())]);
+        assert!(render_context_template("Written in {{missing}}.", &language).is_err());
+        assert!(render_context_template("No variables.", &language).is_err());
+        assert!(render_context_template("Broken {{language.", &language).is_err());
+        assert!(render_context_template("Broken }}.", &BTreeMap::new()).is_err());
+        assert!(render_context_template("Broken {{bad-name}}.", &BTreeMap::new()).is_err());
     }
 
     #[test]

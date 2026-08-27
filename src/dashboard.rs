@@ -65,6 +65,27 @@ enum PhaseStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingConfirmation {
+    Pause,
+    StopAfterIteration,
+    Escalate,
+    Compact,
+    Context,
+}
+
+impl PendingConfirmation {
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Pause => "Pause now and stop the current Claude process?",
+            Self::StopAfterIteration => "Pause after the current OpenSpec change completes?",
+            Self::Escalate => "Stop the local worker and request frontier replanning?",
+            Self::Compact => "Interrupt Claude, compact, and restart the current phase?",
+            Self::Context => "Interrupt Claude and request a context report?",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PhasePanel {
     stage: StageView,
@@ -123,6 +144,7 @@ pub(crate) struct StreamDashboard {
     compact_requested: bool,
     context_requested: bool,
     injection_input: Option<String>,
+    pending_confirmation: Option<PendingConfirmation>,
     stop_after_iteration: bool,
 }
 
@@ -168,6 +190,7 @@ impl StreamDashboard {
             compact_requested: false,
             context_requested: false,
             injection_input: None,
+            pending_confirmation: None,
             stop_after_iteration: false,
         };
         dashboard.draw()?;
@@ -266,6 +289,7 @@ impl StreamDashboard {
         self.compact_requested = false;
         self.context_requested = false;
         self.injection_input = None;
+        self.pending_confirmation = None;
         if let Some(panel) = self.panels.last_mut() {
             panel.status = PhaseStatus::Running;
             panel.finished_at = None;
@@ -398,6 +422,10 @@ impl StreamDashboard {
             return self.handle_injection_event(event);
         }
 
+        if self.pending_confirmation.is_some() {
+            return self.handle_confirmation_event(event);
+        }
+
         if let Event::Mouse(mouse) = &event
             && self.handle_scrollbar_mouse(*mouse)
         {
@@ -407,20 +435,10 @@ impl StreamDashboard {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') if self.campaign.is_some() => {
-                    self.stop_after_iteration = true;
-                    self.push_message(
-                        "campaign",
-                        Color::Magenta,
-                        "Will pause after the current OpenSpec change completes",
-                    );
+                    self.request_confirmation(PendingConfirmation::StopAfterIteration);
                 }
                 KeyCode::Char('p') => {
-                    self.push_message(
-                        "pause",
-                        Color::Magenta,
-                        "Pausing now; the current phase checkpoint will be preserved",
-                    );
-                    return StreamControl::Pause;
+                    self.request_confirmation(PendingConfirmation::Pause);
                 }
                 KeyCode::Char('f') => {
                     if !self.frontier_available() {
@@ -431,30 +449,13 @@ impl StreamDashboard {
                         );
                         return StreamControl::None;
                     }
-                    self.push_message(
-                        "frontier",
-                        Color::Magenta,
-                        "Stopping the local worker and requesting frontier replanning",
-                    );
-                    return StreamControl::Escalate;
+                    self.request_confirmation(PendingConfirmation::Escalate);
                 }
                 KeyCode::Char('c') if !self.compact_requested => {
-                    self.compact_requested = true;
-                    self.push_message(
-                        "compact",
-                        Color::Magenta,
-                        "Requested mid-command compaction; interrupting Claude first",
-                    );
-                    return StreamControl::Compact;
+                    self.request_confirmation(PendingConfirmation::Compact);
                 }
                 KeyCode::Char('C') if !self.context_requested => {
-                    self.context_requested = true;
-                    self.push_message(
-                        "context",
-                        Color::Magenta,
-                        "Requested context inspection; interrupting Claude first",
-                    );
-                    return StreamControl::Context;
+                    self.request_confirmation(PendingConfirmation::Context);
                 }
                 KeyCode::Char('i') => {
                     self.injection_input = Some(String::new());
@@ -496,6 +497,79 @@ impl StreamDashboard {
             _ => {}
         }
         StreamControl::None
+    }
+
+    fn request_confirmation(&mut self, action: PendingConfirmation) {
+        self.pending_confirmation = Some(action);
+        self.dirty = true;
+    }
+
+    fn handle_confirmation_event(&mut self, event: Event) -> StreamControl {
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                self.dirty = true;
+                return StreamControl::None;
+            }
+            _ => return StreamControl::None,
+        };
+        if key.kind != KeyEventKind::Press {
+            return StreamControl::None;
+        }
+
+        let Some(action) = self.pending_confirmation.take() else {
+            return StreamControl::None;
+        };
+        self.dirty = true;
+        if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            return StreamControl::None;
+        }
+
+        match action {
+            PendingConfirmation::Pause => {
+                self.push_message(
+                    "pause",
+                    Color::Magenta,
+                    "Pausing now; the current phase checkpoint will be preserved",
+                );
+                StreamControl::Pause
+            }
+            PendingConfirmation::StopAfterIteration => {
+                self.stop_after_iteration = true;
+                self.push_message(
+                    "campaign",
+                    Color::Magenta,
+                    "Will pause after the current OpenSpec change completes",
+                );
+                StreamControl::None
+            }
+            PendingConfirmation::Escalate => {
+                self.push_message(
+                    "frontier",
+                    Color::Magenta,
+                    "Stopping the local worker and requesting frontier replanning",
+                );
+                StreamControl::Escalate
+            }
+            PendingConfirmation::Compact => {
+                self.compact_requested = true;
+                self.push_message(
+                    "compact",
+                    Color::Magenta,
+                    "Requested mid-command compaction; interrupting Claude first",
+                );
+                StreamControl::Compact
+            }
+            PendingConfirmation::Context => {
+                self.context_requested = true;
+                self.push_message(
+                    "context",
+                    Color::Magenta,
+                    "Requested context inspection; interrupting Claude first",
+                );
+                StreamControl::Context
+            }
+        }
     }
 
     fn frontier_available(&self) -> bool {
@@ -861,8 +935,11 @@ impl StreamDashboard {
         }
 
         if height > 3 {
-            let footer = self.injection_input.as_ref().map_or_else(
-                || {
+            let footer = if let Some(action) = self.pending_confirmation {
+                format!("{}  y confirm · any other key cancel", action.prompt())
+            } else {
+                self.injection_input.as_ref().map_or_else(
+                    || {
                     let campaign = if self.campaign.is_some() {
                         " · q pause after slice"
                     } else {
@@ -870,8 +947,11 @@ impl StreamDashboard {
                     };
                     format!("p pause · f frontier · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
-                |input| format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop"),
-            );
+                    |input| {
+                        format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop")
+                    },
+                )
+            };
             draw_row(
                 &mut output,
                 height - 1,
@@ -1128,6 +1208,7 @@ mod tests {
             compact_requested: false,
             context_requested: false,
             injection_input: None,
+            pending_confirmation: None,
             stop_after_iteration: false,
         };
         dashboard.set_stage(StageView {
@@ -1211,6 +1292,14 @@ mod tests {
         assert_eq!(
             dashboard.handle_event(Event::Key(event::KeyEvent::new(
                 KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert!(!dashboard.stop_after_iteration_requested());
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('y'),
                 KeyModifiers::NONE,
             ))),
             StreamControl::None
@@ -1338,11 +1427,35 @@ mod tests {
     }
 
     #[test]
-    fn plain_p_requests_an_immediate_pause() {
+    fn plain_p_requires_confirmation_before_an_immediate_pause() {
         let mut dashboard = dashboard();
         assert_eq!(
             dashboard.handle_event(Event::Key(event::KeyEvent::new(
                 KeyCode::Char('p'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert_eq!(
+            dashboard.pending_confirmation,
+            Some(PendingConfirmation::Pause)
+        );
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert_eq!(dashboard.pending_confirmation, None);
+
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('y'),
                 KeyModifiers::NONE,
             ))),
             StreamControl::Pause
@@ -1363,6 +1476,13 @@ mod tests {
         assert_eq!(
             dashboard.handle_event(Event::Key(event::KeyEvent::new(
                 KeyCode::Char('f'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('y'),
                 KeyModifiers::NONE,
             ))),
             StreamControl::Escalate
@@ -1410,8 +1530,10 @@ mod tests {
     fn plain_c_queues_one_compaction_per_stream() {
         let mut dashboard = dashboard();
         let compact = Event::Key(event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let confirm = Event::Key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(dashboard.handle_event(compact.clone()), StreamControl::None);
         assert_eq!(
-            dashboard.handle_event(compact.clone()),
+            dashboard.handle_event(confirm.clone()),
             StreamControl::Compact
         );
         assert_eq!(dashboard.handle_event(compact), StreamControl::None);
@@ -1430,8 +1552,9 @@ mod tests {
                 KeyCode::Char('c'),
                 KeyModifiers::NONE,
             ))),
-            StreamControl::Compact
+            StreamControl::None
         );
+        assert_eq!(dashboard.handle_event(confirm), StreamControl::Compact);
     }
 
     #[test]
@@ -1441,8 +1564,10 @@ mod tests {
             KeyCode::Char('C'),
             KeyModifiers::SHIFT,
         ));
+        let confirm = Event::Key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(dashboard.handle_event(context.clone()), StreamControl::None);
         assert_eq!(
-            dashboard.handle_event(context.clone()),
+            dashboard.handle_event(confirm.clone()),
             StreamControl::Context
         );
         assert_eq!(dashboard.handle_event(context), StreamControl::None);
@@ -1461,8 +1586,9 @@ mod tests {
                 KeyCode::Char('C'),
                 KeyModifiers::SHIFT,
             ))),
-            StreamControl::Context
+            StreamControl::None
         );
+        assert_eq!(dashboard.handle_event(confirm), StreamControl::Context);
     }
 
     #[test]
@@ -1491,6 +1617,23 @@ mod tests {
                 KeyModifiers::NONE,
             ))),
             StreamControl::Inject("/compact".to_owned())
+        );
+        assert!(dashboard.injection_input.is_none());
+
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
         );
         assert!(dashboard.injection_input.is_none());
     }

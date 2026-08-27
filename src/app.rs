@@ -432,7 +432,7 @@ impl<U: Ui> App<U> {
             .bootstrap_context
             .as_deref()
             .context("bootstrap context path was not resolved")?;
-        let scaffold = BootstrapScaffold::plan(repo, context_path)?;
+        let scaffold = BootstrapScaffold::plan(repo, context_path, &self.cli.bootstrap_defines)?;
         let init = init_command(repo);
 
         if self.cli.dry_run {
@@ -440,6 +440,17 @@ impl<U: Ui> App<U> {
                 .warn("DRY RUN — bootstrap files and subprocesses will not be created");
             self.ui
                 .info(&format!("Project context: `{}`", context_path.display()));
+            if !self.cli.bootstrap_defines.is_empty() {
+                self.ui.info(&format!(
+                    "Template variables: {}",
+                    self.cli
+                        .bootstrap_defines
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             self.ui
                 .info(&format!("Initialize OpenSpec: {}", init.display()));
             for path in BootstrapScaffold::paths() {

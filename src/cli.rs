@@ -17,6 +17,7 @@ const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 pub struct Cli {
     pub request: String,
     pub bootstrap_context: Option<PathBuf>,
+    pub bootstrap_defines: BTreeMap<String, String>,
     pub repo: PathBuf,
     pub interactive: bool,
     pub test_connection: Option<String>,
@@ -95,6 +96,9 @@ impl Cli {
         if cli.bootstrap_context.is_some() && cli.request != "bootstrap" {
             anyhow::bail!("--context is only valid with `opsx-build bootstrap`");
         }
+        if !cli.bootstrap_defines.is_empty() && cli.request != "bootstrap" {
+            anyhow::bail!("--define is only valid with `opsx-build bootstrap`");
+        }
         if cli.request == "bootstrap" {
             if cli.bootstrap_context.is_none() {
                 anyhow::bail!("`opsx-build bootstrap` requires --context PATH");
@@ -133,6 +137,10 @@ struct CliArgs {
     /// Markdown project context used by `opsx-build bootstrap`.
     #[arg(long, value_name = "PATH")]
     context: Option<PathBuf>,
+
+    /// Substitute one {{name}} placeholder in bootstrap context (repeatable).
+    #[arg(long, value_name = "NAME=VALUE")]
+    define: Vec<String>,
 
     /// Repository containing .git, openspec/, and Claude skills.
     #[arg(long, default_value = ".", value_name = "PATH")]
@@ -528,6 +536,7 @@ where
 }
 
 fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Result<Cli> {
+    let bootstrap_defines = parse_bootstrap_defines(&args.define)?;
     let worker_profile = selected_connection(
         args.test_connection.as_deref().or(args
             .worker_connection
@@ -588,6 +597,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
     Ok(Cli {
         request,
         bootstrap_context: args.context,
+        bootstrap_defines,
         repo: args.repo,
         interactive: args.interactive,
         test_connection: args.test_connection,
@@ -635,6 +645,35 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         archive_command: args.archive_command.or(config.archive_command),
         config_path,
     })
+}
+
+fn parse_bootstrap_defines(values: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut definitions = BTreeMap::new();
+    for definition in values {
+        let (name, value) = definition
+            .split_once('=')
+            .with_context(|| format!("invalid --define {definition:?}; expected NAME=VALUE"))?;
+        if !valid_template_name(name) {
+            anyhow::bail!(
+                "invalid bootstrap variable name `{name}`; use letters, digits, and underscores, beginning with a letter or underscore"
+            );
+        }
+        if definitions
+            .insert(name.to_owned(), value.to_owned())
+            .is_some()
+        {
+            anyhow::bail!("bootstrap variable `{name}` was defined more than once");
+        }
+    }
+    Ok(definitions)
+}
+
+fn valid_template_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn selected_connection(
@@ -1494,16 +1533,41 @@ mod tests {
 
     #[test]
     fn bootstrap_requires_an_explicit_markdown_context() {
-        let cli =
-            Cli::resolve(args(["opsx-build", "bootstrap", "--context", "project.md"])).unwrap();
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--define",
+            "language=Go",
+            "bootstrap",
+            "--context",
+            "project.md",
+        ]))
+        .unwrap();
         assert_eq!(cli.request, "bootstrap");
         assert_eq!(
             cli.bootstrap_context.as_deref(),
             Some(std::path::Path::new("project.md"))
         );
+        assert_eq!(
+            cli.bootstrap_defines.get("language").map(String::as_str),
+            Some("Go")
+        );
 
         assert!(Cli::resolve(args(["opsx-build", "bootstrap"])).is_err());
         assert!(Cli::resolve(args(["opsx-build", "advance", "--context", "project.md"])).is_err());
+        assert!(Cli::resolve(args(["opsx-build", "--define", "language=Go", "advance"])).is_err());
+        assert!(
+            Cli::resolve(args([
+                "opsx-build",
+                "--define",
+                "language=Go",
+                "--define",
+                "language=Rust",
+                "bootstrap",
+                "--context",
+                "project.md"
+            ]))
+            .is_err()
+        );
         assert!(
             Cli::resolve(args([
                 "opsx-build",
