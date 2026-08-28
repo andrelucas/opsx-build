@@ -23,6 +23,8 @@ const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+const MAX_INCOMPLETE_WORKER_RECOVERIES: u32 = 1;
+const MISSING_RESULT_EXCERPT_CHARS: usize = 320;
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -43,11 +45,22 @@ const CLAUDE_CONNECTION_ENV: &[&str] = &[
 ];
 
 #[derive(Debug)]
-struct MissingTerminalResult(&'static str);
+struct MissingTerminalResult(String);
+
+impl MissingTerminalResult {
+    fn new(message: &str, last_response: Option<&str>) -> Self {
+        let mut diagnostic = message.to_owned();
+        if let Some(excerpt) = last_response.and_then(response_excerpt) {
+            diagnostic.push_str(". Last Claude response: ");
+            diagnostic.push_str(&excerpt);
+        }
+        Self(diagnostic)
+    }
+}
 
 impl fmt::Display for MissingTerminalResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
+        formatter.write_str(&self.0)
     }
 }
 
@@ -607,7 +620,8 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         let mut current_session = session;
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
-        let mut recoveries = 0;
+        let mut output_recoveries = 0;
+        let mut incomplete_worker_recoveries = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -618,35 +632,53 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
             });
-            match self.invoke_once(
+            let attempt = self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 protocol,
                 remaining,
-            )? {
-                ClaudeAttempt::Complete(result) => return Ok(result),
-                ClaudeAttempt::OutputLimit if recoveries < self.max_output_retries => {
-                    recoveries += 1;
+            );
+            match attempt {
+                Err(error)
+                    if protocol == StageProtocol::Worker
+                        && is_missing_terminal_result(&error)
+                        && incomplete_worker_recoveries < MAX_INCOMPLETE_WORKER_RECOVERIES =>
+                {
+                    incomplete_worker_recoveries += 1;
+                    self.ui.warn(
+                        "Claude ended the worker phase without a terminal result; compacting and continuing the same session once",
+                    );
+                    self.compact_session(session_id, "an incomplete worker turn")?;
+                    current_session = SessionMode::Resume { id: session_id };
+                    current_prompt = incomplete_worker_continuation_prompt();
+                    current_activity = format!(
+                        "{activity} (incomplete-turn recovery {incomplete_worker_recoveries}/{MAX_INCOMPLETE_WORKER_RECOVERIES})"
+                    );
+                }
+                Err(error) => return Err(error),
+                Ok(ClaudeAttempt::OutputLimit) if output_recoveries < self.max_output_retries => {
+                    output_recoveries += 1;
                     self.ui.warn(&format!(
-                        "Claude reached its output token limit; compacting and continuing the same phase ({recoveries}/{})",
+                        "Claude reached its output token limit; compacting and continuing the same phase ({output_recoveries}/{})",
                         self.max_output_retries
                     ));
                     self.compact_session(session_id, "an output-limit interruption")?;
                     current_session = SessionMode::Resume { id: session_id };
                     current_prompt = output_limit_continuation_prompt(protocol);
                     current_activity = format!(
-                        "{activity} (output-limit continuation {recoveries}/{})",
+                        "{activity} (output-limit continuation {output_recoveries}/{})",
                         self.max_output_retries
                     );
                 }
-                ClaudeAttempt::OutputLimit => {
+                Ok(ClaudeAttempt::OutputLimit) => {
                     return Err(WorkerEscalationRequested::new(format!(
                         "local worker exhausted {} output-limit recovery attempt(s)",
                         self.max_output_retries
                     ))
                     .into());
                 }
+                Ok(ClaudeAttempt::Complete(result)) => return Ok(result),
             }
         }
     }
@@ -877,6 +909,14 @@ fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
     )
 }
 
+fn incomplete_worker_continuation_prompt() -> String {
+    stage_prompt(
+        "",
+        "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result.",
+        StageProtocol::Worker,
+    )
+}
+
 fn output_hit_token_limit(output: &ProcessOutput) -> bool {
     let values = parse_output_values(&output.stdout);
     let last_limit = values
@@ -985,6 +1025,35 @@ fn api_error_message(text: &str) -> Option<String> {
     })
 }
 
+fn response_excerpt(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= MISSING_RESULT_EXCERPT_CHARS {
+        return Some(normalized);
+    }
+    let mut excerpt = normalized
+        .chars()
+        .take(MISSING_RESULT_EXCERPT_CHARS)
+        .collect::<String>();
+    excerpt.push('…');
+    Some(excerpt)
+}
+
+fn last_assistant_response(events: &[Value]) -> Option<&str> {
+    events.iter().rev().find_map(|event| {
+        event
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .rev()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .find(|text| !text.trim().is_empty())
+    })
+}
+
 fn event_api_error(event: &Value) -> Option<String> {
     event
         .get("result")
@@ -1047,8 +1116,9 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
                 if let Some(message) = api_error_message(&text) {
                     return Err(ClaudeApiError(message).into());
                 }
-                return Err(MissingTerminalResult(
+                return Err(MissingTerminalResult::new(
                     "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it",
+                    Some(&text),
                 )
                 .into());
             }
@@ -1116,11 +1186,23 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
     if let Some(message) = events.iter().rev().find_map(event_api_error) {
         return Err(ClaudeApiError(message).into());
     }
+    let last_response = last_assistant_response(&events).or_else(|| {
+        results
+            .iter()
+            .rev()
+            .filter_map(|result| result.get("result").and_then(Value::as_str))
+            .find(|text| !text.trim().is_empty())
+    });
     if results.is_empty() {
-        return Err(MissingTerminalResult("Claude stream ended without a result event").into());
+        return Err(MissingTerminalResult::new(
+            "Claude stream ended without a result event",
+            last_response,
+        )
+        .into());
     }
-    Err(MissingTerminalResult(
+    Err(MissingTerminalResult::new(
         "Claude stream results contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them",
+        last_response,
     )
     .into())
 }
@@ -1306,6 +1388,23 @@ mod tests {
             None
         }
         fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
+    }
+
+    #[cfg(unix)]
+    fn shell_launcher(script: &Path) -> ClaudeLauncher {
+        ClaudeLauncher {
+            connection_name: None,
+            environment_name: None,
+            program: "sh".to_owned(),
+            prefix_args: vec![script.display().to_string()],
+            model: None,
+            context_window: None,
+            auto_compact_window: None,
+            auto_compact_percent: None,
+            max_output_tokens: None,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
+        }
     }
 
     #[test]
@@ -1866,6 +1965,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_stream_result_includes_the_last_assistant_response() {
+        let stdout = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"The test is flaky. I need to repair the synchronization next.\"}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"\",\"structured_output\":null}\n"
+        );
+
+        let error = parse_claude_stream_output(stdout).unwrap_err();
+
+        assert!(is_missing_terminal_result(&error));
+        assert!(error.to_string().contains(
+            "Last Claude response: The test is flaky. I need to repair the synchronization next."
+        ));
+    }
+
+    #[test]
     fn surfaces_api_errors_from_assistant_stream_events() {
         let stdout = concat!(
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: 402 This request would exceed your available credits given your current in-flight requests.\"}]}}\n",
@@ -1998,6 +2112,93 @@ mod tests {
         assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
     }
 
+    #[test]
+    fn incomplete_worker_prompt_requires_actual_tool_use() {
+        let prompt = incomplete_worker_continuation_prompt();
+        assert!(prompt.contains("continue the same phase"));
+        assert!(prompt.contains("actual tools"));
+        assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_worker_recovery_compacts_and_resumes_the_same_session() {
+        let directory =
+            std::env::temp_dir().join(format!("ospx-incomplete-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let script = directory.join("fake-claude.sh");
+        let source = r#"
+state='__STATE__'
+if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
+case "$count" in
+  0) printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","result":"I need to make the fix next.","structured_output":null}' ;;
+  1) printf '%s\n' 'compacted' ;;
+  *) printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","result":"done","structured_output":{"opsx_status":"READY","summary":"continued successfully"}}' ;;
+esac
+printf '%s\n' "$((count + 1))" > "$state"
+"#
+        .replace("__STATE__", &state.display().to_string());
+        std::fs::write(&script, source).unwrap();
+
+        let launcher = shell_launcher(&script);
+        let ui = QuietUi;
+        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
+        let result = client
+            .invoke(
+                SessionMode::New {
+                    id: Uuid::nil(),
+                    name: None,
+                },
+                "do the work",
+                "Fake Claude worker stage",
+                StageProtocol::Worker,
+            )
+            .unwrap();
+
+        assert_eq!(result.signal, StageSignal::Ready);
+        assert_eq!(result.text, "continued successfully");
+        assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "3");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_non_worker_result_is_not_retried() {
+        let directory =
+            std::env::temp_dir().join(format!("ospx-incomplete-ready-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let script = directory.join("fake-claude.sh");
+        let source = r#"
+state='__STATE__'
+if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
+printf '%s\n' '{"is_error":false,"stop_reason":"end_turn","result":"unfinished","structured_output":null}'
+printf '%s\n' "$((count + 1))" > "$state"
+"#
+        .replace("__STATE__", &state.display().to_string());
+        std::fs::write(&script, source).unwrap();
+
+        let launcher = shell_launcher(&script);
+        let ui = QuietUi;
+        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
+        let error = client
+            .invoke(
+                SessionMode::New {
+                    id: Uuid::nil(),
+                    name: None,
+                },
+                "do the work",
+                "Fake Claude milestone stage",
+                StageProtocol::Ready,
+            )
+            .unwrap_err();
+
+        assert!(is_missing_terminal_result(&error));
+        assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn output_limit_recovery_compacts_and_resumes_the_same_session() {
@@ -2018,19 +2219,7 @@ printf '%s\n' "$((count + 1))" > "$state"
         .replace("__STATE__", &state.display().to_string());
         std::fs::write(&script, source).unwrap();
 
-        let launcher = ClaudeLauncher {
-            connection_name: None,
-            environment_name: None,
-            program: "sh".to_owned(),
-            prefix_args: vec![script.display().to_string()],
-            model: None,
-            context_window: None,
-            auto_compact_window: None,
-            auto_compact_percent: None,
-            max_output_tokens: None,
-            environment: Vec::new(),
-            unset_environment: Vec::new(),
-        };
+        let launcher = shell_launcher(&script);
         let ui = QuietUi;
         let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
         let result = client

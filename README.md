@@ -209,6 +209,13 @@ phase requests the same frontier replan; narrow milestone and archive phases
 still fail normally rather than treating protocol trouble as a slice-sizing
 decision.
 
+If an Explore, Apply, or Repair turn instead ends normally but omits every
+terminal result, opsx-build treats it as an incomplete worker turn. It
+best-effort compacts and resumes that same session once, preserving partial
+repository work and requiring actual tool use rather than another description
+of intended work. Provider/API errors, explicit terminal outcomes, and narrow
+milestone stages do not use this recovery.
+
 ## Campaign loop
 
 Advance repeatedly through an ordered agenda:
