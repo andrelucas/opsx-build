@@ -815,6 +815,17 @@ impl StreamDashboard {
                     source: None,
                 }
             }));
+            let change = self
+                .change_name
+                .as_deref()
+                .map_or_else(String::new, |change| format!(" · {change}"));
+            lines.push(RenderLine {
+                text: format!("  ◆ iteration {} · current{change}", campaign.iteration),
+                color: Color::Cyan,
+                bold: true,
+                panel: None,
+                source: None,
+            });
         }
         for (index, panel) in self.panels.iter().enumerate() {
             let selected = if index == self.selected_panel {
@@ -1342,6 +1353,18 @@ mod tests {
         assert!(lines[0].text.contains("iteration 1 · slice-a"));
         assert!(lines[0].text.contains("1m 05s"));
         assert!(lines[0].text.contains("1234567890ab"));
+        assert_eq!(lines[1].text, "  ◆ iteration 2 · current");
+
+        dashboard.set_change_name(Some("slice-b".to_owned()));
+        dashboard.set_stage(StageView {
+            current: 2,
+            total: 6,
+            title: "Propose".to_owned(),
+            started_at: Instant::now(),
+        });
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert_eq!(lines[1].text, "  ◆ iteration 2 · current · slice-b");
+        assert!(lines[2].text.contains("[2/6] Propose"));
     }
 
     #[test]
