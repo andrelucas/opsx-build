@@ -23,7 +23,7 @@ const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
-const MAX_INCOMPLETE_WORKER_RECOVERIES: u32 = 1;
+const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
 const MISSING_RESULT_EXCERPT_CHARS: usize = 320;
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
@@ -621,7 +621,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
-        let mut incomplete_worker_recoveries = 0;
+        let mut incomplete_stage_recoveries = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -641,19 +641,19 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             );
             match attempt {
                 Err(error)
-                    if protocol == StageProtocol::Worker
+                    if supports_incomplete_stage_recovery(protocol)
                         && is_missing_terminal_result(&error)
-                        && incomplete_worker_recoveries < MAX_INCOMPLETE_WORKER_RECOVERIES =>
+                        && incomplete_stage_recoveries < MAX_INCOMPLETE_STAGE_RECOVERIES =>
                 {
-                    incomplete_worker_recoveries += 1;
+                    incomplete_stage_recoveries += 1;
                     self.ui.warn(
-                        "Claude ended the worker phase without a terminal result; compacting and continuing the same session once",
+                        "Claude ended the phase without a terminal result; compacting and continuing the same session once",
                     );
-                    self.compact_session(session_id, "an incomplete worker turn")?;
+                    self.compact_session(session_id, "an incomplete phase turn")?;
                     current_session = SessionMode::Resume { id: session_id };
-                    current_prompt = incomplete_worker_continuation_prompt();
+                    current_prompt = incomplete_stage_continuation_prompt(protocol);
                     current_activity = format!(
-                        "{activity} (incomplete-turn recovery {incomplete_worker_recoveries}/{MAX_INCOMPLETE_WORKER_RECOVERIES})"
+                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
                     );
                 }
                 Err(error) => return Err(error),
@@ -909,12 +909,21 @@ fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
     )
 }
 
-fn incomplete_worker_continuation_prompt() -> String {
-    stage_prompt(
-        "",
-        "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result.",
-        StageProtocol::Worker,
-    )
+fn supports_incomplete_stage_recovery(protocol: StageProtocol) -> bool {
+    matches!(protocol, StageProtocol::Worker | StageProtocol::Verify)
+}
+
+fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
+    let instruction = match protocol {
+        StageProtocol::Worker => {
+            "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result."
+        }
+        StageProtocol::Verify => {
+            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify the implementation or its tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+        }
+        _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
+    };
+    stage_prompt("", instruction, protocol)
 }
 
 fn output_hit_token_limit(output: &ProcessOutput) -> bool {
@@ -2114,10 +2123,28 @@ mod tests {
 
     #[test]
     fn incomplete_worker_prompt_requires_actual_tool_use() {
-        let prompt = incomplete_worker_continuation_prompt();
+        let prompt = incomplete_stage_continuation_prompt(StageProtocol::Worker);
         assert!(prompt.contains("continue the same phase"));
         assert!(prompt.contains("actual tools"));
         assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+    }
+
+    #[test]
+    fn incomplete_verify_prompt_reports_findings_instead_of_repairing() {
+        let prompt = incomplete_stage_continuation_prompt(StageProtocol::Verify);
+        assert!(prompt.contains("Continue verification only"));
+        assert!(prompt.contains("do not repair or modify"));
+        assert!(prompt.contains("return RETRY with the exact finding"));
+        assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
+    }
+
+    #[test]
+    fn incomplete_recovery_is_limited_to_worker_and_verify_phases() {
+        assert!(supports_incomplete_stage_recovery(StageProtocol::Worker));
+        assert!(supports_incomplete_stage_recovery(StageProtocol::Verify));
+        assert!(!supports_incomplete_stage_recovery(StageProtocol::Ready));
+        assert!(!supports_incomplete_stage_recovery(StageProtocol::Propose));
+        assert!(!supports_incomplete_stage_recovery(StageProtocol::Frontier));
     }
 
     #[cfg(unix)]
