@@ -242,6 +242,11 @@ kind of campaign stops on `BLOCKED`, interruption, or an unrecoverable ordinary
 error. There is no additional whole-workflow retry policy around the existing
 stages.
 
+A plain `advance` without `--loop` intentionally completes one agenda slice.
+If more ordered slices remain, the completion output says that the run was a
+single iteration and prints the exact `--loop advance` command for continuing
+as a campaign.
+
 An optional cumulative circuit breaker pauses the campaign cleanly after a
 fixed total number of completed changes:
 

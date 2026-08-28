@@ -679,6 +679,14 @@ impl<U: Ui> App<U> {
                         self.ui.finish_dashboard();
                         self.ui
                             .success(&format!("COMPLETE `{change}` — final {}", short_hash(head)));
+                        if let Some(command) =
+                            single_advance_continuation_command(repo, &completed_state)
+                        {
+                            self.ui.info(
+                                "More ordered agenda slices remain; this was a single iteration.",
+                            );
+                            self.ui.info(&format!("Continue as a campaign: {command}"));
+                        }
                         return Ok(());
                     };
 
@@ -2154,6 +2162,22 @@ fn campaign_limit_resume_command(repo: &Path, current_limit: u32) -> String {
     )
 }
 
+fn single_advance_continuation_command(repo: &Path, state: &RunState) -> Option<String> {
+    if state.request != "advance" || state.campaign.is_some() {
+        return None;
+    }
+    matches!(
+        discover_agenda(repo, &ChangeSnapshot::default()),
+        Ok(AgendaSelection::Next(_))
+    )
+    .then(|| {
+        format!(
+            "opsx-build --repo {} --loop advance",
+            shell_quote(&repo.to_string_lossy())
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2401,5 +2425,34 @@ mod tests {
             campaign_limit_resume_command(Path::new("/tmp/compiler project"), 5),
             "opsx-build --repo '/tmp/compiler project' --resume --loop --max-iterations 10"
         );
+    }
+
+    #[test]
+    fn single_advance_completion_points_to_remaining_campaign_work() {
+        let repo = std::env::temp_dir().join(format!(
+            "opsx-build-single-advance-continuation-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(repo.join("automation/slices")).unwrap();
+        std::fs::create_dir_all(repo.join("openspec/changes/archive/0001-first")).unwrap();
+        std::fs::write(repo.join("automation/slices/0001-first.md"), "# First\n").unwrap();
+        std::fs::write(repo.join("automation/slices/0002-second.md"), "# Second\n").unwrap();
+        let state = RunState::new("advance".to_owned(), ChangeSnapshot::default());
+
+        assert_eq!(
+            single_advance_continuation_command(&repo, &state),
+            Some(format!(
+                "opsx-build --repo {} --loop advance",
+                shell_quote(&repo.to_string_lossy())
+            ))
+        );
+        let campaign =
+            RunState::new_campaign("advance".to_owned(), ChangeSnapshot::default(), None);
+        assert_eq!(single_advance_continuation_command(&repo, &campaign), None);
+
+        std::fs::create_dir(repo.join("openspec/changes/archive/0002-second")).unwrap();
+        assert_eq!(single_advance_continuation_command(&repo, &state), None);
+
+        std::fs::remove_dir_all(repo).unwrap();
     }
 }
