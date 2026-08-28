@@ -398,9 +398,41 @@ pub fn build_claude_command(
     output_format: ClaudeOutputFormat,
     json_schema: Option<&str>,
 ) -> CommandSpec {
+    build_claude_command_with_dirs(
+        repo,
+        launcher,
+        permission_mode,
+        session,
+        prompt,
+        output_format,
+        ClaudeCommandOptions {
+            json_schema,
+            additional_dirs: &[],
+        },
+    )
+}
+
+#[derive(Default)]
+struct ClaudeCommandOptions<'a> {
+    json_schema: Option<&'a str>,
+    additional_dirs: &'a [PathBuf],
+}
+
+fn build_claude_command_with_dirs(
+    repo: &Path,
+    launcher: &ClaudeLauncher,
+    permission_mode: &str,
+    session: &SessionMode,
+    prompt: &str,
+    output_format: ClaudeOutputFormat,
+    options: ClaudeCommandOptions<'_>,
+) -> CommandSpec {
     let mut args = launcher.prefix_args.clone();
     if let Some(model) = &launcher.model {
         args.extend(["--model".to_owned(), model.clone()]);
+    }
+    for directory in options.additional_dirs {
+        args.extend(["--add-dir".to_owned(), directory.display().to_string()]);
     }
     args.push("--print".to_owned());
     match output_format {
@@ -415,7 +447,7 @@ pub fn build_claude_command(
             args.push("--forward-subagent-text".to_owned());
         }
     }
-    if let Some(schema) = json_schema {
+    if let Some(schema) = options.json_schema {
         args.extend(["--json-schema".to_owned(), schema.to_owned()]);
     }
     args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
@@ -576,6 +608,8 @@ pub struct ClaudeClient<'a, U: Ui> {
     stream_filter: Option<StreamFilter>,
     max_output_retries: u32,
     stage_timeout: Option<Duration>,
+    additional_dirs: Vec<PathBuf>,
+    resume_repo: Option<PathBuf>,
     ui: &'a U,
     runner: ProcessRunner<'a, U>,
 }
@@ -598,6 +632,8 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             stream_filter,
             max_output_retries,
             stage_timeout: None,
+            additional_dirs: Vec::new(),
+            resume_repo: None,
             ui,
             runner: ProcessRunner::new(ui),
         }
@@ -606,6 +642,22 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
     pub fn with_stage_timeout(mut self, timeout: Duration) -> Self {
         self.stream_transport = true;
         self.stage_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_additional_dir(mut self, directory: &Path) -> Self {
+        if !self
+            .additional_dirs
+            .iter()
+            .any(|existing| existing == directory)
+        {
+            self.additional_dirs.push(directory.to_path_buf());
+        }
+        self
+    }
+
+    pub fn with_resume_repo(mut self, repo: &Path) -> Self {
+        self.resume_repo = Some(repo.to_path_buf());
         self
     }
 
@@ -703,15 +755,23 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         let mut first_attempt = true;
         let output = loop {
             let schema = use_schema.then(|| protocol.json_schema());
-            let spec = build_claude_command(
+            let spec = build_claude_command_with_dirs(
                 self.repo,
                 self.launcher,
                 self.permission_mode,
                 session,
                 prompt,
                 output_format,
-                schema,
+                ClaudeCommandOptions {
+                    json_schema: schema,
+                    additional_dirs: &self.additional_dirs,
+                },
             );
+            let spec = if let Some(repo) = self.resume_repo.as_deref() {
+                spec.resume_from(repo)
+            } else {
+                spec
+            };
             let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
                 self.run_stage_command(&spec, activity, timeout)?
             } else {
@@ -799,15 +859,23 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             "Claude session: resume {session_id} for best-effort rename"
         ));
         self.ui.debug_prompt("Naming Claude session", &prompt);
-        let spec = build_claude_command(
+        let spec = build_claude_command_with_dirs(
             self.repo,
             self.launcher,
             self.permission_mode,
             &SessionMode::Resume { id: session_id },
             &prompt,
             ClaudeOutputFormat::Json,
-            None,
+            ClaudeCommandOptions {
+                json_schema: None,
+                additional_dirs: &self.additional_dirs,
+            },
         );
+        let spec = if let Some(repo) = self.resume_repo.as_deref() {
+            spec.resume_from(repo)
+        } else {
+            spec
+        };
         let output = self.runner.run(&spec, "Naming Claude session")?;
         if !output.success {
             bail!("session rename failed: {}", diagnostic_text(&output));
@@ -832,7 +900,13 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             self.permission_mode,
             session_id,
             output_format,
+            &self.additional_dirs,
         );
+        let spec = if let Some(repo) = self.resume_repo.as_deref() {
+            spec.resume_from(repo)
+        } else {
+            spec
+        };
         let result = if self.stream_transport {
             self.run_stage_command(&spec, &activity, None)
         } else {
@@ -864,15 +938,19 @@ fn build_compact_command(
     permission_mode: &str,
     session_id: Uuid,
     output_format: ClaudeOutputFormat,
+    additional_dirs: &[PathBuf],
 ) -> CommandSpec {
-    build_claude_command(
+    build_claude_command_with_dirs(
         repo,
         launcher,
         permission_mode,
         &SessionMode::Resume { id: session_id },
         "/compact",
         output_format,
-        None,
+        ClaudeCommandOptions {
+            json_schema: None,
+            additional_dirs,
+        },
     )
     .disable_stream_messages()
 }
@@ -1498,6 +1576,7 @@ mod tests {
             "auto",
             id,
             ClaudeOutputFormat::Text,
+            &[],
         );
         assert_eq!(compact.args.last().map(String::as_str), Some("/compact"));
         assert!(
@@ -1523,6 +1602,7 @@ mod tests {
             "auto",
             id,
             ClaudeOutputFormat::StreamJson,
+            &[],
         );
         assert!(
             streamed_compact
@@ -1565,6 +1645,34 @@ mod tests {
                 .args
                 .iter()
                 .any(|arg| arg == "--forward-subagent-text")
+        );
+    }
+
+    #[test]
+    fn attaches_additional_directories_without_changing_the_working_directory() {
+        let launcher = ClaudeLauncher::parse("claude", None, None, None, None, None).unwrap();
+        let command = build_claude_command_with_dirs(
+            Path::new("/planning"),
+            &launcher,
+            "auto",
+            &SessionMode::New {
+                id: Uuid::nil(),
+                name: None,
+            },
+            "apply the change",
+            ClaudeOutputFormat::Json,
+            ClaudeCommandOptions {
+                json_schema: None,
+                additional_dirs: &[PathBuf::from("/product")],
+            },
+        );
+
+        assert_eq!(command.cwd, PathBuf::from("/planning"));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--add-dir", "/product"])
         );
     }
 

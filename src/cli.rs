@@ -19,6 +19,9 @@ pub struct Cli {
     pub bootstrap_context: Option<PathBuf>,
     pub bootstrap_defines: BTreeMap<String, String>,
     pub repo: PathBuf,
+    pub sidecar: bool,
+    pub sidecar_root: Option<PathBuf>,
+    pub local_only: bool,
     pub interactive: bool,
     pub test_connection: Option<String>,
     pub update_skills: bool,
@@ -94,8 +97,8 @@ impl Cli {
         if cli.loop_workflow && cli.continue_existing {
             anyhow::bail!("--loop cannot be combined with --continue-existing");
         }
-        if cli.bootstrap_context.is_some() && cli.request != "bootstrap" {
-            anyhow::bail!("--context is only valid with `opsx-build bootstrap`");
+        if cli.bootstrap_context.is_some() && cli.request != "bootstrap" && !cli.sidecar {
+            anyhow::bail!("--context is only valid with `opsx-build bootstrap` or --sidecar");
         }
         if !cli.bootstrap_defines.is_empty() && cli.request != "bootstrap" {
             anyhow::bail!("--define is only valid with `opsx-build bootstrap`");
@@ -125,11 +128,30 @@ impl Cli {
                 || cli.max_iterations.is_some()
                 || cli.change.is_some()
                 || cli.direction.is_some()
+                || cli.sidecar
+                || cli.local_only
             {
                 anyhow::bail!(
                     "`opsx-build bootstrap` cannot be combined with another workflow mode"
                 );
             }
+        }
+        if cli.sidecar
+            && !cli.resume
+            && !cli.forget
+            && !cli.update_skills
+            && (cli.request == "advance" || cli.request.is_empty())
+        {
+            anyhow::bail!("--sidecar requires an explicit bounded change request");
+        }
+        if cli.sidecar && cli.loop_workflow {
+            anyhow::bail!("the initial sidecar release supports one bounded change, not --loop");
+        }
+        if cli.sidecar && cli.continue_existing {
+            anyhow::bail!("the initial sidecar release does not support --continue-existing");
+        }
+        if cli.sidecar && !cli.resume && !cli.forget && !cli.update_skills && cli.change.is_none() {
+            anyhow::bail!("--sidecar requires --change NAME for a bounded one-off change");
         }
         Ok(cli)
     }
@@ -156,6 +178,18 @@ struct CliArgs {
     /// Repository containing .git, openspec/, and Claude skills.
     #[arg(long, default_value = ".", value_name = "PATH")]
     repo: PathBuf,
+
+    /// Keep OpenSpec and its history in an external native OpenSpec store.
+    #[arg(long, env = "OPSX_BUILD_SIDECAR")]
+    sidecar: bool,
+
+    /// Parent directory for automatically named sidecar stores.
+    #[arg(long, env = "OPSX_BUILD_SIDECAR_ROOT", value_name = "PATH")]
+    sidecar_root: Option<PathBuf>,
+
+    /// Use only the worker connection and never invoke frontier fallback.
+    #[arg(long, env = "OPSX_BUILD_LOCAL_ONLY")]
+    local_only: bool,
 
     /// Open an interactive Claude session instead of running the OpenSpec workflow.
     #[arg(long)]
@@ -363,6 +397,9 @@ struct FileConfig {
     max_verify_retries: Option<u32>,
     max_output_retries: Option<u32>,
     local_worker_timeout_minutes: Option<std::num::NonZeroU32>,
+    sidecar: Option<bool>,
+    sidecar_root: Option<PathBuf>,
+    local_only: Option<bool>,
     #[serde(rename = "loop")]
     loop_workflow: Option<bool>,
     max_iterations: Option<std::num::NonZeroU32>,
@@ -609,6 +646,9 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         bootstrap_context: args.context,
         bootstrap_defines,
         repo: args.repo,
+        sidecar: args.sidecar || config.sidecar.unwrap_or(false),
+        sidecar_root: args.sidecar_root.or(config.sidecar_root),
+        local_only: args.local_only || config.local_only.unwrap_or(false),
         interactive: args.interactive,
         test_connection: args.test_connection,
         update_skills: args.update_skills,
@@ -919,6 +959,92 @@ mod tests {
     #[test]
     fn uses_the_corrected_program_name() {
         assert_eq!(CliArgs::command().get_name(), "opsx-build");
+    }
+
+    #[test]
+    fn resolves_a_bounded_sidecar_request() {
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "--sidecar",
+            "--local-only",
+            "--sidecar-root",
+            "/tmp/opsx-sidecars",
+            "--context",
+            "/tmp/ceph-change.md",
+            "--change",
+            "ceph-bounded-fix",
+            "fix the bounded Ceph behaviour",
+        ]))
+        .unwrap();
+
+        assert!(cli.sidecar);
+        assert!(cli.local_only);
+        assert_eq!(cli.sidecar_root, Some(PathBuf::from("/tmp/opsx-sidecars")));
+        assert_eq!(
+            cli.bootstrap_context,
+            Some(PathBuf::from("/tmp/ceph-change.md"))
+        );
+        assert_eq!(cli.change.as_deref(), Some("ceph-bounded-fix"));
+        assert_eq!(cli.request, "fix the bounded Ceph behaviour");
+    }
+
+    #[test]
+    fn sidecar_requires_a_named_bounded_change() {
+        let error = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "--sidecar",
+            "--context",
+            "/tmp/context.md",
+            "--dry-run",
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("explicit bounded change request")
+        );
+
+        let error = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "--sidecar",
+            "--context",
+            "/tmp/context.md",
+            "bounded request",
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("requires --change NAME"));
+    }
+
+    #[test]
+    fn reads_sidecar_defaults_from_config() {
+        let directory = env::temp_dir().join(format!("opsx-config-test-{}", Uuid::new_v4()));
+        let config = directory.join("config.toml");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            &config,
+            "sidecar = true\nsidecar_root = '/tmp/stores'\nlocal_only = true\n",
+        )
+        .unwrap();
+
+        let cli = Cli::resolve(args([
+            OsString::from("opsx-build"),
+            OsString::from("--config"),
+            config.as_os_str().to_owned(),
+            OsString::from("--context"),
+            OsString::from("/tmp/context.md"),
+            OsString::from("--change"),
+            OsString::from("ceph-fix"),
+            OsString::from("bounded request"),
+        ]))
+        .unwrap();
+
+        assert!(cli.sidecar);
+        assert!(cli.local_only);
+        assert_eq!(cli.sidecar_root, Some(PathBuf::from("/tmp/stores")));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

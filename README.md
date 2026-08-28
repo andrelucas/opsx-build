@@ -14,8 +14,9 @@ rejecting or losing pre-existing staged, unstaged, or untracked work.
 `opsx-build` bundles the canonical `explore-unattended` and
 `propose-unattended` Claude skills. Before a workflow starts, it installs
 missing copies and replaces stale copies in the repository selected by
-`--repo`, under `.claude/skills`. This keeps the target project's local Claude
-configuration self-contained. `--dry-run` reports the installation or update
+`--repo`, under `.claude/skills`. In sidecar mode they instead live in the
+external planning repository, leaving the product checkout untouched by
+OpenSpec integration files. `--dry-run` reports the installation or update
 without writing it. The retired monolithic `build-unattended` skill is not
 installed because orchestration belongs in this process.
 
@@ -93,6 +94,68 @@ configuration or replace an existing agenda. It stops before initialization if
 either already exists. The selected OpenSpec profile must expose Propose,
 Apply, Verify, and Archive actions; if it does not, enable those actions and run
 `openspec update` before resuming.
+
+## Bounded changes with an external sidecar
+
+For a brownfield product that should not acquire OpenSpec scaffolding, create a
+short Markdown brief describing one bounded change and run:
+
+```sh
+opsx-build --repo ~/src/ceph \
+  --sidecar --local-only \
+  --context ceph-recovery-change.md \
+  --change ceph-recovery-fix \
+  "Correct the bounded recovery behaviour described in the supplied context"
+```
+
+The first invocation creates a native OpenSpec store outside the product
+checkout, initializes its own Git repository and Claude workflows, and embeds
+the supplied context in that store's `openspec/config.yaml`. The default store
+location is `$XDG_DATA_HOME/opsx-build/sidecars` when `XDG_DATA_HOME` is set,
+otherwise `~/.local/share/opsx-build/sidecars`. Override its parent directory
+with `--sidecar-root PATH`.
+
+The product repository keeps only a private association under its Git metadata
+directory. No `openspec/`, `.claude/`, `CLAUDE.md`, or association stub is
+added to its working tree. A reciprocal identity file in the sidecar prevents
+one store from being silently attached to a different checkout. If setup is
+interrupted after OpenSpec creates the native store, rerunning the same command
+recognizes and completes that exact partial setup.
+
+Sidecar operation skips Explore: the supplied brief and exact `--change` name
+are the bounded assignment. The worker connection performs Propose, proposal
+commit, Apply, Verify/repair, Archive, and both final commits. Claude runs with
+the planning repository as its working directory and the product checkout via
+Claude Code's `--add-dir`; prompts direct it to keep OpenSpec artifacts in the
+sidecar, make code/test/documentation edits in the product, read the product's
+own `CLAUDE.md`, and inspect only paths and symbols relevant to the requested
+change. Sidecar workflows are local-only in this initial release even if the
+explicit `--local-only` flag is omitted: `TOO_LARGE` stops with its checkpoint
+and diagnostic rather than invoking a frontier model. The dashboard removes
+the frontier action for such a run.
+
+The proposal milestone is committed only in the planning repository as
+`openspec: propose <change>`. After successful verification and archival,
+Claude commits product changes in the product repository as
+`openspec: complete <change>`, then commits the archived planning state in the
+sidecar as `openspec: archive <change>` with the product commit recorded in its
+commit body. Existing unrelated work remains Claude's responsibility to
+preserve; opsx-build does not impose a clean-tree requirement or infer path
+ownership.
+
+Resume from the product checkout as usual; the private association locates the
+sidecar and the checkpoint records both roots:
+
+```sh
+opsx-build --repo ~/src/ceph --resume
+```
+
+The initial sidecar release deliberately supports one bounded change at a time,
+not bootstrap, `--loop`, or `--continue-existing`. A completed association may
+be reused for later explicitly named one-off changes. OpenSpec 1.10 or newer is
+required for native `openspec store setup` support. Use `--dry-run` with the
+full first-invocation arguments to preview the paths and setup commands without
+creating anything.
 
 ## Workflow
 
@@ -453,6 +516,10 @@ local_worker_timeout_minutes = 60
 # Optional campaign defaults:
 # loop = true
 # max_iterations = 20
+# Optional bounded brownfield defaults:
+# sidecar = true
+# sidecar_root = "/absolute/path/to/sidecars"
+# local_only = true
 permission_mode = "auto"
 claude_command = "omlx launch claude"
 claude_model = "qwen3.6-35b-a3b"
@@ -628,6 +695,9 @@ opsx-build \
 
 The corresponding environment variables are:
 
+- `OPSX_BUILD_SIDECAR`
+- `OPSX_BUILD_SIDECAR_ROOT`
+- `OPSX_BUILD_LOCAL_ONLY`
 - `OPSX_BUILD_MAX_VERIFY_RETRIES`
 - `OPSX_BUILD_MAX_OUTPUT_RETRIES`
 - `OPSX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES`
@@ -676,6 +746,7 @@ options:
 
 - `--print` and `--permission-mode`;
 - `--session-id`, `--resume`, and `--name`;
+- `--add-dir` when an external planning sidecar attaches the product checkout;
 - `--model` when the selected connection configures a model;
 - `--output-format json` for normal unattended operation;
 - `--input-format stream-json --output-format stream-json --verbose
@@ -907,6 +978,8 @@ archive is not repeated merely because its acknowledgement was malformed.
   `PATH`.
 - The repository must contain `openspec/config.yaml`. The unattended Explore
   and Propose skills are installed into the target repository automatically.
+  Sidecar mode is the exception: it creates that setup in an external native
+  OpenSpec store and requires OpenSpec 1.10 or newer.
 - Apply, Verify, and Archive workflow names must be discoverable or configured.
 - Change discovery requires one new change, one uniquely modified change, or
   only one active change.
@@ -918,6 +991,9 @@ archive is not repeated merely because its acknowledgement was malformed.
 - Claude remains responsible for normal proposal/completion commit scope. The
   runner applies deterministic path and state checks only to the special
   frontier agenda commit.
+- Sidecar mode currently handles one explicitly named bounded change, uses the
+  worker connection for every model stage, and does not yet support campaigns,
+  bootstrap, existing-change adoption, or frontier subdivision.
 
 ## Development
 

@@ -7,6 +7,7 @@ mod dashboard;
 pub mod git;
 pub mod openspec;
 pub mod process;
+pub mod sidecar;
 pub mod skills;
 pub mod state;
 pub mod stream;

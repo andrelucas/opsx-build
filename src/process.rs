@@ -77,6 +77,7 @@ pub struct CommandSpec {
     pub cwd: PathBuf,
     pub initial_stdin: Option<String>,
     pub accepts_stream_messages: bool,
+    resume_repo: Option<PathBuf>,
 }
 
 impl CommandSpec {
@@ -90,6 +91,7 @@ impl CommandSpec {
             cwd: cwd.into(),
             initial_stdin: None,
             accepts_stream_messages: false,
+            resume_repo: None,
         }
     }
 
@@ -137,6 +139,11 @@ impl CommandSpec {
 
     pub fn disable_stream_messages(mut self) -> Self {
         self.accepts_stream_messages = false;
+        self
+    }
+
+    pub fn resume_from(mut self, repo: &Path) -> Self {
+        self.resume_repo = Some(repo.to_path_buf());
         self
     }
 
@@ -570,7 +577,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         };
         self.ui.output(&output.stdout, &output.stderr);
         if pause_requested {
-            return Err(PauseRequested::new(spec.cwd.clone()).into());
+            return Err(PauseRequested::new(
+                spec.resume_repo.clone().unwrap_or_else(|| spec.cwd.clone()),
+            )
+            .into());
         }
         if let Some(reason) = escalation_reason {
             return Err(WorkerEscalationRequested::new(reason).into());
@@ -1062,10 +1072,12 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
 
     #[cfg(unix)]
     #[test]
-    fn pause_stops_the_process_group_and_returns_a_resume_command() {
+    fn pause_stops_the_process_group_and_uses_the_user_facing_resume_repo() {
         let ui = InterruptingUi::new(StreamControl::Pause);
         let runner = ProcessRunner::new(&ui);
-        let spec = CommandSpec::new("sh", "/tmp").args(["-c", "sleep 30"]);
+        let spec = CommandSpec::new("sh", "/tmp")
+            .args(["-c", "sleep 30"])
+            .resume_from(Path::new("/tmp/product"));
 
         let error = runner
             .run_streaming(&spec, "Apply", |_| {})
@@ -1073,7 +1085,10 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         let pause = error
             .downcast_ref::<PauseRequested>()
             .expect("pause should remain a typed outcome");
-        assert_eq!(pause.resume_command(), "opsx-build --repo /tmp --resume");
+        assert_eq!(
+            pause.resume_command(),
+            "opsx-build --repo /tmp/product --resume"
+        );
     }
 
     #[cfg(unix)]

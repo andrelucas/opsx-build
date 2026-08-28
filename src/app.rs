@@ -34,6 +34,7 @@ use crate::{
     process::{
         PauseRequested, ProcessRunner, WorkerEscalationRequested, prerequisite_exists, shell_quote,
     },
+    sidecar::{SidecarAssociation, SidecarPlan, default_sidecar_root, load_association},
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::{CampaignIterationView, CampaignView, Ui},
@@ -44,7 +45,7 @@ const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
-const STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_FRONTIER_REPLANS: u32 = 3;
 
 pub struct App<U: Ui> {
@@ -79,6 +80,14 @@ struct RunState {
     frontier_replans: u32,
     #[serde(default)]
     bootstrap: bool,
+    #[serde(default)]
+    product_repo: Option<PathBuf>,
+    #[serde(default)]
+    sidecar_store: Option<String>,
+    #[serde(default)]
+    planning_final_head: Option<String>,
+    #[serde(default)]
+    local_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +139,10 @@ impl RunState {
             slice_baseline: None,
             frontier_replans: 0,
             bootstrap: false,
+            product_repo: None,
+            sidecar_store: None,
+            planning_final_head: None,
+            local_only: false,
         }
     }
 
@@ -167,6 +180,10 @@ impl RunState {
             slice_baseline: None,
             frontier_replans: 0,
             bootstrap: false,
+            product_repo: None,
+            sidecar_store: None,
+            planning_final_head: None,
+            local_only: false,
         }
     }
 
@@ -181,6 +198,22 @@ impl RunState {
             content: bootstrap_instructions().to_owned(),
         });
         state.bootstrap = true;
+        state
+    }
+
+    fn sidecar(
+        request: String,
+        change: String,
+        before_changes: ChangeSnapshot,
+        association: &SidecarAssociation,
+        local_only: bool,
+    ) -> Self {
+        let mut state = Self::new(request, before_changes);
+        state.change = Some(change);
+        state.stage = Stage::Propose;
+        state.product_repo = Some(association.product_root.clone());
+        state.sidecar_store = Some(association.store_id.clone());
+        state.local_only = local_only;
         state
     }
 
@@ -234,8 +267,107 @@ impl<U: Ui> App<U> {
         }
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
-        let repo = repository_root(&requested_repo, &self.ui)?;
-        self.ui.banner(&repo.display().to_string());
+        let product_repo = repository_root(&requested_repo, &self.ui)?;
+        let mut sidecar = load_association(&product_repo, &self.ui)?;
+        if self.cli.sidecar
+            && sidecar.is_none()
+            && (self.cli.resume || self.cli.forget || self.cli.update_skills)
+        {
+            bail!(
+                "this checkout has no associated sidecar; start one bounded --sidecar change with --context and --change first"
+            );
+        }
+        if self.cli.sidecar && sidecar.is_none() {
+            let context_path = self.cli.bootstrap_context.as_deref().context(
+                "the first --sidecar invocation requires --context PATH with the bounded project/change context",
+            )?;
+            let root = self
+                .cli
+                .sidecar_root
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(default_sidecar_root)?;
+            let plan = SidecarPlan::new(&product_repo, context_path, &root)?;
+            self.ui.banner(&product_repo.display().to_string());
+            if self.cli.dry_run {
+                self.ui
+                    .warn("DRY RUN — the external OpenSpec store would not be created");
+                self.ui.info(&format!(
+                    "Planning sidecar: `{}`",
+                    plan.association.planning_root.display()
+                ));
+                if plan.needs_setup() {
+                    self.ui
+                        .info(&format!("Create store: {}", plan.setup_command().display()));
+                } else {
+                    self.ui.info(&format!(
+                        "Recover store: `{}`",
+                        plan.association.planning_root.display()
+                    ));
+                }
+                self.ui.info(&format!(
+                    "Install Claude workflows: {}",
+                    plan.init_command().display()
+                ));
+                self.ui.info(
+                    "Run local Propose, proposal commit, Apply, Verify/repair, Archive, product commit, and sidecar archive commit",
+                );
+                return Ok(());
+            }
+            prerequisite_exists("openspec", &product_repo, &self.ui)?;
+            prerequisite_exists("claude", &product_repo, &self.ui)?;
+            let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
+            if launcher.program != "claude" {
+                prerequisite_exists(&launcher.program, &product_repo, &self.ui)?;
+            }
+            let runner = ProcessRunner::new(&self.ui);
+            if plan.needs_setup() {
+                let setup =
+                    runner.checked(&plan.setup_command(), "Creating OpenSpec sidecar store")?;
+                plan.validate_setup_output(&setup.stdout)?;
+            } else {
+                self.ui
+                    .info("Recovering native sidecar store from an interrupted setup");
+            }
+            runner.checked(
+                &plan.init_command(),
+                "Installing OpenSpec Claude workflows in the sidecar",
+            )?;
+            plan.finish(&self.ui)?;
+            self.ui.success("Created and associated OpenSpec sidecar");
+            sidecar = load_association(&product_repo, &self.ui)?;
+        }
+        if sidecar.is_some() && self.cli.request == "bootstrap" {
+            bail!("sidecar campaign bootstrap is not implemented yet; use one bounded change");
+        }
+        if sidecar.is_some() && self.cli.loop_workflow {
+            bail!("the initial sidecar release supports one bounded change, not --loop");
+        }
+        if sidecar.is_some() && self.cli.continue_existing {
+            bail!("the initial sidecar release does not support --continue-existing");
+        }
+        if sidecar.is_some() && self.cli.bootstrap_context.is_some() && !self.cli.sidecar {
+            bail!(
+                "--context is only used when creating a sidecar; this checkout is already associated"
+            );
+        }
+        let repo = sidecar.as_ref().map_or_else(
+            || product_repo.clone(),
+            |sidecar| sidecar.planning_root.clone(),
+        );
+        self.ui.banner(&product_repo.display().to_string());
+        if let Some(sidecar) = &sidecar {
+            self.ui.info(&format!(
+                "Planning sidecar `{}`: `{}`",
+                sidecar.store_id,
+                sidecar.planning_root.display()
+            ));
+        }
+        let local_only = self.cli.local_only || sidecar.is_some();
+        self.ui.frontier_enabled(!local_only);
+        if local_only {
+            self.ui.info("LOCAL-ONLY: frontier fallback is disabled");
+        }
 
         if self.cli.forget {
             return self.forget_checkpoint(&repo);
@@ -290,31 +422,51 @@ impl<U: Ui> App<U> {
             return self.run_interactive(&repo, &launcher);
         }
 
-        let frontier_launcher = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
-        if frontier_launcher.program != "claude" {
-            prerequisite_exists(&frontier_launcher.program, &repo, &self.ui)?;
-        }
-        if launcher.connection_name.is_some() || frontier_launcher.connection_name.is_some() {
-            self.ui.info(&format!(
-                "Connections: worker {}, frontier {}",
-                connection_description(&launcher),
-                connection_description(&frontier_launcher)
+        let frontier_launcher = if local_only {
+            None
+        } else {
+            let frontier = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
+            if frontier.program != "claude" {
+                prerequisite_exists(&frontier.program, &repo, &self.ui)?;
+            }
+            self.ui.debug(&format!(
+                "frontier launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, environment variables={:?}, unset environment={:?}",
+                frontier.connection_name,
+                frontier.environment_name,
+                frontier.program,
+                frontier.prefix_args,
+                frontier.model,
+                frontier
+                    .environment
+                    .iter()
+                    .map(|variable| variable.name.as_str())
+                    .collect::<Vec<_>>(),
+                frontier.unset_environment
             ));
+            Some(frontier)
+        };
+        if launcher.connection_name.is_some()
+            || frontier_launcher
+                .as_ref()
+                .is_some_and(|frontier| frontier.connection_name.is_some())
+        {
+            let description = frontier_launcher.as_ref().map_or_else(
+                || {
+                    format!(
+                        "worker {} (all model stages)",
+                        connection_description(&launcher)
+                    )
+                },
+                |frontier| {
+                    format!(
+                        "worker {}, frontier {}",
+                        connection_description(&launcher),
+                        connection_description(frontier)
+                    )
+                },
+            );
+            self.ui.info(&format!("Connections: {description}"));
         }
-        self.ui.debug(&format!(
-            "frontier launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, environment variables={:?}, unset environment={:?}",
-            frontier_launcher.connection_name,
-            frontier_launcher.environment_name,
-            frontier_launcher.program,
-            frontier_launcher.prefix_args,
-            frontier_launcher.model,
-            frontier_launcher
-                .environment
-                .iter()
-                .map(|variable| variable.name.as_str())
-                .collect::<Vec<_>>(),
-            frontier_launcher.unset_environment
-        ));
 
         prerequisite_exists("openspec", &repo, &self.ui)?;
         if !repo.join("openspec/config.yaml").is_file() {
@@ -331,7 +483,7 @@ impl<U: Ui> App<U> {
         ));
 
         if self.cli.resume {
-            return self.resume(&repo, &launcher, &frontier_launcher, &commands);
+            return self.resume(&repo, &launcher, frontier_launcher.as_ref(), &commands);
         }
 
         if let Some(existing) = try_load_state(&repo, &self.ui)? {
@@ -346,15 +498,29 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.continue_existing {
-            return self.continue_existing(&repo, &launcher, &frontier_launcher, &commands);
+            return self.continue_existing(&repo, &launcher, frontier_launcher.as_ref(), &commands);
         }
 
         if self.cli.dry_run {
-            return self.print_new_dry_run(&repo, &launcher, &frontier_launcher, &commands);
+            return self.print_new_dry_run(&repo, &launcher, frontier_launcher.as_ref(), &commands);
         }
 
         let before_changes = openspec_snapshot(&repo, &self.ui)?;
-        let mut state = if self.cli.loop_workflow {
+        let mut state = if let Some(sidecar) = &sidecar {
+            let change = self
+                .cli
+                .change
+                .clone()
+                .context("a new sidecar change requires --change NAME")?;
+            validate_change_name(&change)?;
+            RunState::sidecar(
+                self.cli.request.clone(),
+                change,
+                before_changes,
+                sidecar,
+                true,
+            )
+        } else if self.cli.loop_workflow {
             RunState::new_campaign(
                 self.cli.request.clone(),
                 before_changes,
@@ -363,11 +529,20 @@ impl<U: Ui> App<U> {
         } else {
             RunState::new(self.cli.request.clone(), before_changes)
         };
-        self.assign_requested_change(&mut state)?;
-        self.assign_agenda(&repo, &mut state)?;
+        state.local_only |= local_only;
+        if sidecar.is_none() {
+            self.assign_requested_change(&mut state)?;
+            self.assign_agenda(&repo, &mut state)?;
+        }
         arm_slice_baseline(&repo, &mut state, &self.ui)?;
         persist_state(&repo, &state, &self.ui)?;
-        self.run_workflows(&repo, &launcher, &frontier_launcher, &commands, state)
+        self.run_workflows(
+            &repo,
+            &launcher,
+            frontier_launcher.as_ref(),
+            &commands,
+            state,
+        )
     }
 
     fn assign_agenda(&self, repo: &Path, state: &mut RunState) -> Result<()> {
@@ -500,14 +675,20 @@ impl<U: Ui> App<U> {
             commands.propose, commands.apply, commands.verify, commands.archive
         ));
 
-        self.run_workflows(repo, frontier_launcher, frontier_launcher, &commands, state)
+        self.run_workflows(
+            repo,
+            frontier_launcher,
+            Some(frontier_launcher),
+            &commands,
+            state,
+        )
     }
 
     fn continue_existing(
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         let active_changes = openspec_snapshot(repo, &self.ui)?;
@@ -547,7 +728,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         let mut state = load_state(repo, &self.ui)?;
@@ -624,9 +805,10 @@ impl<U: Ui> App<U> {
             return self.print_resume_dry_run(&state, commands);
         }
 
+        state.local_only |= self.cli.local_only;
         persist_state(repo, &state, &self.ui)?;
         let workflow_launcher = if state.bootstrap {
-            frontier_launcher
+            frontier_launcher.context("bootstrap resume requires a frontier connection")?
         } else {
             launcher
         };
@@ -637,7 +819,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
@@ -660,6 +842,26 @@ impl<U: Ui> App<U> {
                             "bootstrap planning did not fit the configured frontier model: {summary}. The checkpoint and repository work were preserved; resume with a more capable frontier connection or refine the project context"
                         );
                     }
+                    if escalated.local_only {
+                        let outcome = escalated
+                            .too_large
+                            .as_ref()
+                            .map(|outcome| outcome.summary.trim())
+                            .unwrap_or("the local model could not complete the bounded change");
+                        bail!(
+                            "LOCAL-ONLY: no frontier model was invoked after the local worker reported TOO_LARGE: {outcome}"
+                        );
+                    }
+                    let frontier_launcher = frontier_launcher.with_context(|| {
+                        let outcome = escalated
+                            .too_large
+                            .as_ref()
+                            .map(|outcome| outcome.summary.trim())
+                            .unwrap_or("the local model could not complete the bounded change");
+                        format!(
+                            "LOCAL-ONLY: no frontier model was invoked after the local worker reported TOO_LARGE: {outcome}"
+                        )
+                    })?;
                     state = self.run_frontier_replan(repo, frontier_launcher, escalated)?;
                     persist_state(repo, &state, &self.ui)?;
                 }
@@ -682,6 +884,13 @@ impl<U: Ui> App<U> {
                         self.ui.finish_dashboard();
                         self.ui
                             .success(&format!("COMPLETE `{change}` — final {}", short_hash(head)));
+                        if let Some(planning_head) = completed_state.planning_final_head.as_deref()
+                        {
+                            self.ui.info(&format!(
+                                "Sidecar archive commit: {}",
+                                short_hash(planning_head)
+                            ));
+                        }
                         if let Some(command) =
                             single_advance_continuation_command(repo, &completed_state)
                         {
@@ -960,6 +1169,13 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         );
+        let claude = if let Some(product) = state.product_repo.as_deref() {
+            claude
+                .with_additional_dir(product)
+                .with_resume_repo(product)
+        } else {
+            claude
+        };
         let worker_claude = ClaudeClient::new(
             repo,
             launcher,
@@ -969,6 +1185,13 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         );
+        let worker_claude = if let Some(product) = state.product_repo.as_deref() {
+            worker_claude
+                .with_additional_dir(product)
+                .with_resume_repo(product)
+        } else {
+            worker_claude
+        };
         let worker_claude = if state.bootstrap {
             worker_claude
         } else {
@@ -1222,6 +1445,11 @@ impl<U: Ui> App<U> {
             format!(
                 "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragment in `CLAUDE.md`, and OpenSpec's project-local Claude integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. Use commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
+        } else if let Some(product_repo) = state.product_repo.as_deref() {
+            format!(
+                "Create the proposal milestone Git commit for sidecar OpenSpec change `{change}`. The current working directory is the planning repository. Commit all planning files belonging to this exact change, including its OpenSpec artifacts and sidecar-local Claude integration, with commit message exactly `openspec: propose {change}`. Do not create a commit in the product repository `{}` during this stage. Preserve unrelated work and never reset, stash, restore, discard, amend, or rewrite history. If the planning work is already committed, confirm that and report READY.",
+                product_repo.display()
+            )
         } else {
             format!(
                 "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
@@ -1258,6 +1486,7 @@ impl<U: Ui> App<U> {
                 "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
             )
         };
+        let base = with_sidecar_context(state, &base);
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let Some(result) = worker_result(
             invoke_fresh(
@@ -1299,6 +1528,7 @@ impl<U: Ui> App<U> {
                 "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
             )
         };
+        let verify_subject = with_sidecar_context(state, &verify_subject);
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
@@ -1412,6 +1642,7 @@ impl<U: Ui> App<U> {
                 "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. If the verifier has exposed that the assigned slice cannot reliably fit one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition. Do not use TOO_LARGE for an ordinary correctable verification failure.\n\nVerifier context:\n{finding}"
             )
         };
+        let base = with_sidecar_context(state, &base);
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let Some(result) = worker_result(
             invoke_fresh(
@@ -1448,6 +1679,7 @@ impl<U: Ui> App<U> {
         let subject = format!(
             "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization."
         );
+        let subject = with_sidecar_context(state, &subject);
         for attempt in 0..=1 {
             let attempt_subject = if attempt == 0 {
                 subject.clone()
@@ -1508,10 +1740,21 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let baseline = current_head(repo, &self.ui)?;
+        let planning_baseline = current_head(repo, &self.ui)?;
+        let product_repo = state.product_repo.clone();
+        let product_baseline = product_repo
+            .as_deref()
+            .map(|product| current_head(product, &self.ui))
+            .transpose()?
+            .flatten();
         let task = if state.bootstrap {
             format!(
                 "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+            )
+        } else if let Some(product_repo) = product_repo.as_deref() {
+            format!(
+                "Complete the two Git milestones for sidecar OpenSpec change `{change}`. First inspect the product repository `{product}` and commit only the implementation, tests, and product documentation belonging to this change there, with commit message exactly `openspec: complete {change}`. Obtain that product commit hash. Then inspect the current planning repository and commit its synchronized specifications, archived change artifacts, sidecar metadata, and other planning-only files with subject exactly `openspec: archive {change}` and a commit body trailer `Product-Commit: <hash>`. Preserve unrelated work in both repositories. Never reset, stash, restore, discard, amend, or rewrite either history. If one repository's relevant work is already committed, preserve it and still complete the other milestone. Report READY only after both repositories have no uncommitted work belonging to this change.",
+                product = product_repo.display()
             )
         } else {
             format!(
@@ -1525,10 +1768,32 @@ impl<U: Ui> App<U> {
             "Claude is committing the completed change",
             StageProtocol::Ready,
         );
-        verify_milestone_ancestry(repo, baseline.as_deref(), "completion", &self.ui)?;
+        verify_milestone_ancestry(
+            repo,
+            planning_baseline.as_deref(),
+            if product_repo.is_some() {
+                "sidecar archive"
+            } else {
+                "completion"
+            },
+            &self.ui,
+        )?;
+        if let Some(product_repo) = product_repo.as_deref() {
+            verify_milestone_ancestry(
+                product_repo,
+                product_baseline.as_deref(),
+                "product completion",
+                &self.ui,
+            )?;
+        }
         let result = result?;
         require_ready("completion commit", &result.text, result.signal)?;
-        state.final_head = current_head(repo, &self.ui)?;
+        if let Some(product_repo) = product_repo.as_deref() {
+            state.final_head = current_head(product_repo, &self.ui)?;
+            state.planning_final_head = current_head(repo, &self.ui)?;
+        } else {
+            state.final_head = current_head(repo, &self.ui)?;
+        }
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)
     }
@@ -1537,7 +1802,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         self.ui
@@ -1594,10 +1859,15 @@ impl<U: Ui> App<U> {
         self.ui.info(&format!("Archive: {}", commands.archive));
         self.ui
             .info("Ask Claude to create completion milestone commit");
-        self.ui.info(&format!(
-            "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
-            frontier_launcher.program, self.cli.local_worker_timeout_minutes
-        ));
+        if let Some(frontier_launcher) = frontier_launcher {
+            self.ui.info(&format!(
+                "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
+                frontier_launcher.program, self.cli.local_worker_timeout_minutes
+            ));
+        } else {
+            self.ui
+                .info("LOCAL-ONLY: stop on TOO_LARGE; never invoke frontier fallback");
+        }
         if self.cli.loop_workflow {
             let limit = self.cli.max_iterations.map_or_else(
                 || "until the agenda or objective is complete".to_owned(),
@@ -1831,11 +2101,12 @@ fn worker_result<U: Ui>(
 }
 
 fn arm_slice_baseline<U: Ui>(repo: &Path, state: &mut RunState, ui: &U) -> Result<()> {
-    if matches!(state.stage, Stage::Complete | Stage::Done) {
+    if state.local_only || matches!(state.stage, Stage::Complete | Stage::Done) {
         state.slice_baseline = None;
         return Ok(());
     }
-    let baseline = capture_slice_baseline(repo, ui)?;
+    let product_repo = product_repository(repo, state).to_path_buf();
+    let baseline = capture_slice_baseline(&product_repo, ui)?;
     state.slice_baseline = Some(baseline);
     Ok(())
 }
@@ -1844,11 +2115,16 @@ fn release_state_baseline<U: Ui>(repo: &Path, state: &mut RunState, ui: &U) {
     let Some(baseline) = state.slice_baseline.take() else {
         return;
     };
-    if let Err(error) = release_slice_baseline(repo, &baseline, ui) {
+    let product_repo = product_repository(repo, state).to_path_buf();
+    if let Err(error) = release_slice_baseline(&product_repo, &baseline, ui) {
         ui.warn(&format!(
             "Could not release private rollback metadata; workflow state is unaffected: {error}"
         ));
     }
+}
+
+fn product_repository<'a>(planning_repo: &'a Path, state: &'a RunState) -> &'a Path {
+    state.product_repo.as_deref().unwrap_or(planning_repo)
 }
 
 fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
@@ -1877,6 +2153,13 @@ fn campaign_subject(state: &RunState) -> String {
             content = assignment.content.trim()
         );
     }
+    if let (Some(product_repo), Some(change)) = (state.product_repo.as_deref(), &state.change) {
+        return format!(
+            "{}\n\nCreate the complete OpenSpec planning artifacts for the exact bounded brownfield change `{change}`. The current working directory is the external planning repository; the product repository is `{}` and is available as an additional Claude directory. Treat `openspec/config.yaml` as durable supplied context. Inspect only the product files, symbols, references, and tests needed for this change; do not attempt to understand or survey the entire product repository. During Propose, write only planning artifacts and do not implement product code.",
+            state.request,
+            product_repo.display()
+        );
+    }
     if let Some(change) = &state.change {
         return format!(
             "{}\n\nUse the exact OpenSpec change name `{change}`. During exploration, investigate without creating artifacts. During proposal, create or continue only `{change}` and do not select or modify a differently named change.",
@@ -1890,6 +2173,16 @@ fn campaign_subject(state: &RunState) -> String {
         ),
         None => state.request.clone(),
     }
+}
+
+fn with_sidecar_context(state: &RunState, subject: &str) -> String {
+    let Some(product_repo) = state.product_repo.as_deref() else {
+        return subject.to_owned();
+    };
+    format!(
+        "{subject}\n\nSIDECAR WORKSPACE: The current working directory contains OpenSpec planning state only. The product source and its Git repository are at `{}` and are available through Claude's additional-directory access. Read the product's existing `CLAUDE.md` when present. Make product code/test/documentation edits only there, run product commands from there, and use targeted language-server navigation and searches rather than surveying the whole repository. Keep OpenSpec artifacts and sidecar-local workflow files in the current planning repository.",
+        product_repo.display()
+    )
 }
 
 fn frontier_replan_prompt(assignment: &AgendaAssignment, outcome: &TooLargeOutcome) -> String {
@@ -2067,12 +2360,18 @@ fn load_state_file(path: &Path) -> Result<RunState> {
         .unwrap_or(0) as u32;
     match schema {
         STATE_SCHEMA_VERSION => serde_json::from_value(value).context("invalid current checkpoint"),
+        4 => migrate_v4(value),
         3 => migrate_v3(value),
         2 => migrate_v2(value),
         other => bail!(
             "unsupported checkpoint schema {other}; use `--forget` to leave repository state untouched and start over"
         ),
     }
+}
+
+fn migrate_v4(mut value: Value) -> Result<RunState> {
+    value["schema_version"] = Value::from(STATE_SCHEMA_VERSION);
+    serde_json::from_value(value).context("invalid version 4 checkpoint")
 }
 
 fn migrate_v3(mut value: Value) -> Result<RunState> {
@@ -2146,6 +2445,10 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         slice_baseline: None,
         frontier_replans: 0,
         bootstrap: false,
+        product_repo: None,
+        sidecar_store: None,
+        planning_final_head: None,
+        local_only: false,
     })
 }
 
@@ -2263,6 +2566,38 @@ mod tests {
         assert!(subject.contains("support remote URI path prefixes"));
         assert!(subject.contains("exact OpenSpec change name `remote-path-prefix`"));
         assert!(subject.contains("do not select or modify a differently named change"));
+    }
+
+    #[test]
+    fn sidecar_subject_keeps_planning_external_and_product_inspection_targeted() {
+        let mut state = RunState::new(
+            "adjust bounded Ceph recovery behaviour".to_owned(),
+            ChangeSnapshot::default(),
+        );
+        state.change = Some("ceph-recovery-fix".to_owned());
+        state.stage = Stage::Propose;
+        state.product_repo = Some(PathBuf::from("/src/ceph"));
+        state.sidecar_store = Some("opsx-ceph-demo".to_owned());
+        state.local_only = true;
+
+        let subject = campaign_subject(&state);
+        assert!(subject.contains("exact bounded brownfield change `ceph-recovery-fix`"));
+        assert!(subject.contains("external planning repository"));
+        assert!(subject.contains("product repository is `/src/ceph`"));
+        assert!(subject.contains("do not attempt to understand or survey the entire"));
+        assert!(!subject.contains("During exploration"));
+
+        let apply = with_sidecar_context(&state, "apply it");
+        assert!(apply.contains("current working directory contains OpenSpec planning state only"));
+        assert!(apply.contains("Make product code/test/documentation edits only there"));
+        assert!(apply.contains("Keep OpenSpec artifacts"));
+
+        let decoded: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(decoded.stage, Stage::Propose);
+        assert_eq!(decoded.product_repo, Some(PathBuf::from("/src/ceph")));
+        assert_eq!(decoded.sidecar_store.as_deref(), Some("opsx-ceph-demo"));
+        assert!(decoded.local_only);
     }
 
     #[test]

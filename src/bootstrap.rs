@@ -83,7 +83,7 @@ impl BootstrapScaffold {
         merge_managed_fragment(&existing_claude)?;
 
         Ok(Self {
-            config: render_config(&context),
+            config: render_project_config(&context),
         })
     }
 
@@ -196,7 +196,7 @@ pub fn validate_agenda(repo: &Path) -> Result<usize> {
     Ok(slices.len())
 }
 
-fn render_config(context: &str) -> String {
+pub fn render_project_config(context: &str) -> String {
     let mut rendered = String::from(
         "schema: spec-driven\n\n# Project context supplied to artifact-generating agents.\ncontext: |\n",
     );
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn renders_markdown_as_yaml_context() {
-        let rendered = render_config("# Widget\n\nBuild a useful widget.\n");
+        let rendered = render_project_config("# Widget\n\nBuild a useful widget.\n");
         assert!(rendered.contains("context: |\n  # Widget\n  \n  Build a useful widget.\n"));
         assert!(rendered.contains("schema: spec-driven"));
         assert!(rendered.contains("Keep each change bounded enough"));

@@ -149,6 +149,7 @@ pub(crate) struct StreamDashboard {
     injection_input: Option<String>,
     pending_confirmation: Option<PendingConfirmation>,
     stop_after_iteration: bool,
+    frontier_enabled: bool,
 }
 
 impl StreamDashboard {
@@ -195,6 +196,7 @@ impl StreamDashboard {
             injection_input: None,
             pending_confirmation: None,
             stop_after_iteration: false,
+            frontier_enabled: true,
         };
         dashboard.draw()?;
         Ok(dashboard)
@@ -219,6 +221,11 @@ impl StreamDashboard {
         if self.active {
             let _ = self.draw();
         }
+    }
+
+    pub(crate) fn set_frontier_enabled(&mut self, enabled: bool) {
+        self.frontier_enabled = enabled;
+        self.dirty = true;
     }
 
     pub(crate) fn stop_after_iteration_requested(&self) -> bool {
@@ -463,6 +470,14 @@ impl StreamDashboard {
                     self.request_confirmation(PendingConfirmation::Pause);
                 }
                 KeyCode::Char('f') => {
+                    if !self.frontier_enabled {
+                        self.push_message(
+                            "frontier",
+                            Color::Yellow,
+                            "Frontier replanning is disabled for this local-only workflow",
+                        );
+                        return StreamControl::None;
+                    }
                     if !self.frontier_available() {
                         self.push_message(
                             "frontier",
@@ -595,16 +610,18 @@ impl StreamDashboard {
     }
 
     fn frontier_available(&self) -> bool {
-        self.panels
-            .iter()
-            .rev()
-            .find(|panel| panel.status == PhaseStatus::Running)
-            .is_some_and(|panel| {
-                matches!(
-                    panel.stage.title.as_str(),
-                    "Explore" | "Propose" | "Apply" | "Verify" | "Repair"
-                )
-            })
+        self.frontier_enabled
+            && self
+                .panels
+                .iter()
+                .rev()
+                .find(|panel| panel.status == PhaseStatus::Running)
+                .is_some_and(|panel| {
+                    matches!(
+                        panel.stage.title.as_str(),
+                        "Explore" | "Propose" | "Apply" | "Verify" | "Repair"
+                    )
+                })
     }
 
     fn handle_injection_event(&mut self, event: Event) -> StreamControl {
@@ -967,7 +984,8 @@ impl StreamDashboard {
                     } else {
                         ""
                     };
-                    format!("p pause · f frontier · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
+                    let frontier = if self.frontier_enabled { " · f frontier" } else { "" };
+                    format!("p pause{frontier} · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
                     |input| {
                         format!("steer> {input}█   Enter interrupt · Esc cancel · Ctrl-C stop")
@@ -1232,6 +1250,7 @@ mod tests {
             injection_input: None,
             pending_confirmation: None,
             stop_after_iteration: false,
+            frontier_enabled: true,
         };
         dashboard.set_stage(StageView {
             current: 1,
@@ -1538,6 +1557,28 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("frontier replanning")
+        );
+    }
+
+    #[test]
+    fn local_only_dashboard_does_not_offer_frontier_escalation() {
+        let mut dashboard = dashboard();
+        dashboard.set_frontier_enabled(false);
+        assert_eq!(
+            dashboard.handle_event(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+            ))),
+            StreamControl::None
+        );
+        assert_eq!(dashboard.pending_confirmation, None);
+        assert!(
+            dashboard.panels[0]
+                .lines
+                .back()
+                .unwrap()
+                .text
+                .contains("disabled")
         );
     }
 
