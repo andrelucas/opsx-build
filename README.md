@@ -61,7 +61,8 @@ The command:
    preserving all user-owned text outside its markers; the managed fragment
    includes workflow safety, revisable dependency selection,
    language-server-first navigation, and scoped canonical source-formatting
-   policy;
+   policy, plus instructions to escape Claude's sandbox narrowly when it
+   prevents a required build or test from executing;
 5. runs the planning-only `bootstrap-implementation-slices` change through the
    existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
    commit stages; and
@@ -886,6 +887,13 @@ planner uses `REPLANNED` only after committing a valid agenda subdivision.
 The corrected structured field and fallback marker are `opsx_status` and
 `OPSX_STATUS`. Results using the old `ospx_status` or `OSPX_STATUS` spellings
 remain readable for compatibility.
+
+Apply, Repair, and Verify prompts explicitly authorize the minimum necessary
+project build or test command to use Claude Code's per-command sandbox escape
+when the sandbox prevents it from running. A sandbox denial must not be "fixed"
+by changing product behavior, adding sandbox-specific tests, weakening tests,
+or substituting synthetic coverage. Verify may report `VERIFIED` only after the
+required real checks have executed and passed.
 
 If the Claude process exits successfully but returns neither structured output
 nor a fallback marker, opsx-build does not rerun that potentially mutating

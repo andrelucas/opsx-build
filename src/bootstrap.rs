@@ -356,13 +356,17 @@ mod tests {
     }
 
     #[test]
-    fn managed_fragment_requires_language_server_use_and_canonical_formatting() {
+    fn managed_fragment_preserves_project_execution_policy() {
         assert!(CLAUDE_FRAGMENT.contains("verify that a language server"));
         assert!(CLAUDE_FRAGMENT.contains("Strongly prefer language-server facilities"));
         assert!(CLAUDE_FRAGMENT.contains("canonical formatter"));
         assert!(CLAUDE_FRAGMENT.contains("Format every source file changed"));
         assert!(CLAUDE_FRAGMENT.contains("Treat third-party library and framework choices"));
         assert!(CLAUDE_FRAGMENT.contains("Do not distort specified behaviour"));
+        assert!(CLAUDE_FRAGMENT.contains("sandbox prevents a required project build or test"));
+        assert!(CLAUDE_FRAGMENT.contains("dangerouslyDisableSandbox: true"));
+        assert!(CLAUDE_FRAGMENT.contains("substitute synthetic or weaker coverage"));
+        assert!(CLAUDE_FRAGMENT.contains("required real checks have run and passed"));
     }
 
     #[test]

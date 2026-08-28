@@ -1354,8 +1354,14 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         format!("{command} {subject}")
     };
     let terminal_values = protocol.terminal_values();
+    let test_execution_policy = match protocol {
+        StageProtocol::Worker | StageProtocol::Verify => {
+            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen Claude Code's sandbox prevents a required project build or test from running, rerun only the affected command outside the sandbox using the Bash tool with `dangerouslyDisableSandbox: true`. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate Claude's sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. A worker must not return READY while tests required by this phase remain unexecuted. Verification must not return VERIFIED unless the required real checks actually ran and passed; report RETRY with the missing validation when it is correctable."
+        }
+        StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
+    };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.{test_execution_policy}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -1865,6 +1871,23 @@ mod tests {
         assert!(!StageProtocol::Verify.json_schema().contains("TOO_LARGE"));
         let prompt = stage_prompt("/explore-unattended", "inspect it", StageProtocol::Worker);
         assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+    }
+
+    #[test]
+    fn worker_and_verify_prompts_require_real_tests_outside_the_sandbox_when_needed() {
+        for protocol in [StageProtocol::Worker, StageProtocol::Verify] {
+            let prompt = stage_prompt("/opsx:apply", "change", protocol);
+            assert!(prompt.contains("sandbox prevents a required project build or test"));
+            assert!(prompt.contains("dangerouslyDisableSandbox: true"));
+            assert!(prompt.contains("Do not rewrite production code or tests"));
+            assert!(prompt.contains("synthetic or weaker coverage"));
+        }
+
+        let verify = stage_prompt("/opsx:verify", "change", StageProtocol::Verify);
+        assert!(verify.contains("must not return VERIFIED"));
+
+        let propose = stage_prompt("/propose-unattended", "change", StageProtocol::Propose);
+        assert!(!propose.contains("PROJECT TEST EXECUTION POLICY"));
     }
 
     #[test]
