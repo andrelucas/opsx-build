@@ -1862,7 +1862,7 @@ fn campaign_subject(state: &RunState) -> String {
             .map(|campaign| format!("campaign iteration {}", campaign.iteration))
             .unwrap_or_else(|| "an advance operation".to_owned());
         return format!(
-            "Advance the repository by implementing the exact ordered agenda assignment below. This is {iteration}. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The agenda content is authoritative; use repository inspection only to elaborate its implementation details.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
+            "Create the OpenSpec planning artifacts for the exact ordered agenda assignment below. This is {iteration}. This Propose stage is planning-only: do not implement production code or invoke an Apply or implementation skill. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The agenda content is authoritative; use repository inspection only to elaborate its implementation details.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
             change = assignment.change,
             path = assignment.path,
             content = assignment.content.trim()
@@ -2193,6 +2193,11 @@ mod tests {
         assert!(subject.contains("exact name `002-test-harness`"));
         assert!(subject.contains("automation/slices/002-test-harness.md"));
         assert!(subject.contains("## Objective"));
+        assert!(subject.contains("OpenSpec planning artifacts"));
+        assert!(subject.contains("This Propose stage is planning-only"));
+        assert!(subject.contains("do not implement production code"));
+        assert!(subject.contains("or invoke an Apply or implementation skill"));
+        assert!(!subject.contains("by implementing the exact ordered agenda"));
         assert!(subject.contains("Do not select, create, or modify a different slice"));
     }
 

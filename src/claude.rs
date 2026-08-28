@@ -53,6 +53,17 @@ impl fmt::Display for MissingTerminalResult {
 
 impl Error for MissingTerminalResult {}
 
+#[derive(Debug)]
+struct ClaudeApiError(String);
+
+impl fmt::Display for ClaudeApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Claude API error: {}", self.0)
+    }
+}
+
+impl Error for ClaudeApiError {}
+
 pub fn is_missing_terminal_result(error: &anyhow::Error) -> bool {
     error.downcast_ref::<MissingTerminalResult>().is_some()
 }
@@ -964,6 +975,33 @@ fn text_mentions_output_limit(text: &str) -> bool {
         || text.contains("output token maximum")
 }
 
+fn api_error_message(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("API Error:")
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn event_api_error(event: &Value) -> Option<String> {
+    event
+        .get("result")
+        .and_then(Value::as_str)
+        .and_then(api_error_message)
+        .or_else(|| {
+            event
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .rev()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .find_map(api_error_message)
+        })
+}
+
 fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
     let parsed = serde_json::from_str::<Value>(stdout).ok();
     let text = parsed
@@ -984,6 +1022,9 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
+        if let Some(message) = api_error_message(&text) {
+            return Err(ClaudeApiError(message).into());
+        }
         bail!("Claude reported an error: {text}");
     }
 
@@ -1000,9 +1041,18 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
                 signal,
             });
         }
-        None => parse_signal(&text).ok_or(MissingTerminalResult(
-            "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it",
-        ))?,
+        None => match parse_signal(&text) {
+            Some(signal) => signal,
+            None => {
+                if let Some(message) = api_error_message(&text) {
+                    return Err(ClaudeApiError(message).into());
+                }
+                return Err(MissingTerminalResult(
+                    "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it",
+                )
+                .into());
+            }
+        },
     };
 
     Ok(ClaudeResult {
@@ -1013,14 +1063,14 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
 }
 
 fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
-    let results = stdout
+    let events = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
         .filter(|value| value.get("type").and_then(Value::as_str) == Some("result"))
         .collect::<Vec<_>>();
-    if results.is_empty() {
-        return Err(MissingTerminalResult("Claude stream ended without a result event").into());
-    }
 
     for result in results.iter().rev() {
         let text = result
@@ -1058,7 +1108,16 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
             .get("result")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if let Some(message) = api_error_message(text) {
+            return Err(ClaudeApiError(message).into());
+        }
         bail!("Claude reported an error: {text}");
+    }
+    if let Some(message) = events.iter().rev().find_map(event_api_error) {
+        return Err(ClaudeApiError(message).into());
+    }
+    if results.is_empty() {
+        return Err(MissingTerminalResult("Claude stream ended without a result event").into());
     }
     Err(MissingTerminalResult(
         "Claude stream results contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them",
@@ -1804,6 +1863,36 @@ mod tests {
             parse_claude_output(r#"{"type":"result","is_error":true,"result":"upstream failed"}"#)
                 .unwrap_err();
         assert!(!is_missing_terminal_result(&reported_error));
+    }
+
+    #[test]
+    fn surfaces_api_errors_from_assistant_stream_events() {
+        let stdout = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: 402 This request would exceed your available credits given your current in-flight requests.\"}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"\",\"structured_output\":null}\n"
+        );
+
+        let error = parse_claude_stream_output(stdout).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Claude API error: 402 This request would exceed your available credits given your current in-flight requests."
+        );
+        assert!(!is_missing_terminal_result(&error));
+    }
+
+    #[test]
+    fn surfaces_api_errors_from_non_stream_results() {
+        let error = parse_claude_output(
+            r#"{"type":"result","subtype":"success","result":"API Error: 429 Rate limit exceeded","structured_output":null}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Claude API error: 429 Rate limit exceeded"
+        );
+        assert!(!is_missing_terminal_result(&error));
     }
 
     #[test]

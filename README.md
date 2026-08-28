@@ -154,6 +154,11 @@ OpenSpec's durable state. An absent active change proves that archival completed
 If the change remains active, Archive is retried once in a fresh Claude session;
 explicit `BLOCKED` results and substantive process errors are not retried.
 
+Provider API failures emitted as Claude assistant activity are preserved and
+reported directly even when the stream omits the normal stage result. They are
+treated as substantive errors rather than missing-protocol retries, and the
+workflow checkpoint remains available for a later `--resume`.
+
 Before each Claude milestone-commit session, opsx-build records the current
 Git commit. It proceeds only if that commit remains an ancestor of the result.
 This catches rewritten or displaced committed history without imposing rules
