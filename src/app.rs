@@ -1676,9 +1676,7 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let subject = format!(
-            "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization."
-        );
+        let subject = archive_subject(&change);
         let subject = with_sidecar_context(state, &subject);
         for attempt in 0..=1 {
             let attempt_subject = if attempt == 0 {
@@ -2267,6 +2265,12 @@ fn with_direction(base: &str, direction: Option<&str>) -> String {
     }
 }
 
+fn archive_subject(change: &str) -> String {
+    format!(
+        "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization. The user has already authorized the normal archive choices: if delta specs need synchronization, choose `Sync now (recommended)`, verify the sync, and continue the archive; if they are already synchronized, choose `Archive now`. Do not stop to request routine confirmation for either choice, and do not treat that confirmation as a BLOCKED condition. Report BLOCKED only if synchronization, verification, or archival cannot safely be completed without a genuine human decision or unavailable external input."
+    )
+}
+
 fn queue_direction(state: &mut RunState, direction: &str) {
     state.pending_direction = Some(direction.to_owned());
     if matches!(
@@ -2777,6 +2781,15 @@ mod tests {
             .insert("other-change".to_owned(), Value::Null);
         assert!(archive_is_absent(&changes, "slice-n"));
         assert!(!archive_is_absent(&changes, "other-change"));
+    }
+
+    #[test]
+    fn archive_prompt_pre_authorizes_normal_spec_sync() {
+        let subject = archive_subject("0009-https-tls-forwarding-valid");
+
+        assert!(subject.contains("choose `Sync now (recommended)`"));
+        assert!(subject.contains("choose `Archive now`"));
+        assert!(subject.contains("do not treat that confirmation as a BLOCKED condition"));
     }
 
     #[test]
