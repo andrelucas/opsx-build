@@ -19,7 +19,7 @@ use crate::{
         CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode,
         SkillCommands, StageProtocol, StageSignal, build_claude_command,
         build_connection_test_command, build_interactive_claude_command,
-        parse_connection_test_output, stage_prompt,
+        is_missing_terminal_result, parse_connection_test_output, stage_prompt,
     },
     cli::Cli,
     git::{
@@ -1436,41 +1436,60 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let result = invoke_fresh(
-            claude,
-            &format!("{change}-archive"),
-            &stage_prompt(
-                &commands.archive,
-                &format!(
-                    "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization."
-                ),
-                StageProtocol::Ready,
-            ),
-            "Claude is archiving the OpenSpec change",
-            StageProtocol::Ready,
+        let subject = format!(
+            "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization."
         );
-        let result = match result {
-            Ok(result) => result,
-            Err(error) if error.downcast_ref::<PauseRequested>().is_some() => return Err(error),
-            Err(error) => match openspec_snapshot(repo, &self.ui) {
-                Ok(changes) if archive_is_absent(&changes, &change) => {
-                    self.ui.warn(
-                        "Archive completed but Claude omitted its terminal result; accepting OpenSpec state",
-                    );
-                    state.stage = state.stage.after_ready()?;
-                    return persist_state(repo, state, &self.ui);
+        for attempt in 0..=1 {
+            let attempt_subject = if attempt == 0 {
+                subject.clone()
+            } else {
+                format!(
+                    "{subject}\n\nRECOVERY: The preceding attempt ended without a usable terminal result while this OpenSpec change remained active. Inspect durable OpenSpec state and complete the archive now. Invoke actual Claude tools one at a time; do not print XML, JSON, or any other textual representation of intended tool calls."
+                )
+            };
+            let result = invoke_fresh(
+                claude,
+                &format!("{change}-archive"),
+                &stage_prompt(&commands.archive, &attempt_subject, StageProtocol::Ready),
+                if attempt == 0 {
+                    "Claude is archiving the OpenSpec change"
+                } else {
+                    "Claude is retrying the OpenSpec archive"
+                },
+                StageProtocol::Ready,
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) if error.downcast_ref::<PauseRequested>().is_some() => {
+                    return Err(error);
                 }
-                Ok(_) => return Err(error),
-                Err(check_error) => {
-                    return Err(error.context(format!(
-                        "could not also confirm archive state: {check_error}"
-                    )));
-                }
-            },
-        };
-        require_ready("archive", &result.text, result.signal)?;
-        state.stage = state.stage.after_ready()?;
-        persist_state(repo, state, &self.ui)
+                Err(error) => match openspec_snapshot(repo, &self.ui) {
+                    Ok(changes) if archive_is_absent(&changes, &change) => {
+                        self.ui.warn(
+                            "Archive completed but Claude omitted its terminal result; accepting OpenSpec state",
+                        );
+                        state.stage = state.stage.after_ready()?;
+                        return persist_state(repo, state, &self.ui);
+                    }
+                    Ok(_) if attempt == 0 && is_missing_terminal_result(&error) => {
+                        self.ui.warn(
+                            "Claude omitted its Archive terminal result while the change remains active; retrying once in a fresh session",
+                        );
+                        continue;
+                    }
+                    Ok(_) => return Err(error),
+                    Err(check_error) => {
+                        return Err(error.context(format!(
+                            "could not also confirm archive state: {check_error}"
+                        )));
+                    }
+                },
+            };
+            require_ready("archive", &result.text, result.signal)?;
+            state.stage = state.stage.after_ready()?;
+            return persist_state(repo, state, &self.ui);
+        }
+        unreachable!("Archive retry loop always returns")
     }
 
     fn run_final_commit(

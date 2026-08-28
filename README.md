@@ -149,6 +149,11 @@ multi-change campaign.
 9. Ask Claude in another fresh session to commit the completed change as
    `openspec: complete <change>`.
 
+If Archive finishes without a usable terminal result, opsx-build first checks
+OpenSpec's durable state. An absent active change proves that archival completed.
+If the change remains active, Archive is retried once in a fresh Claude session;
+explicit `BLOCKED` results and substantive process errors are not retried.
+
 Before each Claude milestone-commit session, opsx-build records the current
 Git commit. It proceeds only if that commit remains an ancestor of the result.
 This catches rewritten or displaced committed history without imposing rules

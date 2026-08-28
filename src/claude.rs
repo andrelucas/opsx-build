@@ -1,4 +1,6 @@
 use std::{
+    error::Error,
+    fmt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -39,6 +41,21 @@ const CLAUDE_CONNECTION_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 ];
+
+#[derive(Debug)]
+struct MissingTerminalResult(&'static str);
+
+impl fmt::Display for MissingTerminalResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for MissingTerminalResult {}
+
+pub fn is_missing_terminal_result(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MissingTerminalResult>().is_some()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherEnvironment {
@@ -983,9 +1000,9 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
                 signal,
             });
         }
-        None => parse_signal(&text).with_context(|| {
-            "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it"
-        })?,
+        None => parse_signal(&text).ok_or(MissingTerminalResult(
+            "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it",
+        ))?,
     };
 
     Ok(ClaudeResult {
@@ -1002,7 +1019,7 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
         .filter(|value| value.get("type").and_then(Value::as_str) == Some("result"))
         .collect::<Vec<_>>();
     if results.is_empty() {
-        bail!("Claude stream ended without a result event");
+        return Err(MissingTerminalResult("Claude stream ended without a result event").into());
     }
 
     for result in results.iter().rev() {
@@ -1043,9 +1060,10 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
             .unwrap_or_default();
         bail!("Claude reported an error: {text}");
     }
-    bail!(
-        "Claude stream results contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them"
+    Err(MissingTerminalResult(
+        "Claude stream results contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect them",
     )
+    .into())
 }
 
 pub fn parse_signal(text: &str) -> Option<StageSignal> {
@@ -1767,6 +1785,25 @@ mod tests {
         let parsed = parse_claude_output(stdout).unwrap();
         assert_eq!(parsed.signal, StageSignal::TooLarge);
         assert_eq!(parsed.text, "Split parser and backend work");
+    }
+
+    #[test]
+    fn classifies_missing_terminal_results_for_targeted_recovery() {
+        let json_error = parse_claude_output(
+            r#"{"type":"result","subtype":"success","result":"Archive complete"}"#,
+        )
+        .unwrap_err();
+        assert!(is_missing_terminal_result(&json_error));
+
+        let stream_error =
+            parse_claude_stream_output("{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n")
+                .unwrap_err();
+        assert!(is_missing_terminal_result(&stream_error));
+
+        let reported_error =
+            parse_claude_output(r#"{"type":"result","is_error":true,"result":"upstream failed"}"#)
+                .unwrap_err();
+        assert!(!is_missing_terminal_result(&reported_error));
     }
 
     #[test]
