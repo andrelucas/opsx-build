@@ -62,6 +62,19 @@ The README must list the slices in execution order, explain how their sequence
 reaches the complete goal, and map every material goal requirement to one or
 more slices, including the final acceptance gate.
 
+## Stage ownership
+
+During OpenSpec Propose, create or update only the normal OpenSpec artifacts for
+the `bootstrap-implementation-slices` change. Do not create or modify
+`automation/slices/README.md` or any implementation slice under
+`automation/slices/` during Propose. Describe the intended agenda structure,
+slice files, acceptance criteria, and required tests in the OpenSpec design and
+tasks so a fresh Apply session can carry them out without conversation history.
+
+During OpenSpec Apply, materialize that approved plan as
+`automation/slices/README.md` and the ordered implementation slice files. Apply
+exclusively owns creation of those agenda deliverables.
+
 Mark this planning change with `skip_specs: true`. Build its normal OpenSpec
 proposal, design, and tasks artifacts, apply those tasks by writing the agenda,
 verify the agenda against this brief and `openspec/config.yaml`, and do not

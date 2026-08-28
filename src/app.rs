@@ -39,6 +39,8 @@ use crate::{
     ui::{CampaignIterationView, CampaignView, Ui},
 };
 
+const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Record the intended agenda structure, slice files, acceptance criteria, and required tests in the OpenSpec design and tasks so a fresh Apply session can materialize them.";
+
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 4;
@@ -1061,7 +1063,7 @@ impl<U: Ui> App<U> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
         let planning_context = if state.bootstrap {
-            "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change."
+            BOOTSTRAP_PROPOSAL_CONTEXT
         } else if state.agenda.is_some() {
             "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
         } else if state.change.is_some() {
@@ -2202,6 +2204,23 @@ mod tests {
         assert!(subject.contains("campaign iteration 7"));
         assert!(subject.contains("exactly one coherent, bounded remaining slice"));
         assert!(subject.contains("return DONE"));
+    }
+
+    #[test]
+    fn bootstrap_propose_defers_agenda_files_to_apply() {
+        assert!(
+            BOOTSTRAP_PROPOSAL_CONTEXT.contains("only that change's normal OpenSpec artifacts")
+        );
+        assert!(
+            BOOTSTRAP_PROPOSAL_CONTEXT
+                .contains("Do not create or modify `automation/slices/README.md`")
+        );
+        assert!(
+            BOOTSTRAP_PROPOSAL_CONTEXT.contains("Apply stage exclusively owns those deliverables")
+        );
+        assert!(
+            BOOTSTRAP_PROPOSAL_CONTEXT.contains("so a fresh Apply session can materialize them")
+        );
     }
 
     #[test]

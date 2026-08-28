@@ -65,7 +65,8 @@ The command:
    prevents a required build or test from executing;
 5. runs the planning-only `bootstrap-implementation-slices` change through the
    existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
-   commit stages; and
+   commit stages; Propose writes only OpenSpec planning artifacts, while Apply
+   materializes the implementation agenda; and
 6. checks that the result is a parseable ordered agenda with a README, bounded
    slice contracts, and the terminal whole-project gate
    `automation/slices/9999-project-acceptance.md`.

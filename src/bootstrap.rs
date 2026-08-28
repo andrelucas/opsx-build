@@ -315,6 +315,15 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_instructions_assign_agenda_materialization_to_apply() {
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("## Stage ownership"));
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("During OpenSpec Propose"));
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("Do not create or modify"));
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("During OpenSpec Apply"));
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("exclusively owns creation"));
+    }
+
+    #[test]
     fn renders_strict_context_variables_without_recursive_expansion() {
         let definitions = BTreeMap::from([
             ("language".to_owned(), "Go".to_owned()),
