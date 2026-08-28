@@ -17,8 +17,9 @@ coverage map. Do not create OpenSpec changes for the implementation slices now.
 
 Each implementation slice must:
 
-- have a four-digit ordinal and kebab-case filename, such as
-  `0001-project-scaffold.md`;
+- use the exact filename form `<four-digit ordinal>-<kebab-case slug>.md`, such
+  as `0001-project-scaffold.md`;
+- begin with a level-one Markdown title (`# ...`) describing the slice;
 - contain `## Objective`, `## Prerequisites`, `## Acceptance Criteria`, and
   `## Required Tests` sections;
 - introduce one new observable capability or one bounded extension;
@@ -30,6 +31,9 @@ Each implementation slice must:
 - leave the repository buildable and its tests passing;
 - be small enough for a substantially less capable local model to reason about
   and verify reliably.
+
+The agenda must contain at least one delivery slice in addition to
+`9999-project-acceptance.md`.
 
 A slice is too large when it requires several independently testable
 behaviours, coordinated novelty across several subsystems, substantial
@@ -74,6 +78,12 @@ tasks so a fresh Apply session can carry them out without conversation history.
 During OpenSpec Apply, materialize that approved plan as
 `automation/slices/README.md` and the ordered implementation slice files. Apply
 exclusively owns creation of those agenda deliverables.
+
+Before reporting Apply complete, inspect the finished agenda and correct every
+structural omission: the README must exist; at least one delivery slice and the
+`9999` final gate must exist; every slice filename, level-one title, and required
+section must match this contract; and the final gate must contain
+`## Project Goal Coverage`.
 
 Mark this planning change with `skip_specs: true`. Build its normal OpenSpec
 proposal, design, and tasks artifacts, apply those tasks by writing the agenda,

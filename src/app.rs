@@ -40,6 +40,7 @@ use crate::{
 };
 
 const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Record the intended agenda structure, slice files, acceptance criteria, and required tests in the OpenSpec design and tasks so a fresh Apply session can materialize them.";
+const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, using `openspec/config.yaml` as the project authority. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Do not archive the bootstrap change.";
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
@@ -1251,9 +1252,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         let base = if state.bootstrap {
-            format!(
-                "{change}\n\nApply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, using `openspec/config.yaml` as the project authority. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Do not archive the bootstrap change."
-            )
+            format!("{change}\n\n{BOOTSTRAP_APPLY_CONTEXT}")
         } else {
             format!(
                 "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
@@ -2221,6 +2220,13 @@ mod tests {
         assert!(
             BOOTSTRAP_PROPOSAL_CONTEXT.contains("so a fresh Apply session can materialize them")
         );
+    }
+
+    #[test]
+    fn bootstrap_apply_self_checks_the_agenda_contract() {
+        assert!(BOOTSTRAP_APPLY_CONTEXT.contains("Before reporting READY"));
+        assert!(BOOTSTRAP_APPLY_CONTEXT.contains("every structural requirement"));
+        assert!(BOOTSTRAP_APPLY_CONTEXT.contains("correct any omission within this Apply stage"));
     }
 
     #[test]
