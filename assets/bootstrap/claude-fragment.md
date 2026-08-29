@@ -17,6 +17,8 @@
 - Preserve unrelated working-tree changes. Never reset, stash, restore,
   discard, amend, or rewrite user work merely to simplify a workflow stage.
 
+{{OPSX_BUILD_MODEL_CONFUSIONS}}
+
 ### Dependency selection
 
 - Treat third-party library and framework choices as revisable design decisions

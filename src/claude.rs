@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     cli::{ClaudeConnection, Cli, ConnectionEnvironmentValue},
+    model_confusions::prompt_guidance as model_confusion_guidance,
     process::{
         CommandSpec, PauseRequested, ProcessOutput, ProcessRunner, WorkerEscalationRequested,
         diagnostic_text, stream_user_message,
@@ -413,6 +414,7 @@ pub fn build_claude_command(
         ClaudeCommandOptions {
             json_schema,
             additional_dirs: &[],
+            plugin_dirs: &[],
         },
     )
 }
@@ -421,6 +423,7 @@ pub fn build_claude_command(
 struct ClaudeCommandOptions<'a> {
     json_schema: Option<&'a str>,
     additional_dirs: &'a [PathBuf],
+    plugin_dirs: &'a [PathBuf],
 }
 
 fn build_claude_command_with_dirs(
@@ -438,6 +441,9 @@ fn build_claude_command_with_dirs(
     }
     for directory in options.additional_dirs {
         args.extend(["--add-dir".to_owned(), directory.display().to_string()]);
+    }
+    for directory in options.plugin_dirs {
+        args.extend(["--plugin-dir".to_owned(), directory.display().to_string()]);
     }
     args.push("--print".to_owned());
     match output_format {
@@ -614,6 +620,7 @@ pub struct ClaudeClient<'a, U: Ui> {
     max_output_retries: u32,
     stage_timeout: Option<Duration>,
     additional_dirs: Vec<PathBuf>,
+    plugin_dirs: Vec<PathBuf>,
     resume_repo: Option<PathBuf>,
     ui: &'a U,
     runner: ProcessRunner<'a, U>,
@@ -638,6 +645,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             max_output_retries,
             stage_timeout: None,
             additional_dirs: Vec::new(),
+            plugin_dirs: Vec::new(),
             resume_repo: None,
             ui,
             runner: ProcessRunner::new(ui),
@@ -657,6 +665,17 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             .any(|existing| existing == directory)
         {
             self.additional_dirs.push(directory.to_path_buf());
+        }
+        self
+    }
+
+    pub fn with_plugin_dir(mut self, directory: &Path) -> Self {
+        if !self
+            .plugin_dirs
+            .iter()
+            .any(|existing| existing == directory)
+        {
+            self.plugin_dirs.push(directory.to_path_buf());
         }
         self
     }
@@ -770,6 +789,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                 ClaudeCommandOptions {
                     json_schema: schema,
                     additional_dirs: &self.additional_dirs,
+                    plugin_dirs: &self.plugin_dirs,
                 },
             );
             let spec = if let Some(repo) = self.resume_repo.as_deref() {
@@ -874,6 +894,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             ClaudeCommandOptions {
                 json_schema: None,
                 additional_dirs: &self.additional_dirs,
+                plugin_dirs: &self.plugin_dirs,
             },
         );
         let spec = if let Some(repo) = self.resume_repo.as_deref() {
@@ -906,6 +927,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             session_id,
             output_format,
             &self.additional_dirs,
+            &self.plugin_dirs,
         );
         let spec = if let Some(repo) = self.resume_repo.as_deref() {
             spec.resume_from(repo)
@@ -944,6 +966,7 @@ fn build_compact_command(
     session_id: Uuid,
     output_format: ClaudeOutputFormat,
     additional_dirs: &[PathBuf],
+    plugin_dirs: &[PathBuf],
 ) -> CommandSpec {
     build_claude_command_with_dirs(
         repo,
@@ -955,6 +978,7 @@ fn build_compact_command(
         ClaudeCommandOptions {
             json_schema: None,
             additional_dirs,
+            plugin_dirs,
         },
     )
     .disable_stream_messages()
@@ -1437,6 +1461,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         format!("{command} {subject}")
     };
     let terminal_values = protocol.terminal_values();
+    let model_confusions = model_confusion_guidance();
     let test_execution_policy = match protocol {
         StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
             "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen Claude Code's sandbox prevents a required project build or test from running, rerun only the affected command outside the sandbox using the Bash tool with `dangerouslyDisableSandbox: true`. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate Claude's sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
@@ -1444,7 +1469,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.{test_execution_policy}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.{test_execution_policy}\n\n{model_confusions}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -1582,6 +1607,7 @@ mod tests {
             id,
             ClaudeOutputFormat::Text,
             &[],
+            &[],
         );
         assert_eq!(compact.args.last().map(String::as_str), Some("/compact"));
         assert!(
@@ -1607,6 +1633,7 @@ mod tests {
             "auto",
             id,
             ClaudeOutputFormat::StreamJson,
+            &[],
             &[],
         );
         assert!(
@@ -1669,6 +1696,7 @@ mod tests {
             ClaudeCommandOptions {
                 json_schema: None,
                 additional_dirs: &[PathBuf::from("/product")],
+                plugin_dirs: &[PathBuf::from("/private/plugin")],
             },
         );
 
@@ -1678,6 +1706,12 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|args| args == ["--add-dir", "/product"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--plugin-dir", "/private/plugin"])
         );
     }
 
@@ -2008,6 +2042,26 @@ mod tests {
 
         let propose = stage_prompt("/propose-unattended", "change", StageProtocol::Propose);
         assert!(!propose.contains("PROJECT TEST EXECUTION POLICY"));
+    }
+
+    #[test]
+    fn every_stage_prompt_includes_the_qwen36_confusion_incident() {
+        for protocol in [
+            StageProtocol::Worker,
+            StageProtocol::Ready,
+            StageProtocol::Verify,
+            StageProtocol::Propose,
+            StageProtocol::Frontier,
+            StageProtocol::TerminalReview,
+        ] {
+            let prompt = stage_prompt("/opsx:apply", "change", protocol);
+            assert!(prompt.contains("KNOWN MODEL-SPECIFIC CONFUSIONS"));
+            assert!(prompt.contains("qwen3.6-openspec-duplicated-s"));
+            assert!(prompt.contains("observed with Qwen3.6"));
+            assert!(prompt.contains("Spell the product name exactly `OpenSpec`"));
+            assert!(prompt.contains("exactly one `s` and two `p`"));
+            assert!(prompt.contains("before repository writes and Git commits"));
+        }
     }
 
     #[test]

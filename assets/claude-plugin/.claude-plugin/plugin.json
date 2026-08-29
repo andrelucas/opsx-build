@@ -1,0 +1,5 @@
+{
+  "name": "opsx-build-model-confusions",
+  "version": "1.0.0",
+  "description": "Prevents known model/version confusions from entering an opsx-build repository."
+}

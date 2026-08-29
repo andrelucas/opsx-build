@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::{agenda::parse_slice_name, process::CommandSpec};
+use crate::{
+    agenda::parse_slice_name, model_confusions::claude_md_guidance as model_confusion_guidance,
+    process::CommandSpec,
+};
 
 pub const BOOTSTRAP_CHANGE: &str = "bootstrap-implementation-slices";
 pub const BOOTSTRAP_PATH: &str = "automation/bootstrap.md";
@@ -18,6 +21,7 @@ const MANAGED_START: &str = "<!-- BEGIN OPSX-BUILD MANAGED -->";
 const MANAGED_END: &str = "<!-- END OPSX-BUILD MANAGED -->";
 const BOOTSTRAP_INSTRUCTIONS: &str = include_str!("../assets/bootstrap/bootstrap.md");
 const CLAUDE_FRAGMENT: &str = include_str!("../assets/bootstrap/claude-fragment.md");
+const MODEL_CONFUSIONS_PLACEHOLDER: &str = "{{OPSX_BUILD_MODEL_CONFUSIONS}}";
 
 #[derive(Debug)]
 pub struct BootstrapScaffold {
@@ -271,6 +275,8 @@ fn valid_template_name(name: &str) -> bool {
 }
 
 fn merge_managed_fragment(existing: &str) -> Result<String> {
+    let fragment =
+        CLAUDE_FRAGMENT.replace(MODEL_CONFUSIONS_PLACEHOLDER, &model_confusion_guidance());
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
     let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
     match (starts.as_slice(), ends.as_slice()) {
@@ -279,15 +285,15 @@ fn merge_managed_fragment(existing: &str) -> Result<String> {
             if !merged.is_empty() {
                 merged.push_str("\n\n");
             }
-            merged.push_str(CLAUDE_FRAGMENT.trim());
+            merged.push_str(fragment.trim());
             merged.push('\n');
             Ok(merged)
         }
         ([(start, _)], [(end, _)]) if start < end => {
             let end = end + MANAGED_END.len();
-            let mut merged = String::with_capacity(existing.len() + CLAUDE_FRAGMENT.len());
+            let mut merged = String::with_capacity(existing.len() + fragment.len());
             merged.push_str(&existing[..*start]);
-            merged.push_str(CLAUDE_FRAGMENT.trim());
+            merged.push_str(fragment.trim());
             merged.push_str(&existing[end..]);
             Ok(merged)
         }
@@ -381,6 +387,16 @@ mod tests {
         assert!(CLAUDE_FRAGMENT.contains("dangerouslyDisableSandbox: true"));
         assert!(CLAUDE_FRAGMENT.contains("substitute synthetic or weaker coverage"));
         assert!(CLAUDE_FRAGMENT.contains("required real checks have run and passed"));
+    }
+
+    #[test]
+    fn managed_fragment_includes_the_qwen36_confusion_incident() {
+        let fragment = merge_managed_fragment("").unwrap();
+        assert!(fragment.contains("### Known model-specific confusions"));
+        assert!(fragment.contains("qwen3.6-openspec-duplicated-s"));
+        assert!(fragment.contains("observed with Qwen3.6"));
+        assert!(fragment.contains("Spell the product name exactly `OpenSpec`"));
+        assert!(fragment.contains("exactly one `s` and two `p`"));
     }
 
     #[test]

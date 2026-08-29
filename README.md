@@ -20,6 +20,20 @@ OpenSpec integration files. `--dry-run` reports the installation or update
 without writing it. The retired monolithic `build-unattended` skill is not
 installed because orchestration belongs in this process.
 
+Every unattended Claude process also loads a private opsx-build plugin from
+Git metadata. Its `PreToolUse` hook rejects known model/version confusions
+before a tool can write them into repository content or Git history. The first
+catalogued incident, `qwen3.6-openspec-duplicated-s`, records Qwen3.6's observed
+tendency to insert an extra `s` at the OpenSpec word boundary. Claude receives
+a precise correction and can retry immediately. The plugin is passed with
+`--plugin-dir` and neither changes nor replaces project settings or hooks.
+
+Known incidents live in `assets/model-confusions.toml`. One declarative entry
+supplies the incident identity and affected model/version, adds guidance to
+every unattended stage and bootstrapped `CLAUDE.md`, and extends the pre-tool
+guard. This keeps future model-specific confusion handling out of orchestration
+code.
+
 ## Bootstrap a new project
 
 Create a Markdown file that states the project goal, technology choices,

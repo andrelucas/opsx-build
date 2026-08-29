@@ -30,6 +30,7 @@ use crate::{
         current_head, head_descends_from, legacy_metadata_dir, metadata_dir,
         release_slice_baseline, remove_metadata, repository_root, reset_to_slice_baseline,
     },
+    model_confusions::ensure_model_confusion_plugin,
     openspec::{
         ChangeSnapshot, identify_assigned_change, identify_change, planning_status,
         select_existing_change, snapshot as openspec_snapshot,
@@ -1066,6 +1067,7 @@ impl<U: Ui> App<U> {
             );
         }
 
+        let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let frontier = ClaudeClient::new(
             repo,
             frontier_launcher,
@@ -1074,7 +1076,8 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,
-        );
+        )
+        .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
         self.ui
@@ -1226,6 +1229,7 @@ impl<U: Ui> App<U> {
             }
         }
 
+        let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let frontier = ClaudeClient::new(
             repo,
             frontier_launcher,
@@ -1234,7 +1238,8 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,
-        );
+        )
+        .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         self.present_campaign(&state);
         self.ui.stage(1, TOTAL_STAGES, "Frontier acceptance review");
@@ -1390,6 +1395,7 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
+        let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let claude = ClaudeClient::new(
             repo,
             launcher,
@@ -1398,7 +1404,8 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,
-        );
+        )
+        .with_plugin_dir(&model_confusion_plugin);
         let claude = if let Some(product) = state.product_repo.as_deref() {
             claude
                 .with_additional_dir(product)
@@ -1414,7 +1421,8 @@ impl<U: Ui> App<U> {
             self.cli.stream_claude,
             self.cli.max_output_retries,
             &self.ui,
-        );
+        )
+        .with_plugin_dir(&model_confusion_plugin);
         let worker_claude = if let Some(product) = state.product_repo.as_deref() {
             worker_claude
                 .with_additional_dir(product)
@@ -1438,7 +1446,8 @@ impl<U: Ui> App<U> {
                 self.cli.stream_claude,
                 self.cli.max_output_retries,
                 &self.ui,
-            );
+            )
+            .with_plugin_dir(&model_confusion_plugin);
             if let Some(product) = state.product_repo.as_deref() {
                 client
                     .with_additional_dir(product)
