@@ -381,6 +381,10 @@ mod tests {
         assert!(CLAUDE_FRAGMENT.contains("Strongly prefer language-server facilities"));
         assert!(CLAUDE_FRAGMENT.contains("canonical formatter"));
         assert!(CLAUDE_FRAGMENT.contains("Format every source file changed"));
+        assert!(CLAUDE_FRAGMENT.contains("### Bounded network operations"));
+        assert!(CLAUDE_FRAGMENT.contains("explicit, practical timeouts"));
+        assert!(CLAUDE_FRAGMENT.contains("connection and overall timeout controls"));
+        assert!(CLAUDE_FRAGMENT.contains("increasingly large"));
         assert!(CLAUDE_FRAGMENT.contains("Treat third-party library and framework choices"));
         assert!(CLAUDE_FRAGMENT.contains("Do not distort specified behaviour"));
         assert!(CLAUDE_FRAGMENT.contains("sandbox prevents a required project build or test"));

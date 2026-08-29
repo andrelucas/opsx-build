@@ -55,6 +55,19 @@
 - Report a missing formatter or unexpected formatter result clearly; do not
   silently skip formatting or claim it succeeded without running it.
 
+### Bounded network operations
+
+- Never run a potentially blocking network command, client, server, or
+  network-dependent test without explicit, practical timeouts. Use native
+  connection and overall timeout controls where available, and use the test
+  framework's timeout mechanism for test suites.
+- Do not rely on operating-system network defaults or repeatedly wait for an
+  endpoint that has already failed. Local test-server connections and
+  diagnostic probes should fail quickly when unavailable.
+- On timeout, stop the affected process, preserve useful diagnostics, and
+  investigate the cause. Do not merely rerun it with an increasingly large
+  timeout.
+
 ### Test execution and Claude's sandbox
 
 - When Claude Code's sandbox prevents a required project build or test from
