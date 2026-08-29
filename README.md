@@ -501,7 +501,10 @@ unrelated work; and never reset, stash, restore, discard, amend, or rewrite
 history. Stable milestone subjects are followed by concise OpenSpec-derived
 bodies: planned scope and acceptance criteria for proposal commits, then
 delivered behavior and checks that actually ran for completion commits. If the
-relevant work is already committed, Claude may report success without
+body needs a second paragraph, it is separated by a blank line; body lines are
+wrapped at 72 columns. File/task inventories and exhaustive implementation
+mechanics are excluded so the result reads as a conventional Git history. If
+the relevant work is already committed, Claude may report success without
 manufacturing an empty commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a

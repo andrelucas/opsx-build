@@ -1753,7 +1753,7 @@ impl<U: Ui> App<U> {
             )
         } else if let Some(product_repo) = product_repo.as_deref() {
             format!(
-                "Complete the two Git milestones for sidecar OpenSpec change `{change}`. First inspect the product repository `{product}` and commit only the implementation, tests, and product documentation belonging to this change there. {commit_message} Obtain that product commit hash. Then inspect the current planning repository and commit its synchronized specifications, archived change artifacts, sidecar metadata, and other planning-only files with subject exactly `openspec: archive {change}`. Give that planning commit a similarly concise plain-text body summarizing the synchronized and archived specification outcome, followed by a final `Product-Commit: <hash>` trailer. Preserve unrelated work in both repositories. Never reset, stash, restore, discard, amend, or rewrite either history. If one repository's relevant work is already committed, preserve it and still complete the other milestone. Report READY only after both repositories have no uncommitted work belonging to this change.",
+                "Complete the two Git milestones for sidecar OpenSpec change `{change}`. First inspect the product repository `{product}` and commit only the implementation, tests, and product documentation belonging to this change there. {commit_message} Obtain that product commit hash. Then inspect the current planning repository and commit its synchronized specifications, archived change artifacts, sidecar metadata, and other planning-only files with subject exactly `openspec: archive {change}`. Give that planning commit a concise imperative-mood body summarizing the synchronized and archived specification outcome. Apply the same short-paragraph, blank-line, 72-column wrapping, and no-inventory rules as the product commit, then add a final `Product-Commit: <hash>` trailer. Preserve unrelated work in both repositories. Never reset, stash, restore, discard, amend, or rewrite either history. If one repository's relevant work is already committed, preserve it and still complete the other milestone. Report READY only after both repositories have no uncommitted work belonging to this change.",
                 product = product_repo.display()
             )
         } else {
@@ -2275,13 +2275,13 @@ fn archive_subject(change: &str) -> String {
 
 fn proposal_commit_message(change: &str) -> String {
     format!(
-        "Use commit subject exactly `openspec: propose {change}`. Add a concise plain-text body derived from the completed OpenSpec proposal, specs, design, and tasks. Summarize the intended observable scope and key acceptance criteria in one or two short paragraphs. Do not add Markdown headings, task or file inventories, generated boilerplate, or behavior not approved by those artifacts. Wrap the body conventionally."
+        "Use commit subject exactly `openspec: propose {change}`. Add a conventional Git commit body derived from the completed OpenSpec proposal, specs, design, and tasks. Use imperative mood. Write a short first paragraph explaining the intended observable change and why it is being made. Add at most one second paragraph for an important scope boundary or acceptance condition. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, command invocations, generated boilerplate, or behavior not approved by those artifacts."
     )
 }
 
 fn completion_commit_message(change: &str) -> String {
     format!(
-        "Use commit subject exactly `openspec: complete {change}`. Add a concise plain-text body derived from the completed OpenSpec artifacts and actual verification results. Summarize the delivered observable behavior and the important validation that really ran in one or two short paragraphs. Do not add Markdown headings, task or file inventories, generated boilerplate, or claims about checks that did not run. Wrap the body conventionally."
+        "Use commit subject exactly `openspec: complete {change}`. Add a conventional Git commit body derived from the completed OpenSpec artifacts and actual verification results. Use imperative mood. Write a short first paragraph explaining the delivered observable behavior and its purpose. Add at most one second paragraph summarizing the most important validation that actually ran or a material scope boundary. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, exhaustive implementation mechanics, generated boilerplate, or claims about checks that did not run."
     )
 }
 
@@ -2810,13 +2810,17 @@ mod tests {
     fn milestone_commit_prompts_require_useful_openspec_summaries() {
         let proposal = proposal_commit_message("0009-https-tls-forwarding-valid");
         assert!(proposal.contains("subject exactly `openspec: propose"));
-        assert!(proposal.contains("intended observable scope and key acceptance criteria"));
-        assert!(proposal.contains("one or two short paragraphs"));
+        assert!(proposal.contains("intended observable change and why"));
+        assert!(proposal.contains("Use imperative mood"));
+        assert!(proposal.contains("hard-wrap every body line at 72 columns or fewer"));
+        assert!(proposal.contains("Do not write one dense summary paragraph"));
+        assert!(proposal.contains("file or task inventories"));
 
         let completion = completion_commit_message("0009-https-tls-forwarding-valid");
         assert!(completion.contains("subject exactly `openspec: complete"));
         assert!(completion.contains("delivered observable behavior"));
-        assert!(completion.contains("validation that really ran"));
+        assert!(completion.contains("validation that actually ran"));
+        assert!(completion.contains("Separate paragraphs with a blank line"));
         assert!(completion.contains("checks that did not run"));
     }
 
