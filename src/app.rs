@@ -1441,18 +1441,19 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
+        let commit_message = proposal_commit_message(&change);
         let task = if state.bootstrap {
             format!(
-                "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragment in `CLAUDE.md`, and OpenSpec's project-local Claude integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. Use commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragment in `CLAUDE.md`, and OpenSpec's project-local Claude integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
         } else if let Some(product_repo) = state.product_repo.as_deref() {
             format!(
-                "Create the proposal milestone Git commit for sidecar OpenSpec change `{change}`. The current working directory is the planning repository. Commit all planning files belonging to this exact change, including its OpenSpec artifacts and sidecar-local Claude integration, with commit message exactly `openspec: propose {change}`. Do not create a commit in the product repository `{}` during this stage. Preserve unrelated work and never reset, stash, restore, discard, amend, or rewrite history. If the planning work is already committed, confirm that and report READY.",
-                product_repo.display()
+                "Create the proposal milestone Git commit for sidecar OpenSpec change `{change}`. The current working directory is the planning repository. Commit all planning files belonging to this exact change, including its OpenSpec artifacts and sidecar-local Claude integration. {commit_message} Do not create a commit in the product repository `{product}` during this stage. Preserve unrelated work and never reset, stash, restore, discard, amend, or rewrite history. If the planning work is already committed, confirm that and report READY.",
+                product = product_repo.display()
             )
         } else {
             format!(
-                "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates, with commit message exactly `openspec: propose {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
         };
         let baseline = current_head(repo, &self.ui)?;
@@ -1738,6 +1739,7 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
+        let commit_message = completion_commit_message(&change);
         let planning_baseline = current_head(repo, &self.ui)?;
         let product_repo = state.product_repo.clone();
         let product_baseline = product_repo
@@ -1747,16 +1749,16 @@ impl<U: Ui> App<U> {
             .flatten();
         let task = if state.bootstrap {
             format!(
-                "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow. {commit_message} Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
         } else if let Some(product_repo) = product_repo.as_deref() {
             format!(
-                "Complete the two Git milestones for sidecar OpenSpec change `{change}`. First inspect the product repository `{product}` and commit only the implementation, tests, and product documentation belonging to this change there, with commit message exactly `openspec: complete {change}`. Obtain that product commit hash. Then inspect the current planning repository and commit its synchronized specifications, archived change artifacts, sidecar metadata, and other planning-only files with subject exactly `openspec: archive {change}` and a commit body trailer `Product-Commit: <hash>`. Preserve unrelated work in both repositories. Never reset, stash, restore, discard, amend, or rewrite either history. If one repository's relevant work is already committed, preserve it and still complete the other milestone. Report READY only after both repositories have no uncommitted work belonging to this change.",
+                "Complete the two Git milestones for sidecar OpenSpec change `{change}`. First inspect the product repository `{product}` and commit only the implementation, tests, and product documentation belonging to this change there. {commit_message} Obtain that product commit hash. Then inspect the current planning repository and commit its synchronized specifications, archived change artifacts, sidecar metadata, and other planning-only files with subject exactly `openspec: archive {change}`. Give that planning commit a similarly concise plain-text body summarizing the synchronized and archived specification outcome, followed by a final `Product-Commit: <hash>` trailer. Preserve unrelated work in both repositories. Never reset, stash, restore, discard, amend, or rewrite either history. If one repository's relevant work is already committed, preserve it and still complete the other milestone. Report READY only after both repositories have no uncommitted work belonging to this change.",
                 product = product_repo.display()
             )
         } else {
             format!(
-                "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change, with commit message exactly `openspec: complete {change}`. Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
         };
         let result = invoke_fresh(
@@ -2268,6 +2270,18 @@ fn with_direction(base: &str, direction: Option<&str>) -> String {
 fn archive_subject(change: &str) -> String {
     format!(
         "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization. The user has already authorized the normal archive choices: if delta specs need synchronization, choose `Sync now (recommended)`, verify the sync, and continue the archive; if they are already synchronized, choose `Archive now`. Do not stop to request routine confirmation for either choice, and do not treat that confirmation as a BLOCKED condition. Report BLOCKED only if synchronization, verification, or archival cannot safely be completed without a genuine human decision or unavailable external input."
+    )
+}
+
+fn proposal_commit_message(change: &str) -> String {
+    format!(
+        "Use commit subject exactly `openspec: propose {change}`. Add a concise plain-text body derived from the completed OpenSpec proposal, specs, design, and tasks. Summarize the intended observable scope and key acceptance criteria in one or two short paragraphs. Do not add Markdown headings, task or file inventories, generated boilerplate, or behavior not approved by those artifacts. Wrap the body conventionally."
+    )
+}
+
+fn completion_commit_message(change: &str) -> String {
+    format!(
+        "Use commit subject exactly `openspec: complete {change}`. Add a concise plain-text body derived from the completed OpenSpec artifacts and actual verification results. Summarize the delivered observable behavior and the important validation that really ran in one or two short paragraphs. Do not add Markdown headings, task or file inventories, generated boilerplate, or claims about checks that did not run. Wrap the body conventionally."
     )
 }
 
@@ -2790,6 +2804,20 @@ mod tests {
         assert!(subject.contains("choose `Sync now (recommended)`"));
         assert!(subject.contains("choose `Archive now`"));
         assert!(subject.contains("do not treat that confirmation as a BLOCKED condition"));
+    }
+
+    #[test]
+    fn milestone_commit_prompts_require_useful_openspec_summaries() {
+        let proposal = proposal_commit_message("0009-https-tls-forwarding-valid");
+        assert!(proposal.contains("subject exactly `openspec: propose"));
+        assert!(proposal.contains("intended observable scope and key acceptance criteria"));
+        assert!(proposal.contains("one or two short paragraphs"));
+
+        let completion = completion_commit_message("0009-https-tls-forwarding-valid");
+        assert!(completion.contains("subject exactly `openspec: complete"));
+        assert!(completion.contains("delivered observable behavior"));
+        assert!(completion.contains("validation that really ran"));
+        assert!(completion.contains("checks that did not run"));
     }
 
     #[test]

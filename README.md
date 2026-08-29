@@ -134,14 +134,16 @@ explicit `--local-only` flag is omitted: `TOO_LARGE` stops with its checkpoint
 and diagnostic rather than invoking a frontier model. The dashboard removes
 the frontier action for such a run.
 
-The proposal milestone is committed only in the planning repository as
-`openspec: propose <change>`. After successful verification and archival,
-Claude commits product changes in the product repository as
-`openspec: complete <change>`, then commits the archived planning state in the
-sidecar as `openspec: archive <change>` with the product commit recorded in its
-commit body. Existing unrelated work remains Claude's responsibility to
-preserve; opsx-build does not impose a clean-tree requirement or infer path
-ownership.
+The proposal milestone is committed only in the planning repository with
+subject `openspec: propose <change>` and a concise body summarizing the planned
+scope and acceptance criteria. After successful verification and archival,
+Claude commits product changes in the product repository with subject
+`openspec: complete <change>` and a body summarizing delivered behavior and
+actual validation. It then commits the archived planning state in the sidecar
+as `openspec: archive <change>`, with a short archive summary and the product
+commit recorded in a trailer. Existing unrelated work remains Claude's
+responsibility to preserve; opsx-build does not impose a clean-tree requirement
+or infer path ownership.
 
 Resume from the product checkout as usual; the private association locates the
 sidecar and the checkpoint records both roots:
@@ -203,16 +205,17 @@ multi-change campaign.
    subagents so READY cannot race unfinished proposal work.
 4. Determine the OpenSpec change name from `openspec list --json`, then retire
    the planning session.
-5. Ask Claude in a fresh session to commit the proposal as
-   `openspec: propose <change>`.
+5. Ask Claude in a fresh session to commit the proposal with subject
+   `openspec: propose <change>` and a concise artifact-derived summary body.
 6. Run the installed OpenSpec Apply workflow in a fresh session. Worker stages
    may return `TOO_LARGE` when a frontier-assigned slice cannot reliably fit
    one bounded local-model change.
 7. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
    Repair/Apply session and then verifies again.
 8. Run Archive in a fresh session after verification succeeds.
-9. Ask Claude in another fresh session to commit the completed change as
-   `openspec: complete <change>`.
+9. Ask Claude in another fresh session to commit the completed change with
+   subject `openspec: complete <change>` and a concise body describing delivered
+   behavior and actual verification.
 
 If Archive finishes without a usable terminal result, opsx-build first checks
 OpenSpec's durable state. An absent active change proves that archival completed.
@@ -495,8 +498,11 @@ baseline and are not copied or cleaned.
 At proposal and completion milestones, Claude is instructed to inspect status,
 history, and diffs; commit only work belonging to the OpenSpec change; preserve
 unrelated work; and never reset, stash, restore, discard, amend, or rewrite
-history. If the relevant work is already committed, Claude may report success
-without manufacturing an empty commit.
+history. Stable milestone subjects are followed by concise OpenSpec-derived
+bodies: planned scope and acceptance criteria for proposal commits, then
+delivered behavior and checks that actually ran for completion commits. If the
+relevant work is already committed, Claude may report success without
+manufacturing an empty commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
