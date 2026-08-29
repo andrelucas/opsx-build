@@ -330,6 +330,7 @@ pub enum StageProtocol {
     Propose,
     Verify,
     Frontier,
+    TerminalReview,
 }
 
 impl StageProtocol {
@@ -340,6 +341,7 @@ impl StageProtocol {
             Self::Propose => "READY, DONE, TOO_LARGE, or BLOCKED",
             Self::Verify => "VERIFIED, RETRY, or BLOCKED",
             Self::Frontier => "REPLANNED or BLOCKED",
+            Self::TerminalReview => "READY, REPLANNED, or BLOCKED",
         }
     }
 
@@ -359,6 +361,9 @@ impl StageProtocol {
             }
             Self::Frontier => {
                 r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["REPLANNED","BLOCKED"]},"summary":{"type":"string","description":"Concise frontier-planning result. REPLANNED means the oversized agenda slice was replaced by a smaller first slice plus one or more ordered hierarchical descendants and committed. BLOCKED means safe subdivision requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
+            }
+            Self::TerminalReview => {
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","REPLANNED","BLOCKED"]},"summary":{"type":"string","description":"Concise terminal acceptance review. READY means the project is ready for its final acceptance slice and no repository state changed. REPLANNED means one or more bounded remediation slices were inserted before the unchanged terminal gate and committed. BLOCKED means safe review or remediation requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
         }
     }
@@ -1433,8 +1438,8 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
     };
     let terminal_values = protocol.terminal_values();
     let test_execution_policy = match protocol {
-        StageProtocol::Worker | StageProtocol::Verify => {
-            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen Claude Code's sandbox prevents a required project build or test from running, rerun only the affected command outside the sandbox using the Bash tool with `dangerouslyDisableSandbox: true`. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate Claude's sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. A worker must not return READY while tests required by this phase remain unexecuted. Verification must not return VERIFIED unless the required real checks actually ran and passed; report RETRY with the missing validation when it is correctable."
+        StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
+            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen Claude Code's sandbox prevents a required project build or test from running, rerun only the affected command outside the sandbox using the Bash tool with `dangerouslyDisableSandbox: true`. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate Claude's sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
         }
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
@@ -1983,7 +1988,11 @@ mod tests {
 
     #[test]
     fn worker_and_verify_prompts_require_real_tests_outside_the_sandbox_when_needed() {
-        for protocol in [StageProtocol::Worker, StageProtocol::Verify] {
+        for protocol in [
+            StageProtocol::Worker,
+            StageProtocol::Verify,
+            StageProtocol::TerminalReview,
+        ] {
             let prompt = stage_prompt("/opsx:apply", "change", protocol);
             assert!(prompt.contains("sandbox prevents a required project build or test"));
             assert!(prompt.contains("dangerouslyDisableSandbox: true"));
@@ -1993,6 +2002,9 @@ mod tests {
 
         let verify = stage_prompt("/opsx:verify", "change", StageProtocol::Verify);
         assert!(verify.contains("must not return VERIFIED"));
+
+        let terminal = stage_prompt("", "review", StageProtocol::TerminalReview);
+        assert!(terminal.contains("terminal acceptance review must not return READY"));
 
         let propose = stage_prompt("/propose-unattended", "change", StageProtocol::Propose);
         assert!(!propose.contains("PROJECT TEST EXECUTION POLICY"));
@@ -2018,6 +2030,14 @@ mod tests {
         );
         let prompt = stage_prompt("", "subdivide it", StageProtocol::Frontier);
         assert!(prompt.contains("REPLANNED or BLOCKED"));
+    }
+
+    #[test]
+    fn terminal_review_protocol_accepts_ready_replanned_or_blocked() {
+        let schema = StageProtocol::TerminalReview.json_schema();
+        assert!(schema.contains(r#"["READY","REPLANNED","BLOCKED"]"#));
+        let prompt = stage_prompt("", "review it", StageProtocol::TerminalReview);
+        assert!(prompt.contains("READY, REPLANNED, or BLOCKED"));
     }
 
     #[test]

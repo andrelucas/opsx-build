@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::openspec::ChangeSnapshot;
 
 const SLICES_DIR: &str = "automation/slices";
+pub const TERMINAL_SLICE_PATH: &str = "automation/slices/9999-project-acceptance.md";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaAssignment {
@@ -20,6 +21,10 @@ pub enum AgendaSelection {
     Absent,
     Next(AgendaAssignment),
     Complete,
+}
+
+pub fn is_terminal_assignment(assignment: &AgendaAssignment) -> bool {
+    assignment.path == TERMINAL_SLICE_PATH
 }
 
 pub fn has_subdivision(repo: &Path, assignment: &AgendaAssignment) -> Result<bool> {
@@ -297,6 +302,21 @@ mod tests {
             Some((vec![12], "12".to_owned(), "12-parser".to_owned()))
         );
         assert_eq!(parse_slice_name("README.md"), None);
+    }
+
+    #[test]
+    fn recognizes_only_the_canonical_terminal_assignment() {
+        let terminal = AgendaAssignment {
+            path: TERMINAL_SLICE_PATH.to_owned(),
+            change: "9999-project-acceptance".to_owned(),
+            title: "Project acceptance".to_owned(),
+            content: "# Project acceptance\n".to_owned(),
+        };
+        assert!(is_terminal_assignment(&terminal));
+
+        let mut ordinary = terminal;
+        ordinary.path = "automation/slices/9998-final-feature.md".to_owned();
+        assert!(!is_terminal_assignment(&ordinary));
     }
 
     #[test]

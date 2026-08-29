@@ -10,7 +10,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    agenda::{AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision},
+    agenda::{
+        AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision,
+        is_terminal_assignment,
+    },
     bootstrap::{
         BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, init_command,
         instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
@@ -47,6 +50,7 @@ const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_FRONTIER_REPLANS: u32 = 3;
+const MAX_TERMINAL_REMEDIATIONS: u32 = 3;
 
 pub struct App<U: Ui> {
     cli: Cli,
@@ -78,6 +82,10 @@ struct RunState {
     slice_baseline: Option<SliceBaseline>,
     #[serde(default)]
     frontier_replans: u32,
+    #[serde(default)]
+    terminal_review_complete: bool,
+    #[serde(default)]
+    terminal_remediations: u32,
     #[serde(default)]
     bootstrap: bool,
     #[serde(default)]
@@ -138,6 +146,8 @@ impl RunState {
             agenda: None,
             slice_baseline: None,
             frontier_replans: 0,
+            terminal_review_complete: false,
+            terminal_remediations: 0,
             bootstrap: false,
             product_repo: None,
             sidecar_store: None,
@@ -179,6 +189,8 @@ impl RunState {
             agenda: None,
             slice_baseline: None,
             frontier_replans: 0,
+            terminal_review_complete: false,
+            terminal_remediations: 0,
             bootstrap: false,
             product_repo: None,
             sidecar_store: None,
@@ -824,11 +836,27 @@ impl<U: Ui> App<U> {
         mut state: RunState,
     ) -> Result<()> {
         loop {
+            if needs_terminal_review(&state) {
+                if state.local_only {
+                    state.terminal_review_complete = true;
+                    persist_state(repo, &state, &self.ui)?;
+                    self.ui.warn(
+                        "LOCAL-ONLY: skipping frontier review of the terminal acceptance gate",
+                    );
+                } else {
+                    let frontier_launcher = frontier_launcher
+                        .context("terminal project acceptance requires a frontier connection")?;
+                    state = self.run_terminal_review(repo, frontier_launcher, state, None)?;
+                    if !is_terminal_gate(&state) {
+                        continue;
+                    }
+                }
+            }
             self.present_campaign(&state);
             let iteration_started = (matches!(state.stage, Stage::Explore | Stage::Propose)
                 && state.planning_session.is_none())
             .then(Instant::now);
-            match self.execute(repo, launcher, commands, state)? {
+            match self.execute(repo, launcher, frontier_launcher, commands, state)? {
                 WorkflowOutcome::TooLarge(escalated) => {
                     if escalated.bootstrap {
                         let summary = escalated
@@ -851,6 +879,21 @@ impl<U: Ui> App<U> {
                         bail!(
                             "LOCAL-ONLY: no frontier model was invoked after the local worker reported TOO_LARGE: {outcome}"
                         );
+                    }
+                    if is_terminal_gate(&escalated) {
+                        let frontier_launcher = frontier_launcher.context(
+                            "terminal project acceptance remediation requires a frontier connection",
+                        )?;
+                        let outcome = escalated.too_large.clone().context(
+                            "terminal acceptance escalation omitted its durable outcome",
+                        )?;
+                        state = self.run_terminal_review(
+                            repo,
+                            frontier_launcher,
+                            escalated,
+                            Some(outcome),
+                        )?;
+                        continue;
                     }
                     let frontier_launcher = frontier_launcher.with_context(|| {
                         let outcome = escalated
@@ -948,6 +991,7 @@ impl<U: Ui> App<U> {
                     state = RunState::new(request, before_changes);
                     state.campaign = Some(campaign);
                     state.pending_direction = pending_direction;
+                    state.terminal_remediations = completed_state.terminal_remediations;
                     self.assign_agenda(repo, &mut state)?;
                     arm_slice_baseline(repo, &mut state, &self.ui)?;
                     if state.stage != Stage::Done
@@ -1132,6 +1176,191 @@ impl<U: Ui> App<U> {
         unreachable!("frontier retry loop always returns")
     }
 
+    fn run_terminal_review(
+        &self,
+        repo: &Path,
+        frontier_launcher: &ClaudeLauncher,
+        mut state: RunState,
+        escalation: Option<TooLargeOutcome>,
+    ) -> Result<RunState> {
+        let assignment = state
+            .agenda
+            .clone()
+            .filter(is_terminal_assignment)
+            .context("terminal review requires the canonical 9999 agenda assignment")?;
+        let baseline = state
+            .slice_baseline
+            .clone()
+            .context("terminal review has no recorded pre-Propose rollback baseline")?;
+
+        if state.terminal_remediations >= MAX_TERMINAL_REMEDIATIONS {
+            if escalation.is_some() {
+                reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+            }
+            bail!(
+                "terminal acceptance reached its limit of {MAX_TERMINAL_REMEDIATIONS} frontier remediation rounds; `{}` remains the terminal gate and the pre-Propose state is preserved",
+                assignment.change
+            );
+        }
+
+        if let Some(outcome) = &escalation {
+            let rollback = reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+            self.ui.warn(&format!(
+                "Abandoned the terminal {} attempt and restored pre-Propose HEAD {}",
+                outcome.stage.title(),
+                short_hash(&baseline.head)
+            ));
+            self.ui.info(&format!(
+                "Failed-attempt diagnostic retained at `{}`",
+                rollback.diagnostic_path.display()
+            ));
+            if let Some(reference) = &rollback.recovery_ref {
+                self.ui
+                    .info(&format!("Failed-attempt commits retained at `{reference}`"));
+            }
+            if openspec_snapshot(repo, &self.ui)? != state.before_changes {
+                bail!(
+                    "terminal rollback did not restore the recorded OpenSpec state; recovery data remains at `{}`",
+                    rollback.diagnostic_path.display()
+                );
+            }
+        }
+
+        let frontier = ClaudeClient::new(
+            repo,
+            frontier_launcher,
+            &self.cli.permission_mode,
+            self.ui.supports_stream_input(),
+            self.cli.stream_claude,
+            self.cli.max_output_retries,
+            &self.ui,
+        );
+        let session = Uuid::new_v4();
+        self.present_campaign(&state);
+        self.ui.stage(1, TOTAL_STAGES, "Frontier acceptance review");
+        let base_prompt = terminal_review_prompt(&assignment, escalation.as_ref());
+        let mut postcondition_failure = None;
+
+        for attempt in 0..2 {
+            let prompt = match &postcondition_failure {
+                None => base_prompt.clone(),
+                Some(failure) => format!(
+                    "{base_prompt}\n\nPOSTCONDITION REPAIR: The preceding frontier response was rejected: {failure}\nThe repository has again been restored to the exact pre-9999 baseline. Perform the review again and satisfy either the unchanged READY contract or the committed agenda-only REPLANNED contract."
+                ),
+            };
+            let result = match frontier.invoke(
+                if attempt == 0 {
+                    SessionMode::New {
+                        id: session,
+                        name: Some("9999-frontier-acceptance-review".to_owned()),
+                    }
+                } else {
+                    SessionMode::Resume { id: session }
+                },
+                &stage_prompt("", &prompt, StageProtocol::TerminalReview),
+                if attempt == 0 {
+                    "Frontier Claude is reviewing whole-project acceptance"
+                } else {
+                    "Frontier Claude is correcting the acceptance review"
+                },
+                StageProtocol::TerminalReview,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return Err(error.context(
+                        "frontier acceptance review failed; the pre-9999 baseline was restored",
+                    ));
+                }
+            };
+
+            let postcondition = match result.signal {
+                StageSignal::Blocked => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return blocked("frontier acceptance review", &result.text);
+                }
+                StageSignal::Ready if escalation.is_some() => Err(anyhow::anyhow!(
+                    "READY is not valid after a failed terminal attempt; insert bounded remediation slices"
+                )),
+                StageSignal::Ready => terminal_review_ready_postcondition(
+                    repo,
+                    &baseline,
+                    &assignment,
+                    &state.before_changes,
+                    &self.ui,
+                )
+                .map(|_| None),
+                StageSignal::Replanned => terminal_remediation_postcondition(
+                    repo,
+                    &baseline,
+                    &assignment,
+                    &state.before_changes,
+                    &self.ui,
+                )
+                .map(Some),
+                other => Err(anyhow::anyhow!(
+                    "frontier acceptance review returned unexpected terminal status {other:?}"
+                )),
+            };
+
+            match postcondition {
+                Ok(None) => {
+                    state.terminal_review_complete = true;
+                    state.too_large = None;
+                    persist_state(repo, &state, &self.ui)?;
+                    self.ui.success(
+                        "Frontier review confirmed readiness for whole-project acceptance",
+                    );
+                    return Ok(state);
+                }
+                Ok(Some(remediation)) => {
+                    state.terminal_remediations += 1;
+                    state.terminal_review_complete = false;
+                    state.too_large = None;
+                    state.change = Some(remediation.change.clone());
+                    state.agenda = Some(remediation.clone());
+                    state.stage = Stage::Propose;
+                    state.planning_session = None;
+                    state.verify_retries = 0;
+                    state.pending_repair = None;
+                    state.proposal_head = None;
+                    state.final_head = None;
+                    state.frontier_replans = 0;
+                    state.before_changes = openspec_snapshot(repo, &self.ui)?;
+                    state.slice_baseline = None;
+                    if let Err(error) = release_slice_baseline(repo, &baseline, &self.ui) {
+                        self.ui.warn(&format!(
+                            "Could not release superseded terminal rollback metadata; workflow state is unaffected: {error}"
+                        ));
+                    }
+                    arm_slice_baseline(repo, &mut state, &self.ui)?;
+                    persist_state(repo, &state, &self.ui)?;
+                    self.ui.change_name(state.change.as_deref());
+                    self.ui.success(&format!(
+                        "Frontier inserted acceptance remediation `{}` before the unchanged 9999 gate",
+                        remediation.change
+                    ));
+                    return Ok(state);
+                }
+                Err(error) if attempt == 0 => {
+                    postcondition_failure = Some(error.to_string());
+                    self.ui.warn(&format!(
+                        "Frontier acceptance review failed its repository contract: {}",
+                        postcondition_failure.as_deref().unwrap_or_default()
+                    ));
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                }
+                Err(error) => {
+                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    return Err(error.context(
+                        "frontier acceptance review failed its repository contract twice; the pre-9999 baseline was restored",
+                    ));
+                }
+            }
+        }
+        unreachable!("terminal review retry loop always returns")
+    }
+
     fn present_campaign(&self, state: &RunState) {
         let Some(campaign) = &state.campaign else {
             self.ui.campaign(None);
@@ -1157,6 +1386,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &ClaudeLauncher,
+        frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
@@ -1199,6 +1429,24 @@ impl<U: Ui> App<U> {
                 u64::from(self.cli.local_worker_timeout_minutes) * 60,
             ))
         };
+        let frontier_claude = frontier_launcher.map(|launcher| {
+            let client = ClaudeClient::new(
+                repo,
+                launcher,
+                &self.cli.permission_mode,
+                true,
+                self.cli.stream_claude,
+                self.cli.max_output_retries,
+                &self.ui,
+            );
+            if let Some(product) = state.product_repo.as_deref() {
+                client
+                    .with_additional_dir(product)
+                    .with_resume_repo(product)
+            } else {
+                client
+            }
+        });
         self.ui.change_name(state.change.as_deref());
 
         loop {
@@ -1216,19 +1464,48 @@ impl<U: Ui> App<U> {
                 return Ok(WorkflowOutcome::Done(state));
             }
 
-            let (stage_number, total_stages) = if state.agenda.is_some() {
+            let use_terminal_frontier = uses_terminal_frontier(&state, frontier_claude.is_some());
+            let (stage_number, total_stages) = if use_terminal_frontier {
+                (state.stage.number(), TOTAL_STAGES)
+            } else if state.agenda.is_some() {
                 (state.stage.number() - 1, AGENDA_TOTAL_STAGES)
             } else {
                 (state.stage.number(), TOTAL_STAGES)
             };
             self.ui
                 .stage(stage_number, total_stages, state.stage.title());
+            let planning_claude = if use_terminal_frontier {
+                frontier_claude
+                    .as_ref()
+                    .context("terminal Propose requires a frontier connection")?
+            } else {
+                &worker_claude
+            };
+            let verifying_claude = if use_terminal_frontier {
+                frontier_claude
+                    .as_ref()
+                    .context("terminal Verify requires a frontier connection")?
+            } else {
+                &worker_claude
+            };
             match state.stage {
                 Stage::Explore => self.run_explore(repo, &worker_claude, commands, &mut state)?,
-                Stage::Propose => self.run_propose(repo, &worker_claude, commands, &mut state)?,
+                Stage::Propose => self.run_propose(
+                    repo,
+                    planning_claude,
+                    commands,
+                    &mut state,
+                    use_terminal_frontier,
+                )?,
                 Stage::ProposalCommit => self.run_proposal_commit(repo, &claude, &mut state)?,
                 Stage::Apply => self.run_apply(repo, &worker_claude, commands, &mut state)?,
-                Stage::Verify => self.run_verify(repo, &worker_claude, commands, &mut state)?,
+                Stage::Verify => self.run_verify(
+                    repo,
+                    verifying_claude,
+                    commands,
+                    &mut state,
+                    use_terminal_frontier,
+                )?,
                 Stage::Repair => self.run_repair(repo, &worker_claude, commands, &mut state)?,
                 Stage::Archive => self.run_archive(repo, &claude, commands, &mut state)?,
                 Stage::FinalCommit => self.run_final_commit(repo, &claude, &mut state)?,
@@ -1283,11 +1560,14 @@ impl<U: Ui> App<U> {
         claude: &ClaudeClient<'_, U>,
         commands: &SkillCommands,
         state: &mut RunState,
+        frontier_terminal: bool,
     ) -> Result<()> {
         let (session, is_new) = planning_session(state);
         persist_state(repo, state, &self.ui)?;
         let planning_context = if state.bootstrap {
             BOOTSTRAP_PROPOSAL_CONTEXT
+        } else if is_terminal_gate(state) && frontier_terminal {
+            "Act as the frontier architect that set the project goal. Formulate the terminal whole-project acceptance change from the exact 9999 agenda assignment, the complete goal in `openspec/config.yaml`, canonical and archived OpenSpec evidence, and the delivered repository. The resulting specs, design, tasks, and acceptance scenarios must test the original goal as an integrated whole rather than merely restating the final agenda file. This is planning-only and must not implement product code. Do not report DONE: the orchestrator has established that the terminal acceptance gate remains."
         } else if state.agenda.is_some() {
             "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
         } else if state.change.is_some() {
@@ -1317,8 +1597,12 @@ impl<U: Ui> App<U> {
                         "opsx-build-planning",
                     ),
                     &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
-                    if retrying_postcondition {
+                    if retrying_postcondition && frontier_terminal {
+                        "Frontier Claude is correcting the terminal acceptance proposal"
+                    } else if retrying_postcondition {
                         "Claude is correcting the incomplete proposal"
+                    } else if frontier_terminal {
+                        "Frontier Claude is defining final project acceptance"
                     } else {
                         "Claude is creating OpenSpec artifacts"
                     },
@@ -1518,11 +1802,16 @@ impl<U: Ui> App<U> {
         claude: &ClaudeClient<'_, U>,
         commands: &SkillCommands,
         state: &mut RunState,
+        frontier_terminal: bool,
     ) -> Result<()> {
         let change = require_change(state)?;
         let verify_subject = if state.bootstrap {
             format!(
                 "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md` and the complete project goal in `openspec/config.yaml`. Confirm that no product code was implemented, every material goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with all concrete corrections when it is not."
+            )
+        } else if frontier_terminal {
+            format!(
+                "{change}\n\nPerform the independent frontier verification of the complete project goal. Verify this terminal change against its OpenSpec artifacts, then compare the delivered repository with every material requirement in `openspec/config.yaml`, the ordered agenda including `automation/slices/9999-project-acceptance.md`, synchronized canonical specs, archived change evidence, and the real end-to-end acceptance results. Run the required whole-project checks rather than relying only on task checkboxes or earlier summaries. Report VERIFIED only when the original project goal is demonstrably complete. Report RETRY with concrete findings for bounded correctable defects; make clear when a finding represents missing functionality broad enough to require new remediation slices before the terminal gate."
             )
         } else {
             format!(
@@ -1535,7 +1824,11 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-verify-{}", state.verify_retries + 1),
                 &stage_prompt(&commands.verify, &verify_subject, StageProtocol::Verify),
-                "Claude is verifying specification compliance",
+                if frontier_terminal {
+                    "Frontier Claude is verifying the complete project goal"
+                } else {
+                    "Claude is verifying specification compliance"
+                },
                 StageProtocol::Verify,
             ),
             repo,
@@ -1580,17 +1873,21 @@ impl<U: Ui> App<U> {
             }
             StageSignal::Retry => {
                 state.verify_retries += 1;
-                state.pending_repair = Some(result.text);
+                state.pending_repair = Some(result.text.clone());
                 if state.verify_retries > self.cli.max_verify_retries {
-                    return record_too_large(
-                        repo,
-                        state,
+                    let summary = if frontier_terminal {
+                        format!(
+                            "frontier acceptance review still found material project-goal gaps after {} local repair cycle(s); insert bounded remediation slices before the terminal gate. Latest findings:\n{}",
+                            self.cli.max_verify_retries,
+                            result.text.trim()
+                        )
+                    } else {
                         format!(
                             "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
                             self.cli.max_verify_retries
-                        ),
-                        &self.ui,
-                    );
+                        )
+                    };
+                    return record_too_large(repo, state, summary, &self.ui);
                 }
                 state.stage = Stage::Repair;
                 persist_state(repo, state, &self.ui)?;
@@ -1822,15 +2119,28 @@ impl<U: Ui> App<U> {
             self.ui.info("Advance: the ordered agenda is complete");
             return Ok(());
         }
+        let terminal_frontier = is_terminal_gate(&dry_state) && frontier_launcher.is_some();
+        if terminal_frontier {
+            self.ui.info(
+                "Frontier acceptance review: confirm readiness or commit bounded remediation slices before 9999",
+            );
+            self.ui
+                .info("Terminal routing: frontier Propose, worker Apply/repair, frontier Verify");
+        }
         let (planning_command, protocol, label) = if dry_state.stage == Stage::Propose {
             (&commands.propose, StageProtocol::Propose, "Propose")
         } else {
             (&commands.explore, StageProtocol::Worker, "Explore")
         };
         let prompt = stage_prompt(planning_command, &campaign_subject(&dry_state), protocol);
+        let planning_launcher = if terminal_frontier {
+            frontier_launcher.unwrap_or(launcher)
+        } else {
+            launcher
+        };
         let command = build_claude_command(
             repo,
-            launcher,
+            planning_launcher,
             &self.cli.permission_mode,
             &SessionMode::New {
                 id: Uuid::nil(),
@@ -1901,6 +2211,11 @@ impl<U: Ui> App<U> {
                 .info(&format!("Implementation workflow: {}", commands.apply));
             self.ui
                 .info(&format!("Verification workflow: {}", commands.verify));
+        }
+        if is_terminal_gate(state) {
+            self.ui.info(
+                "Terminal routing: frontier readiness review/Propose/Verify; worker Apply/repair",
+            );
         }
         Ok(())
     }
@@ -2127,6 +2442,21 @@ fn product_repository<'a>(planning_repo: &'a Path, state: &'a RunState) -> &'a P
     state.product_repo.as_deref().unwrap_or(planning_repo)
 }
 
+fn is_terminal_gate(state: &RunState) -> bool {
+    state.agenda.as_ref().is_some_and(is_terminal_assignment)
+}
+
+fn needs_terminal_review(state: &RunState) -> bool {
+    is_terminal_gate(state)
+        && state.stage == Stage::Propose
+        && !state.terminal_review_complete
+        && state.too_large.is_none()
+}
+
+fn uses_terminal_frontier(state: &RunState, frontier_available: bool) -> bool {
+    is_terminal_gate(state) && !state.local_only && frontier_available
+}
+
 fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     format!(
         "{subject}\n\nPOSTCONDITION REPAIR: {failure} Continue in this same planning session and perform the proposal workflow now; do not merely describe what should be proposed and do not create a duplicate change. Inspect active OpenSpec changes first and continue the intended existing scaffold when one is present. Follow any exact agenda assignment above; otherwise use the completed exploration and repository's durable planning evidence. Run all commands synchronously and wait for every command and subagent to finish. Return READY only after `openspec status --change <name> --json` reports `isPlanningComplete: true`. If no change is warranted, return DONE. If the selected slice exceeds one reliable worker change, return TOO_LARGE with an ordered decomposition. Return BLOCKED only for a genuine external decision."
@@ -2194,6 +2524,131 @@ fn frontier_replan_prompt(assignment: &AgendaAssignment, outcome: &TooLargeOutco
         failure = outcome.summary.trim(),
         content = assignment.content.trim(),
     )
+}
+
+fn terminal_review_prompt(
+    assignment: &AgendaAssignment,
+    escalation: Option<&TooLargeOutcome>,
+) -> String {
+    let failure = escalation.map_or_else(String::new, |outcome| {
+        format!(
+            "\n\nA preceding terminal attempt was abandoned and the repository was restored to its exact pre-Propose state. Remediation is required; READY is not a valid result for this review.\nFailed stage: {}\nFailure report:\n{}",
+            outcome.stage.title(),
+            outcome.summary.trim()
+        )
+    });
+    format!(
+        "Act as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml`, the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Determine whether every material project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
+        path = assignment.path,
+        content = assignment.content.trim(),
+    )
+}
+
+fn terminal_review_ready_postcondition<U: Ui>(
+    repo: &Path,
+    baseline: &SliceBaseline,
+    terminal: &AgendaAssignment,
+    before_changes: &ChangeSnapshot,
+    ui: &U,
+) -> Result<()> {
+    if current_head(repo, ui)?.as_deref() != Some(baseline.head.as_str()) {
+        bail!("frontier returned READY after changing Git history");
+    }
+    if !baseline_matches_except(repo, baseline, None, ui)? {
+        bail!("frontier returned READY after changing repository state");
+    }
+    if openspec_snapshot(repo, ui)? != *before_changes {
+        bail!("frontier returned READY after changing OpenSpec state");
+    }
+    if fs::read_to_string(repo.join(&terminal.path))? != terminal.content {
+        bail!("frontier returned READY after changing the terminal acceptance slice");
+    }
+    Ok(())
+}
+
+fn terminal_remediation_postcondition<U: Ui>(
+    repo: &Path,
+    baseline: &SliceBaseline,
+    terminal: &AgendaAssignment,
+    before_changes: &ChangeSnapshot,
+    ui: &U,
+) -> Result<AgendaAssignment> {
+    let head = current_head(repo, ui)?.context("frontier remediation did not leave a Git HEAD")?;
+    if head == baseline.head {
+        bail!("frontier remediation did not create a commit");
+    }
+    if !head_descends_from(repo, &baseline.head, ui)? {
+        bail!("frontier remediation rewrote or replaced pre-9999 Git history");
+    }
+
+    let committed = committed_paths_since(repo, &baseline.head, ui)?;
+    if committed.is_empty() {
+        bail!("frontier remediation commit changed no files");
+    }
+    let outside_agenda = committed
+        .iter()
+        .filter(|path| !path.starts_with("automation/slices/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !outside_agenda.is_empty() {
+        bail!(
+            "frontier remediation committed files outside `automation/slices/`: {}",
+            outside_agenda.join(", ")
+        );
+    }
+    if !baseline_matches_except(repo, baseline, Some("automation/slices/"), ui)? {
+        bail!(
+            "frontier remediation did not preserve pre-existing state outside `automation/slices/` exactly"
+        );
+    }
+    if openspec_snapshot(repo, ui)? != *before_changes {
+        bail!("frontier remediation changed OpenSpec state");
+    }
+    if fs::read_to_string(repo.join(&terminal.path))? != terminal.content {
+        bail!("frontier remediation modified the terminal 9999 acceptance slice");
+    }
+    let AgendaSelection::Next(remediation) = discover_agenda(repo, before_changes)? else {
+        bail!("frontier remediation left no next ordered agenda slice");
+    };
+    validate_terminal_remediation_assignment(&remediation, &committed)?;
+    if !repo.join("automation/slices/README.md").is_file() {
+        bail!("frontier remediation removed the agenda README");
+    }
+    Ok(remediation)
+}
+
+fn validate_terminal_remediation_assignment(
+    remediation: &AgendaAssignment,
+    committed: &[String],
+) -> Result<()> {
+    if is_terminal_assignment(remediation) {
+        bail!("frontier remediation inserted no executable slice before 9999");
+    }
+    if !committed.iter().any(|path| path == &remediation.path) {
+        bail!(
+            "frontier remediation did not commit the newly selected slice `{}`",
+            remediation.path
+        );
+    }
+    for heading in [
+        "# ",
+        "## Objective",
+        "## Prerequisites",
+        "## Acceptance Criteria",
+        "## Required Tests",
+    ] {
+        if !remediation
+            .content
+            .lines()
+            .any(|line| line.starts_with(heading))
+        {
+            bail!(
+                "frontier remediation slice `{}` omitted required heading `{heading}`",
+                remediation.path
+            );
+        }
+    }
+    Ok(())
 }
 
 fn frontier_replan_postcondition<U: Ui>(
@@ -2462,6 +2917,8 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         agenda: None,
         slice_baseline: None,
         frontier_replans: 0,
+        terminal_review_complete: false,
+        terminal_remediations: 0,
         bootstrap: false,
         product_repo: None,
         sidecar_store: None,
@@ -2682,6 +3139,86 @@ mod tests {
         assert!(prompt.contains("Modify only files under `automation/slices/`"));
         assert!(prompt.contains("do not implement the slice"));
         assert!(prompt.contains("frontend and lowering are too broad together"));
+    }
+
+    #[test]
+    fn terminal_review_preserves_9999_and_inserts_remediation_before_it() {
+        let assignment = AgendaAssignment {
+            path: "automation/slices/9999-project-acceptance.md".to_owned(),
+            change: "9999-project-acceptance".to_owned(),
+            title: "Project acceptance".to_owned(),
+            content: "# Project acceptance\n\n## Objective\n\nAccept it.".to_owned(),
+        };
+
+        let ready = terminal_review_prompt(&assignment, None);
+        assert!(ready.contains("complete goal in `openspec/config.yaml`"));
+        assert!(ready.contains(
+            "leave the repository, index, working tree, and Git history exactly unchanged"
+        ));
+        assert!(ready.contains("return READY"));
+        assert!(
+            ready.contains("preserve `automation/slices/9999-project-acceptance.md` byte-for-byte")
+        );
+        assert!(ready.contains("sort after every existing nonterminal slice and before `9999`"));
+        assert!(ready.contains("Modify only files under `automation/slices/`"));
+
+        let failure = TooLargeOutcome {
+            stage: Stage::Verify,
+            summary: "TLS hostname rejection is not implemented".to_owned(),
+        };
+        let remediation = terminal_review_prompt(&assignment, Some(&failure));
+        assert!(remediation.contains("READY is not a valid result"));
+        assert!(remediation.contains("TLS hostname rejection is not implemented"));
+    }
+
+    #[test]
+    fn terminal_gate_requires_one_durable_frontier_review() {
+        let mut state =
+            RunState::new_campaign("advance".to_owned(), ChangeSnapshot::default(), Some(20));
+        state.stage = Stage::Propose;
+        state.change = Some("9999-project-acceptance".to_owned());
+        state.agenda = Some(AgendaAssignment {
+            path: "automation/slices/9999-project-acceptance.md".to_owned(),
+            change: "9999-project-acceptance".to_owned(),
+            title: "Project acceptance".to_owned(),
+            content: "# Project acceptance\n".to_owned(),
+        });
+
+        assert!(is_terminal_gate(&state));
+        assert!(needs_terminal_review(&state));
+        assert!(uses_terminal_frontier(&state, true));
+        assert!(!uses_terminal_frontier(&state, false));
+        state.terminal_review_complete = true;
+        assert!(!needs_terminal_review(&state));
+        state.local_only = true;
+        assert!(!uses_terminal_frontier(&state, true));
+
+        let decoded: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(decoded.terminal_review_complete);
+        assert_eq!(decoded.terminal_remediations, 0);
+    }
+
+    #[test]
+    fn terminal_remediation_must_be_committed_and_structurally_executable() {
+        let remediation = AgendaAssignment {
+            path: "automation/slices/0014-missing-tls-case.md".to_owned(),
+            change: "0014-missing-tls-case".to_owned(),
+            title: "Missing TLS case".to_owned(),
+            content: "# Missing TLS case\n\n## Objective\nAdd it.\n\n## Prerequisites\nEarlier slices.\n\n## Acceptance Criteria\n- Works.\n\n## Required Tests\n- End to end.\n".to_owned(),
+        };
+        let committed = vec![
+            remediation.path.clone(),
+            "automation/slices/README.md".to_owned(),
+        ];
+        assert!(validate_terminal_remediation_assignment(&remediation, &committed).is_ok());
+
+        let mut malformed = remediation.clone();
+        malformed.content = "# Missing TLS case\n\n## Objective\nAdd it.\n".to_owned();
+        assert!(validate_terminal_remediation_assignment(&malformed, &committed).is_err());
+
+        let uncommitted = vec!["automation/slices/README.md".to_owned()];
+        assert!(validate_terminal_remediation_assignment(&remediation, &uncommitted).is_err());
     }
 
     #[test]

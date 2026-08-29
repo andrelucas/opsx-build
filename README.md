@@ -78,6 +78,24 @@ cover the complete goal rather than stopping at an attractive early milestone.
 Once the final `9999` slice is archived, `advance` has a concrete definition of
 DONE.
 
+When `9999-project-acceptance` becomes the next agenda slice, opsx-build returns
+to the configured frontier connection that established the project goal. Before
+creating the terminal OpenSpec change, the frontier reviews the original
+project context, accumulated OpenSpec record, implementation, and real tests.
+If the project is ready, the frontier creates the terminal proposal, the worker
+applies it and performs bounded repairs, and the frontier performs the final
+whole-project verification before normal archival.
+
+If that review—or a later failed terminal attempt—exposes material missing
+functionality, opsx-build restores the recorded pre-`9999` baseline. The
+frontier may then commit bounded remediation slices whose ordinals place them
+after existing delivery work but before the byte-for-byte unchanged `9999`
+gate. The campaign resumes at the first remediation slice and revisits `9999`
+later. Frontier agenda edits are limited to `automation/slices/`, checked
+against Git and OpenSpec postconditions, and limited to three terminal
+remediation rounds within one durable campaign run. `--local-only` explicitly
+skips this frontier policy and runs `9999` with the worker connection.
+
 Bootstrap uses the same durable checkpoint and fresh-session stage engine as a
 normal build. If it is interrupted after initialization, continue with:
 
@@ -963,7 +981,10 @@ accepts `DONE`. Archive and commit stages use `READY` or `BLOCKED`; Verify uses
 or modified because the requested objective is already satisfied; in campaign
 mode it terminates the outer loop successfully. `TOO_LARGE` means the assigned
 worker slice needs decomposition before another local attempt. The frontier
-planner uses `REPLANNED` only after committing a valid agenda subdivision.
+planner uses `REPLANNED` only after committing a valid agenda subdivision or
+inserting validated remediation slices before the unchanged terminal acceptance
+gate. Terminal frontier review otherwise returns `READY` without changing
+repository state.
 
 The corrected structured field and fallback marker are `opsx_status` and
 `OPSX_STATUS`. Results using the old `ospx_status` or `OSPX_STATUS` spellings
