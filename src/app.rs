@@ -1080,8 +1080,11 @@ impl<U: Ui> App<U> {
         .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
-        self.ui
-            .stage(stage_number, AGENDA_TOTAL_STAGES, "Frontier replan");
+        self.ui.stage(
+            stage_number,
+            AGENDA_TOTAL_STAGES,
+            &model_stage_title("Frontier replan", "frontier", frontier_launcher),
+        );
         let base_prompt = frontier_replan_prompt(&assignment, &outcome);
         let mut failure = None;
         for attempt in 0..2 {
@@ -1242,7 +1245,11 @@ impl<U: Ui> App<U> {
         .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         self.present_campaign(&state);
-        self.ui.stage(1, TOTAL_STAGES, "Frontier acceptance review");
+        self.ui.stage(
+            1,
+            TOTAL_STAGES,
+            &model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
+        );
         let base_prompt = terminal_review_prompt(&assignment, escalation.as_ref());
         let mut postcondition_failure = None;
 
@@ -1474,6 +1481,18 @@ impl<U: Ui> App<U> {
             }
 
             let use_terminal_frontier = uses_terminal_frontier(&state, frontier_claude.is_some());
+            let stage_uses_frontier =
+                stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
+            let stage_launcher = if stage_uses_frontier {
+                frontier_launcher.unwrap_or(launcher)
+            } else {
+                launcher
+            };
+            let stage_role = if stage_uses_frontier {
+                "frontier"
+            } else {
+                "worker"
+            };
             let (stage_number, total_stages) = if use_terminal_frontier {
                 (state.stage.number(), TOTAL_STAGES)
             } else if state.agenda.is_some() {
@@ -1481,8 +1500,11 @@ impl<U: Ui> App<U> {
             } else {
                 (state.stage.number(), TOTAL_STAGES)
             };
-            self.ui
-                .stage(stage_number, total_stages, state.stage.title());
+            self.ui.stage(
+                stage_number,
+                total_stages,
+                &model_stage_title(state.stage.title(), stage_role, stage_launcher),
+            );
             let planning_claude = if use_terminal_frontier {
                 frontier_claude
                     .as_ref()
@@ -1497,6 +1519,13 @@ impl<U: Ui> App<U> {
             } else {
                 &worker_claude
             };
+            let applying_claude = if use_terminal_frontier {
+                frontier_claude
+                    .as_ref()
+                    .context("terminal Apply/repair requires a frontier connection")?
+            } else {
+                &worker_claude
+            };
             match state.stage {
                 Stage::Explore => self.run_explore(repo, &worker_claude, commands, &mut state)?,
                 Stage::Propose => self.run_propose(
@@ -1507,7 +1536,13 @@ impl<U: Ui> App<U> {
                     use_terminal_frontier,
                 )?,
                 Stage::ProposalCommit => self.run_proposal_commit(repo, &claude, &mut state)?,
-                Stage::Apply => self.run_apply(repo, &worker_claude, commands, &mut state)?,
+                Stage::Apply => self.run_apply(
+                    repo,
+                    applying_claude,
+                    commands,
+                    &mut state,
+                    use_terminal_frontier,
+                )?,
                 Stage::Verify => self.run_verify(
                     repo,
                     verifying_claude,
@@ -1515,7 +1550,13 @@ impl<U: Ui> App<U> {
                     &mut state,
                     use_terminal_frontier,
                 )?,
-                Stage::Repair => self.run_repair(repo, &worker_claude, commands, &mut state)?,
+                Stage::Repair => self.run_repair(
+                    repo,
+                    applying_claude,
+                    commands,
+                    &mut state,
+                    use_terminal_frontier,
+                )?,
                 Stage::Archive => self.run_archive(repo, &claude, commands, &mut state)?,
                 Stage::FinalCommit => self.run_final_commit(repo, &claude, &mut state)?,
                 Stage::Complete | Stage::Done => unreachable!(),
@@ -1771,10 +1812,15 @@ impl<U: Ui> App<U> {
         claude: &ClaudeClient<'_, U>,
         commands: &SkillCommands,
         state: &mut RunState,
+        frontier_terminal: bool,
     ) -> Result<()> {
         let change = require_change(state)?;
         let base = if state.bootstrap {
             format!("{change}\n\n{BOOTSTRAP_APPLY_CONTEXT}")
+        } else if frontier_terminal {
+            format!(
+                "{change}\n\nImplement or continue implementing this terminal whole-project acceptance change completely. This is frontier-owned work: exercise the real acceptance criteria against the delivered project, preserve correct partial work, and replace incorrect task-owned work where necessary. Run the required project checks, using narrowly scoped sandbox escape when the checks genuinely require facilities unavailable inside the sandbox. Do not archive the change. Report TOO_LARGE only if the terminal acceptance work cannot safely be completed even by the frontier model; do not subdivide merely because it would be too large for the worker model."
+            )
         } else {
             format!(
                 "{change}\n\nImplement or continue implementing this OpenSpec change completely. Preserve correct partial work and run appropriate project checks. Do not archive the change. If the assigned slice cannot reliably be completed and verified as one bounded worker-model change, report TOO_LARGE with evidence and an ordered decomposition instead of digging an increasingly broad implementation hole. Do not use TOO_LARGE for ordinary difficulty or correctable engineering failures."
@@ -1787,7 +1833,11 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-apply"),
                 &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-                "Claude is applying the OpenSpec change",
+                if frontier_terminal {
+                    "Frontier Claude is applying whole-project acceptance"
+                } else {
+                    "Claude is applying the OpenSpec change"
+                },
                 StageProtocol::Worker,
             ),
             repo,
@@ -1886,7 +1936,7 @@ impl<U: Ui> App<U> {
                 if state.verify_retries > self.cli.max_verify_retries {
                     let summary = if frontier_terminal {
                         format!(
-                            "frontier acceptance review still found material project-goal gaps after {} local repair cycle(s); insert bounded remediation slices before the terminal gate. Latest findings:\n{}",
+                            "frontier acceptance review still found material project-goal gaps after {} frontier repair cycle(s); insert bounded remediation slices before the terminal gate. Latest findings:\n{}",
                             self.cli.max_verify_retries,
                             result.text.trim()
                         )
@@ -1924,17 +1974,21 @@ impl<U: Ui> App<U> {
         claude: &ClaudeClient<'_, U>,
         commands: &SkillCommands,
         state: &mut RunState,
+        frontier_terminal: bool,
     ) -> Result<()> {
         if state.verify_retries > self.cli.max_verify_retries && state.pending_direction.is_none() {
-            return record_too_large(
-                repo,
-                state,
+            let summary = if frontier_terminal {
+                format!(
+                    "frontier terminal acceptance exhausted {} verification repair cycle(s); the remaining findings require bounded remediation slices before the terminal gate",
+                    self.cli.max_verify_retries
+                )
+            } else {
                 format!(
                     "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
                     self.cli.max_verify_retries
-                ),
-                &self.ui,
-            );
+                )
+            };
+            return record_too_large(repo, state, summary, &self.ui);
         }
         let change = require_change(state)?;
         let finding = state.pending_repair.as_deref().unwrap_or(
@@ -1943,6 +1997,10 @@ impl<U: Ui> App<U> {
         let base = if state.bootstrap {
             format!(
                 "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts. Do not implement product code and do not create implementation OpenSpec changes. Re-check the complete goal in `openspec/config.yaml`.\n\nVerifier context:\n{finding}"
+            )
+        } else if frontier_terminal {
+            format!(
+                "{change}\n\nRepair or continue repairing the terminal whole-project acceptance implementation and tests. This is frontier-owned work. Preserve correct partial work, correct task-owned defects, run the real acceptance checks, and keep the approved OpenSpec scope. Use narrowly scoped sandbox escape when required checks genuinely cannot run inside the sandbox. Report TOO_LARGE only if the work cannot safely be completed even by the frontier model.\n\nVerifier context:\n{finding}"
             )
         } else {
             format!(
@@ -1956,7 +2014,11 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-repair-{}", state.verify_retries),
                 &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-                "Claude is repairing the implementation",
+                if frontier_terminal {
+                    "Frontier Claude is repairing whole-project acceptance"
+                } else {
+                    "Claude is repairing the implementation"
+                },
                 StageProtocol::Worker,
             ),
             repo,
@@ -2134,7 +2196,7 @@ impl<U: Ui> App<U> {
                 "Frontier acceptance review: confirm readiness or commit bounded remediation slices before 9999",
             );
             self.ui
-                .info("Terminal routing: frontier Propose, worker Apply/repair, frontier Verify");
+                .info("Terminal routing: frontier Propose/Apply/repair/Verify; worker milestone commits/archive");
         }
         let (planning_command, protocol, label) = if dry_state.stage == Stage::Propose {
             (&commands.propose, StageProtocol::Propose, "Propose")
@@ -2223,7 +2285,7 @@ impl<U: Ui> App<U> {
         }
         if is_terminal_gate(state) {
             self.ui.info(
-                "Terminal routing: frontier readiness review/Propose/Verify; worker Apply/repair",
+                "Terminal routing: frontier readiness review/Propose/Apply/repair/Verify; worker milestone commits/archive",
             );
         }
         Ok(())
@@ -2324,6 +2386,20 @@ fn connection_description(launcher: &ClaudeLauncher) -> String {
         || format!("`{name}` ({model})"),
         |environment| format!("`{name}` ({model}, environment `{environment}`)"),
     )
+}
+
+fn model_stage_title(title: &str, role: &str, launcher: &ClaudeLauncher) -> String {
+    let connection = launcher.connection_name.as_deref().unwrap_or("default");
+    format!("{title} · {role} ({connection})")
+}
+
+fn stage_uses_frontier_model(stage: Stage, bootstrap: bool, terminal_frontier: bool) -> bool {
+    bootstrap
+        || (terminal_frontier
+            && matches!(
+                stage,
+                Stage::Propose | Stage::Apply | Stage::Verify | Stage::Repair
+            ))
 }
 
 fn planning_session(state: &mut RunState) -> (Uuid, bool) {
@@ -3206,6 +3282,35 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(decoded.terminal_review_complete);
         assert_eq!(decoded.terminal_remediations, 0);
+    }
+
+    #[test]
+    fn terminal_acceptance_keeps_model_work_on_frontier() {
+        for stage in [Stage::Propose, Stage::Apply, Stage::Verify, Stage::Repair] {
+            assert!(stage_uses_frontier_model(stage, false, true));
+        }
+        for stage in [
+            Stage::ProposalCommit,
+            Stage::Archive,
+            Stage::FinalCommit,
+            Stage::Complete,
+            Stage::Done,
+        ] {
+            assert!(!stage_uses_frontier_model(stage, false, true));
+        }
+        assert!(!stage_uses_frontier_model(Stage::Apply, false, false));
+        assert!(stage_uses_frontier_model(Stage::Apply, true, false));
+    }
+
+    #[test]
+    fn stage_title_identifies_role_and_connection() {
+        let mut launcher = ClaudeLauncher::parse("claude", None, None, None, None, None).unwrap();
+        launcher.connection_name = Some("anthropic".to_owned());
+
+        assert_eq!(
+            model_stage_title("Apply", "frontier", &launcher),
+            "Apply · frontier (anthropic)"
+        );
     }
 
     #[test]

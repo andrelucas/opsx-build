@@ -96,9 +96,11 @@ When `9999-project-acceptance` becomes the next agenda slice, opsx-build returns
 to the configured frontier connection that established the project goal. Before
 creating the terminal OpenSpec change, the frontier reviews the original
 project context, accumulated OpenSpec record, implementation, and real tests.
-If the project is ready, the frontier creates the terminal proposal, the worker
-applies it and performs bounded repairs, and the frontier performs the final
-whole-project verification before normal archival.
+If the project is ready, the frontier creates, applies, repairs, and verifies
+the terminal whole-project acceptance change before normal archival. Bounded
+remediation slices inserted before `9999` remain worker-owned. Active stage
+headings show both the model role and selected connection so a handoff is
+visible while the campaign runs.
 
 If that review—or a later failed terminal attempt—exposes material missing
 functionality, opsx-build restores the recorded pre-`9999` baseline. The
