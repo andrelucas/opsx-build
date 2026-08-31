@@ -13,6 +13,18 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/hooks/reject-model-confusions.sh\"",
+            "timeout": 5,
+            "statusMessage": "Checking repository for known model confusions"
+          }
+        ]
+      }
     ]
   }
 }

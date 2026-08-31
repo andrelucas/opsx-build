@@ -12,6 +12,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::{stream::StreamControl, ui::Ui};
 
+const MODEL_CONFUSION_REJECTION_MARKER: &str = "Rejected by opsx-build incident";
+const MODEL_CONFUSION_COMPACTION_THRESHOLD: usize = 3;
+
 #[derive(Debug)]
 pub struct PauseRequested {
     repo: PathBuf,
@@ -337,6 +340,8 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut completed_messages = 0usize;
         let mut pending_turns = VecDeque::new();
         let mut pending_interrupt: Option<PendingInterrupt> = None;
+        let mut model_confusion_rejections = 0usize;
+        let mut model_confusion_compaction_attempted = false;
         if let (Some(stdin), Some(initial)) = (child_stdin.as_mut(), spec.initial_stdin.as_deref())
         {
             match write_stream_input(stdin, initial) {
@@ -360,6 +365,32 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                 Ok(PipeChunk::Line(PipeKind::Stdout, line)) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     on_stdout_line(trimmed);
+                    if trimmed.contains(MODEL_CONFUSION_REJECTION_MARKER) {
+                        model_confusion_rejections += 1;
+                        if model_confusion_rejections >= MODEL_CONFUSION_COMPACTION_THRESHOLD
+                            && !model_confusion_compaction_attempted
+                            && pending_interrupt.is_none()
+                            && spec.accepts_stream_messages
+                        {
+                            let request_id = format!("opsx_interrupt_{}", uuid::Uuid::new_v4());
+                            if let Err(error) =
+                                queue_stream_interrupt(&mut child_stdin, &request_id)
+                            {
+                                self.ui.warn(&format!(
+                                    "Repeated model-confusion rejections detected, but automatic compaction could not interrupt Claude: {error}"
+                                ));
+                            } else {
+                                model_confusion_compaction_attempted = true;
+                                pending_interrupt = Some(PendingInterrupt {
+                                    request_id,
+                                    action: InterruptAction::Compact,
+                                });
+                                self.ui.stream_message_sent(
+                                    "Repeated model-confusion rejections detected; automatic compaction interrupt written to Claude",
+                                );
+                            }
+                        }
+                    }
                     if let Some(result) = stream_result(trimmed) {
                         completed_messages += 1;
                         let completed_turn = pending_turns.pop_front();
@@ -1046,6 +1077,45 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         assert!(output.stdout.contains("compact_boundary"));
         assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 3);
         assert!(messages.contains("/compact written after interrupt"));
+        assert!(messages.contains("reissued after compaction"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_model_confusion_rejections_trigger_one_automatic_compaction() {
+        let script = r#"
+IFS= read -r initial
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Rejected by opsx-build incident one"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Rejected by opsx-build incident two"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Rejected by opsx-build incident three"}]}}'
+IFS= read -r control
+request_id=$(printf '%s' "$control" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+test -n "$request_id" || exit 20
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"still_queued":[]}}}\n' "$request_id"
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools","result":"Interrupted"}'
+IFS= read -r compact
+printf '%s' "$compact" | grep -Fq '"text":"/compact"' || exit 21
+printf '%s\n' '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"automatic-model-confusion","pre_tokens":24000}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Compacted"}'
+IFS= read -r resumed
+test "$resumed" = "$initial" || exit 22
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done","structured_output":{"opsx_status":"APPLIED","summary":"resumed"}}'
+"#;
+        let ui = InterruptingUi::new(StreamControl::None);
+        let runner = ProcessRunner::new(&ui);
+        let initial = stream_user_message("/opsx:apply slice-a");
+        let spec = CommandSpec::new("sh", "/tmp")
+            .args(["-c", script])
+            .stream_input(initial);
+
+        let output = runner
+            .run_streaming(&spec, "Apply", |_| {})
+            .expect("automatic model-confusion compaction should recover the turn");
+
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout.matches("compact_boundary").count(), 1);
+        let messages = ui.messages.lock().unwrap().join("\n");
+        assert!(messages.contains("automatic compaction interrupt"));
         assert!(messages.contains("reissued after compaction"));
     }
 

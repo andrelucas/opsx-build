@@ -22,11 +22,16 @@ installed because orchestration belongs in this process.
 
 Every unattended Claude process also loads a private opsx-build plugin from
 Git metadata. Its `PreToolUse` hook rejects known model/version confusions
-before a tool can write them into repository content or Git history. The first
-catalogued incident, `qwen3.6-openspec-duplicated-s`, records Qwen3.6's observed
-tendency to insert an extra `s` at the OpenSpec word boundary. Claude receives
-a precise correction and can retry immediately. The plugin is passed with
-`--plugin-dir` and neither changes nor replaces project settings or hooks.
+before a tool can write them into repository content or Git history, and its
+`Stop` hook refuses stage completion while a forbidden literal remains in the
+repository. The first catalogued incident,
+`qwen3.6-openspec-duplicated-s`, records Qwen3.6's observed tendency to insert
+an extra `s` at the OpenSpec word boundary. Claude receives a precise
+correction and can retry immediately. If a streamed invocation hits the same
+guard three times, opsx-build interrupts it, performs one automatic hard
+compaction, and reissues the active stage command so a confused belief does not
+consume the rest of the turn. The plugin is passed with `--plugin-dir` and
+neither changes nor replaces project settings or hooks.
 
 Known incidents live in `assets/model-confusions.toml`. One declarative entry
 supplies the incident identity and affected model/version, adds guidance to

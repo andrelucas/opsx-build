@@ -123,6 +123,20 @@ fn render_reject_script(catalog: &Catalog) -> String {
         )));
         script.push_str(" >&2\n    exit 2\nfi\n\n");
     }
+    script.push_str(
+        "if printf '%s' \"$input\" | grep -Eq '\"hook_event_name\"[[:space:]]*:[[:space:]]*\"Stop\"'; then\n",
+    );
+    for confusion in &catalog.confusion {
+        script.push_str("    git grep --no-index -I -Fqi -- ");
+        script.push_str(&shell_quote(&confusion.forbidden_literal));
+        script.push_str(" -- . >/dev/null 2>&1\n    status=$?\n    if [ \"$status\" -eq 0 ]; then\n        printf '%s\\n' ");
+        script.push_str(&shell_quote(&format!(
+            "Rejected stage completion by opsx-build incident `{}`. Repository content still contains the forbidden literal `{}`. Correct it without bypassing or disabling the guard, then finish the stage again.",
+            confusion.id, confusion.forbidden_literal
+        )));
+        script.push_str(" >&2\n        exit 2\n    fi\n    if [ \"$status\" -gt 1 ]; then\n        printf '%s\\n' 'opsx-build could not verify the repository model-confusion invariant; do not finish until the repository can be checked' >&2\n        exit 2\n    fi\n");
+    }
+    script.push_str("fi\n\n");
     script.push_str("exit 0\n");
     script
 }
@@ -165,8 +179,13 @@ mod tests {
     }
 
     fn run_hook(script: &Path, input: &str) -> std::process::Output {
+        run_hook_in(script, input, script.parent().unwrap())
+    }
+
+    fn run_hook_in(script: &Path, input: &str, cwd: &Path) -> std::process::Output {
         let mut child = Command::new("/bin/sh")
             .arg(script)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -198,12 +217,35 @@ mod tests {
         assert!(diagnostic.contains("qwen3.6-openspec-duplicated-s"));
         assert!(diagnostic.contains("Qwen3.6-induced failure mode"));
         assert!(diagnostic.contains("exactly one `s` and two `p`"));
+        assert!(diagnostic.contains("Do not bypass, disable, alias"));
 
         let accepted = run_hook(
             &script,
             r#"{"tool_name":"Bash","tool_input":{"command":"git commit -m 'openspec: complete slice'"}}"#,
         );
         assert!(accepted.status.success());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn stop_hook_refuses_to_finish_with_a_confusion_in_repository_content() {
+        let repo = fixture();
+        let ui = TerminalUi::new(false, false, false);
+        let plugin = ensure_model_confusion_plugin(&repo, &ui).unwrap();
+        let script = plugin.join("hooks/reject-model-confusions.sh");
+        let stop = r#"{"hook_event_name":"Stop","last_assistant_message":"Ready"}"#;
+
+        fs::write(repo.join("bad.md"), "use the opensspec command\n").unwrap();
+        let rejected = run_hook_in(&script, stop, &repo);
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(
+            String::from_utf8(rejected.stderr)
+                .unwrap()
+                .contains("Rejected stage completion")
+        );
+
+        fs::write(repo.join("bad.md"), "use the openspec command\n").unwrap();
+        assert!(run_hook_in(&script, stop, &repo).status.success());
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -250,6 +292,11 @@ diagnostic = "Model v1 transposes the final letters."
         assert!(first.join(".claude-plugin/plugin.json").is_file());
         assert!(first.join("hooks/hooks.json").is_file());
         assert!(first.join("model-confusions.toml").is_file());
+        assert!(
+            fs::read_to_string(first.join("hooks/hooks.json"))
+                .unwrap()
+                .contains("\"Stop\"")
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 
