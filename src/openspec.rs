@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::Path,
 };
 
@@ -183,6 +184,59 @@ pub fn identify_assigned_change(
     Ok(assigned.to_owned())
 }
 
+pub fn numeric_prefix_reconciliation_candidate(
+    before: &ChangeSnapshot,
+    after: &ChangeSnapshot,
+    assigned: &str,
+) -> Option<String> {
+    if after.changes.contains_key(assigned) {
+        return None;
+    }
+    let (prefix, expected) = assigned.split_once('-')?;
+    if prefix.is_empty()
+        || !prefix.bytes().all(|byte| byte.is_ascii_digit())
+        || expected.is_empty()
+        || before.changes.contains_key(expected)
+        || !after.changes.contains_key(expected)
+    {
+        return None;
+    }
+
+    let changed = before
+        .changes
+        .keys()
+        .chain(after.changes.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| before.changes.get(*name) != after.changes.get(*name))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    (changed == [expected]).then(|| expected.to_owned())
+}
+
+pub fn rename_change_directory(repo: &Path, current: &str, assigned: &str) -> Result<()> {
+    let changes = repo.join("openspec/changes");
+    let source = changes.join(current);
+    let destination = changes.join(assigned);
+    if !source.is_dir() {
+        bail!(
+            "cannot reconcile OpenSpec change name: source directory `{}` does not exist",
+            source.display()
+        )
+    }
+    if destination.exists() {
+        bail!(
+            "cannot reconcile OpenSpec change name: destination `{}` already exists",
+            destination.display()
+        )
+    }
+    fs::rename(&source, &destination).with_context(|| {
+        format!(
+            "could not reconcile OpenSpec change name `{current}` to assigned name `{assigned}`"
+        )
+    })
+}
+
 pub fn select_existing_change(active: &ChangeSnapshot, requested: Option<&str>) -> Result<String> {
     if let Some(change) = requested {
         if active.changes.contains_key(change) {
@@ -300,6 +354,83 @@ mod tests {
 
         let removed_unrelated = parse_list_json(r#"{"changes":[{"name":"002-next"}]}"#).unwrap();
         assert!(identify_assigned_change(&before, &removed_unrelated, "002-next").is_err());
+    }
+
+    #[test]
+    fn reconciles_one_new_change_that_only_dropped_its_numeric_prefix() {
+        let before = parse_list_json(r#"{"changes":[{"name":"unrelated"}]}"#).unwrap();
+        let after = parse_list_json(
+            r#"{"changes":[{"name":"http-forwarding-core"},{"name":"unrelated"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            numeric_prefix_reconciliation_candidate(&before, &after, "0003-http-forwarding-core")
+                .as_deref(),
+            Some("http-forwarding-core")
+        );
+    }
+
+    #[test]
+    fn refuses_ambiguous_or_inexact_change_name_reconciliation() {
+        let empty = ChangeSnapshot::default();
+        let exact =
+            parse_list_json(r#"{"changes":[{"name":"0003-http-forwarding-core"}]}"#).unwrap();
+        let wrong = parse_list_json(r#"{"changes":[{"name":"forwarding-core"}]}"#).unwrap();
+        let multiple =
+            parse_list_json(r#"{"changes":[{"name":"http-forwarding-core"},{"name":"other"}]}"#)
+                .unwrap();
+        let preexisting =
+            parse_list_json(r#"{"changes":[{"name":"http-forwarding-core"}]}"#).unwrap();
+        let modified =
+            parse_list_json(r#"{"changes":[{"name":"http-forwarding-core","status":"changed"}]}"#)
+                .unwrap();
+
+        assert!(
+            numeric_prefix_reconciliation_candidate(&empty, &exact, "0003-http-forwarding-core")
+                .is_none()
+        );
+        assert!(
+            numeric_prefix_reconciliation_candidate(&empty, &wrong, "0003-http-forwarding-core")
+                .is_none()
+        );
+        assert!(
+            numeric_prefix_reconciliation_candidate(&empty, &multiple, "0003-http-forwarding-core")
+                .is_none()
+        );
+        assert!(
+            numeric_prefix_reconciliation_candidate(
+                &preexisting,
+                &modified,
+                "0003-http-forwarding-core"
+            )
+            .is_none()
+        );
+        assert!(
+            numeric_prefix_reconciliation_candidate(&empty, &wrong, "http-forwarding-core")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn renames_the_change_directory_without_touching_its_contents() {
+        let repo = std::env::temp_dir().join(format!(
+            "opsx-build-openspec-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = repo.join("openspec/changes/http-forwarding-core");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("proposal.md"), "proposal").unwrap();
+
+        rename_change_directory(&repo, "http-forwarding-core", "0003-http-forwarding-core")
+            .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("openspec/changes/0003-http-forwarding-core/proposal.md"))
+                .unwrap(),
+            "proposal"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

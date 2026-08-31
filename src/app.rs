@@ -32,7 +32,8 @@ use crate::{
     },
     model_confusions::ensure_model_confusion_plugin,
     openspec::{
-        ChangeSnapshot, identify_assigned_change, identify_change, planning_status,
+        ChangeSnapshot, identify_assigned_change, identify_change,
+        numeric_prefix_reconciliation_candidate, planning_status, rename_change_directory,
         select_existing_change, snapshot as openspec_snapshot,
     },
     process::{
@@ -1666,7 +1667,7 @@ impl<U: Ui> App<U> {
                 return Ok(());
             };
 
-            let after = openspec_snapshot(repo, &self.ui)?;
+            let mut after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
                 StageSignal::Done => {
                     if let Some(assignment) = &state.agenda {
@@ -1697,6 +1698,16 @@ impl<U: Ui> App<U> {
                 .as_ref()
                 .map(|assignment| assignment.change.as_str())
                 .or(state.change.as_deref());
+            if let Some(assigned) = assigned_change
+                && let Some(created) =
+                    numeric_prefix_reconciliation_candidate(&state.before_changes, &after, assigned)
+            {
+                self.ui.warn(&format!(
+                    "Propose dropped the numeric prefix from `{assigned}`; reconciling unambiguous new change `{created}`"
+                ));
+                rename_change_directory(repo, &created, assigned)?;
+                after = openspec_snapshot(repo, &self.ui)?;
+            }
             let assigned_complete_without_list_change = assigned_change
                 .filter(|change| after.changes.contains_key(*change))
                 .map(|change| {
