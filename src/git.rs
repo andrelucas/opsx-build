@@ -27,6 +27,32 @@ pub fn current_head<U: Ui>(repo: &Path, ui: &U) -> Result<Option<String>> {
     Ok(Some(output.stdout.trim().to_owned()))
 }
 
+pub fn resolve_commit<U: Ui>(repo: &Path, revision: &str, ui: &U) -> Result<String> {
+    if revision.trim().is_empty() {
+        bail!("rewind revision cannot be empty");
+    }
+    let expression = format!("{revision}^{{commit}}");
+    let spec = CommandSpec::new("git", repo).args([
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        &expression,
+    ]);
+    let output = ProcessRunner::new(ui)
+        .checked(&spec, "Resolving rewind target")
+        .with_context(|| format!("Git revision `{revision}` does not resolve to a commit"))?;
+    Ok(output.stdout.trim().to_owned())
+}
+
+pub fn hard_reset<U: Ui>(repo: &Path, commit: &str, ui: &U) -> Result<()> {
+    ProcessRunner::new(ui)
+        .checked(
+            &CommandSpec::new("git", repo).args(["reset", "--hard", commit]),
+            "Rewinding tracked repository state",
+        )
+        .map(|_| ())
+}
+
 pub fn untracked_paths<U: Ui>(repo: &Path, ui: &U) -> Result<Vec<String>> {
     let spec =
         CommandSpec::new("git", repo).args(["ls-files", "--others", "--exclude-standard", "-z"]);
@@ -593,6 +619,32 @@ mod tests {
         git(&repo, &["commit", "-qm", "replacement history"]);
         assert!(!head_descends_from(&repo, &baseline, &ui).unwrap());
 
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rewind_resolves_a_tag_and_preserves_untracked_files() {
+        let repo = fixture();
+        let ui = TerminalUi::new(false, false, false);
+        git(&repo, &["tag", "post-bootstrap"]);
+        let target = resolve_commit(&repo, "post-bootstrap", &ui).unwrap();
+
+        fs::write(repo.join("tracked.txt"), "later committed work\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "later slice"]);
+        fs::write(repo.join("scratch.txt"), "keep me\n").unwrap();
+
+        hard_reset(&repo, &target, &ui).unwrap();
+
+        assert_eq!(current_head(&repo, &ui).unwrap().as_deref(), Some(&*target));
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "committed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("scratch.txt")).unwrap(),
+            "keep me\n"
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 }

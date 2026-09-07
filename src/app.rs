@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -27,8 +28,9 @@ use crate::{
     cli::Cli,
     git::{
         SliceBaseline, baseline_matches_except, capture_slice_baseline, committed_paths_since,
-        current_head, head_descends_from, legacy_metadata_dir, metadata_dir,
+        current_head, hard_reset, head_descends_from, legacy_metadata_dir, metadata_dir,
         release_slice_baseline, remove_metadata, repository_root, reset_to_slice_baseline,
+        resolve_commit, untracked_paths,
     },
     model_confusions::ensure_model_confusion_plugin,
     openspec::{
@@ -53,6 +55,36 @@ const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_FRONTIER_REPLANS: u32 = 3;
 const MAX_TERMINAL_REMEDIATIONS: u32 = 3;
+
+fn stage_after_propose(yolo: bool) -> Stage {
+    if yolo {
+        Stage::Apply
+    } else {
+        Stage::ProposalCommit
+    }
+}
+
+fn displayed_stage_position(
+    stage: Stage,
+    has_agenda: bool,
+    terminal_frontier: bool,
+    yolo: bool,
+) -> (usize, usize) {
+    let (mut number, mut total) = if terminal_frontier {
+        (stage.number(), TOTAL_STAGES)
+    } else if has_agenda {
+        (stage.number() - 1, AGENDA_TOTAL_STAGES)
+    } else {
+        (stage.number(), TOTAL_STAGES)
+    };
+    if yolo {
+        total -= 1;
+        if stage.number() > Stage::ProposalCommit.number() {
+            number -= 1;
+        }
+    }
+    (number, total)
+}
 
 pub struct App<U: Ui> {
     cli: Cli,
@@ -282,6 +314,10 @@ impl<U: Ui> App<U> {
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let product_repo = repository_root(&requested_repo, &self.ui)?;
+        if self.cli.request == "rewind" {
+            self.ui.banner(&product_repo.display().to_string());
+            return self.rewind(&product_repo);
+        }
         let mut sidecar = load_association(&product_repo, &self.ui)?;
         if self.cli.sidecar
             && sidecar.is_none()
@@ -323,9 +359,11 @@ impl<U: Ui> App<U> {
                     "Install Claude workflows: {}",
                     plan.init_command().display()
                 ));
-                self.ui.info(
-                    "Run local Propose, proposal commit, Apply, Verify/repair, Archive, product commit, and sidecar archive commit",
-                );
+                self.ui.info(if self.cli.yolo {
+                    "Run local Propose, Apply, Verify/repair, Archive, product commit, and sidecar archive commit (YOLO: no proposal commit)"
+                } else {
+                    "Run local Propose, proposal commit, Apply, Verify/repair, Archive, product commit, and sidecar archive commit"
+                });
                 return Ok(());
             }
             prerequisite_exists("openspec", &product_repo, &self.ui)?;
@@ -418,6 +456,10 @@ impl<U: Ui> App<U> {
                 "Bootstrap planner: {}",
                 connection_description(&frontier_launcher)
             ));
+            if self.cli.yolo {
+                self.ui
+                    .warn("YOLO mode: proposal milestone commits are disabled");
+            }
             return self.run_bootstrap(&repo, &frontier_launcher);
         }
 
@@ -434,6 +476,11 @@ impl<U: Ui> App<U> {
 
         if self.cli.interactive {
             return self.run_interactive(&repo, &launcher);
+        }
+
+        if self.cli.yolo {
+            self.ui
+                .warn("YOLO mode: proposal milestone commits are disabled");
         }
 
         let frontier_launcher = if local_only {
@@ -589,10 +636,15 @@ impl<U: Ui> App<U> {
                     && planning_status(repo, &assignment.change, &self.ui)?.is_complete
                 {
                     self.ui.info(&format!(
-                        "Assigned change `{}` already has complete planning; continuing at proposal commit",
-                        assignment.change
+                        "Assigned change `{}` already has complete planning; continuing at {}",
+                        assignment.change,
+                        if self.cli.yolo {
+                            "Apply"
+                        } else {
+                            "proposal commit"
+                        }
                     ));
-                    Stage::ProposalCommit
+                    stage_after_propose(self.cli.yolo)
                 } else {
                     Stage::Propose
                 };
@@ -665,8 +717,13 @@ impl<U: Ui> App<U> {
             for path in BootstrapScaffold::paths() {
                 self.ui.info(&format!("Create or update `{path}`"));
             }
+            let proposal_commit = if self.cli.yolo {
+                ""
+            } else {
+                ", proposal commit"
+            };
             self.ui.info(&format!(
-                "Run `{BOOTSTRAP_CHANGE}` through Propose, proposal commit, Apply, Verify/repair, Archive, and completion commit on the frontier connection"
+                "Run `{BOOTSTRAP_CHANGE}` through Propose{proposal_commit}, Apply, Verify/repair, Archive, and completion commit on the frontier connection"
             ));
             self.ui.info(
                 "Require an ordered agenda ending at `automation/slices/9999-project-acceptance.md`",
@@ -709,8 +766,14 @@ impl<U: Ui> App<U> {
         let change = select_existing_change(&active_changes, self.cli.change.as_deref())?;
         validate_change_name(&change)?;
         let mut state = RunState::continue_existing(change.clone(), active_changes);
+        state.stage = stage_after_propose(self.cli.yolo);
         self.ui.info(&format!(
-            "Continuing OpenSpec change `{change}`; planning work will be committed if necessary"
+            "Continuing OpenSpec change `{change}`; {}",
+            if self.cli.yolo {
+                "YOLO mode skips the planning commit"
+            } else {
+                "planning work will be committed if necessary"
+            }
         ));
         if self.cli.dry_run {
             return self.print_resume_dry_run(&state, commands);
@@ -735,6 +798,81 @@ impl<U: Ui> App<U> {
         } else {
             self.ui.info("No opsx-build checkpoint exists");
         }
+        Ok(())
+    }
+
+    fn rewind(&self, repo: &Path) -> Result<()> {
+        let revision = self
+            .cli
+            .rewind_target
+            .as_deref()
+            .context("rewind target was not resolved")?;
+        let target = resolve_commit(repo, revision, &self.ui)?;
+        let previous_head = current_head(repo, &self.ui)?;
+        self.ui.info(&format!(
+            "Rewind target `{revision}` resolves to {}",
+            short_hash(&target)
+        ));
+        self.ui.warn(
+            "Rewind discards tracked working-tree changes and moves the current branch; untracked files are preserved",
+        );
+
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — Git and opsx-build metadata will not be changed");
+            self.ui.info(&format!(
+                "Would run: git reset --hard {}",
+                short_hash(&target)
+            ));
+            self.ui
+                .info("Would forget the current opsx-build workflow checkpoint");
+            return Ok(());
+        }
+
+        if !self.cli.yes {
+            if !io::stdin().is_terminal() {
+                bail!("rewind requires confirmation on a terminal; rerun with --yes");
+            }
+            print!(
+                "Rewind this repository to `{revision}` ({})? [y/N] ",
+                short_hash(&target)
+            );
+            io::stdout()
+                .flush()
+                .context("could not display rewind prompt")?;
+            let mut response = String::new();
+            io::stdin()
+                .read_line(&mut response)
+                .context("could not read rewind confirmation")?;
+            if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                self.ui.info("Rewind cancelled; nothing was changed");
+                return Ok(());
+            }
+        }
+
+        hard_reset(repo, &target, &self.ui)?;
+        self.forget_checkpoint(repo)?;
+        self.ui.success(&format!(
+            "Rewound tracked repository state to `{revision}` ({})",
+            short_hash(&target)
+        ));
+        if let Some(previous_head) = previous_head.filter(|head| head != &target) {
+            self.ui.info(&format!(
+                "Previous HEAD was {}; it remains recoverable through Git's reflog",
+                short_hash(&previous_head)
+            ));
+        }
+        let untracked = untracked_paths(repo, &self.ui)?;
+        if !untracked.is_empty() {
+            self.ui.warn(&format!(
+                "Preserved {} untracked path(s); inspect them before restarting",
+                untracked.len()
+            ));
+        }
+        self.ui.info(&format!(
+            "Restart with: opsx-build --repo {} --loop advance",
+            shell_quote(&repo.to_string_lossy())
+        ));
         Ok(())
     }
 
@@ -1467,6 +1605,12 @@ impl<U: Ui> App<U> {
         self.ui.change_name(state.change.as_deref());
 
         loop {
+            if self.cli.yolo && state.stage == Stage::ProposalCommit {
+                self.ui
+                    .warn("YOLO mode: skipping the proposal milestone commit");
+                state.stage = Stage::Apply;
+                persist_state(repo, &state, &self.ui)?;
+            }
             if state.too_large.is_some() {
                 return Ok(WorkflowOutcome::TooLarge(state));
             }
@@ -1494,13 +1638,12 @@ impl<U: Ui> App<U> {
             } else {
                 "worker"
             };
-            let (stage_number, total_stages) = if use_terminal_frontier {
-                (state.stage.number(), TOTAL_STAGES)
-            } else if state.agenda.is_some() {
-                (state.stage.number() - 1, AGENDA_TOTAL_STAGES)
-            } else {
-                (state.stage.number(), TOTAL_STAGES)
-            };
+            let (stage_number, total_stages) = displayed_stage_position(
+                state.stage,
+                state.agenda.is_some(),
+                use_terminal_frontier,
+                self.cli.yolo,
+            );
             self.ui.stage(
                 stage_number,
                 total_stages,
@@ -1773,7 +1916,7 @@ impl<U: Ui> App<U> {
                     .warn(&format!("Could not rename planning session: {error}"));
             }
             state.planning_session = None;
-            state.stage = state.stage.after_ready()?;
+            state.stage = stage_after_propose(self.cli.yolo);
             persist_state(repo, state, &self.ui)?;
             return Ok(());
         }
@@ -2241,8 +2384,13 @@ impl<U: Ui> App<U> {
                 commands.propose
             ));
         }
-        self.ui
-            .info("Ask Claude in a fresh session to create proposal milestone commit");
+        if self.cli.yolo {
+            self.ui
+                .warn("YOLO mode: skip the proposal milestone commit");
+        } else {
+            self.ui
+                .info("Ask Claude in a fresh session to create proposal milestone commit");
+        }
         self.ui.info(&format!("Apply: {}", commands.apply));
         self.ui.info(&format!(
             "Verify/repair: {} / {}",
@@ -2275,8 +2423,16 @@ impl<U: Ui> App<U> {
     fn print_resume_dry_run(&self, state: &RunState, commands: &SkillCommands) -> Result<()> {
         self.ui
             .warn("DRY RUN — checkpoint and repository will not be changed");
-        self.ui
-            .info(&format!("Next stage: {}", state.stage.title()));
+        let next_stage = if self.cli.yolo && state.stage == Stage::ProposalCommit {
+            Stage::Apply
+        } else {
+            state.stage
+        };
+        self.ui.info(&format!("Next stage: {}", next_stage.title()));
+        if self.cli.yolo && state.stage == Stage::ProposalCommit {
+            self.ui
+                .warn("YOLO mode: the saved proposal commit stage would be skipped");
+        }
         if let Some(campaign) = &state.campaign {
             self.ui.info(&format!(
                 "Campaign iteration {}; {} completed change(s); continue after this workflow",
@@ -2288,7 +2444,7 @@ impl<U: Ui> App<U> {
             self.ui
                 .info(&format!("Pending one-shot direction: {direction}"));
         }
-        if matches!(state.stage, Stage::Apply | Stage::Repair | Stage::Verify) {
+        if matches!(next_stage, Stage::Apply | Stage::Repair | Stage::Verify) {
             self.ui
                 .info(&format!("Implementation workflow: {}", commands.apply));
             self.ui
@@ -3384,6 +3540,32 @@ mod tests {
         assert_eq!(state.change.as_deref(), Some("test-infrastructure"));
         assert_eq!(state.stage, Stage::ProposalCommit);
         assert!(state.planning_session.is_none());
+    }
+
+    #[test]
+    fn yolo_skips_the_proposal_commit_stage() {
+        assert_eq!(stage_after_propose(false), Stage::ProposalCommit);
+        assert_eq!(stage_after_propose(true), Stage::Apply);
+    }
+
+    #[test]
+    fn yolo_stage_numbers_omit_the_proposal_commit() {
+        assert_eq!(
+            displayed_stage_position(Stage::Propose, true, false, true),
+            (1, 5)
+        );
+        assert_eq!(
+            displayed_stage_position(Stage::Apply, true, false, true),
+            (2, 5)
+        );
+        assert_eq!(
+            displayed_stage_position(Stage::FinalCommit, true, false, true),
+            (5, 5)
+        );
+        assert_eq!(
+            displayed_stage_position(Stage::FinalCommit, true, false, false),
+            (6, 6)
+        );
     }
 
     #[test]

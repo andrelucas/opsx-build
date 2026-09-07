@@ -8,11 +8,18 @@ runs each Claude/OpenSpec phase, records the next phase in local metadata, and
 lets the repository, OpenSpec artifacts, and Claude do their own jobs.
 
 During an ordinary run it deliberately does **not** infer file ownership,
-fingerprint dirty files, or police Git HEAD. Claude creates the two milestone
-commits under explicit non-destructive instructions. The one deliberate
-exception is frontier escalation: before Propose, opsx-build records a private
-rollback baseline so a failed oversized local attempt can be discarded without
-rejecting or losing pre-existing staged, unstaged, or untracked work.
+fingerprint dirty files, or police Git HEAD. By default, Claude creates proposal
+and completion milestone commits under explicit non-destructive instructions.
+Development runs can use `--yolo` to skip the proposal commit and retain only
+the completion commit. This saves one fresh Claude invocation per change, at
+the cost of losing the convenient committed plan to which Apply work can be
+selectively reverted. It does not disable the private pre-Propose rollback
+baseline used for frontier recovery, and it does not weaken the final commit.
+`--no-yolo` restores the safe default for a run when `yolo = true` is set in
+the configuration file. The one deliberate exception is frontier escalation:
+before Propose, opsx-build records a private rollback baseline so a failed
+oversized local attempt can be discarded without rejecting or losing
+pre-existing staged, unstaged, or untracked work.
 
 `opsx-build` bundles the canonical `explore-unattended` and
 `propose-unattended` Claude skills. Before a workflow starts, it installs
@@ -137,6 +144,39 @@ either already exists. The selected OpenSpec profile must expose Propose,
 Apply, Verify, and Archive actions; if it does not, enable those actions and run
 `openspec update` before resuming.
 
+## Rewind to post-bootstrap
+
+A tag made after bootstrap is a complete restart boundary: the committed tree
+contains the project context, OpenSpec history, and ordered agenda. The old
+`.git/opsx-build/last-run.json` must not be restored because its sessions,
+current stage, and campaign history describe the discarded run. A fresh
+campaign can infer its first slice from the tagged repository state.
+
+If the boundary is tagged `post-bootstrap`, rewind with:
+
+```sh
+opsx-build --repo ~/git/my-project rewind
+```
+
+An explicit tag, branch, or commit may be supplied as the second positional
+argument:
+
+```sh
+opsx-build --repo ~/git/my-project rewind my-bootstrap-baseline
+```
+
+The command resolves and displays the exact target commit, warns that tracked
+working-tree changes and later branch history will be discarded, and asks for
+confirmation. Use `--dry-run` to inspect the target without changing anything,
+or `--yes` for a non-interactive invocation. After resetting tracked state it
+releases the current rollback baseline, forgets the stale workflow checkpoint,
+and prints the command for starting a new `--loop advance` campaign. The old
+HEAD remains recoverable through Git's reflog.
+
+Rewind deliberately preserves untracked files because they may be user-owned.
+It reports their count after the reset. Inspect them with `git clean -nd` and
+remove them separately only when they are known to be disposable.
+
 ## Bounded changes with an external sidecar
 
 For a brownfield product that should not acquire OpenSpec scaffolding, create a
@@ -165,27 +205,27 @@ interrupted after OpenSpec creates the native store, rerunning the same command
 recognizes and completes that exact partial setup.
 
 Sidecar operation skips Explore: the supplied brief and exact `--change` name
-are the bounded assignment. The worker connection performs Propose, proposal
-commit, Apply, Verify/repair, Archive, and both final commits. Claude runs with
-the planning repository as its working directory and the product checkout via
-Claude Code's `--add-dir`; prompts direct it to keep OpenSpec artifacts in the
-sidecar, make code/test/documentation edits in the product, read the product's
-own `CLAUDE.md`, and inspect only paths and symbols relevant to the requested
-change. Sidecar workflows are local-only in this initial release even if the
-explicit `--local-only` flag is omitted: `TOO_LARGE` stops with its checkpoint
-and diagnostic rather than invoking a frontier model. The dashboard removes
-the frontier action for such a run.
+are the bounded assignment. The worker connection performs Propose, an optional
+proposal commit, Apply, Verify/repair, Archive, and both final commits. Claude
+runs with the planning repository as its working directory and the product
+checkout via Claude Code's `--add-dir`; prompts direct it to keep OpenSpec
+artifacts in the sidecar, make code/test/documentation edits in the product,
+read the product's own `CLAUDE.md`, and inspect only paths and symbols relevant
+to the requested change. Sidecar workflows are local-only in this initial
+release even if the explicit `--local-only` flag is omitted: `TOO_LARGE` stops
+with its checkpoint and diagnostic rather than invoking a frontier model. The
+dashboard removes the frontier action for such a run.
 
-The proposal milestone is committed only in the planning repository with
-subject `openspec: propose <change>` and a concise body summarizing the planned
-scope and acceptance criteria. After successful verification and archival,
-Claude commits product changes in the product repository with subject
-`openspec: complete <change>` and a body summarizing delivered behavior and
-actual validation. It then commits the archived planning state in the sidecar
-as `openspec: archive <change>`, with a short archive summary and the product
-commit recorded in a trailer. Existing unrelated work remains Claude's
-responsibility to preserve; opsx-build does not impose a clean-tree requirement
-or infer path ownership.
+Unless `--yolo` is active, the proposal milestone is committed only in the
+planning repository with subject `openspec: propose <change>` and a concise body
+summarizing the planned scope and acceptance criteria. After successful
+verification and archival, Claude commits product changes in the product
+repository with subject `openspec: complete <change>` and a body summarizing
+delivered behavior and actual validation. It then commits the archived planning
+state in the sidecar as `openspec: archive <change>`, with a short archive
+summary and the product commit recorded in a trailer. Existing unrelated work
+remains Claude's responsibility to preserve; opsx-build does not impose a
+clean-tree requirement or infer path ownership.
 
 Resume from the product checkout as usual; the private association locates the
 sidecar and the checkpoint records both roots:
@@ -540,14 +580,14 @@ baseline and are not copied or cleaned.
 At proposal and completion milestones, Claude is instructed to inspect status,
 history, and diffs; commit only work belonging to the OpenSpec change; preserve
 unrelated work; and never reset, stash, restore, discard, amend, or rewrite
-history. Stable milestone subjects are followed by concise OpenSpec-derived
-bodies: planned scope and acceptance criteria for proposal commits, then
-delivered behavior and checks that actually ran for completion commits. If the
-body needs a second paragraph, it is separated by a blank line; body lines are
-wrapped at 72 columns. File/task inventories and exhaustive implementation
-mechanics are excluded so the result reads as a conventional Git history. If
-the relevant work is already committed, Claude may report success without
-manufacturing an empty commit.
+history. `--yolo` omits the proposal milestone entirely. Stable milestone
+subjects are followed by concise OpenSpec-derived bodies: planned scope and
+acceptance criteria for proposal commits, then delivered behavior and checks
+that actually ran for completion commits. If the body needs a second paragraph,
+it is separated by a blank line; body lines are wrapped at 72 columns. File/task
+inventories and exhaustive implementation mechanics are excluded so the result
+reads as a conventional Git history. If the relevant work is already committed,
+Claude may report success without manufacturing an empty commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
@@ -567,6 +607,8 @@ local_worker_timeout_minutes = 60
 # Optional campaign defaults:
 # loop = true
 # max_iterations = 20
+# Skip the per-change proposal commit while retaining final commits and rollback.
+# yolo = true
 # Optional bounded brownfield defaults:
 # sidecar = true
 # sidecar_root = "/absolute/path/to/sidecars"

@@ -16,12 +16,15 @@ const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub request: String,
+    pub rewind_target: Option<String>,
+    pub yes: bool,
     pub bootstrap_context: Option<PathBuf>,
     pub bootstrap_defines: BTreeMap<String, String>,
     pub repo: PathBuf,
     pub sidecar: bool,
     pub sidecar_root: Option<PathBuf>,
     pub local_only: bool,
+    pub yolo: bool,
     pub interactive: bool,
     pub test_connection: Option<String>,
     pub update_skills: bool,
@@ -91,6 +94,26 @@ impl Cli {
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
+        if cli.rewind_target.is_some() && cli.request != "rewind" {
+            anyhow::bail!("a rewind target is only valid with `opsx-build rewind [REF]`");
+        }
+        if cli.yes && cli.request != "rewind" {
+            anyhow::bail!("--yes is only valid with `opsx-build rewind [REF]`");
+        }
+        if cli.request == "rewind"
+            && (cli.bootstrap_context.is_some()
+                || !cli.bootstrap_defines.is_empty()
+                || cli.interactive
+                || cli.test_connection.is_some()
+                || cli.update_skills
+                || cli.resume
+                || cli.forget
+                || cli.continue_existing
+                || cli.change.is_some()
+                || cli.direction.is_some())
+        {
+            anyhow::bail!("`opsx-build rewind` cannot be combined with another workflow mode");
+        }
         if command_line_max_iterations && !cli.loop_workflow {
             anyhow::bail!("--max-iterations requires --loop (or `loop = true` in config)");
         }
@@ -164,8 +187,15 @@ impl Cli {
     about = "Build an OpenSpec change through synchronous Claude stages"
 )]
 struct CliArgs {
-    /// Change request, `advance`, or `bootstrap`. Defaults to `advance`.
+    /// Change request, `advance`, `bootstrap`, or `rewind`. Defaults to `advance`.
     request: Option<String>,
+
+    /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
+    rewind_target: Option<String>,
+
+    /// Confirm a destructive rewind without prompting.
+    #[arg(long)]
+    yes: bool,
 
     /// Markdown project context used by `opsx-build bootstrap`.
     #[arg(long, value_name = "PATH")]
@@ -190,6 +220,14 @@ struct CliArgs {
     /// Use only the worker connection and never invoke frontier fallback.
     #[arg(long, env = "OPSX_BUILD_LOCAL_ONLY")]
     local_only: bool,
+
+    /// Skip proposal milestone commits, retaining only the final completion commit.
+    #[arg(long, env = "OPSX_BUILD_YOLO", conflicts_with = "no_yolo")]
+    yolo: bool,
+
+    /// Restore proposal milestone commits when yolo is enabled in configuration.
+    #[arg(long)]
+    no_yolo: bool,
 
     /// Open an interactive Claude session instead of running the OpenSpec workflow.
     #[arg(long)]
@@ -400,6 +438,7 @@ struct FileConfig {
     sidecar: Option<bool>,
     sidecar_root: Option<PathBuf>,
     local_only: Option<bool>,
+    yolo: Option<bool>,
     #[serde(rename = "loop")]
     loop_workflow: Option<bool>,
     max_iterations: Option<std::num::NonZeroU32>,
@@ -513,6 +552,7 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
         std::num::NonZeroU32
     );
     override_from_legacy!(loop_workflow, "OSPX_BUILD_LOOP", bool);
+    override_from_legacy!(yolo, "OSPX_BUILD_YOLO", bool);
     override_from_legacy!(
         max_iterations,
         "OSPX_BUILD_MAX_ITERATIONS",
@@ -641,14 +681,26 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         }
         None => "advance".to_owned(),
     };
+    let rewind_target = if request == "rewind" {
+        Some(
+            args.rewind_target
+                .clone()
+                .unwrap_or_else(|| "post-bootstrap".to_owned()),
+        )
+    } else {
+        args.rewind_target.clone()
+    };
     Ok(Cli {
         request,
+        rewind_target,
+        yes: args.yes,
         bootstrap_context: args.context,
         bootstrap_defines,
         repo: args.repo,
         sidecar: args.sidecar || config.sidecar.unwrap_or(false),
         sidecar_root: args.sidecar_root.or(config.sidecar_root),
         local_only: args.local_only || config.local_only.unwrap_or(false),
+        yolo: !args.no_yolo && (args.yolo || config.yolo.unwrap_or(false)),
         interactive: args.interactive,
         test_connection: args.test_connection,
         update_skills: args.update_skills,
@@ -1070,6 +1122,7 @@ mod tests {
                 max_output_retries = 7
                 local_worker_timeout_minutes = 45
                 loop = true
+                yolo = true
                 max_iterations = 12
                 permission_mode = "dontAsk"
                 claude_command = "omlx launch claude"
@@ -1095,6 +1148,7 @@ mod tests {
         assert_eq!(cli.max_output_retries, 7);
         assert_eq!(cli.local_worker_timeout_minutes, 45);
         assert!(cli.loop_workflow);
+        assert!(cli.yolo);
         assert_eq!(cli.max_iterations, Some(12));
         assert_eq!(cli.permission_mode, "dontAsk");
         assert_eq!(cli.worker_connection.command, "omlx launch claude");
@@ -1421,6 +1475,7 @@ mod tests {
             DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES
         );
         assert!(!cli.loop_workflow);
+        assert!(!cli.yolo);
         assert_eq!(cli.max_iterations, None);
         assert_eq!(cli.permission_mode, DEFAULT_PERMISSION_MODE);
         assert_eq!(cli.worker_connection.command, DEFAULT_CLAUDE_COMMAND);
@@ -1491,6 +1546,44 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn enables_yolo_from_the_command_line() {
+        let cli = Cli::resolve(args(["opsx-build", "--yolo", "advance"])).unwrap();
+        assert!(cli.yolo);
+    }
+
+    #[test]
+    fn rewind_defaults_to_the_post_bootstrap_tag_and_accepts_an_override() {
+        let cli = Cli::resolve(args(["opsx-build", "rewind"])).unwrap();
+        assert_eq!(cli.request, "rewind");
+        assert_eq!(cli.rewind_target.as_deref(), Some("post-bootstrap"));
+        assert!(!cli.yes);
+
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--yes",
+            "rewind",
+            "my-bootstrap-baseline",
+        ]))
+        .unwrap();
+        assert_eq!(cli.rewind_target.as_deref(), Some("my-bootstrap-baseline"));
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn rewind_only_options_are_rejected_for_other_workflows() {
+        assert!(Cli::resolve(args(["opsx-build", "build it", "some-ref"])).is_err());
+        assert!(Cli::resolve(args(["opsx-build", "--yes", "advance"])).is_err());
+    }
+
+    #[test]
+    fn no_yolo_restores_safe_commits_over_a_configured_default() {
+        let config: FileConfig = toml::from_str("yolo = true").unwrap();
+        let cli =
+            resolve_values(args(["opsx-build", "--no-yolo", "advance"]), config, None).unwrap();
+        assert!(!cli.yolo);
     }
 
     #[test]
