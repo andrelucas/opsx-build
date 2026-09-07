@@ -1,6 +1,9 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
+    fs::{self, File},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -24,9 +27,11 @@ const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACT_PERCENT_ENV: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
 const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
 const MISSING_RESULT_EXCERPT_CHARS: usize = 320;
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
+const CONNECTION_TOOL_MARKER: &str = "OPSX_TOOL_ROUNDTRIP_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AWS_BASE_URL",
@@ -77,6 +82,101 @@ impl fmt::Display for ClaudeApiError {
 }
 
 impl Error for ClaudeApiError {}
+
+#[derive(Debug)]
+struct TranscriptCursor {
+    config_dir: Option<PathBuf>,
+    session_id: Uuid,
+    offsets: BTreeMap<PathBuf, u64>,
+}
+
+impl TranscriptCursor {
+    fn capture(repo: &Path, launcher: &ClaudeLauncher, session_id: Uuid) -> Self {
+        let config_dir = claude_config_dir(repo, launcher);
+        let offsets = config_dir
+            .as_deref()
+            .map(|directory| {
+                transcript_paths(directory, session_id)
+                    .into_iter()
+                    .filter_map(|path| {
+                        fs::metadata(&path)
+                            .ok()
+                            .map(|metadata| (path, metadata.len()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            config_dir,
+            session_id,
+            offsets,
+        }
+    }
+
+    fn latest_api_error(&self) -> Option<String> {
+        let directory = self.config_dir.as_deref()?;
+        transcript_paths(directory, self.session_id)
+            .into_iter()
+            .filter_map(|path| self.latest_api_error_in(&path))
+            .next_back()
+    }
+
+    fn latest_api_error_in(&self, path: &Path) -> Option<String> {
+        let mut file = File::open(path).ok()?;
+        let length = file.metadata().ok()?.len();
+        let offset = self.offsets.get(path).copied().unwrap_or(0);
+        file.seek(SeekFrom::Start(if offset <= length { offset } else { 0 }))
+            .ok()?;
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|event| {
+                event
+                    .get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .filter_map(|event| event_api_error(&event))
+            .last()
+    }
+}
+
+fn claude_config_dir(repo: &Path, launcher: &ClaudeLauncher) -> Option<PathBuf> {
+    let configured = launcher
+        .environment
+        .iter()
+        .rev()
+        .find(|variable| variable.name == CLAUDE_CONFIG_DIR_ENV)
+        .map(|variable| variable.value.clone())
+        .or_else(|| {
+            (!launcher
+                .unset_environment
+                .iter()
+                .any(|name| name == CLAUDE_CONFIG_DIR_ENV))
+            .then(|| std::env::var(CLAUDE_CONFIG_DIR_ENV).ok())
+            .flatten()
+        });
+    let path = configured
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    })
+}
+
+fn transcript_paths(config_dir: &Path, session_id: Uuid) -> Vec<PathBuf> {
+    let filename = format!("{session_id}.jsonl");
+    fs::read_dir(config_dir.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join(&filename))
+        .filter(|path| path.is_file())
+        .collect()
+}
 
 pub fn is_missing_terminal_result(error: &anyhow::Error) -> bool {
     error.downcast_ref::<MissingTerminalResult>().is_some()
@@ -390,6 +490,21 @@ pub enum ClaudeOutputFormat {
     StreamJson,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTestMode {
+    Basic,
+    Agentic,
+}
+
+impl fmt::Display for ConnectionTestMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Basic => "basic text probe",
+            Self::Agentic => "agentic tool round-trip",
+        })
+    }
+}
+
 enum ClaudeAttempt {
     Complete(ClaudeResult),
     OutputLimit,
@@ -511,6 +626,7 @@ pub fn build_connection_test_command(
     repo: &Path,
     launcher: &ClaudeLauncher,
     permission_mode: &str,
+    mode: ConnectionTestMode,
 ) -> CommandSpec {
     let mut args = launcher.prefix_args.clone();
     if let Some(model) = &launcher.model {
@@ -519,22 +635,47 @@ pub fn build_connection_test_command(
     args.extend([
         "--print".to_owned(),
         "--output-format".to_owned(),
-        "json".to_owned(),
+        match mode {
+            ConnectionTestMode::Basic => "json",
+            ConnectionTestMode::Agentic => "stream-json",
+        }
+        .to_owned(),
         "--no-session-persistence".to_owned(),
         "--permission-mode".to_owned(),
         permission_mode.to_owned(),
-        format!(
+    ]);
+    let prompt = match mode {
+        ConnectionTestMode::Basic => format!(
             "Connectivity test only. Do not inspect files, invoke tools, or perform any other work. Reply with exactly {CONNECTION_TEST_MARKER}."
         ),
-    ]);
+        ConnectionTestMode::Agentic => {
+            args.extend([
+                "--tools".to_owned(),
+                "Bash".to_owned(),
+                "--max-turns".to_owned(),
+                "3".to_owned(),
+                "--verbose".to_owned(),
+            ]);
+            format!(
+                "Claude Code provider compatibility test. Invoke the Bash tool exactly once with the command `printf '{CONNECTION_TOOL_MARKER}\\n'`. After receiving that tool result, reply with exactly {CONNECTION_TEST_MARKER}. Do not inspect files or perform any other work."
+            )
+        }
+    };
+    args.push(prompt);
     with_launcher_environment(
         CommandSpec::new(&launcher.program, repo).args(args),
         launcher,
     )
 }
 
-pub fn parse_connection_test_output(output: &ProcessOutput) -> Result<String> {
+pub fn parse_connection_test_output(
+    output: &ProcessOutput,
+    mode: ConnectionTestMode,
+) -> Result<String> {
     if !output.success {
+        if let Some(message) = process_output_api_error(output) {
+            return Err(ClaudeApiError(message).into());
+        }
         bail!(
             "Claude connection test failed (exit {}): {}",
             output
@@ -543,7 +684,14 @@ pub fn parse_connection_test_output(output: &ProcessOutput) -> Result<String> {
             diagnostic_text(output)
         );
     }
-    let result = parse_output_values(&output.stdout)
+    let values = parse_output_values(&output.stdout);
+    if let Some(message) = values.iter().rev().find_map(event_api_error) {
+        return Err(ClaudeApiError(message).into());
+    }
+    if mode == ConnectionTestMode::Agentic {
+        validate_connection_tool_round_trip(&values)?;
+    }
+    let result = values
         .into_iter()
         .rev()
         .find(|value| {
@@ -579,6 +727,48 @@ pub fn parse_connection_test_output(output: &ProcessOutput) -> Result<String> {
         );
     }
     Ok(text)
+}
+
+fn validate_connection_tool_round_trip(values: &[Value]) -> Result<()> {
+    let invoked = values.iter().any(|value| {
+        value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && block.get("name").and_then(Value::as_str) == Some("Bash")
+                    && block
+                        .pointer("/input/command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.contains(CONNECTION_TOOL_MARKER))
+            })
+    });
+    let observed = values.iter().any(|value| {
+        value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && block
+                        .get("content")
+                        .is_some_and(|content| content.to_string().contains(CONNECTION_TOOL_MARKER))
+            })
+    });
+    if !invoked {
+        bail!(
+            "Claude transport succeeded, but the model did not invoke the required Bash compatibility probe"
+        );
+    }
+    if !observed {
+        bail!(
+            "Claude invoked the compatibility probe, but no tool result reached the subsequent model turn; the provider's Claude tool-result protocol is not usable"
+        );
+    }
+    Ok(())
 }
 
 fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> CommandSpec {
@@ -775,6 +965,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         } else {
             ClaudeOutputFormat::Json
         };
+        let transcript = TranscriptCursor::capture(self.repo, self.launcher, session_id(session));
         let mut use_schema = true;
         let mut first_attempt = true;
         let output = loop {
@@ -834,7 +1025,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                     ClaudeOutputFormat::Json | ClaudeOutputFormat::Text => ClaudeOutputFormat::Text,
                 };
                 if output_format == previous {
-                    bail!("Claude stage failed: {}", diagnostic_text(&output));
+                    return Err(claude_stage_failure(&output, &transcript));
                 }
                 if output_format == ClaudeOutputFormat::Text {
                     use_schema = false;
@@ -846,7 +1037,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                 ));
                 continue;
             }
-            bail!("Claude stage failed: {}", diagnostic_text(&output));
+            return Err(claude_stage_failure(&output, &transcript));
         };
 
         let result = match output_format {
@@ -1185,6 +1376,26 @@ fn event_api_error(event: &Value) -> Option<String> {
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .find_map(api_error_message)
         })
+}
+
+fn process_output_api_error(output: &ProcessOutput) -> Option<String> {
+    parse_output_values(&output.stdout)
+        .iter()
+        .rev()
+        .find_map(event_api_error)
+        .or_else(|| api_error_message(&output.stdout))
+        .or_else(|| api_error_message(&output.stderr))
+}
+
+fn claude_stage_failure(output: &ProcessOutput, transcript: &TranscriptCursor) -> anyhow::Error {
+    let api_error = process_output_api_error(output).or_else(|| transcript.latest_api_error());
+    match api_error {
+        Some(message) => anyhow::anyhow!(
+            "Claude stage failed: Claude API error: {message}\nSecondary Claude CLI diagnostic: {}",
+            diagnostic_text(output)
+        ),
+        None => anyhow::anyhow!("Claude stage failed: {}", diagnostic_text(output)),
+    }
 }
 
 fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
@@ -1896,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn constructs_a_minimal_non_persistent_connection_test() {
+    fn constructs_a_basic_non_persistent_connection_test() {
         let launcher = ClaudeLauncher::parse(
             "omlx launch claude",
             Some("test-model".to_owned()),
@@ -1906,7 +2117,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let command = build_connection_test_command(Path::new("/repo"), &launcher, "auto");
+        let command = build_connection_test_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            ConnectionTestMode::Basic,
+        );
 
         assert_eq!(command.program, "omlx");
         assert!(
@@ -1933,6 +2149,51 @@ mod tests {
     }
 
     #[test]
+    fn constructs_a_bounded_agentic_connection_test() {
+        let launcher = ClaudeLauncher::parse(
+            "claude",
+            Some("test-model".to_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let command = build_connection_test_command(
+            Path::new("/repo"),
+            &launcher,
+            "auto",
+            ConnectionTestMode::Agentic,
+        );
+
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--output-format", "stream-json"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--max-turns", "3"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--tools", "Bash"])
+        );
+        assert!(command.args.iter().any(|arg| arg == "--verbose"));
+        assert!(
+            command
+                .args
+                .last()
+                .is_some_and(|prompt| prompt.contains(CONNECTION_TOOL_MARKER))
+        );
+    }
+
+    #[test]
     fn parses_a_machine_readable_connection_test_response() {
         let output = ProcessOutput {
             success: true,
@@ -1941,7 +2202,7 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(
-            parse_connection_test_output(&output).unwrap(),
+            parse_connection_test_output(&output, ConnectionTestMode::Basic).unwrap(),
             CONNECTION_TEST_MARKER
         );
 
@@ -1951,7 +2212,9 @@ mod tests {
             stdout: r#"{"is_error":false,"subtype":"success","terminal_reason":"completed","stop_reason":"end_turn","result":""}"#.to_owned(),
             stderr: String::new(),
         };
-        let completed_error = parse_connection_test_output(&completed_without_text).unwrap_err();
+        let completed_error =
+            parse_connection_test_output(&completed_without_text, ConnectionTestMode::Basic)
+                .unwrap_err();
         assert!(
             completed_error
                 .to_string()
@@ -1966,7 +2229,7 @@ mod tests {
             stderr: String::new(),
         };
         assert!(
-            parse_connection_test_output(&unexplained_empty)
+            parse_connection_test_output(&unexplained_empty, ConnectionTestMode::Basic)
                 .unwrap_err()
                 .to_string()
                 .contains("unexplained empty model response")
@@ -1979,11 +2242,115 @@ mod tests {
             stderr: String::new(),
         };
         assert!(
-            parse_connection_test_output(&error)
+            parse_connection_test_output(&error, ConnectionTestMode::Basic)
                 .unwrap_err()
                 .to_string()
                 .contains("authentication failed")
         );
+
+        let failed_stream = ProcessOutput {
+            success: false,
+            code: Some(1),
+            stdout: r#"{"type":"assistant","message":{"content":[{"type":"text","text":"API Error: provider rejected tool result"}]}}"#.to_owned(),
+            stderr: "[claude-code:unrecognized_model] custom/model".to_owned(),
+        };
+        let failed_error =
+            parse_connection_test_output(&failed_stream, ConnectionTestMode::Agentic)
+                .unwrap_err()
+                .to_string();
+        assert!(failed_error.contains("Claude API error: provider rejected tool result"));
+        assert!(!failed_error.contains("unrecognized_model"));
+    }
+
+    #[test]
+    fn validates_an_agentic_connection_tool_round_trip() {
+        let output = ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: format!(
+                concat!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"printf '{tool}\\n'"}}}}]}}}}"#,
+                    "\n",
+                    r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":"{tool}"}}]}}}}"#,
+                    "\n",
+                    r#"{{"type":"result","is_error":false,"result":"{result}"}}"#
+                ),
+                tool = CONNECTION_TOOL_MARKER,
+                result = CONNECTION_TEST_MARKER,
+            ),
+            stderr: String::new(),
+        };
+
+        assert_eq!(
+            parse_connection_test_output(&output, ConnectionTestMode::Agentic).unwrap(),
+            CONNECTION_TEST_MARKER
+        );
+
+        let missing_result = ProcessOutput {
+            stdout: output.stdout.lines().next().unwrap().to_owned()
+                + &format!(
+                    "\n{{\"type\":\"result\",\"is_error\":false,\"result\":\"{CONNECTION_TEST_MARKER}\"}}"
+                ),
+            ..output
+        };
+        assert!(
+            parse_connection_test_output(&missing_result, ConnectionTestMode::Agentic)
+                .unwrap_err()
+                .to_string()
+                .contains("no tool result reached")
+        );
+    }
+
+    #[test]
+    fn transcript_cursor_reports_only_api_errors_appended_after_capture() {
+        use std::{fs::OpenOptions, io::Write as _};
+
+        let session_id = Uuid::new_v4();
+        let config_dir = std::env::temp_dir().join(format!("opsx-transcript-{session_id}"));
+        let project_dir = config_dir.join("projects/project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"API Error: stale"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut launcher = ClaudeLauncher::parse("claude", None, None, None, None, None).unwrap();
+        launcher.environment.push(LauncherEnvironment {
+            name: CLAUDE_CONFIG_DIR_ENV.to_owned(),
+            value: config_dir.display().to_string(),
+            redacted: false,
+        });
+        let cursor = TranscriptCursor::capture(Path::new("/repo"), &launcher, session_id);
+        assert_eq!(cursor.latest_api_error(), None);
+
+        writeln!(
+            OpenOptions::new().append(true).open(&transcript).unwrap(),
+            r#"{{"type":"assistant","isApiErrorMessage":true,"message":{{"content":[{{"type":"text","text":"API Error: provider rejected tool result"}}]}}}}"#
+        )
+        .unwrap();
+        assert_eq!(
+            cursor.latest_api_error().as_deref(),
+            Some("provider rejected tool result")
+        );
+        let surfaced = claude_stage_failure(
+            &ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "[claude-code:unrecognized_model] custom/model".to_owned(),
+            },
+            &cursor,
+        )
+        .to_string();
+        assert!(surfaced.contains("Claude API error: provider rejected tool result"));
+        assert!(surfaced.contains("Secondary Claude CLI diagnostic"));
+        assert!(surfaced.contains("unrecognized_model"));
+
+        fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]

@@ -20,9 +20,9 @@ use crate::{
         instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
     },
     claude::{
-        CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat, SessionMode,
-        SkillCommands, StageProtocol, StageSignal, build_claude_command,
-        build_connection_test_command, build_interactive_claude_command,
+        CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat,
+        ConnectionTestMode, SessionMode, SkillCommands, StageProtocol, StageSignal,
+        build_claude_command, build_connection_test_command, build_interactive_claude_command,
         is_missing_terminal_result, parse_connection_test_output, stage_prompt,
     },
     cli::Cli,
@@ -2480,9 +2480,15 @@ impl<U: Ui> App<U> {
 
     fn run_connection_test(&self, repo: &Path, launcher: &ClaudeLauncher) -> Result<()> {
         let connection = connection_description(launcher);
-        let command = build_connection_test_command(repo, launcher, &self.cli.permission_mode);
+        let mode = if self.cli.basic_connection_test {
+            ConnectionTestMode::Basic
+        } else {
+            ConnectionTestMode::Agentic
+        };
+        let command =
+            build_connection_test_command(repo, launcher, &self.cli.permission_mode, mode);
         self.ui
-            .info(&format!("Testing Claude connection {connection}"));
+            .info(&format!("Testing Claude connection {connection} ({mode})"));
         self.ui
             .debug(&format!("connection test command: {}", command.display()));
         if self.cli.dry_run {
@@ -2493,7 +2499,7 @@ impl<U: Ui> App<U> {
         }
 
         let output = ProcessRunner::new(&self.ui).run(&command, "Waiting for model response")?;
-        let response = parse_connection_test_output(&output)?;
+        let response = parse_connection_test_output(&output, mode)?;
         if response == CONNECTION_TEST_MARKER {
             self.ui
                 .success(&format!("Connection {connection} responded successfully"));

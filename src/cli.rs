@@ -27,6 +27,7 @@ pub struct Cli {
     pub yolo: bool,
     pub interactive: bool,
     pub test_connection: Option<String>,
+    pub basic_connection_test: bool,
     pub update_skills: bool,
     pub resume: bool,
     pub forget: bool,
@@ -233,7 +234,7 @@ struct CliArgs {
     #[arg(long)]
     interactive: bool,
 
-    /// Send one minimal prompt through a named Claude connection and exit.
+    /// Exercise a named Claude connection, including one tool-result round trip, and exit.
     #[arg(
         long,
         value_name = "NAME",
@@ -253,6 +254,10 @@ struct CliArgs {
         ]
     )]
     test_connection: Option<String>,
+
+    /// Test only a single text response, without exercising Claude tool-result compatibility.
+    #[arg(long, requires = "test_connection")]
+    basic_connection_test: bool,
 
     /// Install or refresh the bundled unattended skills, then exit.
     #[arg(
@@ -703,6 +708,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         yolo: !args.no_yolo && (args.yolo || config.yolo.unwrap_or(false)),
         interactive: args.interactive,
         test_connection: args.test_connection,
+        basic_connection_test: args.basic_connection_test,
         update_skills: args.update_skills,
         resume: args.resume,
         forget: args.forget,
@@ -1688,6 +1694,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.test_connection.as_deref(), Some("openrouter-kimi"));
+        assert!(!cli.basic_connection_test);
         assert!(cli.request.is_empty());
         assert_eq!(
             cli.worker_connection.name.as_deref(),
@@ -1706,6 +1713,25 @@ mod tests {
             ])
             .is_err()
         );
+        let basic = resolve_values(
+            args([
+                "opsx-build",
+                "--test-connection",
+                "openrouter-kimi",
+                "--basic-connection-test",
+            ]),
+            toml::from_str(
+                r#"
+                    [connections.openrouter-kimi]
+                    model = "moonshotai/kimi-k3"
+                "#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(basic.basic_connection_test);
+        assert!(CliArgs::try_parse_from(["opsx-build", "--basic-connection-test"]).is_err());
     }
 
     #[test]

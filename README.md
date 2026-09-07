@@ -450,11 +450,15 @@ Test one named Claude connection without starting an OpenSpec build:
 ```sh
 opsx-build --test-connection openrouter-kimi
 opsx-build --test-connection openrouter-gemini --verbose
+opsx-build --test-connection openrouter-kimi --basic-connection-test
 ```
 
-This sends a minimal no-tools prompt through the profile's configured command,
-environment, and model, verifies Claude's machine-readable result, and exits.
-It requires neither Git nor OpenSpec; `--repo` merely selects an existing
+By default this performs a bounded agentic compatibility test: Claude must run
+one harmless `printf` through its Bash tool, receive the tool result, and then
+return a machine-readable marker. This catches providers that accept an initial
+Claude request but reject Claude Code's subsequent tool-result message. Use
+`--basic-connection-test` for the cheaper legacy single-text-response probe.
+Neither mode requires Git or OpenSpec; `--repo` merely selects an existing
 working directory for the subprocess. `--dry-run` resolves the profile and
 prints its redacted command without contacting the model.
 
@@ -844,6 +848,8 @@ options:
 - `--output-format json` for normal unattended operation;
 - `--input-format stream-json --output-format stream-json --verbose
   --forward-subagent-text` when live streaming is enabled;
+- `--no-session-persistence`, `--max-turns`, and `--tools Bash` for the
+  bounded agentic connection test;
 - preferably `--json-schema`, returning `structured_output` in the final JSON
   result event.
 
@@ -869,6 +875,13 @@ carrying a valid OpenSpec stage status; later slash-command results such as
 `/compact` do not replace the stage result. A launcher may write diagnostics to
 stderr, but should not mix banners or unrelated prose into non-streaming JSON
 stdout.
+
+If a failed Claude process exposes only a secondary stderr diagnostic,
+opsx-build also checks the portion of that session's local Claude transcript
+written during the failed invocation. It extracts only Claude API-error
+messages and ignores older transcript content. The lookup respects
+`CLAUDE_CONFIG_DIR` and otherwise uses Claude Code's normal `~/.claude`
+location; inability to read a transcript is non-fatal.
 
 `--json-schema` is optional for compatibility: if the launcher clearly rejects
 that option before execution, opsx-build retries once using the documented
