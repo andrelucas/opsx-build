@@ -1216,6 +1216,7 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         )
+        .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
@@ -1381,6 +1382,7 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         )
+        .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
         let session = Uuid::new_v4();
         self.present_campaign(&state);
@@ -1551,6 +1553,7 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         )
+        .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
         let claude = if let Some(product) = state.product_repo.as_deref() {
             claude
@@ -1568,6 +1571,7 @@ impl<U: Ui> App<U> {
             self.cli.max_output_retries,
             &self.ui,
         )
+        .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
         let worker_claude = if let Some(product) = state.product_repo.as_deref() {
             worker_claude
@@ -1593,6 +1597,7 @@ impl<U: Ui> App<U> {
                 self.cli.max_output_retries,
                 &self.ui,
             )
+            .with_provider_retries(self.cli.max_provider_retries)
             .with_plugin_dir(&model_confusion_plugin);
             if let Some(product) = state.product_repo.as_deref() {
                 client
@@ -2519,7 +2524,7 @@ impl<U: Ui> App<U> {
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
         self.ui.debug(&format!(
-            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
+            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, max provider retries={}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
             launcher.connection_name,
             launcher.environment_name,
             launcher.program,
@@ -2529,6 +2534,7 @@ impl<U: Ui> App<U> {
             launcher.auto_compact_window,
             launcher.auto_compact_percent,
             launcher.max_output_tokens,
+            self.cli.max_provider_retries,
             launcher
                 .environment
                 .iter()

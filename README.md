@@ -359,14 +359,20 @@ phase requests the same frontier replan; narrow milestone and archive phases
 still fail normally rather than treating protocol trouble as a slice-sizing
 decision.
 
+Recognizable transient provider failures, including HTTP 429, temporary 5xx
+responses, timeouts, and connection resets, resume the same phase and session
+after bounded exponential backoff. This preserves completed tool work without
+restarting the OpenSpec change. `max_provider_retries` controls the number of
+recovery attempts (default 3); set it to `0` to fail immediately. Authentication,
+configuration, model-selection, and terminal-protocol failures are not retried.
+
 If an Explore, Apply, Repair, or Verify turn instead ends normally but omits
 every terminal result, opsx-build treats it as an incomplete phase turn. It
 best-effort compacts and resumes that same session once, preserving partial
 repository work. Worker phases require actual tool use rather than another
 description of intended work; Verify is instructed to report a concrete
-`RETRY` finding rather than repairing implementation. Provider/API errors,
-explicit terminal outcomes, and narrow milestone stages do not use this
-recovery.
+`RETRY` finding rather than repairing implementation. Explicit terminal
+outcomes and narrow milestone stages do not use this incomplete-turn recovery.
 
 ## Campaign loop
 
@@ -607,6 +613,7 @@ The default launcher is `claude`. oMLX Claude mode can be configured with:
 # ~/.config/opsx-build/config.toml
 max_verify_retries = 3
 max_output_retries = 3
+max_provider_retries = 3
 local_worker_timeout_minutes = 60
 # Optional campaign defaults:
 # loop = true

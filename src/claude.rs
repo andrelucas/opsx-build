@@ -5,6 +5,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -29,6 +30,9 @@ const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
+const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
+const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
+const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const MISSING_RESULT_EXCERPT_CHARS: usize = 320;
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CONNECTION_TOOL_MARKER: &str = "OPSX_TOOL_ROUNDTRIP_OK";
@@ -73,11 +77,39 @@ impl fmt::Display for MissingTerminalResult {
 impl Error for MissingTerminalResult {}
 
 #[derive(Debug)]
-struct ClaudeApiError(String);
+struct ClaudeApiError {
+    message: String,
+    secondary_diagnostic: Option<String>,
+    transient: bool,
+}
+
+impl ClaudeApiError {
+    fn new(message: String) -> Self {
+        let transient = api_error_is_transient(&message);
+        Self {
+            message,
+            secondary_diagnostic: None,
+            transient,
+        }
+    }
+
+    fn with_secondary_diagnostic(message: String, diagnostic: String) -> Self {
+        let mut error = Self::new(message);
+        error.secondary_diagnostic = Some(diagnostic);
+        error
+    }
+}
 
 impl fmt::Display for ClaudeApiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Claude API error: {}", self.0)
+        if self.secondary_diagnostic.is_some() {
+            formatter.write_str("Claude stage failed: ")?;
+        }
+        write!(formatter, "Claude API error: {}", self.message)?;
+        if let Some(diagnostic) = &self.secondary_diagnostic {
+            write!(formatter, "\nSecondary Claude CLI diagnostic: {diagnostic}")?;
+        }
+        Ok(())
     }
 }
 
@@ -674,7 +706,7 @@ pub fn parse_connection_test_output(
 ) -> Result<String> {
     if !output.success {
         if let Some(message) = process_output_api_error(output) {
-            return Err(ClaudeApiError(message).into());
+            return Err(ClaudeApiError::new(message).into());
         }
         bail!(
             "Claude connection test failed (exit {}): {}",
@@ -686,7 +718,7 @@ pub fn parse_connection_test_output(
     }
     let values = parse_output_values(&output.stdout);
     if let Some(message) = values.iter().rev().find_map(event_api_error) {
-        return Err(ClaudeApiError(message).into());
+        return Err(ClaudeApiError::new(message).into());
     }
     if mode == ConnectionTestMode::Agentic {
         validate_connection_tool_round_trip(&values)?;
@@ -808,6 +840,8 @@ pub struct ClaudeClient<'a, U: Ui> {
     stream_transport: bool,
     stream_filter: Option<StreamFilter>,
     max_output_retries: u32,
+    max_provider_retries: u32,
+    provider_retry_base_delay: Duration,
     stage_timeout: Option<Duration>,
     additional_dirs: Vec<PathBuf>,
     plugin_dirs: Vec<PathBuf>,
@@ -833,6 +867,8 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             stream_transport: stream_transport || stream_filter.is_some(),
             stream_filter,
             max_output_retries,
+            max_provider_retries: DEFAULT_MAX_PROVIDER_RETRIES,
+            provider_retry_base_delay: PROVIDER_RETRY_BASE_DELAY,
             stage_timeout: None,
             additional_dirs: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -845,6 +881,11 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
     pub fn with_stage_timeout(mut self, timeout: Duration) -> Self {
         self.stream_transport = true;
         self.stage_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_provider_retries(mut self, retries: u32) -> Self {
+        self.max_provider_retries = retries;
         self
     }
 
@@ -888,6 +929,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
         let mut incomplete_stage_recoveries = 0;
+        let mut provider_retries = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -907,6 +949,31 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             );
             match attempt {
                 Err(error)
+                    if is_transient_api_error(&error)
+                        && provider_retries < self.max_provider_retries =>
+                {
+                    provider_retries += 1;
+                    let delay =
+                        provider_retry_delay(self.provider_retry_base_delay, provider_retries);
+                    if remaining.is_some_and(|remaining| delay >= remaining) {
+                        return Err(error.context(
+                            "transient provider failure could not be retried before the stage timeout",
+                        ));
+                    }
+                    self.ui.warn(&format!(
+                        "Transient Claude provider failure; retrying the same session in {} second(s) ({provider_retries}/{})",
+                        delay.as_secs(),
+                        self.max_provider_retries
+                    ));
+                    thread::sleep(delay);
+                    current_session = SessionMode::Resume { id: session_id };
+                    current_prompt = transient_provider_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (provider recovery {provider_retries}/{})",
+                        self.max_provider_retries
+                    );
+                }
+                Err(error)
                     if supports_incomplete_stage_recovery(protocol)
                         && is_missing_terminal_result(&error)
                         && incomplete_stage_recoveries < MAX_INCOMPLETE_STAGE_RECOVERIES =>
@@ -921,6 +988,12 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                     current_activity = format!(
                         "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
                     );
+                }
+                Err(error) if is_transient_api_error(&error) => {
+                    return Err(error.context(format!(
+                        "transient provider failure persisted after {} recovery attempt(s)",
+                        self.max_provider_retries
+                    )));
                 }
                 Err(error) => return Err(error),
                 Ok(ClaudeAttempt::OutputLimit) if output_recoveries < self.max_output_retries => {
@@ -1207,6 +1280,28 @@ fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
     )
 }
 
+fn transient_provider_continuation_prompt(protocol: StageProtocol) -> String {
+    stage_prompt(
+        "",
+        "The preceding model request was interrupted by a transient provider or network failure. Continue the same opsx-build phase in this session from its durable repository and OpenSpec state. Preserve correct partial work, do not create a duplicate change or restart completed tasks, and finish the outstanding work now.",
+        protocol,
+    )
+}
+
+fn provider_retry_delay(base: Duration, attempt: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    base.saturating_mul(multiplier)
+        .min(PROVIDER_RETRY_MAX_DELAY)
+}
+
+fn is_transient_api_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ClaudeApiError>()
+        .is_some_and(|error| error.transient)
+}
+
 fn supports_incomplete_stage_recovery(protocol: StageProtocol) -> bool {
     matches!(protocol, StageProtocol::Worker | StageProtocol::Verify)
 }
@@ -1332,6 +1427,46 @@ fn api_error_message(text: &str) -> Option<String> {
     })
 }
 
+fn api_error_is_transient(message: &str) -> bool {
+    let lowercase = message.to_ascii_lowercase();
+    let transient_language = [
+        "rate limit",
+        "rate_limit",
+        "overloaded",
+        "temporarily unavailable",
+        "temporary failure",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "socket hang up",
+        "econnreset",
+        "etimedout",
+        "fetch failed",
+        "network error",
+    ]
+    .iter()
+    .any(|fragment| lowercase.contains(fragment));
+    transient_language
+        || [408, 425, 429]
+            .into_iter()
+            .chain(500..=599)
+            .any(|status| message_mentions_http_status(&lowercase, status))
+}
+
+fn message_mentions_http_status(message: &str, status: u16) -> bool {
+    [
+        format!("({status})"),
+        format!("[{status}]"),
+        format!("http {status}"),
+        format!("status {status}"),
+        format!("status code {status}"),
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+        || message.trim_start().starts_with(&format!("{status} "))
+}
+
 fn response_excerpt(text: &str) -> Option<String> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -1390,10 +1525,9 @@ fn process_output_api_error(output: &ProcessOutput) -> Option<String> {
 fn claude_stage_failure(output: &ProcessOutput, transcript: &TranscriptCursor) -> anyhow::Error {
     let api_error = process_output_api_error(output).or_else(|| transcript.latest_api_error());
     match api_error {
-        Some(message) => anyhow::anyhow!(
-            "Claude stage failed: Claude API error: {message}\nSecondary Claude CLI diagnostic: {}",
-            diagnostic_text(output)
-        ),
+        Some(message) => {
+            ClaudeApiError::with_secondary_diagnostic(message, diagnostic_text(output)).into()
+        }
         None => anyhow::anyhow!("Claude stage failed: {}", diagnostic_text(output)),
     }
 }
@@ -1419,7 +1553,7 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
         .unwrap_or(false)
     {
         if let Some(message) = api_error_message(&text) {
-            return Err(ClaudeApiError(message).into());
+            return Err(ClaudeApiError::new(message).into());
         }
         bail!("Claude reported an error: {text}");
     }
@@ -1441,7 +1575,7 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
             Some(signal) => signal,
             None => {
                 if let Some(message) = api_error_message(&text) {
-                    return Err(ClaudeApiError(message).into());
+                    return Err(ClaudeApiError::new(message).into());
                 }
                 return Err(MissingTerminalResult::new(
                     "Claude response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker; rerun with --verbose to inspect it",
@@ -1506,12 +1640,12 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if let Some(message) = api_error_message(text) {
-            return Err(ClaudeApiError(message).into());
+            return Err(ClaudeApiError::new(message).into());
         }
         bail!("Claude reported an error: {text}");
     }
     if let Some(message) = events.iter().rev().find_map(event_api_error) {
-        return Err(ClaudeApiError(message).into());
+        return Err(ClaudeApiError::new(message).into());
     }
     let last_response = last_assistant_response(&events).or_else(|| {
         results
@@ -2795,6 +2929,129 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         assert!(is_missing_terminal_result(&error));
         assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn classifies_only_temporary_api_failures_for_retry() {
+        assert!(api_error_is_transient(
+            "Request rejected (429) · Provider returned error"
+        ));
+        assert!(api_error_is_transient("service overloaded"));
+        assert!(api_error_is_transient("upstream returned HTTP 503"));
+        assert!(api_error_is_transient("connection reset by peer"));
+        assert!(!api_error_is_transient("authentication failed (401)"));
+        assert!(!api_error_is_transient(
+            "[claude-code:unrecognized_model] custom/model"
+        ));
+        assert!(!api_error_is_transient(
+            "generation stopped after 500 output tokens"
+        ));
+    }
+
+    #[test]
+    fn provider_retry_delay_is_bounded() {
+        assert_eq!(
+            provider_retry_delay(Duration::from_secs(5), 1),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            provider_retry_delay(Duration::from_secs(5), 2),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            provider_retry_delay(Duration::from_secs(5), 3),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            provider_retry_delay(Duration::from_secs(5), 4),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            provider_retry_delay(Duration::from_secs(5), 20),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_provider_failure_resumes_the_same_session() {
+        let directory = std::env::temp_dir().join(format!("ospx-provider-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let script = directory.join("fake-claude.sh");
+        let source = r#"
+state='__STATE__'
+if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
+case "$count" in
+  0) printf '%s\n' '{"is_error":true,"session_id":"00000000-0000-0000-0000-000000000000","result":"API Error: Request rejected (429) · Provider returned error"}' ;;
+  *) printf '%s\n' '{"is_error":false,"session_id":"00000000-0000-0000-0000-000000000000","structured_output":{"opsx_status":"READY","summary":"continued after throttling"}}' ;;
+esac
+printf '%s\n' "$((count + 1))" > "$state"
+"#
+        .replace("__STATE__", &state.display().to_string());
+        std::fs::write(&script, source).unwrap();
+
+        let launcher = shell_launcher(&script);
+        let ui = QuietUi;
+        let mut client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui)
+            .with_provider_retries(1);
+        client.provider_retry_base_delay = Duration::ZERO;
+        let result = client
+            .invoke(
+                SessionMode::New {
+                    id: Uuid::nil(),
+                    name: None,
+                },
+                "do the work",
+                "Fake Claude stage",
+                StageProtocol::Ready,
+            )
+            .unwrap();
+
+        assert_eq!(result.signal, StageSignal::Ready);
+        assert_eq!(result.text, "continued after throttling");
+        assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "2");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_provider_failure_stops_after_retry_limit() {
+        let directory =
+            std::env::temp_dir().join(format!("ospx-provider-limit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let script = directory.join("fake-claude.sh");
+        let source = r#"
+state='__STATE__'
+if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
+printf '%s\n' '{"is_error":true,"session_id":"00000000-0000-0000-0000-000000000000","result":"API Error: upstream returned HTTP 503"}'
+printf '%s\n' "$((count + 1))" > "$state"
+"#
+        .replace("__STATE__", &state.display().to_string());
+        std::fs::write(&script, source).unwrap();
+
+        let launcher = shell_launcher(&script);
+        let ui = QuietUi;
+        let mut client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui)
+            .with_provider_retries(2);
+        client.provider_retry_base_delay = Duration::ZERO;
+        let error = client
+            .invoke(
+                SessionMode::New {
+                    id: Uuid::nil(),
+                    name: None,
+                },
+                "do the work",
+                "Fake Claude stage",
+                StageProtocol::Ready,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("persisted after 2 recovery attempt(s)"));
+        assert!(format!("{error:#}").contains("upstream returned HTTP 503"));
+        assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "3");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

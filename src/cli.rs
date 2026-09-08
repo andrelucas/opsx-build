@@ -8,6 +8,7 @@ use crate::stream::StreamFilter;
 
 const DEFAULT_MAX_VERIFY_RETRIES: u32 = 3;
 const DEFAULT_MAX_OUTPUT_RETRIES: u32 = 3;
+const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 const DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES: u32 = 60;
 const DEFAULT_PERMISSION_MODE: &str = "auto";
 const DEFAULT_CLAUDE_COMMAND: &str = "claude";
@@ -40,6 +41,7 @@ pub struct Cli {
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
     pub max_output_retries: u32,
+    pub max_provider_retries: u32,
     pub local_worker_timeout_minutes: u32,
     pub verbose: bool,
     pub debug: bool,
@@ -341,6 +343,10 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
     max_output_retries: Option<u32>,
 
+    /// Maximum same-session retries after a transient provider or network failure.
+    #[arg(long, env = "OPSX_BUILD_MAX_PROVIDER_RETRIES", value_name = "N")]
+    max_provider_retries: Option<u32>,
+
     /// Maximum minutes for one local Explore, Propose, Apply, Verify, or Repair stage.
     #[arg(
         long,
@@ -439,6 +445,7 @@ struct CliArgs {
 struct FileConfig {
     max_verify_retries: Option<u32>,
     max_output_retries: Option<u32>,
+    max_provider_retries: Option<u32>,
     local_worker_timeout_minutes: Option<std::num::NonZeroU32>,
     sidecar: Option<bool>,
     sidecar_root: Option<PathBuf>,
@@ -551,6 +558,7 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
 
     override_from_legacy!(max_verify_retries, "OSPX_BUILD_MAX_VERIFY_RETRIES", u32);
     override_from_legacy!(max_output_retries, "OSPX_BUILD_MAX_OUTPUT_RETRIES", u32);
+    override_from_legacy!(max_provider_retries, "OSPX_BUILD_MAX_PROVIDER_RETRIES", u32);
     override_from_legacy!(
         local_worker_timeout_minutes,
         "OSPX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES",
@@ -731,6 +739,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .max_output_retries
             .or(config.max_output_retries)
             .unwrap_or(DEFAULT_MAX_OUTPUT_RETRIES),
+        max_provider_retries: args
+            .max_provider_retries
+            .or(config.max_provider_retries)
+            .unwrap_or(DEFAULT_MAX_PROVIDER_RETRIES),
         local_worker_timeout_minutes: args
             .local_worker_timeout_minutes
             .or(config.local_worker_timeout_minutes)
@@ -1126,6 +1138,7 @@ mod tests {
             r#"
                 max_verify_retries = 5
                 max_output_retries = 7
+                max_provider_retries = 4
                 local_worker_timeout_minutes = 45
                 loop = true
                 yolo = true
@@ -1152,6 +1165,7 @@ mod tests {
 
         assert_eq!(cli.max_verify_retries, 5);
         assert_eq!(cli.max_output_retries, 7);
+        assert_eq!(cli.max_provider_retries, 4);
         assert_eq!(cli.local_worker_timeout_minutes, 45);
         assert!(cli.loop_workflow);
         assert!(cli.yolo);
@@ -1408,6 +1422,7 @@ mod tests {
             r#"
                 max_verify_retries = 5
                 max_output_retries = 6
+                max_provider_retries = 7
                 local_worker_timeout_minutes = 90
                 claude_model = "config-model"
                 frontier_command = "configured-frontier"
@@ -1425,6 +1440,8 @@ mod tests {
                 "2",
                 "--max-output-retries",
                 "4",
+                "--max-provider-retries",
+                "2",
                 "--local-worker-timeout-minutes",
                 "30",
                 "--claude-model",
@@ -1448,6 +1465,7 @@ mod tests {
 
         assert_eq!(cli.max_verify_retries, 2);
         assert_eq!(cli.max_output_retries, 4);
+        assert_eq!(cli.max_provider_retries, 2);
         assert_eq!(cli.local_worker_timeout_minutes, 30);
         assert_eq!(cli.worker_connection.model.as_deref(), Some("cli-model"));
         assert_eq!(cli.frontier_connection.command, "cli-frontier");
@@ -1476,6 +1494,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.max_verify_retries, DEFAULT_MAX_VERIFY_RETRIES);
         assert_eq!(cli.max_output_retries, DEFAULT_MAX_OUTPUT_RETRIES);
+        assert_eq!(cli.max_provider_retries, DEFAULT_MAX_PROVIDER_RETRIES);
         assert_eq!(
             cli.local_worker_timeout_minutes,
             DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES
