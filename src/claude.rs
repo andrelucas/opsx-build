@@ -11,9 +11,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+#[cfg(test)]
 use uuid::Uuid;
 
 use crate::{
+    backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, StageSignal},
     cli::{ClaudeConnection, Cli, ConnectionEnvironmentValue},
     model_confusions::prompt_guidance as model_confusion_guidance,
     process::{
@@ -118,12 +120,12 @@ impl Error for ClaudeApiError {}
 #[derive(Debug)]
 struct TranscriptCursor {
     config_dir: Option<PathBuf>,
-    session_id: Uuid,
+    session_id: SessionId,
     offsets: BTreeMap<PathBuf, u64>,
 }
 
 impl TranscriptCursor {
-    fn capture(repo: &Path, launcher: &ClaudeLauncher, session_id: Uuid) -> Self {
+    fn capture(repo: &Path, launcher: &ClaudeLauncher, session_id: &SessionId) -> Self {
         let config_dir = claude_config_dir(repo, launcher);
         let offsets = config_dir
             .as_deref()
@@ -140,14 +142,14 @@ impl TranscriptCursor {
             .unwrap_or_default();
         Self {
             config_dir,
-            session_id,
+            session_id: session_id.clone(),
             offsets,
         }
     }
 
     fn latest_api_error(&self) -> Option<String> {
         let directory = self.config_dir.as_deref()?;
-        transcript_paths(directory, self.session_id)
+        transcript_paths(directory, &self.session_id)
             .into_iter()
             .filter_map(|path| self.latest_api_error_in(&path))
             .next_back()
@@ -199,7 +201,7 @@ fn claude_config_dir(repo: &Path, launcher: &ClaudeLauncher) -> Option<PathBuf> 
     })
 }
 
-fn transcript_paths(config_dir: &Path, session_id: Uuid) -> Vec<PathBuf> {
+fn transcript_paths(config_dir: &Path, session_id: &SessionId) -> Vec<PathBuf> {
     let filename = format!("{session_id}.jsonl");
     fs::read_dir(config_dir.join("projects"))
         .into_iter()
@@ -446,76 +448,6 @@ fn normalize_command(command: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageSignal {
-    Ready,
-    Done,
-    TooLarge,
-    Verified,
-    Retry,
-    Blocked,
-    Replanned,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageProtocol {
-    Ready,
-    Worker,
-    Propose,
-    Verify,
-    Frontier,
-    TerminalReview,
-}
-
-impl StageProtocol {
-    fn terminal_values(self) -> &'static str {
-        match self {
-            Self::Ready => "READY or BLOCKED",
-            Self::Worker => "READY, TOO_LARGE, or BLOCKED",
-            Self::Propose => "READY, DONE, TOO_LARGE, or BLOCKED",
-            Self::Verify => "VERIFIED, RETRY, or BLOCKED",
-            Self::Frontier => "REPLANNED or BLOCKED",
-            Self::TerminalReview => "READY, REPLANNED, or BLOCKED",
-        }
-    }
-
-    pub(crate) fn json_schema(self) -> &'static str {
-        match self {
-            Self::Ready => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-            Self::Worker => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","TOO_LARGE","BLOCKED"]},"summary":{"type":"string","description":"Concise worker-stage result. TOO_LARGE means the assigned slice cannot reliably fit one bounded worker-model change; explain why and propose an ordered decomposition. For BLOCKED, include the exact external decision or unavailable input."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-            Self::Propose => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","DONE","TOO_LARGE","BLOCKED"]},"summary":{"type":"string","description":"Concise proposal result. DONE means the requested objective is already satisfied. TOO_LARGE means the assigned slice requires decomposition before a local worker can reliably implement it. Neither outcome may create or modify OpenSpec artifacts. Include decomposition advice for TOO_LARGE and the exact external blocker for BLOCKED."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-            Self::Verify => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED"]},"summary":{"type":"string","description":"Concise stage result. For RETRY, include every actionable verification finding needed by the repair stage. For BLOCKED, include the exact blocker."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-            Self::Frontier => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["REPLANNED","BLOCKED"]},"summary":{"type":"string","description":"Concise frontier-planning result. REPLANNED means the oversized agenda slice was replaced by a smaller first slice plus one or more ordered hierarchical descendants and committed. BLOCKED means safe subdivision requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-            Self::TerminalReview => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","REPLANNED","BLOCKED"]},"summary":{"type":"string","description":"Concise terminal acceptance review. READY means the project is ready for its final acceptance slice and no repository state changed. REPLANNED means one or more bounded remediation slices were inserted before the unchanged terminal gate and committed. BLOCKED means safe review or remediation requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClaudeResult {
-    pub text: String,
-    pub session_id: Option<String>,
-    pub signal: StageSignal,
-}
-
-#[derive(Debug, Clone)]
-pub enum SessionMode {
-    New { id: Uuid, name: Option<String> },
-    Resume { id: Uuid },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeOutputFormat {
     Text,
     Json,
@@ -538,7 +470,7 @@ impl fmt::Display for ConnectionTestMode {
 }
 
 enum ClaudeAttempt {
-    Complete(ClaudeResult),
+    Complete(StageResult),
     OutputLimit,
 }
 
@@ -833,7 +765,7 @@ fn with_launcher_environment(spec: CommandSpec, launcher: &ClaudeLauncher) -> Co
     }
 }
 
-pub struct ClaudeClient<'a, U: Ui> {
+pub struct ClaudeBackend<'a, U: Ui> {
     repo: &'a Path,
     launcher: &'a ClaudeLauncher,
     permission_mode: &'a str,
@@ -850,7 +782,7 @@ pub struct ClaudeClient<'a, U: Ui> {
     runner: ProcessRunner<'a, U>,
 }
 
-impl<'a, U: Ui> ClaudeClient<'a, U> {
+impl<'a, U: Ui> ClaudeBackend<'a, U> {
     pub fn new(
         repo: &'a Path,
         launcher: &'a ClaudeLauncher,
@@ -922,8 +854,8 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         prompt: &str,
         activity: &str,
         protocol: StageProtocol,
-    ) -> Result<ClaudeResult> {
-        let session_id = session_id(&session);
+    ) -> Result<StageResult> {
+        let session_id = session.id().clone();
         let mut current_session = session;
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
@@ -966,7 +898,9 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                         self.max_provider_retries
                     ));
                     thread::sleep(delay);
-                    current_session = SessionMode::Resume { id: session_id };
+                    current_session = SessionMode::Resume {
+                        id: session_id.clone(),
+                    };
                     current_prompt = transient_provider_continuation_prompt(protocol);
                     current_activity = format!(
                         "{activity} (provider recovery {provider_retries}/{})",
@@ -982,8 +916,10 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                     self.ui.warn(
                         "Claude ended the phase without a terminal result; compacting and continuing the same session once",
                     );
-                    self.compact_session(session_id, "an incomplete phase turn")?;
-                    current_session = SessionMode::Resume { id: session_id };
+                    self.compact_session(&session_id, "an incomplete phase turn")?;
+                    current_session = SessionMode::Resume {
+                        id: session_id.clone(),
+                    };
                     current_prompt = incomplete_stage_continuation_prompt(protocol);
                     current_activity = format!(
                         "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
@@ -1002,8 +938,10 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
                         "Claude reached its output token limit; compacting and continuing the same phase ({output_recoveries}/{})",
                         self.max_output_retries
                     ));
-                    self.compact_session(session_id, "an output-limit interruption")?;
-                    current_session = SessionMode::Resume { id: session_id };
+                    self.compact_session(&session_id, "an output-limit interruption")?;
+                    current_session = SessionMode::Resume {
+                        id: session_id.clone(),
+                    };
                     current_prompt = output_limit_continuation_prompt(protocol);
                     current_activity = format!(
                         "{activity} (output-limit continuation {output_recoveries}/{})",
@@ -1038,7 +976,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         } else {
             ClaudeOutputFormat::Json
         };
-        let transcript = TranscriptCursor::capture(self.repo, self.launcher, session_id(session));
+        let transcript = TranscriptCursor::capture(self.repo, self.launcher, session.id());
         let mut use_schema = true;
         let mut first_attempt = true;
         let output = loop {
@@ -1142,7 +1080,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             })
     }
 
-    pub fn rename_session(&self, session_id: Uuid, name: &str) -> Result<()> {
+    pub fn rename_session(&self, session_id: &SessionId, name: &str) -> Result<()> {
         let prompt = format!("/rename {name}");
         self.ui.debug(&format!(
             "Claude session: resume {session_id} for best-effort rename"
@@ -1152,7 +1090,9 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
             self.repo,
             self.launcher,
             self.permission_mode,
-            &SessionMode::Resume { id: session_id },
+            &SessionMode::Resume {
+                id: session_id.clone(),
+            },
             &prompt,
             ClaudeOutputFormat::Json,
             ClaudeCommandOptions {
@@ -1173,7 +1113,7 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
         Ok(())
     }
 
-    pub fn compact_session(&self, session_id: Uuid, completed_phase: &str) -> Result<()> {
+    pub fn compact_session(&self, session_id: &SessionId, completed_phase: &str) -> Result<()> {
         let activity = format!("Hard-compacting context after {completed_phase}");
         self.ui.debug(&format!(
             "Claude session: resume {session_id} for explicit /compact"
@@ -1223,11 +1163,35 @@ impl<'a, U: Ui> ClaudeClient<'a, U> {
     }
 }
 
+impl<U: Ui> AgentBackend for ClaudeBackend<'_, U> {
+    fn name(&self) -> &'static str {
+        "Claude"
+    }
+
+    fn invoke(
+        &self,
+        session: SessionMode,
+        prompt: &str,
+        activity: &str,
+        protocol: StageProtocol,
+    ) -> Result<StageResult> {
+        ClaudeBackend::invoke(self, session, prompt, activity, protocol)
+    }
+
+    fn rename_session(&self, session_id: &SessionId, name: &str) -> Result<()> {
+        ClaudeBackend::rename_session(self, session_id, name)
+    }
+
+    fn compact_session(&self, session_id: &SessionId, completed_phase: &str) -> Result<()> {
+        ClaudeBackend::compact_session(self, session_id, completed_phase)
+    }
+}
+
 fn build_compact_command(
     repo: &Path,
     launcher: &ClaudeLauncher,
     permission_mode: &str,
-    session_id: Uuid,
+    session_id: &SessionId,
     output_format: ClaudeOutputFormat,
     additional_dirs: &[PathBuf],
     plugin_dirs: &[PathBuf],
@@ -1236,7 +1200,9 @@ fn build_compact_command(
         repo,
         launcher,
         permission_mode,
-        &SessionMode::Resume { id: session_id },
+        &SessionMode::Resume {
+            id: session_id.clone(),
+        },
         "/compact",
         output_format,
         ClaudeCommandOptions {
@@ -1263,12 +1229,6 @@ fn session_description(session: &SessionMode) -> String {
             None => format!("new {id}"),
         },
         SessionMode::Resume { id } => format!("resume {id}"),
-    }
-}
-
-fn session_id(session: &SessionMode) -> Uuid {
-    match session {
-        SessionMode::New { id, .. } | SessionMode::Resume { id } => *id,
     }
 }
 
@@ -1532,7 +1492,7 @@ fn claude_stage_failure(output: &ProcessOutput, transcript: &TranscriptCursor) -
     }
 }
 
-fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
+fn parse_claude_output(stdout: &str) -> Result<StageResult> {
     let parsed = serde_json::from_str::<Value>(stdout).ok();
     let text = parsed
         .as_ref()
@@ -1565,7 +1525,7 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
         .flatten();
     let signal = match structured {
         Some((signal, summary)) => {
-            return Ok(ClaudeResult {
+            return Ok(StageResult {
                 text: summary,
                 session_id,
                 signal,
@@ -1586,14 +1546,14 @@ fn parse_claude_output(stdout: &str) -> Result<ClaudeResult> {
         },
     };
 
-    Ok(ClaudeResult {
+    Ok(StageResult {
         text,
         session_id,
         signal,
     })
 }
 
-fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
+fn parse_claude_stream_output(stdout: &str) -> Result<StageResult> {
     let events = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -1614,14 +1574,14 @@ fn parse_claude_stream_output(stdout: &str) -> Result<ClaudeResult> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         if let Some((signal, summary)) = parse_structured_output(result)? {
-            return Ok(ClaudeResult {
+            return Ok(StageResult {
                 text: summary,
                 session_id,
                 signal,
             });
         }
         if let Some(signal) = parse_signal(&text) {
-            return Ok(ClaudeResult {
+            return Ok(StageResult {
                 text,
                 session_id,
                 signal,
@@ -1877,7 +1837,7 @@ mod tests {
 
     #[test]
     fn constructs_new_and_resumed_session_commands() {
-        let id = Uuid::nil();
+        let id = SessionId::new(Uuid::nil().to_string());
         let launcher = ClaudeLauncher::parse(
             "omlx launch claude",
             Some("qwen3.6-35b-a3b".to_owned()),
@@ -1892,7 +1852,7 @@ mod tests {
             &launcher,
             "auto",
             &SessionMode::New {
-                id,
+                id: id.clone(),
                 name: Some("slice-apply".to_owned()),
             },
             "/apply slice",
@@ -1933,7 +1893,7 @@ mod tests {
             Path::new("/repo"),
             &launcher,
             "auto",
-            &SessionMode::Resume { id },
+            &SessionMode::Resume { id: id.clone() },
             "/propose slice",
             ClaudeOutputFormat::Json,
             None,
@@ -1949,7 +1909,7 @@ mod tests {
             Path::new("/repo"),
             &launcher,
             "auto",
-            id,
+            &id,
             ClaudeOutputFormat::Text,
             &[],
             &[],
@@ -1976,7 +1936,7 @@ mod tests {
             Path::new("/repo"),
             &launcher,
             "auto",
-            id,
+            &id,
             ClaudeOutputFormat::StreamJson,
             &[],
             &[],
@@ -2033,7 +1993,7 @@ mod tests {
             &launcher,
             "auto",
             &SessionMode::New {
-                id: Uuid::nil(),
+                id: SessionId::new(Uuid::nil().to_string()),
                 name: None,
             },
             "apply the change",
@@ -2110,7 +2070,7 @@ mod tests {
             &launcher,
             "auto",
             &SessionMode::New {
-                id: Uuid::nil(),
+                id: SessionId::new(Uuid::nil().to_string()),
                 name: None,
             },
             "plan",
@@ -2439,7 +2399,8 @@ mod tests {
     fn transcript_cursor_reports_only_api_errors_appended_after_capture() {
         use std::{fs::OpenOptions, io::Write as _};
 
-        let session_id = Uuid::new_v4();
+        let session_uuid = Uuid::new_v4();
+        let session_id = SessionId::new(session_uuid.to_string());
         let config_dir = std::env::temp_dir().join(format!("opsx-transcript-{session_id}"));
         let project_dir = config_dir.join("projects/project");
         fs::create_dir_all(&project_dir).unwrap();
@@ -2458,7 +2419,7 @@ mod tests {
             value: config_dir.display().to_string(),
             redacted: false,
         });
-        let cursor = TranscriptCursor::capture(Path::new("/repo"), &launcher, session_id);
+        let cursor = TranscriptCursor::capture(Path::new("/repo"), &launcher, &session_id);
         assert_eq!(cursor.latest_api_error(), None);
 
         writeln!(
@@ -2496,7 +2457,7 @@ mod tests {
             &launcher,
             "auto",
             &SessionMode::New {
-                id: Uuid::nil(),
+                id: SessionId::new(Uuid::nil().to_string()),
                 name: None,
             },
             "verify",
@@ -2876,11 +2837,11 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = shell_launcher(&script);
         let ui = QuietUi;
-        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
+        let client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui);
         let result = client
             .invoke(
                 SessionMode::New {
-                    id: Uuid::nil(),
+                    id: SessionId::new(Uuid::nil().to_string()),
                     name: None,
                 },
                 "do the work",
@@ -2914,11 +2875,11 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = shell_launcher(&script);
         let ui = QuietUi;
-        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
+        let client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui);
         let error = client
             .invoke(
                 SessionMode::New {
-                    id: Uuid::nil(),
+                    id: SessionId::new(Uuid::nil().to_string()),
                     name: None,
                 },
                 "do the work",
@@ -2994,13 +2955,13 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = shell_launcher(&script);
         let ui = QuietUi;
-        let mut client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui)
+        let mut client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui)
             .with_provider_retries(1);
         client.provider_retry_base_delay = Duration::ZERO;
         let result = client
             .invoke(
                 SessionMode::New {
-                    id: Uuid::nil(),
+                    id: SessionId::new(Uuid::nil().to_string()),
                     name: None,
                 },
                 "do the work",
@@ -3034,13 +2995,13 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = shell_launcher(&script);
         let ui = QuietUi;
-        let mut client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui)
+        let mut client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui)
             .with_provider_retries(2);
         client.provider_retry_base_delay = Duration::ZERO;
         let error = client
             .invoke(
                 SessionMode::New {
-                    id: Uuid::nil(),
+                    id: SessionId::new(Uuid::nil().to_string()),
                     name: None,
                 },
                 "do the work",
@@ -3077,11 +3038,11 @@ printf '%s\n' "$((count + 1))" > "$state"
 
         let launcher = shell_launcher(&script);
         let ui = QuietUi;
-        let client = ClaudeClient::new(&directory, &launcher, "auto", false, None, 3, &ui);
+        let client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui);
         let result = client
             .invoke(
                 SessionMode::New {
-                    id: Uuid::nil(),
+                    id: SessionId::new(Uuid::nil().to_string()),
                     name: None,
                 },
                 "do the work",

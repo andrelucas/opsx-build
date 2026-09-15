@@ -15,15 +15,16 @@ use crate::{
         AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision,
         is_terminal_assignment,
     },
+    backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, StageSignal},
     bootstrap::{
         BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, init_command,
         instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
     },
     claude::{
-        CONNECTION_TEST_MARKER, ClaudeClient, ClaudeLauncher, ClaudeOutputFormat,
-        ConnectionTestMode, SessionMode, SkillCommands, StageProtocol, StageSignal,
-        build_claude_command, build_connection_test_command, build_interactive_claude_command,
-        is_missing_terminal_result, parse_connection_test_output, stage_prompt,
+        CONNECTION_TEST_MARKER, ClaudeBackend, ClaudeLauncher, ClaudeOutputFormat,
+        ConnectionTestMode, SkillCommands, build_claude_command, build_connection_test_command,
+        build_interactive_claude_command, is_missing_terminal_result, parse_connection_test_output,
+        stage_prompt,
     },
     cli::Cli,
     git::{
@@ -99,7 +100,7 @@ struct RunState {
     stage: Stage,
     verify_retries: u32,
     before_changes: ChangeSnapshot,
-    planning_session: Option<Uuid>,
+    planning_session: Option<SessionId>,
     pending_repair: Option<String>,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
@@ -1207,7 +1208,7 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = ClaudeClient::new(
+        let frontier = ClaudeBackend::new(
             repo,
             frontier_launcher,
             &self.cli.permission_mode,
@@ -1218,7 +1219,7 @@ impl<U: Ui> App<U> {
         )
         .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
-        let session = Uuid::new_v4();
+        let session = SessionId::new(Uuid::new_v4().to_string());
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
         self.ui.stage(
             stage_number,
@@ -1237,11 +1238,13 @@ impl<U: Ui> App<U> {
             let result = match frontier.invoke(
                 if attempt == 0 {
                     SessionMode::New {
-                        id: session,
+                        id: session.clone(),
                         name: Some(format!("{}-frontier-replan", assignment.change)),
                     }
                 } else {
-                    SessionMode::Resume { id: session }
+                    SessionMode::Resume {
+                        id: session.clone(),
+                    }
                 },
                 &stage_prompt("", &prompt, StageProtocol::Frontier),
                 if attempt == 0 {
@@ -1373,7 +1376,7 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = ClaudeClient::new(
+        let frontier = ClaudeBackend::new(
             repo,
             frontier_launcher,
             &self.cli.permission_mode,
@@ -1384,7 +1387,7 @@ impl<U: Ui> App<U> {
         )
         .with_provider_retries(self.cli.max_provider_retries)
         .with_plugin_dir(&model_confusion_plugin);
-        let session = Uuid::new_v4();
+        let session = SessionId::new(Uuid::new_v4().to_string());
         self.present_campaign(&state);
         self.ui.stage(
             1,
@@ -1404,11 +1407,13 @@ impl<U: Ui> App<U> {
             let result = match frontier.invoke(
                 if attempt == 0 {
                     SessionMode::New {
-                        id: session,
+                        id: session.clone(),
                         name: Some("9999-frontier-acceptance-review".to_owned()),
                     }
                 } else {
-                    SessionMode::Resume { id: session }
+                    SessionMode::Resume {
+                        id: session.clone(),
+                    }
                 },
                 &stage_prompt("", &prompt, StageProtocol::TerminalReview),
                 if attempt == 0 {
@@ -1544,7 +1549,7 @@ impl<U: Ui> App<U> {
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let claude = ClaudeClient::new(
+        let claude = ClaudeBackend::new(
             repo,
             launcher,
             &self.cli.permission_mode,
@@ -1562,7 +1567,7 @@ impl<U: Ui> App<U> {
         } else {
             claude
         };
-        let worker_claude = ClaudeClient::new(
+        let worker_claude = ClaudeBackend::new(
             repo,
             launcher,
             &self.cli.permission_mode,
@@ -1588,7 +1593,7 @@ impl<U: Ui> App<U> {
             ))
         };
         let frontier_claude = frontier_launcher.map(|launcher| {
-            let client = ClaudeClient::new(
+            let client = ClaudeBackend::new(
                 repo,
                 launcher,
                 &self.cli.permission_mode,
@@ -1716,7 +1721,7 @@ impl<U: Ui> App<U> {
     fn run_explore(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
     ) -> Result<()> {
@@ -1725,7 +1730,7 @@ impl<U: Ui> App<U> {
         let subject = campaign_subject(state);
         let Some(result) = worker_result(
             claude.invoke(
-                session_mode(session, is_new, "opsx-build-planning"),
+                session_mode(&session, is_new, "opsx-build-planning"),
                 &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
                 "Claude is exploring the change",
                 StageProtocol::Worker,
@@ -1749,14 +1754,14 @@ impl<U: Ui> App<U> {
         }
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)?;
-        claude.compact_session(session, "Explore")?;
+        claude.compact_session(&session, "Explore")?;
         Ok(())
     }
 
     fn run_propose(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
         frontier_terminal: bool,
@@ -1791,7 +1796,7 @@ impl<U: Ui> App<U> {
             let Some(result) = worker_result(
                 claude.invoke(
                     session_mode(
-                        session,
+                        &session,
                         is_new && !retrying_postcondition,
                         "opsx-build-planning",
                     ),
@@ -1916,7 +1921,7 @@ impl<U: Ui> App<U> {
             self.ui.change_name(Some(&change));
             self.ui
                 .info(&format!("Selected OpenSpec change `{change}`"));
-            if let Err(error) = claude.rename_session(session, &change) {
+            if let Err(error) = claude.rename_session(&session, &change) {
                 self.ui
                     .warn(&format!("Could not rename planning session: {error}"));
             }
@@ -1930,7 +1935,7 @@ impl<U: Ui> App<U> {
     fn run_proposal_commit(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
@@ -1968,7 +1973,7 @@ impl<U: Ui> App<U> {
     fn run_apply(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
         frontier_terminal: bool,
@@ -2017,7 +2022,7 @@ impl<U: Ui> App<U> {
     fn run_verify(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
         frontier_terminal: bool,
@@ -2130,7 +2135,7 @@ impl<U: Ui> App<U> {
     fn run_repair(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
         frontier_terminal: bool,
@@ -2199,7 +2204,7 @@ impl<U: Ui> App<U> {
     fn run_archive(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         commands: &SkillCommands,
         state: &mut RunState,
     ) -> Result<()> {
@@ -2262,7 +2267,7 @@ impl<U: Ui> App<U> {
     fn run_final_commit(
         &self,
         repo: &Path,
-        claude: &ClaudeClient<'_, U>,
+        claude: &dyn AgentBackend,
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
@@ -2373,7 +2378,7 @@ impl<U: Ui> App<U> {
             planning_launcher,
             &self.cli.permission_mode,
             &SessionMode::New {
-                id: Uuid::nil(),
+                id: SessionId::new(Uuid::nil().to_string()),
                 name: Some("opsx-build-planning".to_owned()),
             },
             &prompt,
@@ -2581,38 +2586,38 @@ fn stage_uses_frontier_model(stage: Stage, bootstrap: bool, terminal_frontier: b
             ))
 }
 
-fn planning_session(state: &mut RunState) -> (Uuid, bool) {
-    match state.planning_session {
-        Some(id) => (id, false),
+fn planning_session(state: &mut RunState) -> (SessionId, bool) {
+    match &state.planning_session {
+        Some(id) => (id.clone(), false),
         None => {
-            let id = Uuid::new_v4();
-            state.planning_session = Some(id);
+            let id = SessionId::new(Uuid::new_v4().to_string());
+            state.planning_session = Some(id.clone());
             (id, true)
         }
     }
 }
 
-fn session_mode(id: Uuid, is_new: bool, name: &str) -> SessionMode {
+fn session_mode(id: &SessionId, is_new: bool, name: &str) -> SessionMode {
     if is_new {
         SessionMode::New {
-            id,
+            id: id.clone(),
             name: Some(name.to_owned()),
         }
     } else {
-        SessionMode::Resume { id }
+        SessionMode::Resume { id: id.clone() }
     }
 }
 
-fn invoke_fresh<U: Ui>(
-    claude: &ClaudeClient<'_, U>,
+fn invoke_fresh(
+    backend: &dyn AgentBackend,
     name: &str,
     prompt: &str,
     activity: &str,
     protocol: StageProtocol,
-) -> Result<crate::claude::ClaudeResult> {
-    claude.invoke(
+) -> Result<StageResult> {
+    backend.invoke(
         SessionMode::New {
-            id: Uuid::new_v4(),
+            id: SessionId::new(Uuid::new_v4().to_string()),
             name: Some(name.to_owned()),
         },
         prompt,
@@ -2662,11 +2667,11 @@ fn record_too_large<U: Ui>(
 }
 
 fn worker_result<U: Ui>(
-    result: Result<crate::claude::ClaudeResult>,
+    result: Result<StageResult>,
     repo: &Path,
     state: &mut RunState,
     ui: &U,
-) -> Result<Option<crate::claude::ClaudeResult>> {
+) -> Result<Option<StageResult>> {
     match result {
         Ok(result) => Ok(Some(result)),
         Err(error) => {
@@ -3137,7 +3142,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         })
         .and_then(|session| session.get("id"))
         .and_then(Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok());
+        .map(SessionId::new);
 
     Ok(RunState {
         schema_version: STATE_SCHEMA_VERSION,
@@ -3605,7 +3610,10 @@ mod tests {
         assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
         assert_eq!(state.stage, Stage::Repair);
         assert_eq!(state.change.as_deref(), Some("slice-m"));
-        assert_eq!(state.planning_session, Some(Uuid::nil()));
+        assert_eq!(
+            state.planning_session,
+            Some(SessionId::new(Uuid::nil().to_string()))
+        );
         assert_eq!(state.pending_repair.as_deref(), Some("fix lowering"));
     }
 
