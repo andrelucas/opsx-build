@@ -26,7 +26,7 @@ use crate::{
         build_interactive_claude_command, is_missing_terminal_result, parse_connection_test_output,
         stage_prompt,
     },
-    cli::Cli,
+    cli::{AgentConnection, BackendKind, Cli},
     git::{
         SliceBaseline, baseline_matches_except, capture_slice_baseline, committed_paths_since,
         current_head, hard_reset, head_descends_from, legacy_metadata_dir, metadata_dir,
@@ -34,6 +34,12 @@ use crate::{
         resolve_commit, untracked_paths,
     },
     model_confusions::ensure_model_confusion_plugin,
+    opencode::{
+        OpenCodeBackend, OpenCodeLauncher,
+        build_connection_test_command as build_opencode_connection_test_command,
+        build_interactive_opencode_command, build_opencode_command,
+        parse_connection_test_output as parse_opencode_connection_test_output,
+    },
     openspec::{
         ChangeSnapshot, identify_assigned_change, identify_change,
         numeric_prefix_reconciliation_candidate, planning_status, rename_change_directory,
@@ -92,6 +98,58 @@ pub struct App<U: Ui> {
     ui: U,
 }
 
+#[derive(Debug, Clone)]
+enum AgentLauncher {
+    Claude(ClaudeLauncher),
+    OpenCode(OpenCodeLauncher),
+}
+
+impl AgentLauncher {
+    fn from_connection(connection: &AgentConnection) -> Result<Self> {
+        match connection.backend {
+            BackendKind::Claude => ClaudeLauncher::from_connection(connection).map(Self::Claude),
+            BackendKind::OpenCode => {
+                OpenCodeLauncher::from_connection(connection).map(Self::OpenCode)
+            }
+        }
+    }
+
+    fn program(&self) -> &str {
+        match self {
+            Self::Claude(launcher) => &launcher.program,
+            Self::OpenCode(launcher) => &launcher.program,
+        }
+    }
+
+    fn connection_name(&self) -> Option<&str> {
+        match self {
+            Self::Claude(launcher) => launcher.connection_name.as_deref(),
+            Self::OpenCode(launcher) => launcher.connection_name.as_deref(),
+        }
+    }
+
+    fn model(&self) -> Option<&str> {
+        match self {
+            Self::Claude(launcher) => launcher.model.as_deref(),
+            Self::OpenCode(launcher) => launcher.model.as_deref(),
+        }
+    }
+
+    fn environment_name(&self) -> Option<&str> {
+        match self {
+            Self::Claude(launcher) => launcher.environment_name.as_deref(),
+            Self::OpenCode(launcher) => launcher.environment_name.as_deref(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Claude(_) => "claude",
+            Self::OpenCode(_) => "opencode",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunState {
     schema_version: u32,
@@ -101,6 +159,8 @@ struct RunState {
     verify_retries: u32,
     before_changes: ChangeSnapshot,
     planning_session: Option<SessionId>,
+    #[serde(default)]
+    planning_backend: Option<String>,
     pending_repair: Option<String>,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
@@ -171,6 +231,7 @@ impl RunState {
             verify_retries: 0,
             before_changes,
             planning_session: None,
+            planning_backend: None,
             pending_repair: None,
             pending_direction: None,
             proposal_head: None,
@@ -214,6 +275,7 @@ impl RunState {
             verify_retries: 0,
             before_changes: active_changes,
             planning_session: None,
+            planning_backend: None,
             pending_repair: None,
             pending_direction: None,
             proposal_head: None,
@@ -301,16 +363,20 @@ impl<U: Ui> App<U> {
 
         if self.cli.test_connection.is_some() {
             self.ui.banner(&requested_repo.display().to_string());
-            let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
-            if launcher.program != "claude" {
-                prerequisite_exists(&launcher.program, &requested_repo, &self.ui)?;
-            }
-            prerequisite_exists("claude", &requested_repo, &self.ui)?;
+            let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+            ensure_launcher_prerequisites(&launcher, &requested_repo, &self.ui)?;
             self.debug_configuration(&requested_repo, &launcher);
             if let Some(path) = &self.cli.config_path {
                 self.ui.info(&format!("Using config `{}`", path.display()));
             }
-            return self.run_connection_test(&requested_repo, &launcher);
+            return match &launcher {
+                AgentLauncher::Claude(launcher) => {
+                    self.run_connection_test(&requested_repo, launcher)
+                }
+                AgentLauncher::OpenCode(launcher) => {
+                    self.run_opencode_connection_test(&requested_repo, launcher)
+                }
+            };
         }
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
@@ -320,6 +386,13 @@ impl<U: Ui> App<U> {
             return self.rewind(&product_repo);
         }
         let mut sidecar = load_association(&product_repo, &self.ui)?;
+        if (self.cli.sidecar || sidecar.is_some())
+            && self.cli.worker_connection.backend == BackendKind::OpenCode
+        {
+            bail!(
+                "the first OpenCode adapter does not yet support sidecar repositories; use an in-repository OpenSpec project or a Claude worker for this run"
+            );
+        }
         if self.cli.sidecar
             && sidecar.is_none()
             && (self.cli.resume || self.cli.forget || self.cli.update_skills)
@@ -368,11 +441,8 @@ impl<U: Ui> App<U> {
                 return Ok(());
             }
             prerequisite_exists("openspec", &product_repo, &self.ui)?;
-            prerequisite_exists("claude", &product_repo, &self.ui)?;
-            let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
-            if launcher.program != "claude" {
-                prerequisite_exists(&launcher.program, &product_repo, &self.ui)?;
-            }
+            let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+            ensure_launcher_prerequisites(&launcher, &product_repo, &self.ui)?;
             let runner = ProcessRunner::new(&self.ui);
             if plan.needs_setup() {
                 let setup =
@@ -449,13 +519,13 @@ impl<U: Ui> App<U> {
             }
             prerequisite_exists("claude", &repo, &self.ui)?;
             prerequisite_exists("openspec", &repo, &self.ui)?;
-            self.debug_configuration(&repo, &frontier_launcher);
+            self.debug_configuration(&repo, &AgentLauncher::Claude(frontier_launcher.clone()));
             if let Some(path) = &self.cli.config_path {
                 self.ui.info(&format!("Using config `{}`", path.display()));
             }
             self.ui.info(&format!(
                 "Bootstrap planner: {}",
-                connection_description(&frontier_launcher)
+                claude_connection_description(&frontier_launcher)
             ));
             if self.cli.yolo {
                 self.ui
@@ -464,11 +534,8 @@ impl<U: Ui> App<U> {
             return self.run_bootstrap(&repo, &frontier_launcher);
         }
 
-        let launcher = ClaudeLauncher::from_connection(&self.cli.worker_connection)?;
-        if launcher.program != "claude" {
-            prerequisite_exists(&launcher.program, &repo, &self.ui)?;
-        }
-        prerequisite_exists("claude", &repo, &self.ui)?;
+        let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+        ensure_launcher_prerequisites(&launcher, &repo, &self.ui)?;
 
         self.debug_configuration(&repo, &launcher);
         if let Some(path) = &self.cli.config_path {
@@ -476,7 +543,10 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.interactive {
-            return self.run_interactive(&repo, &launcher);
+            return match &launcher {
+                AgentLauncher::Claude(launcher) => self.run_interactive(&repo, launcher),
+                AgentLauncher::OpenCode(launcher) => self.run_interactive_opencode(&repo, launcher),
+            };
         }
 
         if self.cli.yolo {
@@ -507,7 +577,7 @@ impl<U: Ui> App<U> {
             ));
             Some(frontier)
         };
-        if launcher.connection_name.is_some()
+        if launcher.connection_name().is_some()
             || frontier_launcher
                 .as_ref()
                 .is_some_and(|frontier| frontier.connection_name.is_some())
@@ -523,7 +593,7 @@ impl<U: Ui> App<U> {
                     format!(
                         "worker {}, frontier {}",
                         connection_description(&launcher),
-                        connection_description(frontier)
+                        claude_connection_description(frontier)
                     )
                 },
             );
@@ -681,7 +751,7 @@ impl<U: Ui> App<U> {
                 SkillInstallAction::WouldUpdate => "Would update",
             };
             self.ui.info(&format!(
-                "{action} bundled Claude skill `{}` in target repository",
+                "{action} bundled agent skill `{}` in target repository",
                 installed.name
             ));
         }
@@ -747,9 +817,10 @@ impl<U: Ui> App<U> {
             commands.propose, commands.apply, commands.verify, commands.archive
         ));
 
+        let workflow_launcher = AgentLauncher::Claude(frontier_launcher.clone());
         self.run_workflows(
             repo,
-            frontier_launcher,
+            &workflow_launcher,
             Some(frontier_launcher),
             &commands,
             state,
@@ -759,7 +830,7 @@ impl<U: Ui> App<U> {
     fn continue_existing(
         &self,
         repo: &Path,
-        launcher: &ClaudeLauncher,
+        launcher: &AgentLauncher,
         frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
@@ -880,7 +951,7 @@ impl<U: Ui> App<U> {
     fn resume(
         &self,
         repo: &Path,
-        launcher: &ClaudeLauncher,
+        launcher: &AgentLauncher,
         frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
@@ -960,18 +1031,20 @@ impl<U: Ui> App<U> {
 
         state.local_only |= self.cli.local_only;
         persist_state(repo, &state, &self.ui)?;
-        let workflow_launcher = if state.bootstrap {
-            frontier_launcher.context("bootstrap resume requires a frontier connection")?
+        if state.bootstrap {
+            let frontier =
+                frontier_launcher.context("bootstrap resume requires a frontier connection")?;
+            let workflow_launcher = AgentLauncher::Claude(frontier.clone());
+            self.run_workflows(repo, &workflow_launcher, frontier_launcher, commands, state)
         } else {
-            launcher
-        };
-        self.run_workflows(repo, workflow_launcher, frontier_launcher, commands, state)
+            self.run_workflows(repo, launcher, frontier_launcher, commands, state)
+        }
     }
 
     fn run_workflows(
         &self,
         repo: &Path,
-        launcher: &ClaudeLauncher,
+        launcher: &AgentLauncher,
         frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
@@ -1224,7 +1297,7 @@ impl<U: Ui> App<U> {
         self.ui.stage(
             stage_number,
             AGENDA_TOTAL_STAGES,
-            &model_stage_title("Frontier replan", "frontier", frontier_launcher),
+            &claude_model_stage_title("Frontier replan", "frontier", frontier_launcher),
         );
         let base_prompt = frontier_replan_prompt(&assignment, &outcome);
         let mut failure = None;
@@ -1288,6 +1361,7 @@ impl<U: Ui> App<U> {
                     state.agenda = Some(refreshed);
                     state.stage = Stage::Propose;
                     state.planning_session = None;
+                    state.planning_backend = None;
                     state.verify_retries = 0;
                     state.pending_repair = None;
                     state.proposal_head = None;
@@ -1392,7 +1466,7 @@ impl<U: Ui> App<U> {
         self.ui.stage(
             1,
             TOTAL_STAGES,
-            &model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
+            &claude_model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
         );
         let base_prompt = terminal_review_prompt(&assignment, escalation.as_ref());
         let mut postcondition_failure = None;
@@ -1479,6 +1553,7 @@ impl<U: Ui> App<U> {
                     state.agenda = Some(remediation.clone());
                     state.stage = Stage::Propose;
                     state.planning_session = None;
+                    state.planning_backend = None;
                     state.verify_retries = 0;
                     state.pending_repair = None;
                     state.proposal_head = None;
@@ -1543,54 +1618,83 @@ impl<U: Ui> App<U> {
     fn execute(
         &self,
         repo: &Path,
-        launcher: &ClaudeLauncher,
+        launcher: &AgentLauncher,
         frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let claude = ClaudeBackend::new(
-            repo,
-            launcher,
-            &self.cli.permission_mode,
-            self.ui.supports_stream_input(),
-            self.cli.stream_claude,
-            self.cli.max_output_retries,
-            &self.ui,
-        )
-        .with_provider_retries(self.cli.max_provider_retries)
-        .with_plugin_dir(&model_confusion_plugin);
-        let claude = if let Some(product) = state.product_repo.as_deref() {
-            claude
-                .with_additional_dir(product)
-                .with_resume_repo(product)
-        } else {
-            claude
+        let agent: Box<dyn AgentBackend + '_> = match launcher {
+            AgentLauncher::Claude(launcher) => {
+                let client = ClaudeBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    self.ui.supports_stream_input(),
+                    self.cli.stream_claude,
+                    self.cli.max_output_retries,
+                    &self.ui,
+                )
+                .with_provider_retries(self.cli.max_provider_retries)
+                .with_plugin_dir(&model_confusion_plugin);
+                let client = if let Some(product) = state.product_repo.as_deref() {
+                    client
+                        .with_additional_dir(product)
+                        .with_resume_repo(product)
+                } else {
+                    client
+                };
+                Box::new(client)
+            }
+            AgentLauncher::OpenCode(launcher) => Box::new(OpenCodeBackend::new(
+                repo,
+                launcher,
+                self.ui.supports_stream_input(),
+                self.cli.stream_claude,
+                &self.ui,
+            )),
         };
-        let worker_claude = ClaudeBackend::new(
-            repo,
-            launcher,
-            &self.cli.permission_mode,
-            true,
-            self.cli.stream_claude,
-            self.cli.max_output_retries,
-            &self.ui,
-        )
-        .with_provider_retries(self.cli.max_provider_retries)
-        .with_plugin_dir(&model_confusion_plugin);
-        let worker_claude = if let Some(product) = state.product_repo.as_deref() {
-            worker_claude
-                .with_additional_dir(product)
-                .with_resume_repo(product)
-        } else {
-            worker_claude
-        };
-        let worker_claude = if state.bootstrap {
-            worker_claude
-        } else {
-            worker_claude.with_stage_timeout(Duration::from_secs(
-                u64::from(self.cli.local_worker_timeout_minutes) * 60,
-            ))
+        let worker_agent: Box<dyn AgentBackend + '_> = match launcher {
+            AgentLauncher::Claude(launcher) => {
+                let client = ClaudeBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    true,
+                    self.cli.stream_claude,
+                    self.cli.max_output_retries,
+                    &self.ui,
+                )
+                .with_provider_retries(self.cli.max_provider_retries)
+                .with_plugin_dir(&model_confusion_plugin);
+                let client = if let Some(product) = state.product_repo.as_deref() {
+                    client
+                        .with_additional_dir(product)
+                        .with_resume_repo(product)
+                } else {
+                    client
+                };
+                let client = if state.bootstrap {
+                    client
+                } else {
+                    client.with_stage_timeout(Duration::from_secs(
+                        u64::from(self.cli.local_worker_timeout_minutes) * 60,
+                    ))
+                };
+                Box::new(client)
+            }
+            AgentLauncher::OpenCode(launcher) => {
+                let client =
+                    OpenCodeBackend::new(repo, launcher, true, self.cli.stream_claude, &self.ui);
+                let client = if state.bootstrap {
+                    client
+                } else {
+                    client.with_stage_timeout(Duration::from_secs(
+                        u64::from(self.cli.local_worker_timeout_minutes) * 60,
+                    ))
+                };
+                Box::new(client)
+            }
         };
         let frontier_claude = frontier_launcher.map(|launcher| {
             let client = ClaudeBackend::new(
@@ -1638,11 +1742,6 @@ impl<U: Ui> App<U> {
             let use_terminal_frontier = uses_terminal_frontier(&state, frontier_claude.is_some());
             let stage_uses_frontier =
                 stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
-            let stage_launcher = if stage_uses_frontier {
-                frontier_launcher.unwrap_or(launcher)
-            } else {
-                launcher
-            };
             let stage_role = if stage_uses_frontier {
                 "frontier"
             } else {
@@ -1654,65 +1753,74 @@ impl<U: Ui> App<U> {
                 use_terminal_frontier,
                 self.cli.yolo,
             );
-            self.ui.stage(
-                stage_number,
-                total_stages,
-                &model_stage_title(state.stage.title(), stage_role, stage_launcher),
-            );
-            let planning_claude = if use_terminal_frontier {
+            let stage_title = if stage_uses_frontier {
+                claude_model_stage_title(
+                    state.stage.title(),
+                    stage_role,
+                    frontier_launcher.context("frontier stage requires a frontier connection")?,
+                )
+            } else {
+                model_stage_title(state.stage.title(), stage_role, launcher)
+            };
+            self.ui.stage(stage_number, total_stages, &stage_title);
+            let planning_agent: &dyn AgentBackend = if use_terminal_frontier {
                 frontier_claude
                     .as_ref()
                     .context("terminal Propose requires a frontier connection")?
             } else {
-                &worker_claude
+                worker_agent.as_ref()
             };
-            let verifying_claude = if use_terminal_frontier {
+            let verifying_agent: &dyn AgentBackend = if use_terminal_frontier {
                 frontier_claude
                     .as_ref()
                     .context("terminal Verify requires a frontier connection")?
             } else {
-                &worker_claude
+                worker_agent.as_ref()
             };
-            let applying_claude = if use_terminal_frontier {
+            let applying_agent: &dyn AgentBackend = if use_terminal_frontier {
                 frontier_claude
                     .as_ref()
                     .context("terminal Apply/repair requires a frontier connection")?
             } else {
-                &worker_claude
+                worker_agent.as_ref()
             };
             match state.stage {
-                Stage::Explore => self.run_explore(repo, &worker_claude, commands, &mut state)?,
+                Stage::Explore => {
+                    self.run_explore(repo, worker_agent.as_ref(), commands, &mut state)?
+                }
                 Stage::Propose => self.run_propose(
                     repo,
-                    planning_claude,
+                    planning_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
                 )?,
-                Stage::ProposalCommit => self.run_proposal_commit(repo, &claude, &mut state)?,
+                Stage::ProposalCommit => {
+                    self.run_proposal_commit(repo, agent.as_ref(), &mut state)?
+                }
                 Stage::Apply => self.run_apply(
                     repo,
-                    applying_claude,
+                    applying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
                 )?,
                 Stage::Verify => self.run_verify(
                     repo,
-                    verifying_claude,
+                    verifying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
                 )?,
                 Stage::Repair => self.run_repair(
                     repo,
-                    applying_claude,
+                    applying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
                 )?,
-                Stage::Archive => self.run_archive(repo, &claude, commands, &mut state)?,
-                Stage::FinalCommit => self.run_final_commit(repo, &claude, &mut state)?,
+                Stage::Archive => self.run_archive(repo, agent.as_ref(), commands, &mut state)?,
+                Stage::FinalCommit => self.run_final_commit(repo, agent.as_ref(), &mut state)?,
                 Stage::Complete | Stage::Done => unreachable!(),
             }
         }
@@ -1725,14 +1833,14 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         state: &mut RunState,
     ) -> Result<()> {
-        let (session, is_new) = planning_session(state);
+        let (session, is_new) = planning_session(state, claude.name());
         persist_state(repo, state, &self.ui)?;
         let subject = campaign_subject(state);
         let Some(result) = worker_result(
             claude.invoke(
                 session_mode(&session, is_new, "opsx-build-planning"),
                 &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
-                "Claude is exploring the change",
+                "Worker agent is exploring the change",
                 StageProtocol::Worker,
             ),
             repo,
@@ -1742,6 +1850,13 @@ impl<U: Ui> App<U> {
         else {
             return Ok(());
         };
+        let session = result
+            .session_id
+            .as_deref()
+            .map(SessionId::new)
+            .unwrap_or(session);
+        state.planning_session = Some(session.clone());
+        persist_state(repo, state, &self.ui)?;
         if !handle_worker_result(
             repo,
             state,
@@ -1766,7 +1881,7 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
         frontier_terminal: bool,
     ) -> Result<()> {
-        let (session, is_new) = planning_session(state);
+        let (mut session, is_new) = planning_session(state, claude.name());
         persist_state(repo, state, &self.ui)?;
         let planning_context = if state.bootstrap {
             BOOTSTRAP_PROPOSAL_CONTEXT
@@ -1802,13 +1917,13 @@ impl<U: Ui> App<U> {
                     ),
                     &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
                     if retrying_postcondition && frontier_terminal {
-                        "Frontier Claude is correcting the terminal acceptance proposal"
+                        "Frontier agent is correcting the terminal acceptance proposal"
                     } else if retrying_postcondition {
-                        "Claude is correcting the incomplete proposal"
+                        "Worker agent is correcting the incomplete proposal"
                     } else if frontier_terminal {
-                        "Frontier Claude is defining final project acceptance"
+                        "Frontier agent is defining final project acceptance"
                     } else {
-                        "Claude is creating OpenSpec artifacts"
+                        "Worker agent is creating OpenSpec artifacts"
                     },
                     StageProtocol::Propose,
                 ),
@@ -1819,6 +1934,11 @@ impl<U: Ui> App<U> {
             else {
                 return Ok(());
             };
+            if let Some(actual_session) = result.session_id.as_deref() {
+                session = SessionId::new(actual_session);
+                state.planning_session = Some(session.clone());
+                persist_state(repo, state, &self.ui)?;
+            }
 
             let mut after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
@@ -1877,7 +1997,7 @@ impl<U: Ui> App<U> {
                     continue;
                 }
                 bail!(
-                    "Propose still created or modified no active OpenSpec change after one corrective turn. Last Claude summary: {}",
+                    "Propose still created or modified no active OpenSpec change after one corrective turn. Last agent summary: {}",
                     result.text.trim()
                 );
             }
@@ -1890,11 +2010,11 @@ impl<U: Ui> App<U> {
             let change = change_result.with_context(|| {
                 if retrying_postcondition {
                     format!(
-                        "Propose still did not satisfy its READY postcondition after one corrective turn. Last Claude summary: {}",
+                        "Propose still did not satisfy its READY postcondition after one corrective turn. Last agent summary: {}",
                         result.text.trim()
                     )
                 } else {
-                    format!("Propose reported READY. Last Claude summary: {}", result.text.trim())
+                    format!("Propose reported READY. Last agent summary: {}", result.text.trim())
                 }
             })?;
             validate_change_name(&change)?;
@@ -1913,7 +2033,7 @@ impl<U: Ui> App<U> {
                     continue;
                 }
                 bail!(
-                    "Propose still left OpenSpec change `{change}` planning-incomplete after one corrective turn. Remaining work: {next_steps}. Last Claude summary: {}",
+                    "Propose still left OpenSpec change `{change}` planning-incomplete after one corrective turn. Remaining work: {next_steps}. Last agent summary: {}",
                     result.text.trim()
                 );
             }
@@ -1926,6 +2046,7 @@ impl<U: Ui> App<U> {
                     .warn(&format!("Could not rename planning session: {error}"));
             }
             state.planning_session = None;
+            state.planning_backend = None;
             state.stage = stage_after_propose(self.cli.yolo);
             persist_state(repo, state, &self.ui)?;
             return Ok(());
@@ -1959,7 +2080,7 @@ impl<U: Ui> App<U> {
             claude,
             &format!("{change}-proposal-commit"),
             &stage_prompt("", &task, StageProtocol::Ready),
-            "Claude is committing the proposal",
+            "Worker agent is committing the proposal",
             StageProtocol::Ready,
         );
         verify_milestone_ancestry(repo, baseline.as_deref(), "proposal", &self.ui)?;
@@ -1998,9 +2119,9 @@ impl<U: Ui> App<U> {
                 &format!("{change}-apply"),
                 &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
                 if frontier_terminal {
-                    "Frontier Claude is applying whole-project acceptance"
+                    "Frontier agent is applying whole-project acceptance"
                 } else {
-                    "Claude is applying the OpenSpec change"
+                    "Worker agent is applying the OpenSpec change"
                 },
                 StageProtocol::Worker,
             ),
@@ -2048,9 +2169,9 @@ impl<U: Ui> App<U> {
                 &format!("{change}-verify-{}", state.verify_retries + 1),
                 &stage_prompt(&commands.verify, &verify_subject, StageProtocol::Verify),
                 if frontier_terminal {
-                    "Frontier Claude is verifying the complete project goal"
+                    "Frontier agent is verifying the complete project goal"
                 } else {
-                    "Claude is verifying specification compliance"
+                    "Worker agent is verifying specification compliance"
                 },
                 StageProtocol::Verify,
             ),
@@ -2179,9 +2300,9 @@ impl<U: Ui> App<U> {
                 &format!("{change}-repair-{}", state.verify_retries),
                 &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
                 if frontier_terminal {
-                    "Frontier Claude is repairing whole-project acceptance"
+                    "Frontier agent is repairing whole-project acceptance"
                 } else {
-                    "Claude is repairing the implementation"
+                    "Worker agent is repairing the implementation"
                 },
                 StageProtocol::Worker,
             ),
@@ -2216,7 +2337,7 @@ impl<U: Ui> App<U> {
                 subject.clone()
             } else {
                 format!(
-                    "{subject}\n\nRECOVERY: The preceding attempt ended without a usable terminal result while this OpenSpec change remained active. Inspect durable OpenSpec state and complete the archive now. Invoke actual Claude tools one at a time; do not print XML, JSON, or any other textual representation of intended tool calls."
+                    "{subject}\n\nRECOVERY: The preceding attempt ended without a usable terminal result while this OpenSpec change remained active. Inspect durable OpenSpec state and complete the archive now. Invoke actual agent tools one at a time; do not print XML, JSON, or any other textual representation of intended tool calls."
                 )
             };
             let result = invoke_fresh(
@@ -2224,9 +2345,9 @@ impl<U: Ui> App<U> {
                 &format!("{change}-archive"),
                 &stage_prompt(&commands.archive, &attempt_subject, StageProtocol::Ready),
                 if attempt == 0 {
-                    "Claude is archiving the OpenSpec change"
+                    "Worker agent is archiving the OpenSpec change"
                 } else {
-                    "Claude is retrying the OpenSpec archive"
+                    "Worker agent is retrying the OpenSpec archive"
                 },
                 StageProtocol::Ready,
             );
@@ -2238,14 +2359,14 @@ impl<U: Ui> App<U> {
                 Err(error) => match openspec_snapshot(repo, &self.ui) {
                     Ok(changes) if archive_is_absent(&changes, &change) => {
                         self.ui.warn(
-                            "Archive completed but Claude omitted its terminal result; accepting OpenSpec state",
+                            "Archive completed but the worker agent omitted its terminal result; accepting OpenSpec state",
                         );
                         state.stage = state.stage.after_ready()?;
                         return persist_state(repo, state, &self.ui);
                     }
                     Ok(_) if attempt == 0 && is_missing_terminal_result(&error) => {
                         self.ui.warn(
-                            "Claude omitted its Archive terminal result while the change remains active; retrying once in a fresh session",
+                            "The worker agent omitted its Archive terminal result while the change remains active; retrying once in a fresh session",
                         );
                         continue;
                     }
@@ -2297,7 +2418,7 @@ impl<U: Ui> App<U> {
             claude,
             &format!("{change}-completion-commit"),
             &stage_prompt("", &task, StageProtocol::Ready),
-            "Claude is committing the completed change",
+            "Worker agent is committing the completed change",
             StageProtocol::Ready,
         );
         verify_milestone_ancestry(
@@ -2333,7 +2454,7 @@ impl<U: Ui> App<U> {
     fn print_new_dry_run(
         &self,
         repo: &Path,
-        launcher: &ClaudeLauncher,
+        launcher: &AgentLauncher,
         frontier_launcher: Option<&ClaudeLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
@@ -2368,23 +2489,36 @@ impl<U: Ui> App<U> {
             (&commands.explore, StageProtocol::Worker, "Explore")
         };
         let prompt = stage_prompt(planning_command, &campaign_subject(&dry_state), protocol);
-        let planning_launcher = if terminal_frontier {
-            frontier_launcher.unwrap_or(launcher)
-        } else {
-            launcher
+        let session = SessionMode::New {
+            id: SessionId::new(Uuid::nil().to_string()),
+            name: Some("opsx-build-planning".to_owned()),
         };
-        let command = build_claude_command(
-            repo,
-            planning_launcher,
-            &self.cli.permission_mode,
-            &SessionMode::New {
-                id: SessionId::new(Uuid::nil().to_string()),
-                name: Some("opsx-build-planning".to_owned()),
-            },
-            &prompt,
-            ClaudeOutputFormat::Json,
-            Some(protocol.json_schema()),
-        );
+        let command = if terminal_frontier {
+            build_claude_command(
+                repo,
+                frontier_launcher.context("terminal dry run requires a frontier connection")?,
+                &self.cli.permission_mode,
+                &session,
+                &prompt,
+                ClaudeOutputFormat::Json,
+                Some(protocol.json_schema()),
+            )
+        } else {
+            match launcher {
+                AgentLauncher::Claude(launcher) => build_claude_command(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    &session,
+                    &prompt,
+                    ClaudeOutputFormat::Json,
+                    Some(protocol.json_schema()),
+                ),
+                AgentLauncher::OpenCode(launcher) => {
+                    build_opencode_command(repo, launcher, &session, &prompt)
+                }
+            }
+        };
         self.ui.info(&format!("{label}: {}", command.display()));
         if dry_state.stage == Stage::Explore {
             self.ui
@@ -2398,8 +2532,9 @@ impl<U: Ui> App<U> {
             self.ui
                 .warn("YOLO mode: skip the proposal milestone commit");
         } else {
-            self.ui
-                .info("Ask Claude in a fresh session to create proposal milestone commit");
+            self.ui.info(
+                "Ask the worker agent in a fresh session to create the proposal milestone commit",
+            );
         }
         self.ui.info(&format!("Apply: {}", commands.apply));
         self.ui.info(&format!(
@@ -2408,7 +2543,7 @@ impl<U: Ui> App<U> {
         ));
         self.ui.info(&format!("Archive: {}", commands.archive));
         self.ui
-            .info("Ask Claude to create completion milestone commit");
+            .info("Ask the worker agent to create the completion milestone commit");
         if let Some(frontier_launcher) = frontier_launcher {
             self.ui.info(&format!(
                 "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
@@ -2488,8 +2623,28 @@ impl<U: Ui> App<U> {
         ProcessRunner::new(&self.ui).run_interactive(&command)
     }
 
+    fn run_interactive_opencode(&self, repo: &Path, launcher: &OpenCodeLauncher) -> Result<()> {
+        let initial_prompt = (!self.cli.request.is_empty()).then_some(self.cli.request.as_str());
+        let command = build_interactive_opencode_command(
+            repo,
+            launcher,
+            self.cli.permission_mode == "auto",
+            &self.cli.interactive_args,
+            initial_prompt,
+        );
+        self.ui
+            .debug(&format!("interactive command: {}", command.display()));
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — interactive OpenCode will not be launched");
+            self.ui.info(&command.display());
+            return Ok(());
+        }
+        ProcessRunner::new(&self.ui).run_interactive(&command)
+    }
+
     fn run_connection_test(&self, repo: &Path, launcher: &ClaudeLauncher) -> Result<()> {
-        let connection = connection_description(launcher);
+        let connection = claude_connection_description(launcher);
         let mode = if self.cli.basic_connection_test {
             ConnectionTestMode::Basic
         } else {
@@ -2524,31 +2679,78 @@ impl<U: Ui> App<U> {
         Ok(())
     }
 
-    fn debug_configuration(&self, repo: &Path, launcher: &ClaudeLauncher) {
+    fn run_opencode_connection_test(&self, repo: &Path, launcher: &OpenCodeLauncher) -> Result<()> {
+        let connection = connection_description(&AgentLauncher::OpenCode(launcher.clone()));
+        let mode = if self.cli.basic_connection_test {
+            ConnectionTestMode::Basic
+        } else {
+            ConnectionTestMode::Agentic
+        };
+        let command = build_opencode_connection_test_command(repo, launcher, mode);
+        self.ui.info(&format!(
+            "Testing OpenCode connection {connection} ({mode})"
+        ));
+        self.ui
+            .debug(&format!("connection test command: {}", command.display()));
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — the connection test will not contact the model");
+            self.ui.info(&command.display());
+            return Ok(());
+        }
+
+        let output = ProcessRunner::new(&self.ui).run(&command, "Waiting for model response")?;
+        let response = parse_opencode_connection_test_output(&output, mode)?;
+        if response == CONNECTION_TEST_MARKER {
+            self.ui
+                .success(&format!("Connection {connection} responded successfully"));
+        } else {
+            bail!(
+                "OpenCode transport succeeded, but response compatibility failed: expected exactly `{CONNECTION_TEST_MARKER}`, received {response:?}"
+            );
+        }
+        if self.cli.verbose {
+            self.ui.info(&format!("Model response: {response}"));
+        }
+        Ok(())
+    }
+
+    fn debug_configuration(&self, repo: &Path, launcher: &AgentLauncher) {
         self.ui
             .debug("complete prompts are visible and may contain repository content");
         self.ui.debug(&format!("repository: {}", repo.display()));
-        self.ui.debug(&format!(
-            "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, max provider retries={}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
-            launcher.connection_name,
-            launcher.environment_name,
-            launcher.program,
-            launcher.prefix_args,
-            launcher.model,
-            launcher.context_window,
-            launcher.auto_compact_window,
-            launcher.auto_compact_percent,
-            launcher.max_output_tokens,
-            self.cli.max_provider_retries,
-            launcher
-                .environment
-                .iter()
-                .map(|variable| variable.name.as_str())
-                .collect::<Vec<_>>(),
-            launcher.unset_environment,
-            self.cli.permission_mode,
-            self.cli.stream_claude
-        ));
+        match launcher {
+            AgentLauncher::Claude(launcher) => self.ui.debug(&format!(
+                "Claude launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, max provider retries={}, environment variables={:?}, unset environment={:?}, permission mode=`{}`, stream filter={:?}",
+                launcher.connection_name,
+                launcher.environment_name,
+                launcher.program,
+                launcher.prefix_args,
+                launcher.model,
+                launcher.context_window,
+                launcher.auto_compact_window,
+                launcher.auto_compact_percent,
+                launcher.max_output_tokens,
+                self.cli.max_provider_retries,
+                launcher
+                    .environment
+                    .iter()
+                    .map(|variable| variable.name.as_str())
+                    .collect::<Vec<_>>(),
+                launcher.unset_environment,
+                self.cli.permission_mode,
+                self.cli.stream_claude
+            )),
+            AgentLauncher::OpenCode(launcher) => self.ui.debug(&format!(
+                "OpenCode launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, stream filter={:?}",
+                launcher.connection_name,
+                launcher.environment_name,
+                launcher.program,
+                launcher.prefix_args,
+                launcher.model,
+                self.cli.stream_claude
+            )),
+        }
         self.ui.debug(&format!(
             "resolved config file: {}",
             self.cli
@@ -2563,18 +2765,47 @@ impl<U: Ui> App<U> {
     }
 }
 
-fn connection_description(launcher: &ClaudeLauncher) -> String {
-    let name = launcher.connection_name.as_deref().unwrap_or("default");
-    let model = launcher.model.as_deref().unwrap_or("harness default model");
-    launcher.environment_name.as_deref().map_or_else(
-        || format!("`{name}` ({model})"),
-        |environment| format!("`{name}` ({model}, environment `{environment}`)"),
+fn connection_description(launcher: &AgentLauncher) -> String {
+    let name = launcher.connection_name().unwrap_or("default");
+    let model = launcher.model().unwrap_or("harness default model");
+    let backend = launcher.backend_name();
+    launcher.environment_name().map_or_else(
+        || format!("`{name}` ({backend}, {model})"),
+        |environment| format!("`{name}` ({backend}, {model}, environment `{environment}`)"),
     )
 }
 
-fn model_stage_title(title: &str, role: &str, launcher: &ClaudeLauncher) -> String {
+fn claude_connection_description(launcher: &ClaudeLauncher) -> String {
+    connection_description(&AgentLauncher::Claude(launcher.clone()))
+}
+
+fn model_stage_title(title: &str, role: &str, launcher: &AgentLauncher) -> String {
+    let connection = launcher.connection_name().unwrap_or("default");
+    format!(
+        "{title} · {role} ({connection}, {})",
+        launcher.backend_name()
+    )
+}
+
+fn claude_model_stage_title(title: &str, role: &str, launcher: &ClaudeLauncher) -> String {
     let connection = launcher.connection_name.as_deref().unwrap_or("default");
     format!("{title} · {role} ({connection})")
+}
+
+fn ensure_launcher_prerequisites<U: Ui>(
+    launcher: &AgentLauncher,
+    repo: &Path,
+    ui: &U,
+) -> Result<()> {
+    match launcher {
+        AgentLauncher::Claude(_) => {
+            if launcher.program() != "claude" {
+                prerequisite_exists(launcher.program(), repo, ui)?;
+            }
+            prerequisite_exists("claude", repo, ui)
+        }
+        AgentLauncher::OpenCode(_) => prerequisite_exists(launcher.program(), repo, ui),
+    }
 }
 
 fn stage_uses_frontier_model(stage: Stage, bootstrap: bool, terminal_frontier: bool) -> bool {
@@ -2586,12 +2817,23 @@ fn stage_uses_frontier_model(stage: Stage, bootstrap: bool, terminal_frontier: b
             ))
 }
 
-fn planning_session(state: &mut RunState) -> (SessionId, bool) {
-    match &state.planning_session {
-        Some(id) => (id.clone(), false),
-        None => {
+fn planning_session(state: &mut RunState, backend: &str) -> (SessionId, bool) {
+    let saved_backend = state
+        .planning_backend
+        .as_deref()
+        .or_else(|| state.planning_session.as_ref().map(|_| "Claude"));
+    match (&state.planning_session, saved_backend == Some(backend)) {
+        (Some(id), true) => (id.clone(), false),
+        (None, _) => {
             let id = SessionId::new(Uuid::new_v4().to_string());
             state.planning_session = Some(id.clone());
+            state.planning_backend = Some(backend.to_owned());
+            (id, true)
+        }
+        (Some(_), false) => {
+            let id = SessionId::new(Uuid::new_v4().to_string());
+            state.planning_session = Some(id.clone());
+            state.planning_backend = Some(backend.to_owned());
             (id, true)
         }
     }
@@ -3166,6 +3408,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default(),
+        planning_backend: planning_session.as_ref().map(|_| "Claude".to_owned()),
         planning_session,
         pending_repair: value
             .get("pending_repair")
@@ -3490,10 +3733,11 @@ mod tests {
     fn stage_title_identifies_role_and_connection() {
         let mut launcher = ClaudeLauncher::parse("claude", None, None, None, None, None).unwrap();
         launcher.connection_name = Some("anthropic".to_owned());
+        let agent_launcher = AgentLauncher::Claude(launcher);
 
         assert_eq!(
-            model_stage_title("Apply", "frontier", &launcher),
-            "Apply · frontier (anthropic)"
+            model_stage_title("Apply", "worker", &agent_launcher),
+            "Apply · worker (anthropic, claude)"
         );
     }
 
@@ -3557,6 +3801,19 @@ mod tests {
         assert_eq!(state.change.as_deref(), Some("test-infrastructure"));
         assert_eq!(state.stage, Stage::ProposalCommit);
         assert!(state.planning_session.is_none());
+    }
+
+    #[test]
+    fn planning_resume_starts_fresh_when_the_backend_changes() {
+        let mut state = RunState::new("build it".to_owned(), ChangeSnapshot::default());
+        state.planning_session = Some(SessionId::new("claude-session"));
+        state.planning_backend = Some("Claude".to_owned());
+
+        let (session, is_new) = planning_session(&mut state, "OpenCode");
+
+        assert!(is_new);
+        assert_ne!(session.as_str(), "claude-session");
+        assert_eq!(state.planning_backend.as_deref(), Some("OpenCode"));
     }
 
     #[test]

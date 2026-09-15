@@ -15,7 +15,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, StageSignal},
+    backend::{
+        AgentBackend, MissingTerminalResult, SessionId, SessionMode, StageProtocol, StageResult,
+        StageSignal, parse_status_value,
+    },
     cli::{AgentConnection, BackendKind, Cli, ConnectionEnvironmentValue},
     model_confusions::prompt_guidance as model_confusion_guidance,
     process::{
@@ -35,7 +38,6 @@ const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
 const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-const MISSING_RESULT_EXCERPT_CHARS: usize = 320;
 pub const CONNECTION_TEST_MARKER: &str = "OPSX_CONNECTION_OK";
 const CONNECTION_TOOL_MARKER: &str = "OPSX_TOOL_ROUNDTRIP_OK";
 const CLAUDE_CONNECTION_ENV: &[&str] = &[
@@ -55,28 +57,6 @@ const CLAUDE_CONNECTION_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 ];
-
-#[derive(Debug)]
-struct MissingTerminalResult(String);
-
-impl MissingTerminalResult {
-    fn new(message: &str, last_response: Option<&str>) -> Self {
-        let mut diagnostic = message.to_owned();
-        if let Some(excerpt) = last_response.and_then(response_excerpt) {
-            diagnostic.push_str(". Last Claude response: ");
-            diagnostic.push_str(&excerpt);
-        }
-        Self(diagnostic)
-    }
-}
-
-impl fmt::Display for MissingTerminalResult {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Error for MissingTerminalResult {}
 
 #[derive(Debug)]
 struct ClaudeApiError {
@@ -212,9 +192,7 @@ fn transcript_paths(config_dir: &Path, session_id: &SessionId) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn is_missing_terminal_result(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<MissingTerminalResult>().is_some()
-}
+pub use crate::backend::{is_missing_terminal_result, parse_terminal_signal as parse_signal};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherEnvironment {
@@ -367,8 +345,10 @@ impl SkillCommands {
                 cli.apply_command.as_deref(),
                 &[
                     SkillCandidate::skill("openspec-apply-change"),
+                    SkillCandidate::opencode_skill("openspec-apply-change"),
                     SkillCandidate::command("opsx/apply.md", "opsx:apply"),
                     SkillCandidate::command("opsx/apply", "opsx:apply"),
+                    SkillCandidate::opencode_command("opsx-apply.md", "opsx-apply"),
                 ],
                 "apply",
             )?,
@@ -377,8 +357,10 @@ impl SkillCommands {
                 cli.verify_command.as_deref(),
                 &[
                     SkillCandidate::skill("openspec-verify-change"),
+                    SkillCandidate::opencode_skill("openspec-verify-change"),
                     SkillCandidate::command("opsx/verify.md", "opsx:verify"),
                     SkillCandidate::command("opsx/verify", "opsx:verify"),
+                    SkillCandidate::opencode_command("opsx-verify.md", "opsx-verify"),
                 ],
                 "verify",
             )?,
@@ -387,8 +369,10 @@ impl SkillCommands {
                 cli.archive_command.as_deref(),
                 &[
                     SkillCandidate::skill("openspec-archive-change"),
+                    SkillCandidate::opencode_skill("openspec-archive-change"),
                     SkillCandidate::command("opsx/archive.md", "opsx:archive"),
                     SkillCandidate::command("opsx/archive", "opsx:archive"),
+                    SkillCandidate::opencode_command("opsx-archive.md", "opsx-archive"),
                 ],
                 "archive",
             )?,
@@ -422,6 +406,20 @@ impl SkillCandidate {
             invocation: format!("/{invocation}"),
         }
     }
+
+    fn opencode_skill(name: &str) -> Self {
+        Self {
+            relative_path: PathBuf::from(format!(".opencode/skills/{name}/SKILL.md")),
+            invocation: format!("/{name}"),
+        }
+    }
+
+    fn opencode_command(path: &str, invocation: &str) -> Self {
+        Self {
+            relative_path: PathBuf::from(format!(".opencode/commands/{path}")),
+            invocation: format!("/{invocation}"),
+        }
+    }
 }
 
 fn resolve_command(
@@ -442,7 +440,7 @@ fn resolve_command(
     }
 
     bail!(
-        "could not discover the Claude {stage} skill in `.claude/skills` or `.claude/commands`; pass `--{stage}-command /your-command`"
+        "could not discover the {stage} workflow in `.claude` or `.opencode`; pass `--{stage}-command /your-command`"
     )
 }
 
@@ -1434,22 +1432,6 @@ fn message_mentions_http_status(message: &str, status: u16) -> bool {
         || message.trim_start().starts_with(&format!("{status} "))
 }
 
-fn response_excerpt(text: &str) -> Option<String> {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    if normalized.chars().count() <= MISSING_RESULT_EXCERPT_CHARS {
-        return Some(normalized);
-    }
-    let mut excerpt = normalized
-        .chars()
-        .take(MISSING_RESULT_EXCERPT_CHARS)
-        .collect::<String>();
-    excerpt.push('…');
-    Some(excerpt)
-}
-
 fn last_assistant_response(events: &[Value]) -> Option<&str> {
     events.iter().rev().find_map(|event| {
         event
@@ -1635,15 +1617,6 @@ fn parse_claude_stream_output(stdout: &str) -> Result<StageResult> {
     .into())
 }
 
-pub fn parse_signal(text: &str) -> Option<StageSignal> {
-    text.lines().rev().find_map(|line| {
-        line.trim()
-            .strip_prefix("OPSX_STATUS:")
-            .or_else(|| line.trim().strip_prefix("OSPX_STATUS:"))
-            .and_then(parse_status_value)
-    })
-}
-
 fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String)>> {
     let Some(output) = result.get("structured_output") else {
         return Ok(None);
@@ -1672,19 +1645,6 @@ fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String
         .unwrap_or_default()
         .to_owned();
     Ok(Some((signal, summary)))
-}
-
-fn parse_status_value(status: &str) -> Option<StageSignal> {
-    match status.trim().to_ascii_uppercase().as_str() {
-        "READY" => Some(StageSignal::Ready),
-        "DONE" => Some(StageSignal::Done),
-        "TOO_LARGE" => Some(StageSignal::TooLarge),
-        "VERIFIED" => Some(StageSignal::Verified),
-        "RETRY" => Some(StageSignal::Retry),
-        "BLOCKED" => Some(StageSignal::Blocked),
-        "REPLANNED" => Some(StageSignal::Replanned),
-        _ => None,
-    }
 }
 
 fn unsupported_json_option(output: &ProcessOutput) -> bool {
@@ -1776,7 +1736,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
     let model_confusions = model_confusion_guidance();
     let test_execution_policy = match protocol {
         StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
-            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen Claude Code's sandbox prevents a required project build or test from running, rerun only the affected command outside the sandbox using the Bash tool with `dangerouslyDisableSandbox: true`. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate Claude's sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
+            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen the coding-agent runtime's sandbox prevents a required project build or test from running, use the runtime's narrowest available permission override to rerun only the affected command. In Claude Code, use the Bash tool with `dangerouslyDisableSandbox: true`; in another backend, use its native equivalent. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate the agent sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
         }
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
@@ -2162,6 +2122,30 @@ mod tests {
             resolve_bundled_command(Some("custom-propose"), "propose-unattended"),
             "/custom-propose"
         );
+    }
+
+    #[test]
+    fn discovers_native_opencode_workflow_layout() {
+        let repo = std::env::temp_dir().join(format!("opsx-opencode-workflow-{}", Uuid::new_v4()));
+        let path = repo.join(".opencode/commands/opsx-apply.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "apply").unwrap();
+
+        let command = resolve_command(
+            &repo,
+            None,
+            &[
+                SkillCandidate::skill("openspec-apply-change"),
+                SkillCandidate::opencode_skill("openspec-apply-change"),
+                SkillCandidate::command("opsx/apply.md", "opsx:apply"),
+                SkillCandidate::opencode_command("opsx-apply.md", "opsx-apply"),
+            ],
+            "apply",
+        )
+        .unwrap();
+
+        assert_eq!(command, "/opsx-apply");
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
@@ -2660,7 +2644,7 @@ mod tests {
 
         assert!(is_missing_terminal_result(&error));
         assert!(error.to_string().contains(
-            "Last Claude response: The test is flaky. I need to repair the synchronization next."
+            "Last agent response: The test is flaky. I need to repair the synchronization next."
         ));
     }
 

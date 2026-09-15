@@ -572,7 +572,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                             }
                         } else {
                             self.ui.warn(
-                                "This Claude invocation does not accept interrupting commands",
+                                "This agent backend does not accept interrupting commands in its current transport mode",
                             );
                         }
                     }
@@ -629,7 +629,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
             .with_context(|| format!("failed to launch `{}`", spec.program))?;
         if !status.success() {
             bail!(
-                "interactive Claude exited with {}",
+                "interactive agent exited with {}",
                 status
                     .code()
                     .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}"))

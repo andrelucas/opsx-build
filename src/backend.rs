@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error, fmt};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,60 @@ pub struct StageResult {
     pub text: String,
     pub session_id: Option<String>,
     pub signal: StageSignal,
+}
+
+#[derive(Debug)]
+pub struct MissingTerminalResult(String);
+
+impl MissingTerminalResult {
+    pub fn new(message: &str, last_response: Option<&str>) -> Self {
+        const EXCERPT_CHARS: usize = 320;
+
+        let mut diagnostic = message.to_owned();
+        if let Some(response) = last_response.map(str::trim).filter(|text| !text.is_empty()) {
+            let mut excerpt = response.chars().take(EXCERPT_CHARS).collect::<String>();
+            if response.chars().count() > EXCERPT_CHARS {
+                excerpt.push('…');
+            }
+            diagnostic.push_str(". Last agent response: ");
+            diagnostic.push_str(&excerpt.replace('\n', " "));
+        }
+        Self(diagnostic)
+    }
+}
+
+impl fmt::Display for MissingTerminalResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for MissingTerminalResult {}
+
+pub fn is_missing_terminal_result(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MissingTerminalResult>().is_some()
+}
+
+pub fn parse_terminal_signal(text: &str) -> Option<StageSignal> {
+    text.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix("OPSX_STATUS:")
+            .or_else(|| line.trim().strip_prefix("OSPX_STATUS:"))
+            .and_then(parse_status_value)
+    })
+}
+
+pub fn parse_status_value(status: &str) -> Option<StageSignal> {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "READY" => Some(StageSignal::Ready),
+        "DONE" => Some(StageSignal::Done),
+        "TOO_LARGE" => Some(StageSignal::TooLarge),
+        "VERIFIED" => Some(StageSignal::Verified),
+        "RETRY" => Some(StageSignal::Retry),
+        "BLOCKED" => Some(StageSignal::Blocked),
+        "REPLANNED" => Some(StageSignal::Replanned),
+        _ => None,
+    }
 }
 
 pub trait AgentBackend {

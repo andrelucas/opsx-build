@@ -260,11 +260,11 @@ struct CliArgs {
     #[arg(long)]
     no_yolo: bool,
 
-    /// Open an interactive Claude session instead of running the OpenSpec workflow.
+    /// Open an interactive session with the selected worker backend.
     #[arg(long)]
     interactive: bool,
 
-    /// Exercise a named Claude connection, including one tool-result round trip, and exit.
+    /// Exercise a named agent connection, including one tool-result round trip, and exit.
     #[arg(
         long,
         value_name = "NAME",
@@ -285,7 +285,7 @@ struct CliArgs {
     )]
     test_connection: Option<String>,
 
-    /// Test only a single text response, without exercising Claude tool-result compatibility.
+    /// Test only a single text response, without exercising tool-result compatibility.
     #[arg(long, requires = "test_connection")]
     basic_connection_test: bool,
 
@@ -351,8 +351,8 @@ struct CliArgs {
     #[arg(long, requires = "resume", value_name = "TEXT")]
     direction: Option<String>,
 
-    /// Additional arguments passed directly to Claude after `--`.
-    #[arg(last = true, value_name = "CLAUDE_ARGS", requires = "interactive")]
+    /// Additional arguments passed directly to the selected agent after `--`.
+    #[arg(last = true, value_name = "AGENT_ARGS", requires = "interactive")]
     interactive_args: Vec<String>,
 
     /// Load defaults from this TOML file.
@@ -387,13 +387,14 @@ struct CliArgs {
     #[arg(long, short)]
     verbose: bool,
 
-    /// Show resolved commands, Claude session details, and complete prompts.
+    /// Show resolved commands, agent session details, and complete prompts.
     #[arg(long)]
     debug: bool,
 
-    /// Stream Claude activity; optionally select activity, full, or raw filtering.
+    /// Stream agent activity; optionally select activity, full, or raw filtering.
     #[arg(
         long,
+        visible_alias = "stream-agent",
         env = "OPSX_BUILD_STREAM_CLAUDE",
         value_enum,
         value_name = "FILTER",
@@ -1860,6 +1861,14 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(raw.stream_claude, Some(StreamFilter::Raw));
+
+        let generic = Cli::resolve(args([
+            "opsx-build",
+            "--stream-agent=full",
+            "build something",
+        ]))
+        .unwrap();
+        assert_eq!(generic.stream_claude, Some(StreamFilter::Full));
     }
 
     #[test]
