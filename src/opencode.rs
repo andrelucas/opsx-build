@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -16,10 +17,12 @@ use crate::{
     },
     claude::{CONNECTION_TEST_MARKER, ConnectionTestMode, stage_prompt},
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
+    opencode_server::OpenCodeServer,
     process::{
-        CommandSpec, ProcessOutput, ProcessRunner, WorkerEscalationRequested, diagnostic_text,
+        BackendStreamControlDisposition, BackendStreamControlRequested, CommandSpec, ProcessOutput,
+        ProcessRunner, WorkerEscalationRequested, diagnostic_text,
     },
-    stream::{StreamFilter, StreamItem},
+    stream::{StreamControl, StreamFilter, StreamItem},
     ui::Ui,
 };
 
@@ -61,6 +64,7 @@ pub struct OpenCodeLauncher {
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
+    pub context_window: Option<u64>,
     environment: Vec<LauncherEnvironment>,
     unset_environment: Vec<String>,
 }
@@ -124,10 +128,68 @@ impl OpenCodeLauncher {
             program: words.remove(0),
             prefix_args: words,
             model: connection.model.clone(),
+            context_window: connection.context_window,
             environment,
             unset_environment,
         })
     }
+}
+
+pub(crate) fn build_opencode_server_command(
+    repo: &Path,
+    launcher: &OpenCodeLauncher,
+    port: u16,
+) -> CommandSpec {
+    let mut args = launcher.prefix_args.clone();
+    args.extend([
+        "serve".to_owned(),
+        "--hostname".to_owned(),
+        "127.0.0.1".to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ]);
+    with_launcher_environment(
+        CommandSpec::new(&launcher.program, repo).args(args),
+        launcher,
+    )
+    .remove_env("OPENCODE_SERVER_PASSWORD")
+    .remove_env("OPENCODE_SERVER_USERNAME")
+}
+
+fn build_attached_opencode_command(
+    repo: &Path,
+    launcher: &OpenCodeLauncher,
+    server_url: &str,
+    session_id: &SessionId,
+    prompt: &str,
+) -> CommandSpec {
+    let invocation = resolve_invocation(repo, prompt);
+    let mut args = launcher.prefix_args.clone();
+    args.extend([
+        "run".to_owned(),
+        "--format".to_owned(),
+        "json".to_owned(),
+        "--auto".to_owned(),
+        "--attach".to_owned(),
+        server_url.to_owned(),
+        "--session".to_owned(),
+        session_id.to_string(),
+    ]);
+    if let Some(model) = &launcher.model {
+        args.extend(["--model".to_owned(), model.clone()]);
+    }
+    if let Some(command) = invocation.command {
+        args.extend(["--command".to_owned(), command]);
+    }
+    if !invocation.message.is_empty() {
+        args.push(invocation.message);
+    }
+    with_launcher_environment(
+        CommandSpec::new(&launcher.program, repo).args(args),
+        launcher,
+    )
+    .remove_env("OPENCODE_SERVER_PASSWORD")
+    .remove_env("OPENCODE_SERVER_USERNAME")
 }
 
 pub fn build_opencode_command(
@@ -268,6 +330,7 @@ pub fn parse_connection_test_output(
 pub struct OpenCodeBackend<'a, U: Ui> {
     repo: &'a Path,
     launcher: &'a OpenCodeLauncher,
+    server: Arc<OpenCodeServer>,
     stream_transport: bool,
     stream_filter: Option<StreamFilter>,
     max_output_retries: u32,
@@ -290,6 +353,7 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         Self {
             repo,
             launcher,
+            server: Arc::new(OpenCodeServer::new(repo, launcher)),
             stream_transport: stream_transport || stream_filter.is_some(),
             stream_filter,
             max_output_retries: 0,
@@ -300,6 +364,11 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
             ui,
             runner: ProcessRunner::new(ui),
         }
+    }
+
+    pub(crate) fn with_server(mut self, server: Arc<OpenCodeServer>) -> Self {
+        self.server = server;
+        self
     }
 
     pub fn with_stage_timeout(mut self, timeout: Duration) -> Self {
@@ -321,49 +390,84 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
 
     fn invoke_once(
         &self,
-        session: &SessionMode,
+        session_id: &SessionId,
         prompt: &str,
         activity: &str,
         timeout: Option<Duration>,
     ) -> Result<OpenCodeAttempt> {
-        self.ui.debug(&format!(
-            "OpenCode session: {}",
-            session_description(session)
-        ));
+        self.ui
+            .debug(&format!("OpenCode session: resume {session_id}"));
         self.ui.debug_prompt(activity, prompt);
-        let spec = build_opencode_command(self.repo, self.launcher, session, prompt);
+        let client = self.server.client(self.ui)?;
+        let spec = build_attached_opencode_command(
+            self.repo,
+            self.launcher,
+            client.base_url(),
+            session_id,
+            prompt,
+        );
         let spec = if let Some(repo) = self.resume_repo.as_deref() {
             spec.resume_from(repo)
         } else {
             spec
         };
         let output = if self.stream_transport {
-            self.runner
-                .run_streaming_with_timeout(&spec, activity, timeout, |line| {
+            self.runner.run_streaming_with_timeout_and_controls(
+                &spec,
+                activity,
+                timeout,
+                |line| {
                     if let Some(filter) = self.stream_filter {
                         for item in filter_opencode_line(line, filter) {
                             self.ui.stream_item(&item);
                         }
                     }
-                })?
+                },
+                |control| {
+                    client.abort_session(session_id.as_str())?;
+                    let disposition = match control {
+                        StreamControl::Compact => {
+                            self.ui.stream_message_sent(
+                                "OpenCode acknowledged compaction request; waiting for active work to stop",
+                            );
+                            BackendStreamControlDisposition::RestartStage
+                        }
+                        StreamControl::Context => {
+                            self.ui.stream_message_sent(
+                                "OpenCode acknowledged context request; waiting for active work to stop",
+                            );
+                            BackendStreamControlDisposition::RestartStage
+                        }
+                        StreamControl::Inject(_) => {
+                            self.ui.stream_message_sent(
+                                "OpenCode acknowledged steering request; waiting for active work to stop",
+                            );
+                            BackendStreamControlDisposition::RestartStage
+                        }
+                        StreamControl::Interrupt
+                        | StreamControl::Pause
+                        | StreamControl::Escalate
+                        | StreamControl::None => BackendStreamControlDisposition::Unhandled,
+                    };
+                    Ok(disposition)
+                },
+            )?
         } else {
             self.runner.run(&spec, activity)?
         };
         if output_hit_token_limit(&output) {
-            let session_id = output_session_id(&output.stdout)
-                .or_else(|| match session {
-                    SessionMode::Resume { id } => Some(id.clone()),
-                    SessionMode::New { .. } => None,
-                })
-                .context(
-                    "OpenCode reached its output limit but omitted the created session ID, so continuation is unsafe",
-                )?;
+            let session_id =
+                output_session_id(&output.stdout).unwrap_or_else(|| session_id.clone());
             return Ok(OpenCodeAttempt::OutputLimit(session_id));
         }
         if !output.success {
             return Err(opencode_stage_failure(&output));
         }
-        parse_opencode_output(&output.stdout).map(OpenCodeAttempt::Complete)
+        let mut result = parse_opencode_output(&output.stdout)?;
+        result
+            .session_id
+            .get_or_insert_with(|| session_id.to_string());
+        Ok(OpenCodeAttempt::Complete(result))
     }
 }
 
@@ -379,7 +483,13 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         activity: &str,
         protocol: StageProtocol,
     ) -> Result<StageResult> {
-        let mut current_session = session;
+        let client = self.server.client(self.ui)?;
+        let mut current_session = match session {
+            SessionMode::New { name, .. } => {
+                SessionId::new(client.create_session(name.as_deref())?)
+            }
+            SessionMode::Resume { id } => id,
+        };
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
@@ -402,6 +512,34 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
             ) {
                 Err(error)
                     if error
+                        .downcast_ref::<BackendStreamControlRequested>()
+                        .is_some() =>
+                {
+                    let control = error
+                        .downcast_ref::<BackendStreamControlRequested>()
+                        .expect("guard established backend stream control")
+                        .control()
+                        .clone();
+                    match &control {
+                        StreamControl::Compact => {
+                            client.compact_session(current_session.as_str())?;
+                            self.ui.stream_item(&StreamItem::Lifecycle(format!(
+                                "OpenCode compacted session {current_session}"
+                            )));
+                        }
+                        StreamControl::Context => {
+                            let report = client.context_report(current_session.as_str())?;
+                            self.ui.stream_item(&StreamItem::Lifecycle(report));
+                        }
+                        StreamControl::Inject(_) => {}
+                        _ => unreachable!("only restart controls produce this result"),
+                    }
+                    current_prompt = manual_control_continuation_prompt(protocol, &control);
+                    current_activity =
+                        format!("{activity} (after {})", manual_control_label(&control));
+                }
+                Err(error)
+                    if error
                         .downcast_ref::<OpenCodeApiError>()
                         .is_some_and(|error| error.transient)
                         && provider_retries < self.max_provider_retries =>
@@ -417,22 +555,14 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                     let session_id = error
                         .downcast_ref::<OpenCodeApiError>()
                         .and_then(|error| error.session_id.clone())
-                        .or_else(|| match &current_session {
-                            SessionMode::Resume { id } => Some(id.clone()),
-                            SessionMode::New { .. } => None,
-                        });
-                    let Some(session_id) = session_id else {
-                        return Err(error.context(
-                            "transient OpenCode failure omitted the created session ID, so a same-session retry is unsafe",
-                        ));
-                    };
+                        .unwrap_or_else(|| current_session.clone());
                     self.ui.warn(&format!(
                         "Transient OpenCode provider failure; retrying the same session in {} second(s) ({provider_retries}/{})",
                         delay.as_secs(),
                         self.max_provider_retries
                     ));
                     thread::sleep(delay);
-                    current_session = SessionMode::Resume { id: session_id };
+                    current_session = session_id;
                     current_prompt = transient_provider_continuation_prompt(protocol);
                     current_activity = format!(
                         "{activity} (provider recovery {provider_retries}/{})",
@@ -458,7 +588,7 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                         "OpenCode reached its output token limit; continuing the same phase ({output_recoveries}/{})",
                         self.max_output_retries
                     ));
-                    current_session = SessionMode::Resume { id: session_id };
+                    current_session = session_id;
                     current_prompt = output_limit_continuation_prompt(protocol);
                     current_activity = format!(
                         "{activity} (output-limit continuation {output_recoveries}/{})",
@@ -477,16 +607,21 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         }
     }
 
-    fn rename_session(&self, _session_id: &SessionId, _name: &str) -> Result<()> {
-        // `opencode run` can title a new session but cannot rename an existing one.
-        // The orchestrator retains the change/session association in its checkpoint.
-        Ok(())
+    fn rename_session(&self, session_id: &SessionId, name: &str) -> Result<()> {
+        self.server
+            .client(self.ui)?
+            .rename_session(session_id.as_str(), name)
     }
 
     fn compact_session(&self, session_id: &SessionId, completed_phase: &str) -> Result<()> {
-        self.ui.warn(&format!(
-            "OpenCode's synchronous `run` transport cannot hard-compact session {session_id} after {completed_phase}; continuing with its automatic context management"
+        self.ui.info(&format!(
+            "Hard-compacting OpenCode session after {completed_phase}"
         ));
+        self.server
+            .client(self.ui)?
+            .compact_session(session_id.as_str())?;
+        self.ui
+            .success(&format!("Compacted OpenCode session {session_id}"));
         Ok(())
     }
 }
@@ -675,6 +810,33 @@ fn transient_provider_continuation_prompt(protocol: StageProtocol) -> String {
     )
 }
 
+fn manual_control_label(control: &StreamControl) -> &'static str {
+    match control {
+        StreamControl::Compact => "manual compaction",
+        StreamControl::Context => "context inspection",
+        StreamControl::Inject(_) => "operator steering",
+        _ => "live control",
+    }
+}
+
+fn manual_control_continuation_prompt(protocol: StageProtocol, control: &StreamControl) -> String {
+    let instruction = match control {
+        StreamControl::Compact => {
+            "The operator interrupted the preceding turn and compacted this OpenCode session. Continue the same opsx-build phase from the compacted session and durable repository state. Preserve correct partial work, do not restart completed tasks, and finish the outstanding phase."
+                .to_owned()
+        }
+        StreamControl::Context => {
+            "The operator interrupted the preceding turn to inspect this OpenCode session's context usage. Continue the same opsx-build phase from its durable repository state. Preserve correct partial work, do not restart completed tasks, and finish the outstanding phase."
+                .to_owned()
+        }
+        StreamControl::Inject(message) => format!(
+            "The operator interrupted the preceding turn with this steering direction:\n\n{message}\n\nApply that direction to the current opsx-build phase. Preserve correct partial work and continue until the phase reaches its required terminal result."
+        ),
+        _ => unreachable!("only manual restart controls need continuation prompts"),
+    };
+    stage_prompt("", &instruction, protocol)
+}
+
 fn opencode_event_error(event: &Value) -> Option<String> {
     if event.get("type").and_then(Value::as_str) != Some("error") {
         return None;
@@ -701,7 +863,7 @@ fn filter_opencode_line(line: &str, filter: StreamFilter) -> Vec<StreamItem> {
             .pointer("/part/text")
             .and_then(Value::as_str)
             .filter(|text| !text.trim().is_empty())
-            .map(|text| vec![StreamItem::Assistant(text.to_owned())])
+            .map(|text| vec![StreamItem::OpenCode(text.to_owned())])
             .unwrap_or_default(),
         Some("tool_use") => {
             let tool = event
@@ -760,16 +922,6 @@ fn with_launcher_environment(spec: CommandSpec, launcher: &OpenCodeLauncher) -> 
             spec.env(&variable.name, &variable.value)
         }
     })
-}
-
-fn session_description(session: &SessionMode) -> String {
-    match session {
-        SessionMode::New { id, name } => match name {
-            Some(name) => format!("new (provisional {id}), title `{name}`"),
-            None => format!("new (provisional {id})"),
-        },
-        SessionMode::Resume { id } => format!("resume {id}"),
-    }
 }
 
 fn validate_environment_name(name: &str) -> Result<()> {
@@ -855,6 +1007,13 @@ fn split_command(command: &str) -> Result<Vec<String>> {
 mod tests {
     use std::fs;
 
+    #[cfg(unix)]
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::JoinHandle,
+    };
+
     use super::*;
     use crate::{backend::StageSignal, cli::BackendKind};
     #[cfg(unix)]
@@ -894,6 +1053,54 @@ mod tests {
         fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
     }
 
+    #[cfg(unix)]
+    fn fake_session_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST /session?directory="));
+            let body = r#"{"id":"ses_created"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (url, thread)
+    }
+
+    #[cfg(unix)]
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
     fn launcher() -> OpenCodeLauncher {
         OpenCodeLauncher {
             connection_name: Some("open".to_owned()),
@@ -901,6 +1108,7 @@ mod tests {
             program: "opencode".to_owned(),
             prefix_args: Vec::new(),
             model: Some("openrouter/qwen/qwen3.6-35b-a3b".to_owned()),
+            context_window: Some(262_144),
             environment: Vec::new(),
             unset_environment: Vec::new(),
         }
@@ -947,6 +1155,61 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--session", "ses_123"])
         );
+    }
+
+    #[test]
+    fn constructs_private_server_and_attached_stage_commands() {
+        let repo = Path::new("/repo");
+        let mut launcher = launcher();
+        launcher.environment.push(LauncherEnvironment {
+            name: "OPENCODE_SERVER_PASSWORD".to_owned(),
+            value: "inherited-secret".to_owned(),
+            redacted: true,
+        });
+        let server = build_opencode_server_command(repo, &launcher, 43123);
+        assert_eq!(
+            server.args,
+            ["serve", "--hostname", "127.0.0.1", "--port", "43123"]
+        );
+        assert!(
+            server
+                .env_remove
+                .iter()
+                .any(|name| name == "OPENCODE_SERVER_PASSWORD")
+        );
+        assert!(
+            server
+                .env
+                .iter()
+                .all(|(name, _)| name != "OPENCODE_SERVER_PASSWORD")
+        );
+
+        let attached = build_attached_opencode_command(
+            repo,
+            &launcher,
+            "http://127.0.0.1:43123",
+            &SessionId::new("ses_123"),
+            "/opsx-apply slice-a",
+        );
+        assert!(
+            attached
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--attach", "http://127.0.0.1:43123"] })
+        );
+        assert!(
+            attached
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--session", "ses_123"])
+        );
+        assert!(
+            attached
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--command", "opsx-apply"])
+        );
+        assert_eq!(attached.args.last().map(String::as_str), Some("slice-a"));
     }
 
     #[test]
@@ -1043,6 +1306,16 @@ mod tests {
     }
 
     #[test]
+    fn labels_streamed_model_text_as_opencode() {
+        let items = filter_opencode_line(
+            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"Working on it."}}"#,
+            StreamFilter::Activity,
+        );
+
+        assert_eq!(items, [StreamItem::OpenCode("Working on it.".to_owned())]);
+    }
+
+    #[test]
     fn validates_an_agentic_connection_tool_round_trip() {
         let output = ProcessOutput {
             success: true,
@@ -1120,12 +1393,15 @@ printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","te
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,
+            context_window: None,
             environment: Vec::new(),
             unset_environment: Vec::new(),
         };
         let ui = QuietUi;
         let mut backend =
             OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(0, 1);
+        let (server_url, server) = fake_session_server();
+        backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, server_url));
         backend.provider_retry_base_delay = Duration::from_millis(1);
 
         let result = backend
@@ -1143,6 +1419,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","te
         assert_eq!(result.signal, StageSignal::Ready);
         let resumed_arguments = fs::read_to_string(arguments).unwrap();
         assert!(resumed_arguments.contains("--session ses_actual"));
+        server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1175,12 +1452,15 @@ printf '%s\n' '{"type":"text","sessionID":"ses_limit","part":{"type":"text","tex
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,
+            context_window: None,
             environment: Vec::new(),
             unset_environment: Vec::new(),
         };
         let ui = QuietUi;
-        let backend =
+        let mut backend =
             OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(1, 0);
+        let (server_url, server) = fake_session_server();
+        backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, server_url));
 
         let result = backend
             .invoke(
@@ -1197,6 +1477,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_limit","part":{"type":"text","tex
         assert_eq!(result.signal, StageSignal::Ready);
         let resumed_arguments = fs::read_to_string(arguments).unwrap();
         assert!(resumed_arguments.contains("--session ses_limit"));
+        server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

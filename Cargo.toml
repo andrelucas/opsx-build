@@ -1,6 +1,6 @@
 [package]
 name = "opsx-build"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
 description = "Unattended OpenSpec build orchestrator for coding agents"
 license = "MIT"
@@ -15,4 +15,5 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }

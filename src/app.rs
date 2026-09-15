@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -40,6 +41,7 @@ use crate::{
         build_interactive_opencode_command, build_opencode_command,
         parse_connection_test_output as parse_opencode_connection_test_output,
     },
+    opencode_server::OpenCodeServer,
     openspec::{
         ChangeSnapshot, identify_assigned_change, identify_change,
         numeric_prefix_reconciliation_candidate, planning_status, rename_change_directory,
@@ -1624,6 +1626,12 @@ impl<U: Ui> App<U> {
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
+        let opencode_server = match launcher {
+            AgentLauncher::OpenCode(launcher) => {
+                Some(Arc::new(OpenCodeServer::new(repo, launcher)))
+            }
+            AgentLauncher::Claude(_) => None,
+        };
         let agent: Box<dyn AgentBackend + '_> = match launcher {
             AgentLauncher::Claude(launcher) => {
                 let client = ClaudeBackend::new(
@@ -1653,6 +1661,12 @@ impl<U: Ui> App<U> {
                     self.ui.supports_stream_input(),
                     self.cli.stream_claude,
                     &self.ui,
+                )
+                .with_server(
+                    opencode_server
+                        .as_ref()
+                        .expect("OpenCode launcher has a shared server")
+                        .clone(),
                 )
                 .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries),
             ),
@@ -1689,6 +1703,12 @@ impl<U: Ui> App<U> {
             AgentLauncher::OpenCode(launcher) => {
                 let client =
                     OpenCodeBackend::new(repo, launcher, true, self.cli.stream_claude, &self.ui)
+                        .with_server(
+                            opencode_server
+                                .as_ref()
+                                .expect("OpenCode launcher has a shared server")
+                                .clone(),
+                        )
                         .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries);
                 let client = if state.bootstrap {
                     client

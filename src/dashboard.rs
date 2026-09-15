@@ -80,11 +80,11 @@ enum PendingConfirmation {
 impl PendingConfirmation {
     fn prompt(self) -> &'static str {
         match self {
-            Self::Pause => "Pause now and stop the current Claude process?",
+            Self::Pause => "Pause now and stop the current agent process?",
             Self::StopAfterIteration => "Pause after the current OpenSpec change completes?",
             Self::Escalate => "Stop the local worker and request frontier replanning?",
-            Self::Compact => "Interrupt Claude, compact, and restart the current phase?",
-            Self::Context => "Interrupt Claude and request a context report?",
+            Self::Compact => "Interrupt the active agent, compact, and restart the current phase?",
+            Self::Context => "Interrupt the active agent and request a context report?",
         }
     }
 }
@@ -358,11 +358,17 @@ impl StreamDashboard {
 
     pub(crate) fn push(&mut self, item: &StreamItem) {
         if let StreamItem::Assistant(text) = item {
-            self.push_claude_message(text);
+            self.push_agent_message("claude", "Claude", text);
+            return;
+        }
+        if let StreamItem::OpenCode(text) = item {
+            self.push_agent_message("opencode", "OpenCode", text);
             return;
         }
         let (label, color, text) = match item {
-            StreamItem::Assistant(_) => unreachable!("assistant messages returned above"),
+            StreamItem::Assistant(_) | StreamItem::OpenCode(_) => {
+                unreachable!("assistant messages returned above")
+            }
             StreamItem::Subagent(text) => ("agent", Color::Blue, text),
             StreamItem::Tool(text) => ("tool", Color::Yellow, text),
             StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
@@ -372,19 +378,19 @@ impl StreamDashboard {
         self.push_message(label, color, text);
     }
 
-    fn push_claude_message(&mut self, text: &str) {
+    fn push_agent_message(&mut self, label: &str, display_name: &str, text: &str) {
         let lines = text.lines().collect::<Vec<_>>();
         if lines.len() <= MAX_CLAUDE_MESSAGE_LINES {
-            self.push_message("claude", Color::Cyan, text);
+            self.push_message(label, Color::Cyan, text);
             return;
         }
 
         let omitted = lines.len() - MAX_CLAUDE_MESSAGE_LINES;
         let mut displayed = lines[..CLAUDE_MESSAGE_HEAD_LINES].to_vec();
-        let marker = format!("… {omitted} lines omitted from this Claude message …");
+        let marker = format!("… {omitted} lines omitted from this {display_name} message …");
         displayed.push(&marker);
         displayed.extend_from_slice(&lines[lines.len() - CLAUDE_MESSAGE_TAIL_LINES..]);
-        self.push_message("claude", Color::Cyan, &displayed.join("\n"));
+        self.push_message(label, Color::Cyan, &displayed.join("\n"));
     }
 
     fn push_line(&mut self, line: DisplayLine) {
@@ -593,7 +599,7 @@ impl StreamDashboard {
                 self.push_message(
                     "compact",
                     Color::Magenta,
-                    "Requested mid-command compaction; interrupting Claude first",
+                    "Requested mid-command compaction; interrupting the active agent first",
                 );
                 StreamControl::Compact
             }
@@ -602,7 +608,7 @@ impl StreamDashboard {
                 self.push_message(
                     "context",
                     Color::Magenta,
-                    "Requested context inspection; interrupting Claude first",
+                    "Requested context inspection; interrupting the active agent first",
                 );
                 StreamControl::Context
             }
@@ -1319,6 +1325,22 @@ mod tests {
         );
         assert_eq!(lines[CLAUDE_MESSAGE_HEAD_LINES + 1].text, "line 170");
         assert_eq!(lines.back().unwrap().text, "line 249");
+    }
+
+    #[test]
+    fn opencode_messages_have_their_own_source_label() {
+        let mut dashboard = dashboard();
+
+        dashboard.push(&StreamItem::OpenCode("working".to_owned()));
+
+        assert_eq!(dashboard.panels[0].lines[0].text, "working");
+        assert_eq!(
+            dashboard.panels[0].lines[0].source,
+            Some(SourceLabel {
+                text: "opencode".to_owned(),
+                color: Color::Cyan,
+            })
+        );
     }
 
     #[test]

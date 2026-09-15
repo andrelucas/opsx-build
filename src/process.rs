@@ -70,6 +70,39 @@ impl std::fmt::Display for WorkerEscalationRequested {
 
 impl std::error::Error for WorkerEscalationRequested {}
 
+#[derive(Debug)]
+pub struct BackendStreamControlRequested {
+    control: StreamControl,
+}
+
+impl BackendStreamControlRequested {
+    fn new(control: StreamControl) -> Self {
+        Self { control }
+    }
+
+    pub fn control(&self) -> &StreamControl {
+        &self.control
+    }
+}
+
+impl std::fmt::Display for BackendStreamControlRequested {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "agent stream control requested: {:?}",
+            self.control
+        )
+    }
+}
+
+impl std::error::Error for BackendStreamControlRequested {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendStreamControlDisposition {
+    Unhandled,
+    RestartStage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: String,
@@ -115,6 +148,8 @@ impl CommandSpec {
 
     pub fn remove_env(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
+        self.env.retain(|(key, _)| key != &name);
+        self.redacted_env.remove(&name);
         if !self.env_remove.contains(&name) {
             self.env_remove.push(name);
         }
@@ -296,10 +331,31 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         spec: &CommandSpec,
         activity: &str,
         timeout: Option<Duration>,
-        mut on_stdout_line: F,
+        on_stdout_line: F,
     ) -> Result<ProcessOutput>
     where
         F: FnMut(&str),
+    {
+        self.run_streaming_with_timeout_and_controls(
+            spec,
+            activity,
+            timeout,
+            on_stdout_line,
+            |_| Ok(BackendStreamControlDisposition::Unhandled),
+        )
+    }
+
+    pub fn run_streaming_with_timeout_and_controls<F, C>(
+        &self,
+        spec: &CommandSpec,
+        activity: &str,
+        timeout: Option<Duration>,
+        mut on_stdout_line: F,
+        mut on_control: C,
+    ) -> Result<ProcessOutput>
+    where
+        F: FnMut(&str),
+        C: FnMut(&StreamControl) -> Result<BackendStreamControlDisposition>,
     {
         self.ui.command(&spec.display());
         let mut command = command_for(spec);
@@ -332,6 +388,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut cancelled = false;
         let mut pause_requested = false;
         let mut escalation_reason = None;
+        let mut backend_control = None;
         let mut cancel_started = None;
         let mut forced_stop = false;
         let started_at = std::time::Instant::now();
@@ -492,7 +549,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if !cancelled {
+            if !cancelled && backend_control.is_none() {
                 if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
                     let limit = timeout.expect("timeout was checked above");
                     let reason = format!(
@@ -501,6 +558,11 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     );
                     self.ui
                         .warn(&format!("{reason}; stopping it before frontier replanning"));
+                    if let Err(error) = on_control(&StreamControl::Interrupt) {
+                        self.ui.warn(&format!(
+                            "Could not stop the backend's active session after timeout: {error}"
+                        ));
+                    }
                     child_stdin.take();
                     cancelled = true;
                     escalation_reason = Some(reason);
@@ -510,9 +572,15 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     }
                     continue;
                 }
-                match self.ui.poll_stream() {
+                let control = self.ui.poll_stream();
+                match control {
                     StreamControl::None => {}
                     StreamControl::Interrupt => {
+                        if let Err(error) = on_control(&StreamControl::Interrupt) {
+                            self.ui.warn(&format!(
+                                "Could not stop the backend's active session: {error}"
+                            ));
+                        }
                         child_stdin.take();
                         cancelled = true;
                         cancel_started = Some(std::time::Instant::now());
@@ -521,6 +589,11 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                         }
                     }
                     StreamControl::Pause => {
+                        if let Err(error) = on_control(&StreamControl::Pause) {
+                            self.ui.warn(&format!(
+                                "Could not stop the backend's active session before pausing: {error}"
+                            ));
+                        }
                         child_stdin.take();
                         cancelled = true;
                         pause_requested = true;
@@ -530,6 +603,11 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                         }
                     }
                     StreamControl::Escalate => {
+                        if let Err(error) = on_control(&StreamControl::Escalate) {
+                            self.ui.warn(&format!(
+                                "Could not stop the backend's active session before escalation: {error}"
+                            ));
+                        }
                         child_stdin.take();
                         cancelled = true;
                         escalation_reason =
@@ -542,6 +620,21 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                     control @ (StreamControl::Compact
                     | StreamControl::Context
                     | StreamControl::Inject(_)) => {
+                        match on_control(&control) {
+                            Ok(BackendStreamControlDisposition::RestartStage) => {
+                                child_stdin.take();
+                                backend_control = Some(control);
+                                cancel_started = Some(std::time::Instant::now());
+                                continue;
+                            }
+                            Ok(BackendStreamControlDisposition::Unhandled) => {}
+                            Err(error) => {
+                                self.ui.warn(&format!(
+                                    "Could not send the command to the active backend session: {error}"
+                                ));
+                                continue;
+                            }
+                        }
                         if spec.accepts_stream_messages {
                             let action = match control {
                                 StreamControl::Context => InterruptAction::Context,
@@ -592,9 +685,10 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         }
 
         let status = child.wait();
-        let succeeded = status.as_ref().is_ok_and(|status| status.success())
-            && read_error.is_none()
-            && !cancelled;
+        let succeeded = backend_control.is_some()
+            || (status.as_ref().is_ok_and(|status| status.success())
+                && read_error.is_none()
+                && !cancelled);
         self.ui.finish_stream(succeeded, activity);
         let status = status.with_context(|| format!("failed waiting for `{}`", spec.program))?;
         if let Some(error) = read_error {
@@ -615,6 +709,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         }
         if let Some(reason) = escalation_reason {
             return Err(WorkerEscalationRequested::new(reason).into());
+        }
+        if let Some(control) = backend_control {
+            return Err(BackendStreamControlRequested::new(control).into());
         }
         if cancelled {
             bail!("streamed command interrupted by user");
@@ -757,7 +854,7 @@ fn control_response(line: &str, request_id: &str) -> Option<Result<(), String>> 
     }
 }
 
-fn command_for(spec: &CommandSpec) -> Command {
+pub(crate) fn command_for(spec: &CommandSpec) -> Command {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     for name in &spec.env_remove {
@@ -770,31 +867,31 @@ fn command_for(spec: &CommandSpec) -> Command {
 }
 
 #[cfg(unix)]
-fn configure_stream_process(command: &mut Command) {
+pub(crate) fn configure_stream_process(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_stream_process(_command: &mut Command) {}
+pub(crate) fn configure_stream_process(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
     signal_process_group(child, libc::SIGINT)
 }
 
 #[cfg(not(unix))]
-fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
     child.kill()
 }
 
 #[cfg(unix)]
-fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
     signal_process_group(child, libc::SIGKILL)
 }
 
 #[cfg(not(unix))]
-fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn kill_stream_process(child: &mut Child) -> std::io::Result<()> {
     child.kill()
 }
 
@@ -1138,6 +1235,44 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"D
         assert_eq!(output.stdout.matches(r#""type":"result""#).count(), 2);
         assert!(messages.contains("Steering instruction written after interrupt"));
         assert!(!messages.contains("Interrupted command reissued"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_backend_control_returns_a_typed_stage_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-external-control-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let stopped = directory.join("stopped");
+        let ui = InterruptingUi::new(StreamControl::Compact);
+        let runner = ProcessRunner::new(&ui);
+        let script = r#"while [ ! -f "$1" ]; do sleep 0.01; done; exit 130"#;
+        let spec = CommandSpec::new("sh", &directory).args([
+            "-c",
+            script,
+            "opsx-test",
+            stopped.to_str().unwrap(),
+        ]);
+
+        let error = runner
+            .run_streaming_with_timeout_and_controls(
+                &spec,
+                "Apply",
+                None,
+                |_| {},
+                |control| {
+                    assert_eq!(control, &StreamControl::Compact);
+                    std::fs::write(&stopped, "stop").unwrap();
+                    Ok(BackendStreamControlDisposition::RestartStage)
+                },
+            )
+            .expect_err("external compact should unwind only the current subprocess");
+        let request = error
+            .downcast_ref::<BackendStreamControlRequested>()
+            .expect("external controls should remain typed");
+        assert_eq!(request.control(), &StreamControl::Compact);
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

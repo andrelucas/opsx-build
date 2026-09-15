@@ -26,6 +26,7 @@ pub enum StreamFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamItem {
     Assistant(String),
+    OpenCode(String),
     Subagent(String),
     Tool(String),
     ToolResult(String),

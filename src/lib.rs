@@ -8,6 +8,7 @@ mod dashboard;
 pub mod git;
 pub mod model_confusions;
 pub mod opencode;
+mod opencode_server;
 pub mod openspec;
 pub mod process;
 pub mod sidecar;

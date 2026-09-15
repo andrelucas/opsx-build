@@ -31,7 +31,7 @@ pub struct CampaignIterationView {
 }
 
 pub trait Ui {
-    /// Whether Claude stages should use persistent bidirectional stream input.
+    /// Whether agent stages should expose interactive stream controls.
     fn supports_stream_input(&self) -> bool {
         false
     }
@@ -334,6 +334,7 @@ impl Ui for TerminalUi {
         }
         let (label, style, text) = match item {
             StreamItem::Assistant(text) => ("claude", Style::new().cyan(), text),
+            StreamItem::OpenCode(text) => ("opencode", Style::new().cyan(), text),
             StreamItem::Subagent(text) => ("agent", Style::new().blue(), text),
             StreamItem::Tool(text) => ("tool", Style::new().yellow(), text),
             StreamItem::ToolResult(text) => ("result", Style::new().dim(), text),

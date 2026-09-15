@@ -741,8 +741,9 @@ environment = "local-network"
 OpenCode selects its provider explicitly from the model name and may use its
 normal credential store in addition to environment supplied by the profile.
 Explicit `unset_env` entries are honored. Automatic Claude-environment
-isolation and the Claude token-policy fields do not apply to OpenCode in the
-initial adapter.
+isolation and the Claude auto-compaction/output-limit environment variables do
+not apply to OpenCode. A profile's `context_window` is used to add a capacity
+and percentage to the OpenCode `C` context report.
 
 A hosted connection must still be usable by Claude Code. Direct endpoints or
 gateways should implement the Anthropic Messages interface expected by
@@ -860,11 +861,19 @@ The corresponding environment variables are:
 
 Set `backend = "opencode"` on a named worker connection to use OpenCode for
 normal Propose, proposal commit, Apply, Verify/repair, Archive, and completion
-commit stages. The adapter starts `opencode run --format json --auto` as a
-blocking subprocess, passes `--model provider/model` when configured, captures
-its JSON events, and records the real OpenCode `sessionID` in the durable
-checkpoint. Resumed planning uses `--session`; new sessions receive a useful
-`--title`.
+commit stages. The adapter lazily starts one private OpenCode server on an
+ephemeral loopback port for the workflow, creates and names sessions through
+its HTTP API, and attaches a blocking `opencode run --format json --auto`
+subprocess for each turn. It passes `--model provider/model` when configured,
+captures the CLI's JSON events, and records the real OpenCode session ID in the
+durable checkpoint.
+
+The server is a local control plane, not another LLM gateway. It inherits the
+selected OpenCode connection's provider credentials and environment. Any
+inherited `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are removed
+for this process because the server is short-lived, bound only to
+`127.0.0.1`, and launched for this opsx-build process. It is stopped when the
+workflow backend is dropped.
 
 OpenCode's native `.opencode/skills` and `.opencode/commands` layouts are
 discovered. The bundled unattended skills remain under `.claude/skills`
@@ -873,34 +882,42 @@ one. A leading installed skill is expressed as an explicit instruction to use
 the skill tool; an OpenCode command is invoked through `run --command`.
 
 `--test-connection`, `--basic-connection-test`, `--interactive`, `--dry-run`,
-the terminal dashboard, stage timeout, process pause, process stop, and manual
-frontier escalation all work with an OpenCode worker. `--stream-agent` is an
-alias for the backwards-compatible `--stream-claude` option.
+the terminal dashboard, stage timeout, process pause, process stop, hard
+phase-boundary compaction, and manual frontier escalation all work with an
+OpenCode worker. `--stream-agent` is an alias for the backwards-compatible
+`--stream-claude` option. Streamed model text is labelled `opencode` in the
+dashboard and linear output.
 
-The initial synchronous adapter intentionally has narrower control-plane
-support than Claude:
+The `c`, `C`, and `i` live controls also work. Each first aborts the active
+OpenCode session turn through the server, then stops the attached CLI if it
+does not exit promptly. `c` summarizes the session before resuming the same
+stage, `C` reports the latest-turn and cumulative token counts before resuming,
+and `i` resumes with the operator's steering text. Set `context_window` on the
+connection profile to make `C` include capacity and percentage. Pause, stop,
+frontier escalation, and stage timeout likewise abort the server-side turn so
+detaching the local CLI does not leave model work running in the background.
+
+The OpenCode adapter still has a few intentional limitations:
 
 - bootstrap and frontier planning/recovery still require a Claude connection;
 - sidecar repositories are not yet supported by an OpenCode worker;
-- OpenCode `run` has no CLI operation for hard-compacting an existing session,
-  so the Explore boundary reports that it is leaving context management to
-  OpenCode;
-- the `c`, `C`, and `i` live controls are unavailable because synchronous
-  `opencode run` does not expose Claude's stdin interrupt protocol;
 - schema-validated terminal output and compact-then-continue recovery for a
-  stage that simply omits its terminal result remain Claude-only. OpenCode does
-  detect its typed output-limit and retryable provider errors and continues the
-  same emitted session under the configured retry limits, but without a hard
-  compaction step.
+  stage that simply omits its terminal result remain Claude-only;
+- automatic context-threshold compaction remains OpenCode's responsibility;
+  the profile's Claude-specific auto-compaction fields are not translated into
+  OpenCode configuration.
+
+OpenCode does detect typed output-limit and retryable provider errors and
+continues the same session under the configured retry limits.
 
 These are adapter limitations, not workflow-state limitations. Repository,
-OpenSpec, Git, and checkpoint postconditions are shared by both backends. A
-later persistent OpenCode server transport can add compaction and live steering
-without changing the stage engine.
+OpenSpec, Git, and checkpoint postconditions are shared by both backends.
 
-This adapter targets OpenCode 1.18.31's documented `run` JSON event format and
-CLI session flags. See the [OpenCode CLI documentation][opencode-cli],
-[skills documentation][opencode-skills], and [server documentation][opencode-server].
+This adapter targets OpenCode 1.18.31's documented `run` JSON event format,
+CLI session flags, and session server API. See the
+[OpenCode CLI documentation][opencode-cli],
+[skills documentation][opencode-skills], and
+[server documentation][opencode-server].
 
 ## Claude launcher compatibility
 
@@ -1024,11 +1041,11 @@ Its arrow buttons move one line, its track is clickable, and its thumb can be
 dragged. Mouse-wheel and keyboard scrolling continue to work; reaching the
 bottom resumes tail-following.
 
-An individual Claude message is limited to 200 displayed lines in the
-dashboard. Longer messages retain their first 120 and final 80 lines with an
-omission marker showing the number of hidden lines. This affects presentation
-only; subprocess capture and workflow result parsing retain the complete
-message.
+An individual Claude or OpenCode message is limited to 200 displayed lines in
+the dashboard. Longer messages retain their first 120 and final 80 lines with
+an omission marker showing the number of hidden lines. This affects
+presentation only; subprocess capture and workflow result parsing retain the
+complete message.
 
 Campaign mode adds the iteration number to the header and retains a compact
 summary row for every completed change. The active iteration continues to use
@@ -1037,18 +1054,17 @@ phase chatter while preserving its summary.
 
 Controls:
 
-- `p`, followed by `y`, immediately stops the active Claude subprocess and
-  exits successfully, preserving the current phase checkpoint for `--resume`;
+- `p`, followed by `y`, immediately stops the active agent turn and exits
+  successfully, preserving the current phase checkpoint for `--resume`;
 - `f` during Explore, Propose, Apply, Verify, or Repair stops the local worker
   and requests frontier subdivision at the next orchestration opportunity
   after confirmation;
-- `c` sends Claude's interrupt control request—the streaming equivalent of
-  Escape—then runs `/compact` and reissues the interrupted stage command (once
-  per invocation) after confirmation;
+- `c` interrupts the active turn, compacts its session, and reissues the
+  interrupted stage command (once per invocation) after confirmation;
 - `C` follows the same interrupt/resume cycle but runs `/context`, leaving
   Claude's context report in the phase disclosure for debugging, after
   confirmation;
-- `i` opens a steering prompt; Enter interrupts the active Claude turn and
+- `i` opens a steering prompt; Enter interrupts the active agent turn and
   delivers the entered instruction as its continuation;
 - `q` in campaign mode pauses cleanly after the current change completes after
   confirmation;
@@ -1073,13 +1089,15 @@ progress. `c` and `C` send their slash command, wait for that result, and then
 reissue the exact stage input because diagnostic/maintenance slash commands do
 not themselves continue the work. None rolls back repository changes made
 before interruption; OpenSpec and the repository remain the durable state from
-which Claude continues.
-The dashboard records each step. A write or interrupt acknowledgement is not a
-compaction acknowledgement; successful compaction is reported by Claude's
-`compact_boundary` event, which is shown by the `activity` filter. If the
-launcher rejects interrupt controls, opsx-build degrades to
-queuing the requested command after the current turn. These controls are
-available in the TTY dashboard; linear non-TTY streaming remains output-only.
+which the agent continues.
+The dashboard records each step. With Claude, a write or interrupt
+acknowledgement is not a compaction acknowledgement; successful compaction is
+reported by Claude's `compact_boundary` event, which is shown by the `activity`
+filter. If a Claude-compatible launcher rejects interrupt controls, opsx-build
+degrades to queuing the requested command after the current turn. OpenCode
+performs abort, compact, and context operations through its loopback server API
+before starting the continuation. These controls are available in the TTY
+dashboard; linear non-TTY streaming remains output-only.
 
 Repeated Verify and Repair phases are retained separately as `pass 2`,
 `pass 3`, and so on. The dashboard restores the previous terminal screen when
