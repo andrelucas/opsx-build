@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, StageSignal},
-    cli::{ClaudeConnection, Cli, ConnectionEnvironmentValue},
+    cli::{AgentConnection, BackendKind, Cli, ConnectionEnvironmentValue},
     model_confusions::prompt_guidance as model_confusion_guidance,
     process::{
         CommandSpec, PauseRequested, ProcessOutput, ProcessRunner, WorkerEscalationRequested,
@@ -266,7 +266,14 @@ impl ClaudeLauncher {
         })
     }
 
-    pub fn from_connection(connection: &ClaudeConnection) -> Result<Self> {
+    pub fn from_connection(connection: &AgentConnection) -> Result<Self> {
+        if connection.backend != BackendKind::Claude {
+            bail!(
+                "connection profile `{}` selects {} rather than the Claude backend",
+                connection.name.as_deref().unwrap_or("unnamed"),
+                connection.backend
+            );
+        }
         let mut launcher = Self::parse(
             &connection.command,
             connection.model.clone(),
@@ -2038,8 +2045,9 @@ mod tests {
 
     #[test]
     fn resolves_an_isolated_named_connection_into_commands() {
-        let connection = ClaudeConnection {
+        let connection = AgentConnection {
             name: Some("hosted".to_owned()),
+            backend: BackendKind::Claude,
             environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: Some("provider/model".to_owned()),
@@ -2113,8 +2121,9 @@ mod tests {
 
     #[test]
     fn reports_a_missing_referenced_connection_environment_variable() {
-        let connection = ClaudeConnection {
+        let connection = AgentConnection {
             name: Some("hosted".to_owned()),
+            backend: BackendKind::Claude,
             environment_name: Some("provider".to_owned()),
             command: "claude".to_owned(),
             model: None,

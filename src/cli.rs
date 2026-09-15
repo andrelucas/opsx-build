@@ -14,6 +14,33 @@ const DEFAULT_PERMISSION_MODE: &str = "auto";
 const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendKind {
+    #[default]
+    Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
+}
+
+impl BackendKind {
+    fn default_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+impl Display for BackendKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub request: String,
@@ -48,8 +75,8 @@ pub struct Cli {
     pub stream_claude: Option<StreamFilter>,
     pub dry_run: bool,
     pub permission_mode: String,
-    pub worker_connection: ClaudeConnection,
-    pub frontier_connection: ClaudeConnection,
+    pub worker_connection: AgentConnection,
+    pub frontier_connection: AgentConnection,
     pub explore_command: Option<String>,
     pub propose_command: Option<String>,
     pub apply_command: Option<String>,
@@ -59,8 +86,9 @@ pub struct Cli {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeConnection {
+pub struct AgentConnection {
     pub name: Option<String>,
+    pub backend: BackendKind,
     pub environment_name: Option<String>,
     pub command: String,
     pub model: Option<String>,
@@ -477,6 +505,7 @@ struct FileConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConnection {
+    backend: BackendKind,
     command: Option<String>,
     model: Option<String>,
     environment: Option<String>,
@@ -816,7 +845,7 @@ fn selected_connection(
                 connections.keys().cloned().collect::<Vec<_>>().join(", ")
             )
         };
-        format!("unknown Claude connection profile `{name}`; {available}")
+        format!("unknown agent connection profile `{name}`; {available}")
     })?;
     Ok(Some((name.to_owned(), profile)))
 }
@@ -836,7 +865,7 @@ fn resolve_connection(
     legacy_percentage: Option<Percentage>,
     legacy_output_tokens: Option<TokenCount>,
     default_command: &str,
-) -> Result<ClaudeConnection> {
+) -> Result<AgentConnection> {
     let (name, profile) = profile
         .map(|(name, profile)| (Some(name), profile))
         .unwrap_or_default();
@@ -858,13 +887,21 @@ fn resolve_connection(
             unset_env.push(variable);
         }
     }
-    Ok(ClaudeConnection {
+    let backend = profile.backend;
+    Ok(AgentConnection {
         name,
+        backend,
         environment_name,
         command: command_line_command
             .or(profile.command)
             .or(legacy_command)
-            .unwrap_or_else(|| default_command.to_owned()),
+            .unwrap_or_else(|| {
+                if backend == BackendKind::Claude {
+                    default_command.to_owned()
+                } else {
+                    backend.default_command().to_owned()
+                }
+            }),
         model: command_line_model.or(profile.model).or(legacy_model),
         context_window: profile.context_window.map(|count| count.0),
         auto_compact_window: command_line_window
@@ -907,7 +944,7 @@ fn selected_environment(
             )
         };
         format!(
-            "Claude connection profile `{}` references unknown environment profile `{name}`; {available}",
+            "Agent connection profile `{}` references unknown environment profile `{name}`; {available}",
             connection_name.unwrap_or("unnamed")
         )
     })?;
@@ -1254,6 +1291,35 @@ mod tests {
     }
 
     #[test]
+    fn connection_profiles_select_an_explicit_backend() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "open"
+                frontier_connection = "frontier"
+
+                [connections.open]
+                backend = "opencode"
+                model = "provider/worker"
+
+                [connections.frontier]
+                command = "claude-wrapper"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args(["opsx-build", "build something"]),
+            config,
+            Some(PathBuf::from("config.toml")),
+        )
+        .unwrap();
+
+        assert_eq!(cli.worker_connection.backend, BackendKind::OpenCode);
+        assert_eq!(cli.worker_connection.command, "opencode");
+        assert_eq!(cli.frontier_connection.backend, BackendKind::Claude);
+        assert_eq!(cli.frontier_connection.command, "claude-wrapper");
+    }
+
+    #[test]
     fn multiple_connections_share_one_environment_profile() {
         let config: FileConfig = toml::from_str(
             r#"
@@ -1411,7 +1477,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unknown Claude connection profile `missing`")
+                .contains("unknown agent connection profile `missing`")
         );
         assert!(error.to_string().contains("available profiles: local"));
     }
