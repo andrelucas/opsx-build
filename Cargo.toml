@@ -2,7 +2,7 @@
 name = "opsx-build"
 version = "0.26.0"
 edition = "2024"
-description = "Unattended OpenSpec build orchestrator for Claude Code"
+description = "Unattended OpenSpec build orchestrator for coding agents"
 license = "MIT"
 
 [dependencies]

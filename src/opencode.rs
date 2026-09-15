@@ -510,7 +510,7 @@ fn resolve_invocation(repo: &Path, prompt: &str) -> Invocation {
         .unwrap_or(after_slash.len());
     let name = &after_slash[..command_end];
     let arguments = after_slash[command_end..].trim_start();
-    if skill_exists(repo, name) {
+    if matches!(name, "explore-unattended" | "propose-unattended") || skill_exists(repo, name) {
         Invocation {
             command: None,
             message: format!(
@@ -992,6 +992,22 @@ mod tests {
         assert!(command.args.last().unwrap().contains("skill tool"));
         assert!(command.args.last().unwrap().contains("slice one"));
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn dry_run_recognizes_bundled_skills_before_installation() {
+        let command = build_opencode_command(
+            Path::new("/repo-without-installed-skills"),
+            &launcher(),
+            &SessionMode::New {
+                id: SessionId::new("provisional"),
+                name: None,
+            },
+            "/explore-unattended inspect it",
+        );
+
+        assert!(!command.args.iter().any(|arg| arg == "--command"));
+        assert!(command.args.last().unwrap().contains("skill tool"));
     }
 
     #[test]
