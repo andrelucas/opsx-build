@@ -1646,13 +1646,16 @@ impl<U: Ui> App<U> {
                 };
                 Box::new(client)
             }
-            AgentLauncher::OpenCode(launcher) => Box::new(OpenCodeBackend::new(
-                repo,
-                launcher,
-                self.ui.supports_stream_input(),
-                self.cli.stream_claude,
-                &self.ui,
-            )),
+            AgentLauncher::OpenCode(launcher) => Box::new(
+                OpenCodeBackend::new(
+                    repo,
+                    launcher,
+                    self.ui.supports_stream_input(),
+                    self.cli.stream_claude,
+                    &self.ui,
+                )
+                .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries),
+            ),
         };
         let worker_agent: Box<dyn AgentBackend + '_> = match launcher {
             AgentLauncher::Claude(launcher) => {
@@ -1685,7 +1688,8 @@ impl<U: Ui> App<U> {
             }
             AgentLauncher::OpenCode(launcher) => {
                 let client =
-                    OpenCodeBackend::new(repo, launcher, true, self.cli.stream_claude, &self.ui);
+                    OpenCodeBackend::new(repo, launcher, true, self.cli.stream_claude, &self.ui)
+                        .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries);
                 let client = if state.bootstrap {
                     client
                 } else {

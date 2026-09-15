@@ -1,6 +1,9 @@
 use std::{
+    error::Error,
+    fmt,
     path::{Path, PathBuf},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,14 +14,38 @@ use crate::{
         AgentBackend, MissingTerminalResult, SessionId, SessionMode, StageProtocol, StageResult,
         parse_terminal_signal,
     },
-    claude::{CONNECTION_TEST_MARKER, ConnectionTestMode},
+    claude::{CONNECTION_TEST_MARKER, ConnectionTestMode, stage_prompt},
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
-    process::{CommandSpec, ProcessOutput, ProcessRunner, diagnostic_text},
+    process::{
+        CommandSpec, ProcessOutput, ProcessRunner, WorkerEscalationRequested, diagnostic_text,
+    },
     stream::{StreamFilter, StreamItem},
     ui::Ui,
 };
 
 const CONNECTION_TOOL_MARKER: &str = "OPSX_TOOL_ROUNDTRIP_OK";
+const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
+const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct OpenCodeApiError {
+    message: String,
+    transient: bool,
+    session_id: Option<SessionId>,
+}
+
+impl fmt::Display for OpenCodeApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for OpenCodeApiError {}
+
+enum OpenCodeAttempt {
+    Complete(StageResult),
+    OutputLimit(SessionId),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LauncherEnvironment {
@@ -243,6 +270,9 @@ pub struct OpenCodeBackend<'a, U: Ui> {
     launcher: &'a OpenCodeLauncher,
     stream_transport: bool,
     stream_filter: Option<StreamFilter>,
+    max_output_retries: u32,
+    max_provider_retries: u32,
+    provider_retry_base_delay: Duration,
     stage_timeout: Option<Duration>,
     resume_repo: Option<PathBuf>,
     ui: &'a U,
@@ -262,6 +292,9 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
             launcher,
             stream_transport: stream_transport || stream_filter.is_some(),
             stream_filter,
+            max_output_retries: 0,
+            max_provider_retries: 0,
+            provider_retry_base_delay: PROVIDER_RETRY_BASE_DELAY,
             stage_timeout: None,
             resume_repo: None,
             ui,
@@ -275,6 +308,12 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         self
     }
 
+    pub fn with_retries(mut self, output_retries: u32, provider_retries: u32) -> Self {
+        self.max_output_retries = output_retries;
+        self.max_provider_retries = provider_retries;
+        self
+    }
+
     pub fn with_resume_repo(mut self, repo: &Path) -> Self {
         self.resume_repo = Some(repo.to_path_buf());
         self
@@ -282,16 +321,17 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
 
     fn invoke_once(
         &self,
-        session: SessionMode,
+        session: &SessionMode,
         prompt: &str,
         activity: &str,
-    ) -> Result<StageResult> {
+        timeout: Option<Duration>,
+    ) -> Result<OpenCodeAttempt> {
         self.ui.debug(&format!(
             "OpenCode session: {}",
-            session_description(&session)
+            session_description(session)
         ));
         self.ui.debug_prompt(activity, prompt);
-        let spec = build_opencode_command(self.repo, self.launcher, &session, prompt);
+        let spec = build_opencode_command(self.repo, self.launcher, session, prompt);
         let spec = if let Some(repo) = self.resume_repo.as_deref() {
             spec.resume_from(repo)
         } else {
@@ -299,7 +339,7 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         };
         let output = if self.stream_transport {
             self.runner
-                .run_streaming_with_timeout(&spec, activity, self.stage_timeout, |line| {
+                .run_streaming_with_timeout(&spec, activity, timeout, |line| {
                     if let Some(filter) = self.stream_filter {
                         for item in filter_opencode_line(line, filter) {
                             self.ui.stream_item(&item);
@@ -309,10 +349,21 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         } else {
             self.runner.run(&spec, activity)?
         };
+        if output_hit_token_limit(&output) {
+            let session_id = output_session_id(&output.stdout)
+                .or_else(|| match session {
+                    SessionMode::Resume { id } => Some(id.clone()),
+                    SessionMode::New { .. } => None,
+                })
+                .context(
+                    "OpenCode reached its output limit but omitted the created session ID, so continuation is unsafe",
+                )?;
+            return Ok(OpenCodeAttempt::OutputLimit(session_id));
+        }
         if !output.success {
             return Err(opencode_stage_failure(&output));
         }
-        parse_opencode_output(&output.stdout)
+        parse_opencode_output(&output.stdout).map(OpenCodeAttempt::Complete)
     }
 }
 
@@ -326,9 +377,104 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         session: SessionMode,
         prompt: &str,
         activity: &str,
-        _protocol: StageProtocol,
+        protocol: StageProtocol,
     ) -> Result<StageResult> {
-        self.invoke_once(session, prompt, activity)
+        let mut current_session = session;
+        let mut current_prompt = prompt.to_owned();
+        let mut current_activity = activity.to_owned();
+        let mut output_recoveries = 0;
+        let mut provider_retries = 0;
+        let deadline = self
+            .stage_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+
+        loop {
+            let remaining = deadline.map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
+            });
+            match self.invoke_once(
+                &current_session,
+                &current_prompt,
+                &current_activity,
+                remaining,
+            ) {
+                Err(error)
+                    if error
+                        .downcast_ref::<OpenCodeApiError>()
+                        .is_some_and(|error| error.transient)
+                        && provider_retries < self.max_provider_retries =>
+                {
+                    provider_retries += 1;
+                    let delay =
+                        provider_retry_delay(self.provider_retry_base_delay, provider_retries);
+                    if remaining.is_some_and(|remaining| delay >= remaining) {
+                        return Err(error.context(
+                            "transient provider failure could not be retried before the stage timeout",
+                        ));
+                    }
+                    let session_id = error
+                        .downcast_ref::<OpenCodeApiError>()
+                        .and_then(|error| error.session_id.clone())
+                        .or_else(|| match &current_session {
+                            SessionMode::Resume { id } => Some(id.clone()),
+                            SessionMode::New { .. } => None,
+                        });
+                    let Some(session_id) = session_id else {
+                        return Err(error.context(
+                            "transient OpenCode failure omitted the created session ID, so a same-session retry is unsafe",
+                        ));
+                    };
+                    self.ui.warn(&format!(
+                        "Transient OpenCode provider failure; retrying the same session in {} second(s) ({provider_retries}/{})",
+                        delay.as_secs(),
+                        self.max_provider_retries
+                    ));
+                    thread::sleep(delay);
+                    current_session = SessionMode::Resume { id: session_id };
+                    current_prompt = transient_provider_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (provider recovery {provider_retries}/{})",
+                        self.max_provider_retries
+                    );
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<OpenCodeApiError>()
+                        .is_some_and(|error| error.transient) =>
+                {
+                    return Err(error.context(format!(
+                        "transient provider failure persisted after {} recovery attempt(s)",
+                        self.max_provider_retries
+                    )));
+                }
+                Err(error) => return Err(error),
+                Ok(OpenCodeAttempt::OutputLimit(session_id))
+                    if output_recoveries < self.max_output_retries =>
+                {
+                    output_recoveries += 1;
+                    self.ui.warn(&format!(
+                        "OpenCode reached its output token limit; continuing the same phase ({output_recoveries}/{})",
+                        self.max_output_retries
+                    ));
+                    current_session = SessionMode::Resume { id: session_id };
+                    current_prompt = output_limit_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (output-limit continuation {output_recoveries}/{})",
+                        self.max_output_retries
+                    );
+                }
+                Ok(OpenCodeAttempt::OutputLimit(_)) => {
+                    return Err(WorkerEscalationRequested::new(format!(
+                        "local worker exhausted {} output-limit recovery attempt(s)",
+                        self.max_output_retries
+                    ))
+                    .into());
+                }
+                Ok(OpenCodeAttempt::Complete(result)) => return Ok(result),
+            }
+        }
     }
 
     fn rename_session(&self, _session_id: &SessionId, _name: &str) -> Result<()> {
@@ -395,6 +541,9 @@ fn parse_opencode_output(stdout: &str) -> Result<StageResult> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
+    if let Some(error) = events.iter().rev().find_map(opencode_api_error) {
+        return Err(error.into());
+    }
     if let Some(error) = events.iter().rev().find_map(opencode_event_error) {
         bail!("OpenCode stage failed: {error}");
     }
@@ -429,11 +578,101 @@ fn opencode_stage_failure(output: &ProcessOutput) -> anyhow::Error {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
+    if let Some(error) = events.iter().rev().find_map(opencode_api_error) {
+        return error.into();
+    }
     if let Some(error) = events.iter().rev().find_map(opencode_event_error) {
         anyhow::anyhow!("OpenCode stage failed: {error}")
     } else {
         anyhow::anyhow!("OpenCode stage failed: {}", diagnostic_text(output))
     }
+}
+
+fn opencode_api_error(event: &Value) -> Option<OpenCodeApiError> {
+    if event.get("type").and_then(Value::as_str) != Some("error")
+        || event.pointer("/error/name").and_then(Value::as_str) != Some("APIError")
+    {
+        return None;
+    }
+    let message = event
+        .pointer("/error/data/message")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenCode provider API error")
+        .to_owned();
+    let status = event
+        .pointer("/error/data/statusCode")
+        .and_then(Value::as_u64);
+    let transient = event
+        .pointer("/error/data/isRetryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(status, Some(408 | 425 | 429 | 500..=599));
+    Some(OpenCodeApiError {
+        message: format!("OpenCode API error: {message}"),
+        transient,
+        session_id: event
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .map(SessionId::new),
+    })
+}
+
+fn output_session_id(stdout: &str) -> Option<SessionId> {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| {
+            event
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(SessionId::new)
+        })
+        .next_back()
+}
+
+fn output_hit_token_limit(output: &ProcessOutput) -> bool {
+    let event_limit = output
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            event.pointer("/error/name").and_then(Value::as_str) == Some("MessageOutputLengthError")
+                || (event.get("type").and_then(Value::as_str) == Some("step_finish")
+                    && event.pointer("/part/reason").and_then(Value::as_str) == Some("length"))
+        });
+    event_limit || text_mentions_output_limit(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn text_mentions_output_limit(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("messageoutputlengtherror")
+        || text.contains("max output tokens")
+        || text.contains("maximum output tokens")
+        || text.contains("output token limit")
+}
+
+fn provider_retry_delay(base: Duration, attempt: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    base.saturating_mul(multiplier)
+        .min(PROVIDER_RETRY_MAX_DELAY)
+}
+
+fn output_limit_continuation_prompt(protocol: StageProtocol) -> String {
+    stage_prompt(
+        "",
+        "The preceding agent turn reached its output token limit before this opsx-build phase produced a terminal result. Continue the same phase from the existing OpenCode session and durable repository state. Preserve correct completed work, do not restart the phase, and finish the outstanding work now.",
+        protocol,
+    )
+}
+
+fn transient_provider_continuation_prompt(protocol: StageProtocol) -> String {
+    stage_prompt(
+        "",
+        "The preceding model request was interrupted by a transient provider or network failure. Continue the same opsx-build phase in this OpenCode session from its durable repository and OpenSpec state. Preserve correct partial work, do not create a duplicate change or restart completed tasks, and finish the outstanding work now.",
+        protocol,
+    )
 }
 
 fn opencode_event_error(event: &Value) -> Option<String> {
@@ -618,7 +857,42 @@ mod tests {
 
     use super::*;
     use crate::{backend::StageSignal, cli::BackendKind};
+    #[cfg(unix)]
+    use crate::{
+        stream::{StreamControl, StreamItem},
+        ui::Ui,
+    };
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    struct QuietUi;
+
+    #[cfg(unix)]
+    impl Ui for QuietUi {
+        fn banner(&self, _: &str) {}
+        fn change_name(&self, _: Option<&str>) {}
+        fn stage(&self, _: usize, _: usize, _: &str) {}
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn success(&self, _: &str) {}
+        fn failure(&self, _: &str) {}
+        fn command(&self, _: &str) {}
+        fn debug(&self, _: &str) {}
+        fn debug_prompt(&self, _: &str, _: &str) {}
+        fn start_stream(&self, _: &str) {}
+        fn poll_stream(&self) -> StreamControl {
+            StreamControl::None
+        }
+        fn stream_message_sent(&self, _: &str) {}
+        fn stream_item(&self, _: &StreamItem) {}
+        fn finish_stream(&self, _: bool, _: &str) {}
+        fn finish_dashboard(&self) {}
+        fn output(&self, _: &str, _: &str) {}
+        fn start_activity(&self, _: &str) -> Option<indicatif::ProgressBar> {
+            None
+        }
+        fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
+    }
 
     fn launcher() -> OpenCodeLauncher {
         OpenCodeLauncher {
@@ -773,6 +1047,141 @@ mod tests {
             parse_connection_test_output(&output, ConnectionTestMode::Agentic).unwrap(),
             CONNECTION_TEST_MARKER
         );
+    }
+
+    #[test]
+    fn classifies_typed_provider_and_output_limit_events() {
+        let transient: Value = serde_json::from_str(
+            r#"{"type":"error","sessionID":"ses_retry","error":{"name":"APIError","data":{"message":"busy","statusCode":429,"isRetryable":false}}}"#,
+        )
+        .unwrap();
+        let error = opencode_api_error(&transient).unwrap();
+        assert!(error.transient);
+        assert_eq!(
+            error.session_id.as_ref().map(SessionId::as_str),
+            Some("ses_retry")
+        );
+
+        let output = ProcessOutput {
+            success: false,
+            code: Some(1),
+            stdout: r#"{"type":"error","sessionID":"ses_limit","error":{"name":"MessageOutputLengthError","data":{}}}"#.to_owned(),
+            stderr: String::new(),
+        };
+        assert!(output_hit_token_limit(&output));
+        assert_eq!(
+            output_session_id(&output.stdout).unwrap().as_str(),
+            "ses_limit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_provider_failure_resumes_the_emitted_session() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-opencode-retry-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let arguments = directory.join("arguments");
+        let script = directory.join("fake-opencode.sh");
+        let source = r#"
+state='__STATE__'
+arguments='__ARGUMENTS__'
+if [ ! -f "$state" ]; then
+  : > "$state"
+  printf '%s\n' '{"type":"error","sessionID":"ses_actual","error":{"name":"APIError","data":{"message":"provider overloaded","statusCode":503,"isRetryable":true}}}'
+  exit 1
+fi
+printf '%s\n' "$*" > "$arguments"
+printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","text":"continued\nOPSX_STATUS: READY"}}'
+"#
+        .replace("__STATE__", &state.display().to_string())
+        .replace("__ARGUMENTS__", &arguments.display().to_string());
+        fs::write(&script, source).unwrap();
+        let launcher = OpenCodeLauncher {
+            connection_name: None,
+            environment_name: None,
+            program: "sh".to_owned(),
+            prefix_args: vec![script.display().to_string()],
+            model: None,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
+        };
+        let ui = QuietUi;
+        let mut backend =
+            OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(0, 1);
+        backend.provider_retry_base_delay = Duration::from_millis(1);
+
+        let result = backend
+            .invoke(
+                SessionMode::New {
+                    id: SessionId::new("provisional"),
+                    name: None,
+                },
+                "do the work",
+                "OpenCode test",
+                StageProtocol::Worker,
+            )
+            .unwrap();
+
+        assert_eq!(result.signal, StageSignal::Ready);
+        let resumed_arguments = fs::read_to_string(arguments).unwrap();
+        assert!(resumed_arguments.contains("--session ses_actual"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_resumes_the_emitted_session() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-opencode-limit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("count");
+        let arguments = directory.join("arguments");
+        let script = directory.join("fake-opencode.sh");
+        let source = r#"
+state='__STATE__'
+arguments='__ARGUMENTS__'
+if [ ! -f "$state" ]; then
+  : > "$state"
+  printf '%s\n' '{"type":"error","sessionID":"ses_limit","error":{"name":"MessageOutputLengthError","data":{}}}'
+  exit 1
+fi
+printf '%s\n' "$*" > "$arguments"
+printf '%s\n' '{"type":"text","sessionID":"ses_limit","part":{"type":"text","text":"continued\nOPSX_STATUS: READY"}}'
+"#
+        .replace("__STATE__", &state.display().to_string())
+        .replace("__ARGUMENTS__", &arguments.display().to_string());
+        fs::write(&script, source).unwrap();
+        let launcher = OpenCodeLauncher {
+            connection_name: None,
+            environment_name: None,
+            program: "sh".to_owned(),
+            prefix_args: vec![script.display().to_string()],
+            model: None,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
+        };
+        let ui = QuietUi;
+        let backend =
+            OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(1, 0);
+
+        let result = backend
+            .invoke(
+                SessionMode::New {
+                    id: SessionId::new("provisional"),
+                    name: None,
+                },
+                "do the work",
+                "OpenCode test",
+                StageProtocol::Worker,
+            )
+            .unwrap();
+
+        assert_eq!(result.signal, StageSignal::Ready);
+        let resumed_arguments = fs::read_to_string(arguments).unwrap();
+        assert!(resumed_arguments.contains("--session ses_limit"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

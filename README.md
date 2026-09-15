@@ -887,8 +887,11 @@ support than Claude:
   OpenCode;
 - the `c`, `C`, and `i` live controls are unavailable because synchronous
   `opencode run` does not expose Claude's stdin interrupt protocol;
-- schema-validated terminal output, same-session output-limit continuation,
-  and transient-provider retry remain Claude-only in this increment.
+- schema-validated terminal output and compact-then-continue recovery for a
+  stage that simply omits its terminal result remain Claude-only. OpenCode does
+  detect its typed output-limit and retryable provider errors and continues the
+  same emitted session under the configured retry limits, but without a hard
+  compaction step.
 
 These are adapter limitations, not workflow-state limitations. Repository,
 OpenSpec, Git, and checkpoint postconditions are shared by both backends. A
