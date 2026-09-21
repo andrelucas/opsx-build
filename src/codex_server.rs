@@ -203,7 +203,7 @@ impl CodexServerClient {
             .context("Codex thread/start response omitted thread.id")?
             .to_owned();
         self.remember_thread(&thread_id)?;
-        if let Some(name) = name {
+        if let Some(name) = name.filter(|_| !ephemeral) {
             self.rename_thread(&thread_id, name)?;
         }
         Ok(thread_id)
@@ -247,18 +247,17 @@ impl CodexServerClient {
         thread_id: &str,
         input: Value,
         output_schema: Value,
-        sandbox_policy: Value,
+        sandbox_policy: Option<Value>,
     ) -> Result<String> {
-        let response = self.request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": input,
-                "outputSchema": output_schema,
-                "sandboxPolicy": sandbox_policy
-            }),
-            REQUEST_TIMEOUT,
-        )?;
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": input,
+            "outputSchema": output_schema
+        });
+        if let Some(sandbox_policy) = sandbox_policy {
+            params["sandboxPolicy"] = sandbox_policy;
+        }
+        let response = self.request("turn/start", params, REQUEST_TIMEOUT)?;
         response
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -487,6 +486,7 @@ read remaining
             program: "sh".to_owned(),
             prefix_args: vec![script.display().to_string()],
             model: None,
+            permission_profile: None,
             context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,
@@ -496,7 +496,7 @@ read remaining
         };
         let client = CodexServerClient::start(&launcher, &directory, &QuietUi).unwrap();
         let thread = client
-            .start_thread(&launcher, &directory, "dontAsk", Some("slice"), &[], true)
+            .start_thread(&launcher, &directory, "dontAsk", Some("slice"), &[], false)
             .unwrap();
         assert_eq!(thread, "thread-1");
         client.compact_thread(&thread).unwrap();

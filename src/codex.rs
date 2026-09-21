@@ -38,6 +38,7 @@ pub struct CodexLauncher {
     pub program: String,
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
+    pub permission_profile: Option<String>,
     pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
@@ -96,6 +97,7 @@ impl CodexLauncher {
             program: words.remove(0),
             prefix_args: words,
             model: connection.model.clone(),
+            permission_profile: connection.permission_profile.clone(),
             context_window: connection.context_window,
             auto_compact_window: connection.auto_compact_window,
             auto_compact_percent: connection.auto_compact_percent,
@@ -142,16 +144,37 @@ impl CodexLauncher {
             "cwd": repo,
             "approvalPolicy": approval_policy,
             "approvalsReviewer": approvals_reviewer,
-            "sandbox": sandbox,
             "runtimeWorkspaceRoots": roots,
         });
+        if !self.uses_permission_profile(permission_mode) {
+            params["sandbox"] = json!(sandbox);
+        }
         if let Some(model) = &self.model {
             params["model"] = json!(model);
         }
+        let mut config = serde_json::Map::new();
+        if let Some(profile) = self
+            .permission_profile
+            .as_ref()
+            .filter(|_| self.uses_permission_profile(permission_mode))
+        {
+            config.insert("default_permissions".to_owned(), json!(profile));
+        }
         if let Some(limit) = self.compaction_limit() {
-            params["config"] = json!({"model_auto_compact_token_limit": limit});
+            config.insert("model_auto_compact_token_limit".to_owned(), json!(limit));
+        }
+        if !config.is_empty() {
+            params["config"] = Value::Object(config);
         }
         Ok(params)
+    }
+
+    fn uses_permission_profile(&self, permission_mode: &str) -> bool {
+        self.permission_profile.is_some()
+            && matches!(
+                permission_mode,
+                "auto" | "acceptEdits" | "default" | "dontAsk"
+            )
     }
 
     fn compaction_limit(&self) -> Option<u64> {
@@ -167,9 +190,12 @@ impl CodexLauncher {
         repo: &Path,
         permission_mode: &str,
         additional_roots: &[PathBuf],
-    ) -> Result<Value> {
+    ) -> Result<Option<Value>> {
+        if self.uses_permission_profile(permission_mode) {
+            return Ok(None);
+        }
         let (_, _, sandbox) = codex_permissions(permission_mode)?;
-        Ok(match sandbox {
+        Ok(Some(match sandbox {
             "read-only" => json!({"type": "readOnly", "networkAccess": false}),
             "danger-full-access" => json!({"type": "dangerFullAccess"}),
             "workspace-write" => {
@@ -186,7 +212,7 @@ impl CodexLauncher {
                 })
             }
             _ => unreachable!("codex_permissions returned an unknown sandbox"),
-        })
+        }))
     }
 }
 
@@ -202,24 +228,41 @@ pub fn build_interactive_codex_command(
     if let Some(model) = &launcher.model {
         args.extend(["--model".to_owned(), model.clone()]);
     }
-    match permission_mode {
-        "auto" | "acceptEdits" | "default" => args.push("--approve-for-me".to_owned()),
-        "dontAsk" => args.extend([
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "never".to_owned(),
-        ]),
-        "plan" => args.extend([
-            "--sandbox".to_owned(),
-            "read-only".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "never".to_owned(),
-        ]),
-        "bypassPermissions" => args.push("--dangerously-bypass-approvals-and-sandbox".to_owned()),
-        other => bail!(
-            "Claude permission mode `{other}` has no Codex mapping; use auto, acceptEdits, default, dontAsk, plan, or bypassPermissions"
-        ),
+    if launcher.uses_permission_profile(permission_mode) {
+        let (approval_policy, approvals_reviewer, _) = codex_permissions(permission_mode)?;
+        let profile = launcher
+            .permission_profile
+            .as_deref()
+            .expect("permission profile was checked above");
+        for (key, value) in [
+            ("default_permissions", profile),
+            ("approval_policy", approval_policy),
+            ("approvals_reviewer", approvals_reviewer),
+        ] {
+            args.extend(["-c".to_owned(), format!("{key}={}", json!(value))]);
+        }
+    } else {
+        match permission_mode {
+            "auto" | "acceptEdits" | "default" => args.push("--approve-for-me".to_owned()),
+            "dontAsk" => args.extend([
+                "--sandbox".to_owned(),
+                "workspace-write".to_owned(),
+                "--ask-for-approval".to_owned(),
+                "never".to_owned(),
+            ]),
+            "plan" => args.extend([
+                "--sandbox".to_owned(),
+                "read-only".to_owned(),
+                "--ask-for-approval".to_owned(),
+                "never".to_owned(),
+            ]),
+            "bypassPermissions" => {
+                args.push("--dangerously-bypass-approvals-and-sandbox".to_owned())
+            }
+            other => bail!(
+                "Claude permission mode `{other}` has no Codex mapping; use auto, acceptEdits, default, dontAsk, plan, or bypassPermissions"
+            ),
+        }
     }
     args.extend(interactive_args.iter().cloned());
     if let Some(prompt) = initial_prompt {
@@ -968,6 +1011,7 @@ mod tests {
             environment_name: None,
             command: "codex --profile local".to_owned(),
             model: Some("gpt-5.6-codex".to_owned()),
+            permission_profile: None,
             context_window: Some(200_000),
             auto_compact_window: None,
             auto_compact_percent: Some(75),
@@ -983,6 +1027,7 @@ mod tests {
         assert_eq!(
             launcher
                 .turn_sandbox_policy(Path::new("/repo"), "auto", &[])
+                .unwrap()
                 .unwrap()["writableRoots"],
             json!(["/repo"])
         );
@@ -999,6 +1044,50 @@ mod tests {
         )
         .unwrap();
         assert!(interactive.args.iter().any(|arg| arg == "--approve-for-me"));
+    }
+
+    #[test]
+    fn named_permission_profile_replaces_inline_codex_sandbox() {
+        let connection = AgentConnection {
+            name: Some("codex-worker".to_owned()),
+            backend: BackendKind::Codex,
+            environment_name: None,
+            command: "codex".to_owned(),
+            model: None,
+            permission_profile: Some("opsx-build".to_owned()),
+            context_window: None,
+            auto_compact_window: Some(150_000),
+            auto_compact_percent: None,
+            max_output_tokens: None,
+            env: BTreeMap::new(),
+            isolate: true,
+            unset_env: Vec::new(),
+        };
+        let launcher = CodexLauncher::from_connection(&connection).unwrap();
+        let params = launcher
+            .thread_params(Path::new("/repo"), "auto", &[])
+            .unwrap();
+        assert!(params.get("sandbox").is_none());
+        assert_eq!(params["config"]["default_permissions"], "opsx-build");
+        assert_eq!(params["config"]["model_auto_compact_token_limit"], 150_000);
+        assert!(
+            launcher
+                .turn_sandbox_policy(Path::new("/repo"), "auto", &[])
+                .unwrap()
+                .is_none()
+        );
+
+        let interactive =
+            build_interactive_codex_command(Path::new("/repo"), &launcher, "auto", &[], None)
+                .unwrap();
+        assert!(
+            interactive
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-c", "default_permissions=\"opsx-build\""])
+        );
+        assert!(!interactive.args.iter().any(|arg| arg == "--sandbox"));
+        assert!(!interactive.args.iter().any(|arg| arg == "--approve-for-me"));
     }
 
     #[test]

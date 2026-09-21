@@ -530,20 +530,43 @@ impl<U: Ui> App<U> {
         if self.cli.bootstrap_context.is_some() {
             let frontier_launcher = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
             ensure_launcher_prerequisites(&frontier_launcher, &repo, &self.ui)?;
+            let worker_launcher = self
+                .cli
+                .execute
+                .then(|| AgentLauncher::from_connection(&self.cli.worker_connection))
+                .transpose()?;
+            if let Some(worker_launcher) = worker_launcher.as_ref() {
+                ensure_launcher_prerequisites(worker_launcher, &repo, &self.ui)?;
+            }
             prerequisite_exists("openspec", &repo, &self.ui)?;
             self.debug_configuration(&repo, &frontier_launcher);
+            if let Some(worker_launcher) = worker_launcher.as_ref() {
+                self.debug_configuration(&repo, worker_launcher);
+            }
             if let Some(path) = &self.cli.config_path {
                 self.ui.info(&format!("Using config `{}`", path.display()));
             }
-            self.ui.info(&format!(
-                "Bootstrap planner: {}",
-                connection_description(&frontier_launcher)
-            ));
+            if let Some(worker_launcher) = worker_launcher.as_ref() {
+                self.ui.info(&format!(
+                    "Connections: bootstrap/frontier {}, campaign worker {}",
+                    connection_description(&frontier_launcher),
+                    connection_description(worker_launcher)
+                ));
+            } else {
+                self.ui.info(&format!(
+                    "Bootstrap planner: {}",
+                    connection_description(&frontier_launcher)
+                ));
+            }
             if self.cli.yolo {
                 self.ui
                     .warn("YOLO mode: proposal milestone commits are disabled");
             }
-            return self.run_bootstrap(&repo, &frontier_launcher);
+            return self.run_bootstrap(
+                &repo,
+                worker_launcher.as_ref().unwrap_or(&frontier_launcher),
+                &frontier_launcher,
+            );
         }
 
         let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
@@ -768,7 +791,12 @@ impl<U: Ui> App<U> {
         Ok(changed)
     }
 
-    fn run_bootstrap(&self, repo: &Path, frontier_launcher: &AgentLauncher) -> Result<()> {
+    fn run_bootstrap(
+        &self,
+        repo: &Path,
+        worker_launcher: &AgentLauncher,
+        frontier_launcher: &AgentLauncher,
+    ) -> Result<()> {
         let context_path = self
             .cli
             .bootstrap_context
@@ -809,6 +837,11 @@ impl<U: Ui> App<U> {
             self.ui.info(
                 "Require an ordered agenda ending at `automation/slices/9999-project-acceptance.md`",
             );
+            if self.cli.execute {
+                self.ui.info(
+                    "Then run the generated agenda as an advance campaign with the worker connection",
+                );
+            }
             return Ok(());
         }
 
@@ -817,7 +850,14 @@ impl<U: Ui> App<U> {
         self.ui.success("Created bootstrap planning inputs");
         self.synchronize_skills(repo)?;
         let before_changes = openspec_snapshot(repo, &self.ui)?;
-        let state = RunState::bootstrap(before_changes);
+        let mut state = RunState::bootstrap(before_changes);
+        if self.cli.execute {
+            state.campaign = Some(CampaignState {
+                iteration: 1,
+                max_iterations: self.cli.max_iterations,
+                completed: Vec::new(),
+            });
+        }
         persist_state(repo, &state, &self.ui)?;
         let commands = SkillCommands::discover(repo, &self.cli).with_context(|| {
             "OpenSpec initialization did not install the complete Propose/Apply/Verify/Archive workflow; enable the required OpenSpec actions and run `openspec update`"
@@ -829,7 +869,7 @@ impl<U: Ui> App<U> {
 
         self.run_workflows(
             repo,
-            frontier_launcher,
+            worker_launcher,
             Some(frontier_launcher),
             &commands,
             state,
@@ -1040,13 +1080,7 @@ impl<U: Ui> App<U> {
 
         state.local_only |= self.cli.local_only;
         persist_state(repo, &state, &self.ui)?;
-        if state.bootstrap {
-            let frontier =
-                frontier_launcher.context("bootstrap resume requires a frontier connection")?;
-            self.run_workflows(repo, frontier, frontier_launcher, commands, state)
-        } else {
-            self.run_workflows(repo, launcher, frontier_launcher, commands, state)
-        }
+        self.run_workflows(repo, launcher, frontier_launcher, commands, state)
     }
 
     fn run_workflows(
@@ -1078,7 +1112,12 @@ impl<U: Ui> App<U> {
             let iteration_started = (matches!(state.stage, Stage::Explore | Stage::Propose)
                 && state.planning_session.is_none())
             .then(Instant::now);
-            match self.execute(repo, launcher, frontier_launcher, commands, state)? {
+            let stage_launcher = if state.bootstrap {
+                frontier_launcher.context("bootstrap requires a frontier connection")?
+            } else {
+                launcher
+            };
+            match self.execute(repo, stage_launcher, frontier_launcher, commands, state)? {
                 WorkflowOutcome::TooLarge(escalated) => {
                     if escalated.bootstrap {
                         let summary = escalated
@@ -1140,6 +1179,22 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 WorkflowOutcome::Complete(mut completed_state) => {
+                    if completed_state.bootstrap && completed_state.campaign.is_some() {
+                        let campaign = completed_state
+                            .campaign
+                            .take()
+                            .expect("bootstrap campaign was checked above");
+                        let before_changes = openspec_snapshot(repo, &self.ui)?;
+                        state = RunState::new("advance".to_owned(), before_changes);
+                        state.campaign = Some(campaign);
+                        self.assign_agenda(repo, &mut state)?;
+                        arm_slice_baseline(repo, &mut state, &self.ui)?;
+                        persist_state(repo, &state, &self.ui)?;
+                        self.ui.success(
+                            "Bootstrap complete — starting the generated implementation agenda",
+                        );
+                        continue;
+                    }
                     let Some(campaign) = completed_state.campaign.as_ref() else {
                         let change = completed_state.change.as_deref().unwrap_or("change");
                         let head = completed_state
@@ -2900,12 +2955,13 @@ impl<U: Ui> App<U> {
                 self.cli.stream_claude
             )),
             AgentLauncher::Codex(launcher) => self.ui.debug(&format!(
-                "Codex launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
+                "Codex launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, permission profile={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
                 launcher.connection_name,
                 launcher.environment_name,
                 launcher.program,
                 launcher.prefix_args,
                 launcher.model,
+                launcher.permission_profile,
                 launcher.context_window,
                 launcher.auto_compact_window,
                 launcher.auto_compact_percent,

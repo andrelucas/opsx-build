@@ -1489,6 +1489,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_limit","part":{"type":"text","tex
             environment_name: None,
             command: "wrapper opencode".to_owned(),
             model: Some("provider/model".to_owned()),
+            permission_profile: None,
             context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,

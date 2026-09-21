@@ -32,6 +32,13 @@ claude_model = "qwen3.6-35b-a3b"
 # [connections.anthropic]
 # backend = "claude"
 # command = "claude"
+#
+# A Codex connection may select a named permission profile from
+# ~/.codex/config.toml. This lets App Server inherit cache, network, and
+# loopback policy without opsx-build replacing it with an inline sandbox.
+# [connections.codex-worker]
+# backend = "codex"
+# permission_profile = "opsx-build"
 
 # Uncomment these only when automatic project discovery does not match your
 # installed OpenSpec delivery profile.

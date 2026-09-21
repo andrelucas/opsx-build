@@ -150,6 +150,38 @@ either already exists. The selected OpenSpec profile must expose Propose,
 Apply, Verify, and Archive actions; if it does not, enable those actions and run
 `openspec update` before resuming.
 
+### Bootstrap and execute the agenda
+
+`execute` composes bootstrap with the existing `advance` campaign without
+changing either workflow:
+
+```sh
+opsx-build --repo ~/git/my-project \
+  --worker-connection codex-worker \
+  --frontier-connection codex-frontier \
+  --context project.md \
+  --define language=Go \
+  execute
+```
+
+The frontier connection runs the complete bootstrap change. After its final
+commit, opsx-build reads the newly materialized agenda and immediately starts
+iteration 1 with the worker connection. `execute` implies `--loop advance`;
+`--max-iterations`, `--yolo`, streaming, and ordinary UI options still
+apply. The bootstrap itself does not consume an iteration.
+
+The composition is durable rather than a shell shortcut. Before bootstrap
+starts, its checkpoint records the pending campaign. If the process is
+interrupted during bootstrap or a later slice, the ordinary command resumes
+the correct role and phase:
+
+```sh
+opsx-build --repo ~/git/my-project --resume
+```
+
+Use `execute --context ... --dry-run` to inspect both halves without changing
+the repository.
+
 ## Rewind to post-bootstrap
 
 A tag made after bootstrap is a complete restart boundary: the committed tree
@@ -689,6 +721,7 @@ environment = "openrouter-opencode"
 backend = "codex"
 command = "codex" # This is the backend default and may be omitted.
 # model is optional; omit it to use the Codex CLI configured default.
+permission_profile = "opsx-build"
 context_window = "200k"
 auto_compact_percent = 75
 
@@ -696,6 +729,7 @@ auto_compact_percent = 75
 backend = "codex"
 command = "codex"
 # model is optional; omit it to use the Codex CLI configured default.
+permission_profile = "opsx-build"
 ```
 
 Select a configured connection for one invocation with:
@@ -968,6 +1002,16 @@ reviewer, and the `workspace-write` sandbox. `dontAsk` keeps the same sandbox
 but denies escalation requests; `plan` is read-only; and the explicitly unsafe
 `bypassPermissions` selects `danger-full-access` with no approvals.
 
+A Codex connection may additionally set `permission_profile = "NAME"` to
+select a named profile from `~/.codex/config.toml`. For normal editing modes,
+opsx-build passes that profile to App Server and deliberately omits its legacy
+inline sandbox at both thread and turn level. This allows the named profile's
+filesystem roots, network domains, Unix sockets, and local-binding policy to
+take effect. `plan` and `bypassPermissions` remain explicit per-run
+overrides. Codex permission profiles require a recent Codex CLI and must not be
+combined with legacy global `sandbox_mode` or `sandbox_workspace_write`
+settings; see the official [Codex permissions documentation][codex-permissions].
+
 Bundled and OpenSpec skills discovered under `.claude/skills`,
 `.agents/skills`, or `.opencode/skills` are passed as explicit App Server skill
 inputs. Claude/OpenSpec command files are handled the same way. When Codex is selected, opsx-build also adds or refreshes its marked guidance
@@ -1203,6 +1247,7 @@ flags and are not read from the config file.
 [opencode-skills]: https://opencode.ai/docs/skills/
 [opencode-server]: https://opencode.ai/docs/server/
 [codex-app-server]: https://developers.openai.com/codex/app-server/
+[codex-permissions]: https://developers.openai.com/codex/permissions/
 
 ## Interactive launcher testing
 

@@ -47,6 +47,7 @@ impl Display for BackendKind {
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub request: String,
+    pub execute: bool,
     pub rewind_target: Option<String>,
     pub yes: bool,
     pub bootstrap_context: Option<PathBuf>,
@@ -95,6 +96,7 @@ pub struct AgentConnection {
     pub environment_name: Option<String>,
     pub command: String,
     pub model: Option<String>,
+    pub permission_profile: Option<String>,
     pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
@@ -154,11 +156,19 @@ impl Cli {
         if cli.loop_workflow && cli.continue_existing {
             anyhow::bail!("--loop cannot be combined with --continue-existing");
         }
-        if cli.bootstrap_context.is_some() && cli.request != "bootstrap" && !cli.sidecar {
-            anyhow::bail!("--context is only valid with `opsx-build bootstrap` or --sidecar");
+        if cli.bootstrap_context.is_some()
+            && cli.request != "bootstrap"
+            && !cli.execute
+            && !cli.sidecar
+        {
+            anyhow::bail!(
+                "--context is only valid with `opsx-build bootstrap`, `opsx-build execute`, or --sidecar"
+            );
         }
-        if !cli.bootstrap_defines.is_empty() && cli.request != "bootstrap" {
-            anyhow::bail!("--define is only valid with `opsx-build bootstrap`");
+        if !cli.bootstrap_defines.is_empty() && cli.request != "bootstrap" && !cli.execute {
+            anyhow::bail!(
+                "--define is only valid with `opsx-build bootstrap` or `opsx-build execute`"
+            );
         }
         if cli.change.is_some() && !cli.continue_existing {
             if !request_was_supplied || cli.request == "advance" {
@@ -193,6 +203,25 @@ impl Cli {
                 );
             }
         }
+        if cli.execute {
+            if cli.bootstrap_context.is_none() {
+                anyhow::bail!("`opsx-build execute` requires --context PATH");
+            }
+            if cli.interactive
+                || cli.test_connection.is_some()
+                || cli.update_skills
+                || cli.resume
+                || cli.forget
+                || cli.continue_existing
+                || cli.no_loop
+                || cli.change.is_some()
+                || cli.direction.is_some()
+                || cli.sidecar
+                || cli.local_only
+            {
+                anyhow::bail!("`opsx-build execute` cannot be combined with another workflow mode");
+            }
+        }
         if cli.sidecar
             && !cli.resume
             && !cli.forget
@@ -221,7 +250,7 @@ impl Cli {
     about = "Build an OpenSpec change through synchronous Claude stages"
 )]
 struct CliArgs {
-    /// Change request, `advance`, `bootstrap`, or `rewind`. Defaults to `advance`.
+    /// Change request, `advance`, `bootstrap`, `execute`, or `rewind`. Defaults to `advance`.
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
@@ -231,7 +260,7 @@ struct CliArgs {
     #[arg(long)]
     yes: bool,
 
-    /// Markdown project context used by `opsx-build bootstrap`.
+    /// Markdown project context used by `opsx-build bootstrap` or `execute`.
     #[arg(long, value_name = "PATH")]
     context: Option<PathBuf>,
 
@@ -512,6 +541,7 @@ struct FileConnection {
     backend: BackendKind,
     command: Option<String>,
     model: Option<String>,
+    permission_profile: Option<String>,
     environment: Option<String>,
     context_window: Option<TokenCount>,
     auto_compact_window: Option<TokenCount>,
@@ -727,6 +757,12 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         }
         None => "advance".to_owned(),
     };
+    let execute = request == "execute";
+    let request = if execute {
+        "advance".to_owned()
+    } else {
+        request
+    };
     let rewind_target = if request == "rewind" {
         Some(
             args.rewind_target
@@ -738,6 +774,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
     };
     Ok(Cli {
         request,
+        execute,
         rewind_target,
         yes: args.yes,
         bootstrap_context: args.context,
@@ -755,7 +792,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         forget: args.forget,
         continue_existing: args.continue_existing,
         loop_workflow: !args.no_loop
-            && (args.loop_workflow || config.loop_workflow.unwrap_or(false)),
+            && (execute || args.loop_workflow || config.loop_workflow.unwrap_or(false)),
         no_loop: args.no_loop,
         max_iterations: args
             .max_iterations
@@ -892,6 +929,12 @@ fn resolve_connection(
         }
     }
     let backend = profile.backend;
+    if profile.permission_profile.is_some() && backend != BackendKind::Codex {
+        anyhow::bail!(
+            "connection profile `{}` sets permission_profile, which is supported only by the Codex backend",
+            name.as_deref().unwrap_or("unnamed")
+        );
+    }
     Ok(AgentConnection {
         name,
         backend,
@@ -907,6 +950,7 @@ fn resolve_connection(
                 }
             }),
         model: command_line_model.or(profile.model).or(legacy_model),
+        permission_profile: profile.permission_profile,
         context_window: profile.context_window.map(|count| count.0),
         auto_compact_window: command_line_window
             .or(profile.auto_compact_window)
@@ -1333,6 +1377,7 @@ mod tests {
                 [connections.codex-worker]
                 backend = "codex"
                 model = "gpt-5.6-codex"
+                permission_profile = "opsx-build"
                 context_window = "200k"
                 auto_compact_percent = 75
 
@@ -1353,6 +1398,10 @@ mod tests {
         assert_eq!(cli.worker_connection.backend, BackendKind::Codex);
         assert_eq!(cli.worker_connection.command, "codex");
         assert_eq!(
+            cli.worker_connection.permission_profile.as_deref(),
+            Some("opsx-build")
+        );
+        assert_eq!(
             cli.worker_connection.model.as_deref(),
             Some("gpt-5.6-codex")
         );
@@ -1363,6 +1412,31 @@ mod tests {
         assert_eq!(
             cli.frontier_connection.model.as_deref(),
             Some("gpt-frontier")
+        );
+    }
+
+    #[test]
+    fn permission_profiles_are_codex_only() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "claude-worker"
+
+                [connections.claude-worker]
+                backend = "claude"
+                permission_profile = "opsx-build"
+            "#,
+        )
+        .unwrap();
+        let error = resolve_values(
+            args(["opsx-build", "build something"]),
+            config,
+            Some(PathBuf::from("config.toml")),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supported only by the Codex backend")
         );
     }
 
@@ -1970,6 +2044,40 @@ mod tests {
                 "--context",
                 "project.md",
                 "--loop"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn execute_composes_bootstrap_and_an_advance_campaign() {
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--define",
+            "language=Go",
+            "--max-iterations",
+            "9",
+            "execute",
+            "--context",
+            "project.md",
+        ]))
+        .unwrap();
+        assert!(cli.execute);
+        assert_eq!(cli.request, "advance");
+        assert!(cli.loop_workflow);
+        assert_eq!(cli.max_iterations, Some(9));
+        assert_eq!(
+            cli.bootstrap_context.as_deref(),
+            Some(std::path::Path::new("project.md"))
+        );
+        assert!(Cli::resolve(args(["opsx-build", "execute"])).is_err());
+        assert!(
+            Cli::resolve(args([
+                "opsx-build",
+                "--no-loop",
+                "execute",
+                "--context",
+                "project.md"
             ]))
             .is_err()
         );
