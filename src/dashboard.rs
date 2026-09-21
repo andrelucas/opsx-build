@@ -142,6 +142,8 @@ pub(crate) struct StreamDashboard {
     spinner_index: usize,
     last_tick: Instant,
     last_draw: Instant,
+    last_size: Option<(u16, u16)>,
+    last_footer: Option<String>,
     dirty: bool,
     active: bool,
     compact_requested: bool,
@@ -189,6 +191,8 @@ impl StreamDashboard {
             spinner_index: 0,
             last_tick: now,
             last_draw: now,
+            last_size: None,
+            last_footer: None,
             dirty: true,
             active: true,
             compact_requested: false,
@@ -889,13 +893,21 @@ impl StreamDashboard {
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        let now = Instant::now();
         let (width, height) = terminal::size()?;
+        self.draw_to(&mut io::stderr().lock(), width, height)
+    }
+
+    fn draw_to<W: Write>(&mut self, terminal: &mut W, width: u16, height: u16) -> io::Result<()> {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let mut output = io::stderr().lock();
-        queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+        let now = Instant::now();
+        let resized = self.last_size != Some((width, height));
+        // Buffer the frame instead of writing each terminal command to stderr.
+        let mut output = Vec::new();
+        if resized {
+            queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+        }
         draw_row(
             &mut output,
             0,
@@ -978,6 +990,10 @@ impl StreamDashboard {
         let body_width = width.saturating_sub(u16::from(self.scrollbar.is_some()));
 
         self.heading_rows.clear();
+        let visible_rows = lines
+            .len()
+            .saturating_sub(self.viewport_start)
+            .min(body_height);
         for (index, line) in lines
             .iter()
             .skip(self.viewport_start)
@@ -990,11 +1006,19 @@ impl StreamDashboard {
                 self.heading_rows.push((row, panel));
             }
         }
+        // Collapsing a panel or starting an iteration can leave fewer body rows.
+        for index in visible_rows..body_height {
+            queue!(
+                output,
+                MoveTo(0, 3 + index as u16),
+                Clear(ClearType::CurrentLine)
+            )?;
+        }
         if let Some(scrollbar) = self.scrollbar {
             draw_scrollbar(&mut output, scrollbar)?;
         }
 
-        if height > 3 {
+        let footer = if height > 3 {
             let footer = if let Some(action) = self.pending_confirmation {
                 format!("{}  y confirm · any other key cancel", action.prompt())
             } else {
@@ -1013,16 +1037,24 @@ impl StreamDashboard {
                     },
                 )
             };
-            draw_row(
-                &mut output,
-                height - 1,
-                width,
-                &footer,
-                Color::DarkGrey,
-                false,
-            )?;
-        }
-        output.flush()?;
+            if resized || self.last_footer.as_ref() != Some(&footer) {
+                draw_row(
+                    &mut output,
+                    height - 1,
+                    width,
+                    &footer,
+                    Color::DarkGrey,
+                    false,
+                )?;
+            }
+            Some(footer)
+        } else {
+            None
+        };
+        terminal.write_all(&output)?;
+        terminal.flush()?;
+        self.last_size = Some((width, height));
+        self.last_footer = footer;
         self.last_draw = Instant::now();
         self.dirty = false;
         Ok(())
@@ -1264,6 +1296,8 @@ mod tests {
             spinner_index: 0,
             last_tick: now,
             last_draw: now,
+            last_size: None,
+            last_footer: None,
             dirty: false,
             active: false,
             compact_requested: false,
@@ -1775,6 +1809,88 @@ mod tests {
     #[test]
     fn sanitizes_terminal_control_characters() {
         assert_eq!(sanitize("safe\u{1b}[2J\ttext"), "safe[2J text");
+    }
+
+    #[test]
+    fn codex_redraw_does_not_erase_unchanged_keyboard_help() {
+        let mut dashboard = dashboard();
+        let mut output = Vec::new();
+        dashboard.draw_to(&mut output, 180, 12).unwrap();
+        assert!(
+            String::from_utf8(output.clone())
+                .unwrap()
+                .contains("p pause")
+        );
+
+        output.clear();
+        dashboard.push(&StreamItem::Codex("new Codex output".to_owned()));
+        dashboard.spinner_index += 1;
+        dashboard.draw_to(&mut output, 180, 12).unwrap();
+
+        let frame = String::from_utf8(output).unwrap();
+        assert!(frame.contains("new Codex output"));
+        assert!(!frame.contains(&Clear(ClearType::All).to_string()));
+        assert!(!frame.contains(&MoveTo(0, 11).to_string()));
+        assert!(!frame.contains("p pause"));
+    }
+
+    #[test]
+    fn keyboard_help_refreshes_for_controls_and_terminal_resize() {
+        let mut dashboard = dashboard();
+        let mut output = Vec::new();
+        dashboard.draw_to(&mut output, 180, 12).unwrap();
+
+        output.clear();
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        dashboard.draw_to(&mut output, 180, 12).unwrap();
+        let frame = String::from_utf8(output.clone()).unwrap();
+        assert!(frame.contains(PendingConfirmation::Pause.prompt()));
+        assert!(!frame.contains(&Clear(ClearType::All).to_string()));
+
+        output.clear();
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        dashboard.draw_to(&mut output, 180, 12).unwrap();
+        assert!(
+            String::from_utf8(output.clone())
+                .unwrap()
+                .contains("p pause")
+        );
+
+        output.clear();
+        dashboard.draw_to(&mut output, 100, 15).unwrap();
+        let frame = String::from_utf8(output).unwrap();
+        assert!(frame.contains(&Clear(ClearType::All).to_string()));
+        assert!(frame.contains(&MoveTo(0, 14).to_string()));
+        assert!(frame.contains("p pause"));
+    }
+
+    #[test]
+    fn collapsing_output_clears_old_body_rows_without_erasing_help() {
+        let mut dashboard = dashboard();
+        dashboard.push(&StreamItem::Codex("first\nsecond\nthird".to_owned()));
+        let mut output = Vec::new();
+        dashboard.draw_to(&mut output, 120, 10).unwrap();
+
+        output.clear();
+        dashboard.panels[0].expanded = false;
+        dashboard.draw_to(&mut output, 120, 10).unwrap();
+        let frame = String::from_utf8(output).unwrap();
+        for row in 4..9 {
+            assert!(frame.contains(&format!(
+                "{}{}",
+                MoveTo(0, row),
+                Clear(ClearType::CurrentLine)
+            )));
+        }
+        assert!(!frame.contains(&Clear(ClearType::All).to_string()));
+        assert!(!frame.contains(&MoveTo(0, 9).to_string()));
+        assert!(!frame.contains("second"));
     }
 
     #[test]
