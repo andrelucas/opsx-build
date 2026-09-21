@@ -779,7 +779,7 @@ fn filter_codex_event(event: &Value, filter: StreamFilter) -> Vec<StreamItem> {
                         .get("command")
                         .and_then(Value::as_str)
                         .unwrap_or("command");
-                    let mut items = vec![StreamItem::Tool(format!("Shell: {command}"))];
+                    let mut items = vec![StreamItem::Tool(format!("Shell: {}", one_line(command)))];
                     if filter == StreamFilter::Full
                         && let Some(output) = item.get("aggregatedOutput").and_then(Value::as_str)
                         && !output.trim().is_empty()
@@ -805,6 +805,16 @@ fn filter_codex_event(event: &Value, filter: StreamFilter) -> Vec<StreamItem> {
         }
         _ => Vec::new(),
     }
+}
+
+fn one_line(value: &str) -> String {
+    const LIMIT: usize = 240;
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= LIMIT {
+        return compact;
+    }
+    let prefix = compact.chars().take(LIMIT - 1).collect::<String>();
+    format!("{prefix}…")
 }
 
 fn continuation_prompt(protocol: StageProtocol, reason: &str) -> String {
@@ -1014,6 +1024,31 @@ mod tests {
         .unwrap();
         assert_eq!(result.text, "done");
         assert_eq!(result.session_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn activity_ellipsizes_long_codex_tool_commands() {
+        let command = format!("echo first\n{}", "x".repeat(300));
+        let event = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "command": command,
+                    "aggregatedOutput": "full output remains hidden in activity mode"
+                }
+            }
+        });
+
+        let items = filter_codex_event(&event, StreamFilter::Activity);
+        let [StreamItem::Tool(summary)] = items.as_slice() else {
+            panic!("expected one tool summary, got {items:?}");
+        };
+        assert!(summary.starts_with("Shell: echo first "));
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), "Shell: ".chars().count() + 240);
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains("full output remains hidden"));
     }
 
     #[test]
