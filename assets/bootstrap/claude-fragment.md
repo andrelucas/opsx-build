@@ -68,16 +68,17 @@
   investigate the cause. Do not merely rerun it with an increasingly large
   timeout.
 
-### Test execution and Claude's sandbox
+### Test execution and agent sandboxes
 
-- When Claude Code's sandbox prevents a required project build or test from
-  running, rerun only the affected command outside the sandbox with the Bash
-  tool's `dangerouslyDisableSandbox: true` option. Treat sandbox denial as an
-  execution-environment limitation, not a product defect.
-- Do not rewrite production code or tests to accommodate Claude's sandbox, add
+- When the active coding agent's sandbox prevents a required project build or
+  test from running, use that agent's supported approval or elevated-execution
+  mechanism for only the affected command. Treat sandbox denial as an
+  execution-environment limitation, not a product defect. Do not invent flags
+  or bypass mechanisms that the active agent does not provide.
+- Do not rewrite production code or tests to accommodate an agent sandbox, add
   sandbox-specific behavior, substitute synthetic or weaker coverage, skip the
   gate, or mark it complete without a real execution. Verification succeeds
   only when the required real checks have run and passed.
-- Use the sandbox escape for the minimum required project build or test command,
-  not unrelated activity.
+- Use elevated execution for the minimum required project build or test
+  command, not unrelated activity.
 <!-- END OPSX-BUILD MANAGED -->

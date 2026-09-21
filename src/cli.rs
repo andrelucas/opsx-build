@@ -21,6 +21,7 @@ pub enum BackendKind {
     Claude,
     #[serde(rename = "opencode")]
     OpenCode,
+    Codex,
 }
 
 impl BackendKind {
@@ -28,6 +29,7 @@ impl BackendKind {
         match self {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Codex => "codex",
         }
     }
 }
@@ -37,6 +39,7 @@ impl Display for BackendKind {
         formatter.write_str(match self {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Codex => "codex",
         })
     }
 }
@@ -1318,6 +1321,49 @@ mod tests {
         assert_eq!(cli.worker_connection.command, "opencode");
         assert_eq!(cli.frontier_connection.backend, BackendKind::Claude);
         assert_eq!(cli.frontier_connection.command, "claude-wrapper");
+    }
+
+    #[test]
+    fn codex_connection_uses_the_codex_default_command() {
+        let config: FileConfig = toml::from_str(
+            r#"
+                worker_connection = "codex-worker"
+                frontier_connection = "codex-frontier"
+
+                [connections.codex-worker]
+                backend = "codex"
+                model = "gpt-5.6-codex"
+                context_window = "200k"
+                auto_compact_percent = 75
+
+                [connections.codex-frontier]
+                backend = "codex"
+                command = "codex --profile frontier"
+                model = "gpt-frontier"
+            "#,
+        )
+        .unwrap();
+        let cli = resolve_values(
+            args(["opsx-build", "build something"]),
+            config,
+            Some(PathBuf::from("config.toml")),
+        )
+        .unwrap();
+
+        assert_eq!(cli.worker_connection.backend, BackendKind::Codex);
+        assert_eq!(cli.worker_connection.command, "codex");
+        assert_eq!(
+            cli.worker_connection.model.as_deref(),
+            Some("gpt-5.6-codex")
+        );
+        assert_eq!(cli.worker_connection.context_window, Some(204_800));
+        assert_eq!(cli.worker_connection.auto_compact_percent, Some(75));
+        assert_eq!(cli.frontier_connection.backend, BackendKind::Codex);
+        assert_eq!(cli.frontier_connection.command, "codex --profile frontier");
+        assert_eq!(
+            cli.frontier_connection.model.as_deref(),
+            Some("gpt-frontier")
+        );
     }
 
     #[test]

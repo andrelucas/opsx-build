@@ -18,7 +18,7 @@ use crate::{
     },
     backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, StageSignal},
     bootstrap::{
-        BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, init_command,
+        BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, ensure_codex_guidance, init_command,
         instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
     },
     claude::{
@@ -28,6 +28,8 @@ use crate::{
         stage_prompt,
     },
     cli::{AgentConnection, BackendKind, Cli},
+    codex::{CodexBackend, CodexLauncher, build_interactive_codex_command},
+    codex_server::CodexServer,
     git::{
         SliceBaseline, baseline_matches_except, capture_slice_baseline, committed_paths_since,
         current_head, hard_reset, head_descends_from, legacy_metadata_dir, metadata_dir,
@@ -48,7 +50,8 @@ use crate::{
         select_existing_change, snapshot as openspec_snapshot,
     },
     process::{
-        PauseRequested, ProcessRunner, WorkerEscalationRequested, prerequisite_exists, shell_quote,
+        CommandSpec, PauseRequested, ProcessRunner, WorkerEscalationRequested, prerequisite_exists,
+        shell_quote,
     },
     sidecar::{SidecarAssociation, SidecarPlan, default_sidecar_root, load_association},
     skills::{SkillInstallAction, ensure_unattended_skills},
@@ -104,6 +107,7 @@ pub struct App<U: Ui> {
 enum AgentLauncher {
     Claude(ClaudeLauncher),
     OpenCode(OpenCodeLauncher),
+    Codex(CodexLauncher),
 }
 
 impl AgentLauncher {
@@ -113,6 +117,7 @@ impl AgentLauncher {
             BackendKind::OpenCode => {
                 OpenCodeLauncher::from_connection(connection).map(Self::OpenCode)
             }
+            BackendKind::Codex => CodexLauncher::from_connection(connection).map(Self::Codex),
         }
     }
 
@@ -120,6 +125,7 @@ impl AgentLauncher {
         match self {
             Self::Claude(launcher) => &launcher.program,
             Self::OpenCode(launcher) => &launcher.program,
+            Self::Codex(launcher) => &launcher.program,
         }
     }
 
@@ -127,6 +133,7 @@ impl AgentLauncher {
         match self {
             Self::Claude(launcher) => launcher.connection_name.as_deref(),
             Self::OpenCode(launcher) => launcher.connection_name.as_deref(),
+            Self::Codex(launcher) => launcher.connection_name.as_deref(),
         }
     }
 
@@ -134,6 +141,7 @@ impl AgentLauncher {
         match self {
             Self::Claude(launcher) => launcher.model.as_deref(),
             Self::OpenCode(launcher) => launcher.model.as_deref(),
+            Self::Codex(launcher) => launcher.model.as_deref(),
         }
     }
 
@@ -141,6 +149,7 @@ impl AgentLauncher {
         match self {
             Self::Claude(launcher) => launcher.environment_name.as_deref(),
             Self::OpenCode(launcher) => launcher.environment_name.as_deref(),
+            Self::Codex(launcher) => launcher.environment_name.as_deref(),
         }
     }
 
@@ -148,6 +157,7 @@ impl AgentLauncher {
         match self {
             Self::Claude(_) => "claude",
             Self::OpenCode(_) => "opencode",
+            Self::Codex(_) => "codex",
         }
     }
 }
@@ -378,6 +388,9 @@ impl<U: Ui> App<U> {
                 AgentLauncher::OpenCode(launcher) => {
                     self.run_opencode_connection_test(&requested_repo, launcher)
                 }
+                AgentLauncher::Codex(launcher) => {
+                    self.run_codex_connection_test(&requested_repo, launcher)
+                }
             };
         }
 
@@ -515,19 +528,16 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.bootstrap_context.is_some() {
-            let frontier_launcher = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
-            if frontier_launcher.program != "claude" {
-                prerequisite_exists(&frontier_launcher.program, &repo, &self.ui)?;
-            }
-            prerequisite_exists("claude", &repo, &self.ui)?;
+            let frontier_launcher = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
+            ensure_launcher_prerequisites(&frontier_launcher, &repo, &self.ui)?;
             prerequisite_exists("openspec", &repo, &self.ui)?;
-            self.debug_configuration(&repo, &AgentLauncher::Claude(frontier_launcher.clone()));
+            self.debug_configuration(&repo, &frontier_launcher);
             if let Some(path) = &self.cli.config_path {
                 self.ui.info(&format!("Using config `{}`", path.display()));
             }
             self.ui.info(&format!(
                 "Bootstrap planner: {}",
-                claude_connection_description(&frontier_launcher)
+                connection_description(&frontier_launcher)
             ));
             if self.cli.yolo {
                 self.ui
@@ -548,6 +558,7 @@ impl<U: Ui> App<U> {
             return match &launcher {
                 AgentLauncher::Claude(launcher) => self.run_interactive(&repo, launcher),
                 AgentLauncher::OpenCode(launcher) => self.run_interactive_opencode(&repo, launcher),
+                AgentLauncher::Codex(launcher) => self.run_interactive_codex(&repo, launcher),
             };
         }
 
@@ -559,30 +570,15 @@ impl<U: Ui> App<U> {
         let frontier_launcher = if local_only {
             None
         } else {
-            let frontier = ClaudeLauncher::from_connection(&self.cli.frontier_connection)?;
-            if frontier.program != "claude" {
-                prerequisite_exists(&frontier.program, &repo, &self.ui)?;
-            }
-            self.ui.debug(&format!(
-                "frontier launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, environment variables={:?}, unset environment={:?}",
-                frontier.connection_name,
-                frontier.environment_name,
-                frontier.program,
-                frontier.prefix_args,
-                frontier.model,
-                frontier
-                    .environment
-                    .iter()
-                    .map(|variable| variable.name.as_str())
-                    .collect::<Vec<_>>(),
-                frontier.unset_environment
-            ));
+            let frontier = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
+            ensure_launcher_prerequisites(&frontier, &repo, &self.ui)?;
+            self.debug_configuration(&repo, &frontier);
             Some(frontier)
         };
         if launcher.connection_name().is_some()
             || frontier_launcher
                 .as_ref()
-                .is_some_and(|frontier| frontier.connection_name.is_some())
+                .is_some_and(|frontier| frontier.connection_name().is_some())
         {
             let description = frontier_launcher.as_ref().map_or_else(
                 || {
@@ -595,7 +591,7 @@ impl<U: Ui> App<U> {
                     format!(
                         "worker {}, frontier {}",
                         connection_description(&launcher),
-                        claude_connection_description(frontier)
+                        connection_description(frontier)
                     )
                 },
             );
@@ -757,10 +753,22 @@ impl<U: Ui> App<U> {
                 installed.name
             ));
         }
-        Ok(changes.len())
+        let mut changed = changes.len();
+        if (self.cli.worker_connection.backend == BackendKind::Codex
+            || self.cli.frontier_connection.backend == BackendKind::Codex)
+            && ensure_codex_guidance(repo, self.cli.dry_run)?
+        {
+            self.ui.info(if self.cli.dry_run {
+                "Would add the opsx-build managed guidance to AGENTS.md for Codex"
+            } else {
+                "Added the opsx-build managed guidance to AGENTS.md for Codex"
+            });
+            changed += 1;
+        }
+        Ok(changed)
     }
 
-    fn run_bootstrap(&self, repo: &Path, frontier_launcher: &ClaudeLauncher) -> Result<()> {
+    fn run_bootstrap(&self, repo: &Path, frontier_launcher: &AgentLauncher) -> Result<()> {
         let context_path = self
             .cli
             .bootstrap_context
@@ -819,10 +827,9 @@ impl<U: Ui> App<U> {
             commands.propose, commands.apply, commands.verify, commands.archive
         ));
 
-        let workflow_launcher = AgentLauncher::Claude(frontier_launcher.clone());
         self.run_workflows(
             repo,
-            &workflow_launcher,
+            frontier_launcher,
             Some(frontier_launcher),
             &commands,
             state,
@@ -833,7 +840,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &AgentLauncher,
-        frontier_launcher: Option<&ClaudeLauncher>,
+        frontier_launcher: Option<&AgentLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         let active_changes = openspec_snapshot(repo, &self.ui)?;
@@ -954,7 +961,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &AgentLauncher,
-        frontier_launcher: Option<&ClaudeLauncher>,
+        frontier_launcher: Option<&AgentLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         let mut state = load_state(repo, &self.ui)?;
@@ -1036,8 +1043,7 @@ impl<U: Ui> App<U> {
         if state.bootstrap {
             let frontier =
                 frontier_launcher.context("bootstrap resume requires a frontier connection")?;
-            let workflow_launcher = AgentLauncher::Claude(frontier.clone());
-            self.run_workflows(repo, &workflow_launcher, frontier_launcher, commands, state)
+            self.run_workflows(repo, frontier, frontier_launcher, commands, state)
         } else {
             self.run_workflows(repo, launcher, frontier_launcher, commands, state)
         }
@@ -1047,7 +1053,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &AgentLauncher,
-        frontier_launcher: Option<&ClaudeLauncher>,
+        frontier_launcher: Option<&AgentLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
@@ -1233,10 +1239,53 @@ impl<U: Ui> App<U> {
         }
     }
 
+    fn frontier_backend<'a>(
+        &'a self,
+        repo: &'a Path,
+        launcher: &'a AgentLauncher,
+        model_confusion_plugin: &Path,
+    ) -> Box<dyn AgentBackend + 'a> {
+        match launcher {
+            AgentLauncher::Claude(launcher) => Box::new(
+                ClaudeBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    self.ui.supports_stream_input(),
+                    self.cli.stream_claude,
+                    self.cli.max_output_retries,
+                    &self.ui,
+                )
+                .with_provider_retries(self.cli.max_provider_retries)
+                .with_plugin_dir(model_confusion_plugin),
+            ),
+            AgentLauncher::OpenCode(launcher) => Box::new(
+                OpenCodeBackend::new(
+                    repo,
+                    launcher,
+                    self.ui.supports_stream_input(),
+                    self.cli.stream_claude,
+                    &self.ui,
+                )
+                .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries),
+            ),
+            AgentLauncher::Codex(launcher) => Box::new(
+                CodexBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    self.cli.stream_claude,
+                    &self.ui,
+                )
+                .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries),
+            ),
+        }
+    }
+
     fn run_frontier_replan(
         &self,
         repo: &Path,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: &AgentLauncher,
         mut state: RunState,
     ) -> Result<RunState> {
         let outcome = state
@@ -1283,23 +1332,13 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = ClaudeBackend::new(
-            repo,
-            frontier_launcher,
-            &self.cli.permission_mode,
-            self.ui.supports_stream_input(),
-            self.cli.stream_claude,
-            self.cli.max_output_retries,
-            &self.ui,
-        )
-        .with_provider_retries(self.cli.max_provider_retries)
-        .with_plugin_dir(&model_confusion_plugin);
+        let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
         let session = SessionId::new(Uuid::new_v4().to_string());
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
         self.ui.stage(
             stage_number,
             AGENDA_TOTAL_STAGES,
-            &claude_model_stage_title("Frontier replan", "frontier", frontier_launcher),
+            &model_stage_title("Frontier replan", "frontier", frontier_launcher),
         );
         let base_prompt = frontier_replan_prompt(&assignment, &outcome);
         let mut failure = None;
@@ -1323,9 +1362,9 @@ impl<U: Ui> App<U> {
                 },
                 &stage_prompt("", &prompt, StageProtocol::Frontier),
                 if attempt == 0 {
-                    "Frontier Claude is subdividing the oversized agenda slice"
+                    "Frontier agent is subdividing the oversized agenda slice"
                 } else {
-                    "Frontier Claude is correcting the agenda subdivision"
+                    "Frontier agent is correcting the agenda subdivision"
                 },
                 StageProtocol::Frontier,
             ) {
@@ -1404,7 +1443,7 @@ impl<U: Ui> App<U> {
     fn run_terminal_review(
         &self,
         repo: &Path,
-        frontier_launcher: &ClaudeLauncher,
+        frontier_launcher: &AgentLauncher,
         mut state: RunState,
         escalation: Option<TooLargeOutcome>,
     ) -> Result<RunState> {
@@ -1452,23 +1491,13 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = ClaudeBackend::new(
-            repo,
-            frontier_launcher,
-            &self.cli.permission_mode,
-            self.ui.supports_stream_input(),
-            self.cli.stream_claude,
-            self.cli.max_output_retries,
-            &self.ui,
-        )
-        .with_provider_retries(self.cli.max_provider_retries)
-        .with_plugin_dir(&model_confusion_plugin);
+        let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
         let session = SessionId::new(Uuid::new_v4().to_string());
         self.present_campaign(&state);
         self.ui.stage(
             1,
             TOTAL_STAGES,
-            &claude_model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
+            &model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
         );
         let base_prompt = terminal_review_prompt(&assignment, escalation.as_ref());
         let mut postcondition_failure = None;
@@ -1493,9 +1522,9 @@ impl<U: Ui> App<U> {
                 },
                 &stage_prompt("", &prompt, StageProtocol::TerminalReview),
                 if attempt == 0 {
-                    "Frontier Claude is reviewing whole-project acceptance"
+                    "Frontier agent is reviewing whole-project acceptance"
                 } else {
-                    "Frontier Claude is correcting the acceptance review"
+                    "Frontier agent is correcting the acceptance review"
                 },
                 StageProtocol::TerminalReview,
             ) {
@@ -1621,7 +1650,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &AgentLauncher,
-        frontier_launcher: Option<&ClaudeLauncher>,
+        frontier_launcher: Option<&AgentLauncher>,
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<WorkflowOutcome> {
@@ -1630,7 +1659,11 @@ impl<U: Ui> App<U> {
             AgentLauncher::OpenCode(launcher) => {
                 Some(Arc::new(OpenCodeServer::new(repo, launcher)))
             }
-            AgentLauncher::Claude(_) => None,
+            AgentLauncher::Claude(_) | AgentLauncher::Codex(_) => None,
+        };
+        let codex_server = match launcher {
+            AgentLauncher::Codex(launcher) => Some(Arc::new(CodexServer::new(repo, launcher))),
+            AgentLauncher::Claude(_) | AgentLauncher::OpenCode(_) => None,
         };
         let agent: Box<dyn AgentBackend + '_> = match launcher {
             AgentLauncher::Claude(launcher) => {
@@ -1670,6 +1703,30 @@ impl<U: Ui> App<U> {
                 )
                 .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries),
             ),
+            AgentLauncher::Codex(launcher) => {
+                let client = CodexBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    self.cli.stream_claude,
+                    &self.ui,
+                )
+                .with_server(
+                    codex_server
+                        .as_ref()
+                        .expect("Codex launcher has a shared server")
+                        .clone(),
+                )
+                .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries);
+                let client = if let Some(product) = state.product_repo.as_deref() {
+                    client
+                        .with_additional_dir(product)
+                        .with_resume_repo(product)
+                } else {
+                    client
+                };
+                Box::new(client)
+            }
         };
         let worker_agent: Box<dyn AgentBackend + '_> = match launcher {
             AgentLauncher::Claude(launcher) => {
@@ -1719,27 +1776,40 @@ impl<U: Ui> App<U> {
                 };
                 Box::new(client)
             }
-        };
-        let frontier_claude = frontier_launcher.map(|launcher| {
-            let client = ClaudeBackend::new(
-                repo,
-                launcher,
-                &self.cli.permission_mode,
-                true,
-                self.cli.stream_claude,
-                self.cli.max_output_retries,
-                &self.ui,
-            )
-            .with_provider_retries(self.cli.max_provider_retries)
-            .with_plugin_dir(&model_confusion_plugin);
-            if let Some(product) = state.product_repo.as_deref() {
-                client
-                    .with_additional_dir(product)
-                    .with_resume_repo(product)
-            } else {
-                client
+            AgentLauncher::Codex(launcher) => {
+                let client = CodexBackend::new(
+                    repo,
+                    launcher,
+                    &self.cli.permission_mode,
+                    self.cli.stream_claude,
+                    &self.ui,
+                )
+                .with_server(
+                    codex_server
+                        .as_ref()
+                        .expect("Codex launcher has a shared server")
+                        .clone(),
+                )
+                .with_retries(self.cli.max_output_retries, self.cli.max_provider_retries);
+                let client = if let Some(product) = state.product_repo.as_deref() {
+                    client
+                        .with_additional_dir(product)
+                        .with_resume_repo(product)
+                } else {
+                    client
+                };
+                let client = if state.bootstrap {
+                    client
+                } else {
+                    client.with_stage_timeout(Duration::from_secs(
+                        u64::from(self.cli.local_worker_timeout_minutes) * 60,
+                    ))
+                };
+                Box::new(client)
             }
-        });
+        };
+        let frontier_agent = frontier_launcher
+            .map(|launcher| self.frontier_backend(repo, launcher, &model_confusion_plugin));
         self.ui.change_name(state.change.as_deref());
 
         loop {
@@ -1763,7 +1833,7 @@ impl<U: Ui> App<U> {
                 return Ok(WorkflowOutcome::Done(state));
             }
 
-            let use_terminal_frontier = uses_terminal_frontier(&state, frontier_claude.is_some());
+            let use_terminal_frontier = uses_terminal_frontier(&state, frontier_agent.is_some());
             let stage_uses_frontier =
                 stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
             let stage_role = if stage_uses_frontier {
@@ -1778,7 +1848,7 @@ impl<U: Ui> App<U> {
                 self.cli.yolo,
             );
             let stage_title = if stage_uses_frontier {
-                claude_model_stage_title(
+                model_stage_title(
                     state.stage.title(),
                     stage_role,
                     frontier_launcher.context("frontier stage requires a frontier connection")?,
@@ -1788,22 +1858,22 @@ impl<U: Ui> App<U> {
             };
             self.ui.stage(stage_number, total_stages, &stage_title);
             let planning_agent: &dyn AgentBackend = if use_terminal_frontier {
-                frontier_claude
-                    .as_ref()
+                frontier_agent
+                    .as_deref()
                     .context("terminal Propose requires a frontier connection")?
             } else {
                 worker_agent.as_ref()
             };
             let verifying_agent: &dyn AgentBackend = if use_terminal_frontier {
-                frontier_claude
-                    .as_ref()
+                frontier_agent
+                    .as_deref()
                     .context("terminal Verify requires a frontier connection")?
             } else {
                 worker_agent.as_ref()
             };
             let applying_agent: &dyn AgentBackend = if use_terminal_frontier {
-                frontier_claude
-                    .as_ref()
+                frontier_agent
+                    .as_deref()
                     .context("terminal Apply/repair requires a frontier connection")?
             } else {
                 worker_agent.as_ref()
@@ -2087,11 +2157,11 @@ impl<U: Ui> App<U> {
         let commit_message = proposal_commit_message(&change);
         let task = if state.bootstrap {
             format!(
-                "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragment in `CLAUDE.md`, and OpenSpec's project-local Claude integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the proposal milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and diffs. Commit the generated bootstrap scaffold (`openspec/config.yaml`, `automation/bootstrap.md`, the opsx-build managed fragments in `CLAUDE.md` and `AGENTS.md`, and OpenSpec's project-local agent integration) together with the proposal artifacts for this exact change. Do not commit the source Markdown passed to the bootstrap command merely because it is present. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
         } else if let Some(product_repo) = state.product_repo.as_deref() {
             format!(
-                "Create the proposal milestone Git commit for sidecar OpenSpec change `{change}`. The current working directory is the planning repository. Commit all planning files belonging to this exact change, including its OpenSpec artifacts and sidecar-local Claude integration. {commit_message} Do not create a commit in the product repository `{product}` during this stage. Preserve unrelated work and never reset, stash, restore, discard, amend, or rewrite history. If the planning work is already committed, confirm that and report READY.",
+                "Create the proposal milestone Git commit for sidecar OpenSpec change `{change}`. The current working directory is the planning repository. Commit all planning files belonging to this exact change, including its OpenSpec artifacts and sidecar-local agent integration. {commit_message} Do not create a commit in the product repository `{product}` during this stage. Preserve unrelated work and never reset, stash, restore, discard, amend, or rewrite history. If the planning work is already committed, confirm that and report READY.",
                 product = product_repo.display()
             )
         } else {
@@ -2479,7 +2549,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         launcher: &AgentLauncher,
-        frontier_launcher: Option<&ClaudeLauncher>,
+        frontier_launcher: Option<&AgentLauncher>,
         commands: &SkillCommands,
     ) -> Result<()> {
         self.ui
@@ -2517,32 +2587,19 @@ impl<U: Ui> App<U> {
             id: SessionId::new(Uuid::nil().to_string()),
             name: Some("opsx-build-planning".to_owned()),
         };
-        let command = if terminal_frontier {
-            build_claude_command(
-                repo,
-                frontier_launcher.context("terminal dry run requires a frontier connection")?,
-                &self.cli.permission_mode,
-                &session,
-                &prompt,
-                ClaudeOutputFormat::Json,
-                Some(protocol.json_schema()),
-            )
+        let selected_launcher = if terminal_frontier {
+            frontier_launcher.context("terminal dry run requires a frontier connection")?
         } else {
-            match launcher {
-                AgentLauncher::Claude(launcher) => build_claude_command(
-                    repo,
-                    launcher,
-                    &self.cli.permission_mode,
-                    &session,
-                    &prompt,
-                    ClaudeOutputFormat::Json,
-                    Some(protocol.json_schema()),
-                ),
-                AgentLauncher::OpenCode(launcher) => {
-                    build_opencode_command(repo, launcher, &session, &prompt)
-                }
-            }
+            launcher
         };
+        let command = build_agent_dry_run_command(
+            repo,
+            selected_launcher,
+            &self.cli.permission_mode,
+            &session,
+            &prompt,
+            protocol,
+        );
         self.ui.info(&format!("{label}: {}", command.display()));
         if dry_state.stage == Stage::Explore {
             self.ui
@@ -2571,7 +2628,8 @@ impl<U: Ui> App<U> {
         if let Some(frontier_launcher) = frontier_launcher {
             self.ui.info(&format!(
                 "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
-                frontier_launcher.program, self.cli.local_worker_timeout_minutes
+                frontier_launcher.program(),
+                self.cli.local_worker_timeout_minutes
             ));
         } else {
             self.ui
@@ -2667,8 +2725,28 @@ impl<U: Ui> App<U> {
         ProcessRunner::new(&self.ui).run_interactive(&command)
     }
 
+    fn run_interactive_codex(&self, repo: &Path, launcher: &CodexLauncher) -> Result<()> {
+        let initial_prompt = (!self.cli.request.is_empty()).then_some(self.cli.request.as_str());
+        let command = build_interactive_codex_command(
+            repo,
+            launcher,
+            &self.cli.permission_mode,
+            &self.cli.interactive_args,
+            initial_prompt,
+        )?;
+        self.ui
+            .debug(&format!("interactive command: {}", command.display()));
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — interactive Codex will not be launched");
+            self.ui.info(&command.display());
+            return Ok(());
+        }
+        ProcessRunner::new(&self.ui).run_interactive(&command)
+    }
+
     fn run_connection_test(&self, repo: &Path, launcher: &ClaudeLauncher) -> Result<()> {
-        let connection = claude_connection_description(launcher);
+        let connection = connection_description(&AgentLauncher::Claude(launcher.clone()));
         let mode = if self.cli.basic_connection_test {
             ConnectionTestMode::Basic
         } else {
@@ -2739,6 +2817,53 @@ impl<U: Ui> App<U> {
         Ok(())
     }
 
+    fn run_codex_connection_test(&self, repo: &Path, launcher: &CodexLauncher) -> Result<()> {
+        let connection = connection_description(&AgentLauncher::Codex(launcher.clone()));
+        let prompt = if self.cli.basic_connection_test {
+            format!(
+                "Connectivity test only. Do not inspect files or perform any other work. Return the required structured output with opsx_status READY and summary exactly {CONNECTION_TEST_MARKER}."
+            )
+        } else {
+            format!(
+                "Codex provider compatibility test. Invoke the shell tool exactly once with the command `printf 'OPSX_TOOL_ROUNDTRIP_OK\\n'`. After receiving the tool result, return the required structured output with opsx_status READY and summary exactly {CONNECTION_TEST_MARKER}. Do not inspect files or perform any other work."
+            )
+        };
+        self.ui
+            .info(&format!("Testing Codex connection {connection}"));
+        if self.cli.dry_run {
+            self.ui
+                .warn("DRY RUN — the connection test will not contact the model");
+            self.ui.info(&launcher.server_command(repo).display());
+            return Ok(());
+        }
+        let backend = CodexBackend::new(
+            repo,
+            launcher,
+            &self.cli.permission_mode,
+            self.cli.stream_claude,
+            &self.ui,
+        )
+        .without_session_persistence();
+        let result = backend.invoke(
+            SessionMode::New {
+                id: SessionId::new(Uuid::new_v4().to_string()),
+                name: Some("opsx-build-connection-test".to_owned()),
+            },
+            &prompt,
+            "Waiting for model response",
+            StageProtocol::Ready,
+        )?;
+        if result.text.trim() != CONNECTION_TEST_MARKER {
+            bail!(
+                "Codex transport succeeded, but response compatibility failed: expected exactly `{CONNECTION_TEST_MARKER}`, received {:?}",
+                result.text.trim()
+            );
+        }
+        self.ui
+            .success(&format!("Connection {connection} responded successfully"));
+        Ok(())
+    }
+
     fn debug_configuration(&self, repo: &Path, launcher: &AgentLauncher) {
         self.ui
             .debug("complete prompts are visible and may contain repository content");
@@ -2774,6 +2899,20 @@ impl<U: Ui> App<U> {
                 launcher.model,
                 self.cli.stream_claude
             )),
+            AgentLauncher::Codex(launcher) => self.ui.debug(&format!(
+                "Codex launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
+                launcher.connection_name,
+                launcher.environment_name,
+                launcher.program,
+                launcher.prefix_args,
+                launcher.model,
+                launcher.context_window,
+                launcher.auto_compact_window,
+                launcher.auto_compact_percent,
+                launcher.max_output_tokens,
+                self.cli.permission_mode,
+                self.cli.stream_claude
+            )),
         }
         self.ui.debug(&format!(
             "resolved config file: {}",
@@ -2789,6 +2928,31 @@ impl<U: Ui> App<U> {
     }
 }
 
+fn build_agent_dry_run_command(
+    repo: &Path,
+    launcher: &AgentLauncher,
+    permission_mode: &str,
+    session: &SessionMode,
+    prompt: &str,
+    protocol: StageProtocol,
+) -> CommandSpec {
+    match launcher {
+        AgentLauncher::Claude(launcher) => build_claude_command(
+            repo,
+            launcher,
+            permission_mode,
+            session,
+            prompt,
+            ClaudeOutputFormat::Json,
+            Some(protocol.json_schema()),
+        ),
+        AgentLauncher::OpenCode(launcher) => {
+            build_opencode_command(repo, launcher, session, prompt)
+        }
+        AgentLauncher::Codex(launcher) => launcher.server_command(repo),
+    }
+}
+
 fn connection_description(launcher: &AgentLauncher) -> String {
     let name = launcher.connection_name().unwrap_or("default");
     let model = launcher.model().unwrap_or("harness default model");
@@ -2799,21 +2963,12 @@ fn connection_description(launcher: &AgentLauncher) -> String {
     )
 }
 
-fn claude_connection_description(launcher: &ClaudeLauncher) -> String {
-    connection_description(&AgentLauncher::Claude(launcher.clone()))
-}
-
 fn model_stage_title(title: &str, role: &str, launcher: &AgentLauncher) -> String {
     let connection = launcher.connection_name().unwrap_or("default");
     format!(
         "{title} · {role} ({connection}, {})",
         launcher.backend_name()
     )
-}
-
-fn claude_model_stage_title(title: &str, role: &str, launcher: &ClaudeLauncher) -> String {
-    let connection = launcher.connection_name.as_deref().unwrap_or("default");
-    format!("{title} · {role} ({connection})")
 }
 
 fn ensure_launcher_prerequisites<U: Ui>(
@@ -2829,6 +2984,7 @@ fn ensure_launcher_prerequisites<U: Ui>(
             prerequisite_exists("claude", repo, ui)
         }
         AgentLauncher::OpenCode(_) => prerequisite_exists(launcher.program(), repo, ui),
+        AgentLauncher::Codex(_) => prerequisite_exists(launcher.program(), repo, ui),
     }
 }
 

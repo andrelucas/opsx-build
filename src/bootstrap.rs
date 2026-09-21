@@ -15,6 +15,7 @@ pub const BOOTSTRAP_CHANGE: &str = "bootstrap-implementation-slices";
 pub const BOOTSTRAP_PATH: &str = "automation/bootstrap.md";
 const CONFIG_PATH: &str = "openspec/config.yaml";
 const CLAUDE_PATH: &str = "CLAUDE.md";
+const AGENTS_PATH: &str = "AGENTS.md";
 const SLICES_PATH: &str = "automation/slices";
 const FINAL_SLICE: &str = "9999-project-acceptance.md";
 const MANAGED_START: &str = "<!-- BEGIN OPSX-BUILD MANAGED -->";
@@ -84,7 +85,10 @@ impl BootstrapScaffold {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error).context("could not read CLAUDE.md"),
         };
-        merge_managed_fragment(&existing_claude)?;
+        merge_managed_fragment(&existing_claude, CLAUDE_PATH)?;
+
+        let existing_agents = read_optional_text(&repo.join(AGENTS_PATH), AGENTS_PATH)?;
+        merge_managed_fragment(&existing_agents, AGENTS_PATH)?;
 
         Ok(Self {
             config: render_project_config(&context),
@@ -107,13 +111,14 @@ impl BootstrapScaffold {
                 return Err(error).context("could not read CLAUDE.md after OpenSpec init");
             }
         };
-        let claude = merge_managed_fragment(&existing_claude)?;
+        let claude = merge_managed_fragment(&existing_claude, CLAUDE_PATH)?;
         fs::write(repo.join(CLAUDE_PATH), claude).context("could not update CLAUDE.md")?;
+        ensure_codex_guidance(repo, false)?;
         Ok(())
     }
 
-    pub fn paths() -> [&'static str; 3] {
-        [CONFIG_PATH, BOOTSTRAP_PATH, CLAUDE_PATH]
+    pub fn paths() -> [&'static str; 4] {
+        [CONFIG_PATH, BOOTSTRAP_PATH, CLAUDE_PATH, AGENTS_PATH]
     }
 }
 
@@ -274,7 +279,28 @@ fn valid_template_name(name: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-fn merge_managed_fragment(existing: &str) -> Result<String> {
+pub fn ensure_codex_guidance(repo: &Path, dry_run: bool) -> Result<bool> {
+    let path = repo.join(AGENTS_PATH);
+    let existing = read_optional_text(&path, AGENTS_PATH)?;
+    let merged = merge_managed_fragment(&existing, AGENTS_PATH)?;
+    if merged == existing {
+        return Ok(false);
+    }
+    if !dry_run {
+        fs::write(&path, merged).context("could not update AGENTS.md")?;
+    }
+    Ok(true)
+}
+
+fn read_optional_text(path: &Path, label: &str) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("could not read {label}")),
+    }
+}
+
+fn merge_managed_fragment(existing: &str, file_name: &str) -> Result<String> {
     let fragment =
         CLAUDE_FRAGMENT.replace(MODEL_CONFUSIONS_PLACEHOLDER, &model_confusion_guidance());
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
@@ -298,7 +324,7 @@ fn merge_managed_fragment(existing: &str) -> Result<String> {
             Ok(merged)
         }
         _ => bail!(
-            "CLAUDE.md has malformed or repeated opsx-build managed markers; repair them before bootstrapping"
+            "{file_name} has malformed or repeated opsx-build managed markers; repair them before bootstrapping"
         ),
     }
 }
@@ -366,13 +392,13 @@ mod tests {
 
     #[test]
     fn appends_and_replaces_only_the_managed_claude_fragment() {
-        let first = merge_managed_fragment("# User rules\n\nKeep this.\n").unwrap();
+        let first = merge_managed_fragment("# User rules\n\nKeep this.\n", CLAUDE_PATH).unwrap();
         assert!(first.starts_with("# User rules\n\nKeep this.\n\n"));
         assert_eq!(first.matches(MANAGED_START).count(), 1);
 
-        let updated = merge_managed_fragment(&first).unwrap();
+        let updated = merge_managed_fragment(&first, CLAUDE_PATH).unwrap();
         assert_eq!(updated, first);
-        assert!(merge_managed_fragment(MANAGED_START).is_err());
+        assert!(merge_managed_fragment(MANAGED_START, CLAUDE_PATH).is_err());
     }
 
     #[test]
@@ -387,15 +413,15 @@ mod tests {
         assert!(CLAUDE_FRAGMENT.contains("increasingly large"));
         assert!(CLAUDE_FRAGMENT.contains("Treat third-party library and framework choices"));
         assert!(CLAUDE_FRAGMENT.contains("Do not distort specified behaviour"));
-        assert!(CLAUDE_FRAGMENT.contains("sandbox prevents a required project build or test"));
-        assert!(CLAUDE_FRAGMENT.contains("dangerouslyDisableSandbox: true"));
+        assert!(CLAUDE_FRAGMENT.contains("### Test execution and agent sandboxes"));
+        assert!(CLAUDE_FRAGMENT.contains("supported approval or elevated-execution"));
         assert!(CLAUDE_FRAGMENT.contains("substitute synthetic or weaker coverage"));
         assert!(CLAUDE_FRAGMENT.contains("required real checks have run and passed"));
     }
 
     #[test]
     fn managed_fragment_includes_the_qwen36_confusion_incident() {
-        let fragment = merge_managed_fragment("").unwrap();
+        let fragment = merge_managed_fragment("", CLAUDE_PATH).unwrap();
         assert!(fragment.contains("### Known model-specific confusions"));
         assert!(fragment.contains("qwen3.6-openspec-duplicated-s"));
         assert!(fragment.contains("observed with Qwen3.6"));

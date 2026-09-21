@@ -365,8 +365,12 @@ impl StreamDashboard {
             self.push_agent_message("opencode", "OpenCode", text);
             return;
         }
+        if let StreamItem::Codex(text) = item {
+            self.push_agent_message("codex", "Codex", text);
+            return;
+        }
         let (label, color, text) = match item {
-            StreamItem::Assistant(_) | StreamItem::OpenCode(_) => {
+            StreamItem::Assistant(_) | StreamItem::OpenCode(_) | StreamItem::Codex(_) => {
                 unreachable!("assistant messages returned above")
             }
             StreamItem::Subagent(text) => ("agent", Color::Blue, text),

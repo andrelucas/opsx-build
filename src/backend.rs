@@ -155,6 +155,42 @@ pub fn parse_status_value(status: &str) -> Option<StageSignal> {
     }
 }
 
+pub(crate) fn stage_result_from_text(
+    text: &str,
+    session_id: Option<String>,
+    backend: &str,
+) -> Result<StageResult> {
+    let structured = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+    let structured_signal = structured.as_ref().and_then(|value| {
+        value
+            .get("opsx_status")
+            .or_else(|| value.get("ospx_status"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_status_value)
+    });
+    let signal = structured_signal
+        .or_else(|| parse_terminal_signal(text))
+        .ok_or_else(|| {
+            MissingTerminalResult::new(
+                &format!(
+                    "{backend} response contained neither structured `opsx_status` output nor an `OPSX_STATUS` terminal marker"
+                ),
+                Some(text),
+            )
+        })?;
+    let result_text = structured
+        .as_ref()
+        .and_then(|value| value.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(text)
+        .to_owned();
+    Ok(StageResult {
+        text: result_text,
+        session_id,
+        signal,
+    })
+}
+
 pub trait AgentBackend {
     fn name(&self) -> &'static str;
 

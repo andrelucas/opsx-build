@@ -27,6 +27,7 @@ pub enum StreamFilter {
 pub enum StreamItem {
     Assistant(String),
     OpenCode(String),
+    Codex(String),
     Subagent(String),
     Tool(String),
     ToolResult(String),

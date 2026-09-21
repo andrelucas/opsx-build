@@ -21,7 +21,7 @@ pub struct PauseRequested {
 }
 
 impl PauseRequested {
-    fn new(repo: PathBuf) -> Self {
+    pub(crate) fn new(repo: PathBuf) -> Self {
         Self { repo }
     }
 

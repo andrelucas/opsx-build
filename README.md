@@ -6,15 +6,15 @@
 `opsx-build` is a small synchronous runner for unattended OpenSpec builds. It
 runs each coding-agent/OpenSpec phase, records the next phase in local metadata,
 and lets the repository, OpenSpec artifacts, and selected agent do their own
-jobs. Claude Code is the default backend; OpenCode is available as an explicit
-worker backend.
+jobs. Claude Code is the default backend; OpenCode and Codex are available as
+explicit worker or frontier backends.
 
 During an ordinary run it deliberately does **not** infer file ownership,
-fingerprint dirty files, or police Git HEAD. By default, Claude creates proposal
-and completion milestone commits under explicit non-destructive instructions.
+fingerprint dirty files, or police Git HEAD. By default, the selected worker agent creates
+proposal and completion milestone commits under explicit non-destructive instructions.
 Development runs can use `--yolo` to skip the proposal commit and retain only
-the completion commit. This saves one fresh Claude invocation per change, at
-the cost of losing the convenient committed plan to which Apply work can be
+the completion commit. This saves one fresh worker-agent invocation per change,
+at the cost of losing the convenient committed plan to which Apply work can be
 selectively reverted. It does not disable the private pre-Propose rollback
 baseline used for frontier recovery, and it does not weaken the final commit.
 `--no-yolo` restores the safe default for a run when `yolo = true` is set in
@@ -27,7 +27,8 @@ pre-existing staged, unstaged, or untracked work.
 `propose-unattended` agent skills. Before a workflow starts, it installs
 missing copies and replaces stale copies in the repository selected by
 `--repo`, under `.claude/skills`, a compatibility location recognized by both
-Claude Code and OpenCode. In sidecar mode they instead live in the
+Claude Code and OpenCode. Codex receives those same files as explicit skill
+inputs through App Server. In sidecar mode they instead live in the
 external planning repository, leaving the product checkout untouched by
 OpenSpec integration files. `--dry-run` reports the installation or update
 without writing it. The retired monolithic `build-unattended` skill is not
@@ -48,10 +49,10 @@ neither changes nor replaces project settings or hooks.
 
 Known incidents live in `assets/model-confusions.toml`. One declarative entry
 supplies the incident identity and affected model/version, adds guidance to
-every unattended stage and bootstrapped `CLAUDE.md`, and extends the pre-tool
-guard. This keeps future model-specific confusion handling out of orchestration
-code. This hook mechanism is Claude-specific; OpenCode workers still receive
-the corresponding prompt guidance, but do not load the Claude plugin.
+every unattended stage and bootstrapped `CLAUDE.md`/`AGENTS.md`, and extends
+its pre-tool guard. This keeps future model-specific confusion handling out of orchestration code.
+This hook mechanism is Claude-specific; OpenCode and Codex connections still
+receive the corresponding prompt guidance, but do not load the Claude plugin.
 
 ## Bootstrap a new project
 
@@ -88,15 +89,16 @@ file itself should be committed.
 
 The command:
 
-1. initializes OpenSpec non-interactively for Claude;
+1. initializes OpenSpec non-interactively with its Claude-compatible skill
+   integration;
 2. creates `openspec/config.yaml` from the supplied context;
 3. installs the reusable planning brief at `automation/bootstrap.md`;
-4. adds or refreshes only the marked `opsx-build` fragment in `CLAUDE.md`,
-   preserving all user-owned text outside its markers; the managed fragment
-   includes workflow safety, revisable dependency selection,
+4. adds or refreshes the marked `opsx-build` fragments in `CLAUDE.md` and
+   `AGENTS.md`, preserving all user-owned text outside its markers; the managed
+   fragment includes workflow safety, revisable dependency selection,
    language-server-first navigation, and scoped canonical source-formatting
-   policy, plus instructions to escape Claude's sandbox narrowly when it
-   prevents a required build or test from executing;
+   policy, plus instructions to escape the selected agent's sandbox narrowly
+   when it prevents a required build or test from executing;
 5. runs the planning-only `bootstrap-implementation-slices` change through the
    existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
    commit stages; Propose writes only OpenSpec planning artifacts, while Apply
@@ -299,26 +301,26 @@ multi-change campaign.
 7. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
    Repair/Apply session and then verifies again.
 8. Run Archive in a fresh session after verification succeeds.
-9. Ask Claude in another fresh session to commit the completed change with
-   subject `openspec: complete <change>` and a concise body describing delivered
+9. Ask the selected worker agent in another fresh session to commit the completed
+   change with subject `openspec: complete <change>` and a concise body describing delivered
    behavior and actual verification.
 
 If Archive finishes without a usable terminal result, opsx-build first checks
 OpenSpec's durable state. An absent active change proves that archival completed.
-If the change remains active, Archive is retried once in a fresh Claude session;
+If the change remains active, Archive is retried once in a fresh agent session;
 explicit `BLOCKED` results and substantive process errors are not retried.
 
-Provider API failures emitted as Claude assistant activity are preserved and
+Provider API failures emitted in agent activity are preserved and
 reported directly even when the stream omits the normal stage result. They are
 treated as substantive errors rather than missing-protocol retries, and the
 workflow checkpoint remains available for a later `--resume`.
 
-Before each Claude milestone-commit session, opsx-build records the current
+Before each agent milestone-commit session, opsx-build records the current
 Git commit. It proceeds only if that commit remains an ancestor of the result.
 This catches rewritten or displaced committed history without imposing rules
 about paths, dirty files, commit count, merges, or other working-tree shape.
 
-Every Claude invocation is a blocking subprocess. The checkpoint records only
+Every agent invocation is blocking. The checkpoint records only
 workflow facts: request, assigned agenda slice when advancing, change name,
 next stage, planning session, retry count, pending verifier finding, pending
 user direction, milestone HEADs, and any `TOO_LARGE` decomposition report.
@@ -331,7 +333,7 @@ Verify/Repair allowance, or receives the dashboard's `f` command.
 
 On escalation, opsx-build retains a diagnostic and any failed commits under
 private Git metadata, then restores the exact pre-Propose Git-visible state. A
-fresh frontier Claude process narrows the original agenda file, adds one or
+fresh frontier-agent session narrows the original agenda file, adds one or
 more hierarchical child slices, and commits only `automation/slices/`.
 Deterministic postconditions require the original first slice to remain next,
 at least one child to exist, OpenSpec state to be unchanged, all frontier
@@ -354,9 +356,9 @@ starts directly at Propose. Proposal commit, Apply, Verify, Repair, Archive,
 and completion work all use disposable fresh sessions, so there is no carried
 context to compact at those boundaries.
 
-If a Claude result reports `stop_reason: max_tokens` or a
+If an agent result reports `stop_reason: max_tokens` or a
 `max_output_tokens` API failure, opsx-build treats the turn as interrupted
-rather than failed. It best-effort compacts that same Claude session and asks it
+rather than failed. It best-effort compacts that same agent session and asks it
 to continue the current phase from durable repository state. This recovery is
 bounded by `max_output_retries` (default 3). Exhausting it in a bounded worker
 phase requests the same frontier replan; narrow milestone and archive phases
@@ -432,8 +434,8 @@ In the TTY dashboard, press `q` to finish the current change and then pause the
 campaign cleanly. Ctrl-C still interrupts the active phase immediately and
 leaves it resumable.
 
-Press `p` to pause immediately during any streamed Claude phase. opsx-build
-interrupts the complete Claude process group, restores the terminal, preserves
+Press `p` to pause immediately during any streamed agent phase. opsx-build
+interrupts the active backend process group, restores the terminal, preserves
 the current phase checkpoint and partial repository work, and exits
 successfully with the exact `--resume` command. This is the preferred way to
 stop work before suspending or repurposing the machine; unlike `q`, it does not
@@ -682,6 +684,18 @@ backend = "opencode"
 command = "opencode" # This is the backend default and may be omitted.
 model = "openrouter/qwen/qwen3.6-35b-a3b"
 environment = "openrouter-opencode"
+
+[connections.codex-worker]
+backend = "codex"
+command = "codex" # This is the backend default and may be omitted.
+# model is optional; omit it to use the Codex CLI configured default.
+context_window = "200k"
+auto_compact_percent = 75
+
+[connections.codex-frontier]
+backend = "codex"
+command = "codex"
+# model is optional; omit it to use the Codex CLI configured default.
 ```
 
 Select a configured connection for one invocation with:
@@ -691,7 +705,7 @@ opsx-build --worker-connection local --frontier-connection openrouter-kimi \
   --loop advance
 ```
 
-To run ordinary worker stages through OpenCode while retaining Claude for
+To use OpenCode for worker stages while retaining a Claude connection for
 bootstrap and frontier recovery:
 
 ```sh
@@ -699,12 +713,20 @@ opsx-build --worker-connection opencode-qwen \
   --frontier-connection openrouter-kimi --loop advance
 ```
 
+To use Codex for every model-driven stage, select Codex connections for both
+roles:
+
+```sh
+opsx-build --worker-connection codex-worker \
+  --frontier-connection codex-frontier --loop advance
+```
+
 OpenCode model names must use its `provider/model` form. A model name may
 contain further slashes, as in the OpenRouter example above.
 
 The legacy `--claude-command`, `--claude-model`, and worker token-policy flags
-override Claude worker profiles. `--frontier-command` and `--frontier-model`
-override the selected Claude frontier profile. A profile may also set its own
+override the selected worker profile. `--frontier-command` and `--frontier-model`
+override the selected frontier profile. A profile may also set its own
 `context_window`, `auto_compact_window`, `auto_compact_percent`, and
 `max_output_tokens`; frontier profiles therefore do not accidentally inherit
 worker policy. `context_window` is intentionally profile-only because it
@@ -859,10 +881,11 @@ The corresponding environment variables are:
 
 ## OpenCode backend compatibility
 
-Set `backend = "opencode"` on a named worker connection to use OpenCode for
-normal Propose, proposal commit, Apply, Verify/repair, Archive, and completion
-commit stages. The adapter lazily starts one private OpenCode server on an
-ephemeral loopback port for the workflow, creates and names sessions through
+Set `backend = "opencode"` on a named worker or frontier connection. As a
+worker it handles normal Propose, proposal commit, Apply, Verify/repair,
+Archive, and completion-commit stages. As a frontier it handles bootstrap,
+oversized-slice replanning, and terminal acceptance. The adapter lazily starts
+one private OpenCode server on an ephemeral loopback port for the workflow, creates and names sessions through
 its HTTP API, and attaches a blocking `opencode run --format json --auto`
 subprocess for each turn. It passes `--model provider/model` when configured,
 captures the CLI's JSON events, and records the real OpenCode session ID in the
@@ -884,7 +907,7 @@ the skill tool; an OpenCode command is invoked through `run --command`.
 `--test-connection`, `--basic-connection-test`, `--interactive`, `--dry-run`,
 the terminal dashboard, stage timeout, process pause, process stop, hard
 phase-boundary compaction, and manual frontier escalation all work with an
-OpenCode worker. `--stream-agent` is an alias for the backwards-compatible
+OpenCode connection. `--stream-agent` is an alias for the backwards-compatible
 `--stream-claude` option. Streamed model text is labelled `opencode` in the
 dashboard and linear output.
 
@@ -899,25 +922,74 @@ detaching the local CLI does not leave model work running in the background.
 
 The OpenCode adapter still has a few intentional limitations:
 
-- bootstrap and frontier planning/recovery still require a Claude connection;
 - sidecar repositories are not yet supported by an OpenCode worker;
 - schema-validated terminal output and compact-then-continue recovery for a
-  stage that simply omits its terminal result remain Claude-only;
+  stage that simply omits its terminal result remain unavailable;
 - automatic context-threshold compaction remains OpenCode's responsibility;
-  the profile's Claude-specific auto-compaction fields are not translated into
+  the profile's auto-compaction fields are not translated into
   OpenCode configuration.
 
 OpenCode does detect typed output-limit and retryable provider errors and
 continues the same session under the configured retry limits.
 
 These are adapter limitations, not workflow-state limitations. Repository,
-OpenSpec, Git, and checkpoint postconditions are shared by both backends.
+OpenSpec, Git, and checkpoint postconditions are shared by all agent backends.
 
 This adapter targets OpenCode 1.18.31's documented `run` JSON event format,
 CLI session flags, and session server API. See the
 [OpenCode CLI documentation][opencode-cli],
 [skills documentation][opencode-skills], and
 [server documentation][opencode-server].
+
+## Codex backend compatibility
+
+Set `backend = "codex"` on a named worker or frontier connection. As a worker it
+handles normal Propose, proposal commit, Apply, Verify/repair, Archive, and
+completion-commit stages. As a frontier it handles bootstrap, oversized-slice
+replanning, and terminal acceptance. opsx-build starts a private
+`codex app-server --listen stdio://` process for each active Codex backend
+runtime and communicates with it over newline-delimited JSON-RPC. It creates,
+resumes, and names durable Codex threads; constrains every stage's final result
+with the same JSON schema used for Claude; and stores the real Codex thread ID
+in the ordinary workflow checkpoint.
+
+The selected connection's environment and command prefix are applied to App
+Server. Authentication is Codex's own: a plain `command = "codex"` reuses the
+installed CLI's login and configuration. `model` is optional and overrides the
+thread model when present. `auto_compact_window`, or `context_window` combined
+with `auto_compact_percent`, is translated to Codex's
+`model_auto_compact_token_limit`. Codex controls the model's output-token
+limit, so `max_output_tokens` is retained in the shared profile but is not sent
+to App Server.
+
+The existing `permission_mode` setting maps onto Codex approval and sandbox
+policies. The normal `auto` mode uses `on-request`, Codex's `auto_review`
+reviewer, and the `workspace-write` sandbox. `dontAsk` keeps the same sandbox
+but denies escalation requests; `plan` is read-only; and the explicitly unsafe
+`bypassPermissions` selects `danger-full-access` with no approvals.
+
+Bundled and OpenSpec skills discovered under `.claude/skills`,
+`.agents/skills`, or `.opencode/skills` are passed as explicit App Server skill
+inputs. Claude/OpenSpec command files are handled the same way. When Codex is selected, opsx-build also adds or refreshes its marked guidance
+block in `AGENTS.md`, preserving every byte outside the managed markers.
+Bootstrap now creates both `CLAUDE.md` and `AGENTS.md` guidance so either backend can follow
+the same project rules.
+
+`--test-connection`, `--basic-connection-test`, `--interactive`, `--dry-run`,
+the terminal dashboard, stage timeout, pause, stop, hard phase-boundary
+compaction, structured output, output/provider recovery, and frontier
+escalation are supported. Streamed model messages are labelled `codex`.
+`c` interrupts the active turn, compacts its thread, and resumes the stage;
+`C` interrupts, shows App Server's latest token-usage report, and resumes. The
+`i` control uses Codex's native `turn/steer`, so the direction reaches the
+currently active turn without first discarding it.
+
+Codex can serve as the worker, the frontier, or both. Selecting Codex profiles
+for both roles keeps the deliberately separate responsibilities while running
+every model-driven workflow stage through Codex. App Server is an
+experimental Codex interface; this adapter is tested against Codex CLI 0.155.1
+and follows its generated protocol schemas plus the official
+[Codex App Server documentation][codex-app-server].
 
 ## Claude launcher compatibility
 
@@ -1064,8 +1136,9 @@ Controls:
 - `C` follows the same interrupt/resume cycle but runs `/context`, leaving
   Claude's context report in the phase disclosure for debugging, after
   confirmation;
-- `i` opens a steering prompt; Enter interrupts the active agent turn and
-  delivers the entered instruction as its continuation;
+- `i` opens a steering prompt; Enter delivers the entered instruction to the
+  active agent turn (or as its immediate continuation when the backend lacks
+  native same-turn steering);
 - `q` in campaign mode pauses cleanly after the current change completes after
   confirmation;
 - Escape cancels the injection prompt;
@@ -1083,13 +1156,15 @@ new shortcut. Steering is already a deliberate two-step action: Escape cancels
 its input prompt and Enter sends the entered text. Ctrl-C remains an immediate
 emergency stop.
 
-All three injection controls interrupt the active turn first. `i` delivers the
-entered text as the continuation, which lets it steer the work already in
-progress. `c` and `C` send their slash command, wait for that result, and then
-reissue the exact stage input because diagnostic/maintenance slash commands do
-not themselves continue the work. None rolls back repository changes made
-before interruption; OpenSpec and the repository remain the durable state from
-which the agent continues.
+Claude's three injection controls interrupt the active turn first. `i`
+delivers the entered text as the continuation, which lets it steer the work
+already in progress. `c` and `C` send their slash command, wait for that result,
+and then reissue the exact stage input because diagnostic/maintenance slash
+commands do not themselves continue the work. OpenCode uses its server abort
+and continuation operations. Codex uses native same-turn steering for `i` and
+App Server interruption plus thread operations for `c` and `C`. None rolls back
+repository changes made before interruption; OpenSpec and the repository remain
+the durable state from which the agent continues.
 The dashboard records each step. With Claude, a write or interrupt
 acknowledgement is not a compaction acknowledgement; successful compaction is
 reported by Claude's `compact_boundary` event, which is shown by the `activity`
@@ -1127,18 +1202,19 @@ flags and are not read from the config file.
 [opencode-cli]: https://opencode.ai/docs/cli/
 [opencode-skills]: https://opencode.ai/docs/skills/
 [opencode-server]: https://opencode.ai/docs/server/
+[codex-app-server]: https://developers.openai.com/codex/app-server/
 
 ## Interactive launcher testing
 
-Open an ordinary interactive Claude session using the configured launcher,
-model, and permission mode:
+Open an ordinary interactive session using the configured worker backend, model,
+and permission mode:
 
 ```sh
 opsx-build --interactive -- --effort xhigh
 ```
 
 An optional positional argument becomes the initial prompt. Arguments after
-`--` pass directly to Claude. Interactive mode does not read or update the
+`--` pass directly to the selected backend launcher. Interactive mode does not read or update the
 OpenSpec workflow checkpoint.
 
 ## Terminal protocol
@@ -1176,22 +1252,22 @@ The corrected structured field and fallback marker are `opsx_status` and
 remain readable for compatibility.
 
 Apply, Repair, and Verify prompts explicitly authorize the minimum necessary
-project build or test command to use Claude Code's per-command sandbox escape
+project build or test command to use the selected agent's permission mechanism
 when the sandbox prevents it from running. A sandbox denial must not be "fixed"
 by changing product behavior, adding sandbox-specific tests, weakening tests,
 or substituting synthetic coverage. Verify may report `VERIFIED` only after the
 required real checks have executed and passed.
 
-If the Claude process exits successfully but returns neither structured output
-nor a fallback marker, opsx-build does not rerun that potentially mutating
+If the agent backend finishes successfully but returns neither structured
+output nor a fallback marker, opsx-build does not rerun that potentially mutating
 stage. Archive additionally checks durable OpenSpec state so a completed
 archive is not repeated merely because its acknowledgement was malformed.
 
 ## Prerequisites and limitations
 
 - The configured worker backend executable, `openspec`, and `git` must be on
-  `PATH`. Bootstrap and enabled frontier recovery additionally require the
-  configured Claude launcher and `claude`.
+  `PATH`. Bootstrap and enabled frontier recovery additionally
+  require the configured frontier backend executable.
 - The repository must contain `openspec/config.yaml`. The unattended Explore
   and Propose skills are installed into the target repository automatically.
   Sidecar mode is the exception: it creates that setup in an external native
