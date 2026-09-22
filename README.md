@@ -366,13 +366,26 @@ user direction, milestone HEADs, and any `TOO_LARGE` decomposition report.
 
 `TOO_LARGE` is a normal worker-routing outcome, distinct from `BLOCKED` and
 ordinary failure. It is accepted from Explore, Propose, Apply, and Repair.
-Worker is a workflow role, not an assumption that the selected model is less
-capable than the planner. The default is to complete the assigned change with
-ordered tasks. Multiple files, subsystems, test cases, and independently testable
+Worker execution defaults to completing the assigned change with ordered
+tasks. Multiple files, subsystems, test cases, and independently testable
 intermediate steps alone do not justify subdivision. Planning stages must cite
 targeted repository evidence; Apply and Repair must describe the work attempted
 and the observed constraint. The report must explain why sequencing work within
 the existing change cannot resolve that constraint.
+
+For agenda sizing, the frontier planner assumes a smaller local worker by
+default. Pass `--frontier-worker` when your selected worker is a frontier-capable
+model, for example `opsx-build execute --frontier-worker`. This adjusts the
+planner's capacity assumption during bootstrap, frontier replanning, and
+acceptance remediation. It does not select a connection or model, change stage
+timeouts, or relax the evidence required for `TOO_LARGE`. Both modes plan
+coherent, testable delivery slices and keep internal steps as tasks within them.
+
+Use `--frontier-worker` on subsequent invocations, including `--resume`, or set
+`frontier_worker = true` in the config file (environment equivalent:
+`OPSX_BUILD_FRONTIER_WORKER=true`). opsx-build reports the planning assumption
+at startup; it does not infer worker capacity from model names or connection
+selection.
 
 Agenda runs also escalate when a bounded worker stage exceeds
 `local_worker_timeout_minutes`, exhausts output-limit recovery, exhausts the
@@ -693,6 +706,8 @@ max_verify_retries = 3
 max_output_retries = 3
 max_provider_retries = 3
 local_worker_timeout_minutes = 60
+# Tell the planner the selected worker is a frontier-capable model:
+# frontier_worker = true
 # Optional campaign defaults:
 # loop = true
 # max_iterations = 20

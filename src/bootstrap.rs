@@ -23,6 +23,7 @@ const MANAGED_END: &str = "<!-- END OPSX-BUILD MANAGED -->";
 const BOOTSTRAP_INSTRUCTIONS: &str = include_str!("../assets/bootstrap/bootstrap.md");
 const CLAUDE_FRAGMENT: &str = include_str!("../assets/bootstrap/claude-fragment.md");
 const MODEL_CONFUSIONS_PLACEHOLDER: &str = "{{OPSX_BUILD_MODEL_CONFUSIONS}}";
+const WORKER_CAPACITY_PLACEHOLDER: &str = "{{OPSX_BUILD_WORKER_CAPACITY}}";
 
 #[derive(Debug)]
 pub struct BootstrapScaffold {
@@ -116,14 +117,14 @@ impl BootstrapScaffold {
         })
     }
 
-    pub fn write(&self, repo: &Path) -> Result<()> {
+    pub fn write(&self, repo: &Path, frontier_worker: bool) -> Result<()> {
         fs::create_dir_all(repo.join("openspec"))
             .context("could not create the OpenSpec directory")?;
         fs::create_dir_all(repo.join(SLICES_PATH))
             .context("could not create the implementation-agenda directory")?;
         fs::write(repo.join(CONFIG_PATH), &self.config)
             .context("could not write openspec/config.yaml")?;
-        fs::write(repo.join(BOOTSTRAP_PATH), BOOTSTRAP_INSTRUCTIONS)
+        fs::write(repo.join(BOOTSTRAP_PATH), instructions(frontier_worker))
             .context("could not write automation/bootstrap.md")?;
         let existing_claude = match fs::read_to_string(repo.join(CLAUDE_PATH)) {
             Ok(contents) => contents,
@@ -147,8 +148,19 @@ pub fn init_command(repo: &Path) -> CommandSpec {
     CommandSpec::new("openspec", repo).args(["init", "--tools", "claude", "--no-animation", "."])
 }
 
-pub fn instructions() -> &'static str {
-    BOOTSTRAP_INSTRUCTIONS
+pub fn instructions(frontier_worker: bool) -> String {
+    BOOTSTRAP_INSTRUCTIONS.replace(
+        WORKER_CAPACITY_PLACEHOLDER,
+        worker_capacity_guidance(frontier_worker),
+    )
+}
+
+pub fn worker_capacity_guidance(frontier_worker: bool) -> &'static str {
+    if frontier_worker {
+        "Implementation worker capacity: the worker is a frontier-capable model (--frontier-worker). Size coherent, testable delivery slices for that capability rather than imposing a smaller local model's limitations. The worker still needs explicit acceptance criteria and enough durable context to implement and verify each slice independently."
+    } else {
+        "Implementation worker capacity: assume the worker is a smaller local coding model, substantially less capable than the frontier planner. Size coherent, testable delivery slices that this worker can implement and verify reliably in one OpenSpec cycle. Provide focused scope, concrete implementation guidance, explicit acceptance criteria, and enough durable context to work without the planner's conversation history."
+    }
 }
 
 pub fn validate_agenda(repo: &Path) -> Result<usize> {
@@ -433,6 +445,33 @@ mod tests {
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("exclusively owns creation"));
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("Before reporting Apply complete"));
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("final gate must contain"));
+    }
+
+    #[test]
+    fn bootstrap_file_records_the_selected_worker_capacity() {
+        for frontier_worker in [false, true] {
+            let repo =
+                std::env::temp_dir().join(format!("opsx-worker-capacity-{}", Uuid::new_v4()));
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(
+                repo.join("context.md"),
+                "# Widget\nBuild a tested widget.\n",
+            )
+            .unwrap();
+            let scaffold = BootstrapScaffold::plan(&repo, None, &BTreeMap::new()).unwrap();
+            scaffold.write(&repo, frontier_worker).unwrap();
+            let saved = fs::read_to_string(repo.join(BOOTSTRAP_PATH)).unwrap();
+            assert_eq!(saved, instructions(frontier_worker));
+            assert!(saved.contains(worker_capacity_guidance(frontier_worker)));
+            assert!(!saved.contains(WORKER_CAPACITY_PLACEHOLDER));
+            assert_eq!(
+                saved.contains("substantially less capable"),
+                !frontier_worker
+            );
+            assert_eq!(saved.contains("frontier-capable model"), frontier_worker);
+            assert!(saved.contains("Several files, subsystems, test cases"));
+            fs::remove_dir_all(repo).unwrap();
+        }
     }
 
     #[test]

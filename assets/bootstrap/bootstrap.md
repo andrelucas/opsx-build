@@ -6,6 +6,8 @@ Create the complete implementation agenda that opsx-build will subsequently
 execute with the configured worker model. This is a planning-only change. It MUST
 NOT implement product functionality.
 
+{{OPSX_BUILD_WORKER_CAPACITY}}
+
 Treat `openspec/config.yaml` as the authoritative project goal and planning
 context. Do not survey or attempt to understand the product source tree. Read
 only the configuration and project documentation needed to resolve a genuine
@@ -29,8 +31,7 @@ Each implementation slice must:
 - include enough durable context for a worker without the planner's
   conversation history;
 - leave the repository buildable and its tests passing;
-- be bounded enough for the configured worker to implement and verify reliably;
-  worker is a workflow role and does not imply a smaller or less capable model.
+- be bounded enough for the configured worker to implement and verify reliably.
 
 The agenda must contain at least one delivery slice in addition to
 `9999-project-acceptance.md`.

@@ -20,6 +20,7 @@ use crate::{
     bootstrap::{
         BOOTSTRAP_CHANGE, BOOTSTRAP_PATH, BootstrapScaffold, ensure_codex_guidance, init_command,
         instructions as bootstrap_instructions, validate_agenda as validate_bootstrap_agenda,
+        worker_capacity_guidance,
     },
     claude::{
         CONNECTION_TEST_MARKER, ClaudeBackend, ClaudeLauncher, ClaudeOutputFormat,
@@ -309,7 +310,7 @@ impl RunState {
         }
     }
 
-    fn bootstrap(before_changes: ChangeSnapshot) -> Self {
+    fn bootstrap(before_changes: ChangeSnapshot, frontier_worker: bool) -> Self {
         let mut state = Self::new("bootstrap".to_owned(), before_changes);
         state.change = Some(BOOTSTRAP_CHANGE.to_owned());
         state.stage = Stage::Propose;
@@ -317,7 +318,7 @@ impl RunState {
             path: BOOTSTRAP_PATH.to_owned(),
             change: BOOTSTRAP_CHANGE.to_owned(),
             title: "Bootstrap implementation agenda".to_owned(),
-            content: bootstrap_instructions().to_owned(),
+            content: bootstrap_instructions(frontier_worker),
         });
         state.bootstrap = true;
         state
@@ -528,6 +529,13 @@ impl<U: Ui> App<U> {
         self.ui.frontier_enabled(!local_only);
         if local_only {
             self.ui.info("LOCAL-ONLY: frontier fallback is disabled");
+        }
+        if !local_only && !self.cli.interactive && !self.cli.forget && !self.cli.update_skills {
+            self.ui.info(if self.cli.frontier_worker {
+                "Planning assumes a frontier-capable worker (--frontier-worker)"
+            } else {
+                "Planning assumes a smaller local worker"
+            });
         }
 
         if self.cli.forget {
@@ -870,11 +878,11 @@ impl<U: Ui> App<U> {
         }
 
         ProcessRunner::new(&self.ui).checked(&init, "Initializing OpenSpec")?;
-        scaffold.write(repo)?;
+        scaffold.write(repo, self.cli.frontier_worker)?;
         self.ui.success("Created bootstrap planning inputs");
         self.synchronize_skills(repo)?;
         let before_changes = openspec_snapshot(repo, &self.ui)?;
-        let mut state = RunState::bootstrap(before_changes);
+        let mut state = RunState::bootstrap(before_changes, self.cli.frontier_worker);
         if self.cli.execute {
             state.campaign = Some(CampaignState {
                 iteration: 1,
@@ -1419,7 +1427,7 @@ impl<U: Ui> App<U> {
             AGENDA_TOTAL_STAGES,
             &model_stage_title("Frontier replan", "frontier", frontier_launcher),
         );
-        let base_prompt = frontier_replan_prompt(&assignment, &outcome);
+        let base_prompt = frontier_replan_prompt(&assignment, &outcome, self.cli.frontier_worker);
         let mut failure = None;
         for attempt in 0..2 {
             let prompt = match &failure {
@@ -1579,7 +1587,8 @@ impl<U: Ui> App<U> {
             TOTAL_STAGES,
             &model_stage_title("Frontier acceptance review", "frontier", frontier_launcher),
         );
-        let base_prompt = terminal_review_prompt(&assignment, escalation.as_ref());
+        let base_prompt =
+            terminal_review_prompt(&assignment, escalation.as_ref(), self.cli.frontier_worker);
         let mut postcondition_failure = None;
 
         for attempt in 0..2 {
@@ -1992,7 +2001,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let session = planning_session(state, claude)?;
         persist_state(repo, state, &self.ui)?;
-        let subject = campaign_subject(state);
+        let subject = campaign_subject(state, self.cli.frontier_worker);
         let Some(result) = worker_result(
             claude.invoke(
                 session.clone(),
@@ -2053,7 +2062,7 @@ impl<U: Ui> App<U> {
         };
         let base = format!(
             "{}\n\n{planning_context} Run every OpenSpec command synchronously: never background or detach commands, and do not return while a command or subagent is still working.",
-            campaign_subject(state)
+            campaign_subject(state, self.cli.frontier_worker)
         );
         let mut retrying_postcondition = false;
         loop {
@@ -2258,7 +2267,10 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         let base = if state.bootstrap {
-            format!("{change}\n\n{BOOTSTRAP_APPLY_CONTEXT}")
+            format!(
+                "{change}\n\n{BOOTSTRAP_APPLY_CONTEXT}\n\n{}",
+                worker_capacity_guidance(self.cli.frontier_worker)
+            )
         } else if frontier_terminal {
             format!(
                 "{change}\n\nImplement or continue implementing this terminal whole-project acceptance change completely. This is frontier-owned work: exercise the real acceptance criteria against the delivered project, preserve correct partial work, and replace incorrect task-owned work where necessary. Run the required project checks, using narrowly scoped sandbox escape when the checks genuinely require facilities unavailable inside the sandbox. Do not archive the change. Report TOO_LARGE only if the terminal acceptance work cannot safely be completed even by the frontier model; do not subdivide merely because it would be too large for the worker model."
@@ -2308,7 +2320,8 @@ impl<U: Ui> App<U> {
         let change = require_change(state)?;
         let verify_subject = if state.bootstrap {
             format!(
-                "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md` and the complete project goal in `openspec/config.yaml`. Confirm that no product code was implemented, every material goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with all concrete corrections when it is not."
+                "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md` and the complete project goal in `openspec/config.yaml`. Confirm that no product code was implemented, every material goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with all concrete corrections when it is not.\n\n{}",
+                worker_capacity_guidance(self.cli.frontier_worker)
             )
         } else if frontier_terminal {
             format!(
@@ -2438,7 +2451,8 @@ impl<U: Ui> App<U> {
         );
         let base = if state.bootstrap {
             format!(
-                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts. Do not implement product code and do not create implementation OpenSpec changes. Re-check the complete goal in `openspec/config.yaml`.\n\nVerifier context:\n{finding}"
+                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts. Do not implement product code and do not create implementation OpenSpec changes. Re-check the complete goal in `openspec/config.yaml`.\n\n{}\n\nVerifier context:\n{finding}",
+                worker_capacity_guidance(self.cli.frontier_worker)
             )
         } else if frontier_terminal {
             format!(
@@ -2645,7 +2659,11 @@ impl<U: Ui> App<U> {
         } else {
             (&commands.explore, StageProtocol::Worker, "Explore")
         };
-        let prompt = stage_prompt(planning_command, &campaign_subject(&dry_state), protocol);
+        let prompt = stage_prompt(
+            planning_command,
+            &campaign_subject(&dry_state, self.cli.frontier_worker),
+            protocol,
+        );
         let session = SessionMode::New {
             id: SessionId::new(Uuid::nil().to_string()),
             name: Some("opsx-build-planning".to_owned()),
@@ -3217,11 +3235,11 @@ fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     )
 }
 
-fn campaign_subject(state: &RunState) -> String {
+fn campaign_subject(state: &RunState, frontier_worker: bool) -> String {
     if state.bootstrap {
         return format!(
             "Bootstrap this repository by carrying out the exact planning assignment below. Create or continue only the OpenSpec change `{BOOTSTRAP_CHANGE}`. This change decomposes the complete project goal into a durable agenda for later worker-model runs; it does not implement product functionality. Treat `openspec/config.yaml` as the project authority and do not survey the product source tree.\n\nAssigned bootstrap file: `{BOOTSTRAP_PATH}`\n\n--- BEGIN BOOTSTRAP ASSIGNMENT ---\n{}\n--- END BOOTSTRAP ASSIGNMENT ---",
-            bootstrap_instructions().trim()
+            bootstrap_instructions(frontier_worker).trim()
         );
     }
     if let Some(assignment) = &state.agenda {
@@ -3269,9 +3287,14 @@ fn with_sidecar_context(state: &RunState, subject: &str) -> String {
     )
 }
 
-fn frontier_replan_prompt(assignment: &AgendaAssignment, outcome: &TooLargeOutcome) -> String {
+fn frontier_replan_prompt(
+    assignment: &AgendaAssignment,
+    outcome: &TooLargeOutcome,
+    frontier_worker: bool,
+) -> String {
+    let worker_capacity = worker_capacity_guidance(frontier_worker);
     format!(
-        "The worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Worker is a workflow role, not an assumption of limited model capability. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria so the sequence still delivers the original objective.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
+        "{worker_capacity}\n\nThe worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria so the sequence still delivers the original objective.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
         path = assignment.path,
         change = assignment.change,
         stage = outcome.stage.title(),
@@ -3283,7 +3306,9 @@ fn frontier_replan_prompt(assignment: &AgendaAssignment, outcome: &TooLargeOutco
 fn terminal_review_prompt(
     assignment: &AgendaAssignment,
     escalation: Option<&TooLargeOutcome>,
+    frontier_worker: bool,
 ) -> String {
+    let worker_capacity = worker_capacity_guidance(frontier_worker);
     let failure = escalation.map_or_else(String::new, |outcome| {
         format!(
             "\n\nA preceding terminal attempt was abandoned and the repository was restored to its exact pre-Propose state. Remediation is required; READY is not a valid result for this review.\nFailed stage: {}\nFailure report:\n{}",
@@ -3292,7 +3317,7 @@ fn terminal_review_prompt(
         )
     });
     format!(
-        "Act as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml`, the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Determine whether every material project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
+        "{worker_capacity}\n\nAct as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml`, the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Determine whether every material project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
         path = assignment.path,
         content = assignment.content.trim(),
     )
@@ -3838,7 +3863,7 @@ mod tests {
 
     #[test]
     fn bootstrap_display_starts_iteration_one_only_after_handoff() {
-        let mut bootstrap = RunState::bootstrap(ChangeSnapshot::default());
+        let mut bootstrap = RunState::bootstrap(ChangeSnapshot::default(), false);
         bootstrap.campaign = Some(CampaignState {
             iteration: 1,
             max_iterations: Some(10),
@@ -3870,7 +3895,7 @@ mod tests {
             Some(20),
         );
         state.campaign.as_mut().unwrap().iteration = 7;
-        let subject = campaign_subject(&state);
+        let subject = campaign_subject(&state, false);
         assert!(subject.contains("finish the compiler"));
         assert!(subject.contains("campaign iteration 7"));
         assert!(subject.contains("exactly one coherent, bounded remaining slice"));
@@ -3910,7 +3935,7 @@ mod tests {
             title: "002 - Test harness".to_owned(),
             content: "# 002 - Test harness\n\n## Objective\n\nBuild it.".to_owned(),
         });
-        let subject = campaign_subject(&state);
+        let subject = campaign_subject(&state, false);
         assert!(subject.contains("exact name `002-test-harness`"));
         assert!(subject.contains("automation/slices/002-test-harness.md"));
         assert!(subject.contains("## Objective"));
@@ -3930,7 +3955,7 @@ mod tests {
         );
         state.change = Some("remote-path-prefix".to_owned());
 
-        let subject = campaign_subject(&state);
+        let subject = campaign_subject(&state, false);
 
         assert!(subject.contains("support remote URI path prefixes"));
         assert!(subject.contains("exact OpenSpec change name `remote-path-prefix`"));
@@ -3949,7 +3974,7 @@ mod tests {
         state.sidecar_store = Some("opsx-ceph-demo".to_owned());
         state.local_only = true;
 
-        let subject = campaign_subject(&state);
+        let subject = campaign_subject(&state, false);
         assert!(subject.contains("exact bounded brownfield change `ceph-recovery-fix`"));
         assert!(subject.contains("external planning repository"));
         assert!(subject.contains("product repository is `/src/ceph`"));
@@ -4025,7 +4050,7 @@ mod tests {
             summary: "frontend and lowering are too broad together".to_owned(),
         };
 
-        let prompt = frontier_replan_prompt(&assignment, &outcome);
+        let prompt = frontier_replan_prompt(&assignment, &outcome, false);
 
         assert!(prompt.contains("Keep its current filename"));
         assert!(prompt.contains("0009.1-next-part.md"));
@@ -4033,6 +4058,46 @@ mod tests {
         assert!(prompt.contains("Modify only files under `automation/slices/`"));
         assert!(prompt.contains("do not implement the slice"));
         assert!(prompt.contains("frontend and lowering are too broad together"));
+    }
+
+    #[test]
+    fn frontier_planning_uses_selected_capacity_without_telling_workers_to_subdivide() {
+        let assignment = AgendaAssignment {
+            path: "automation/slices/0009-feature.md".to_owned(),
+            change: "0009-feature".to_owned(),
+            title: "Feature".to_owned(),
+            content: "# Feature\nDeliver a tested feature.".to_owned(),
+        };
+        let failure = TooLargeOutcome {
+            stage: Stage::Apply,
+            summary: "Concrete capacity constraint".to_owned(),
+        };
+        for frontier_worker in [false, true] {
+            let bootstrap = RunState::bootstrap(ChangeSnapshot::default(), frontier_worker);
+            assert_eq!(
+                bootstrap.agenda.as_ref().unwrap().content,
+                bootstrap_instructions(frontier_worker)
+            );
+            for prompt in [
+                campaign_subject(&bootstrap, frontier_worker),
+                frontier_replan_prompt(&assignment, &failure, frontier_worker),
+                terminal_review_prompt(&assignment, Some(&failure), frontier_worker),
+            ] {
+                assert!(prompt.contains(worker_capacity_guidance(frontier_worker)));
+                assert_eq!(
+                    prompt.contains("substantially less capable"),
+                    !frontier_worker
+                );
+                assert_eq!(prompt.contains("frontier-capable model"), frontier_worker);
+            }
+        }
+        let mut worker = RunState::new("advance".to_owned(), ChangeSnapshot::default());
+        worker.agenda = Some(assignment);
+        assert_eq!(
+            campaign_subject(&worker, false),
+            campaign_subject(&worker, true)
+        );
+        assert!(!campaign_subject(&worker, false).contains("substantially less capable"));
     }
 
     #[test]
@@ -4044,7 +4109,7 @@ mod tests {
             content: "# Project acceptance\n\n## Objective\n\nAccept it.".to_owned(),
         };
 
-        let ready = terminal_review_prompt(&assignment, None);
+        let ready = terminal_review_prompt(&assignment, None, false);
         assert!(ready.contains("complete goal in `openspec/config.yaml`"));
         assert!(ready.contains(
             "leave the repository, index, working tree, and Git history exactly unchanged"
@@ -4060,7 +4125,7 @@ mod tests {
             stage: Stage::Verify,
             summary: "TLS hostname rejection is not implemented".to_owned(),
         };
-        let remediation = terminal_review_prompt(&assignment, Some(&failure));
+        let remediation = terminal_review_prompt(&assignment, Some(&failure), false);
         assert!(remediation.contains("READY is not a valid result"));
         assert!(remediation.contains("TLS hostname rejection is not implemented"));
     }

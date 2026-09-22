@@ -56,6 +56,7 @@ pub struct Cli {
     pub sidecar: bool,
     pub sidecar_root: Option<PathBuf>,
     pub local_only: bool,
+    pub frontier_worker: bool,
     pub yolo: bool,
     pub interactive: bool,
     pub test_connection: Option<String>,
@@ -273,6 +274,10 @@ struct CliArgs {
     /// Use only the worker connection and never invoke frontier fallback.
     #[arg(long, env = "OPSX_BUILD_LOCAL_ONLY")]
     local_only: bool,
+
+    /// Plan delivery slices for a frontier-capable worker instead of a smaller local model.
+    #[arg(long, env = "OPSX_BUILD_FRONTIER_WORKER")]
+    frontier_worker: bool,
 
     /// Skip proposal milestone commits, retaining only the final completion commit.
     #[arg(long, env = "OPSX_BUILD_YOLO", conflicts_with = "no_yolo")]
@@ -501,6 +506,7 @@ struct FileConfig {
     sidecar: Option<bool>,
     sidecar_root: Option<PathBuf>,
     local_only: Option<bool>,
+    frontier_worker: Option<bool>,
     yolo: Option<bool>,
     #[serde(rename = "loop")]
     loop_workflow: Option<bool>,
@@ -773,6 +779,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         sidecar: args.sidecar || config.sidecar.unwrap_or(false),
         sidecar_root: args.sidecar_root.or(config.sidecar_root),
         local_only: args.local_only || config.local_only.unwrap_or(false),
+        frontier_worker: args.frontier_worker || config.frontier_worker.unwrap_or(false),
         yolo: !args.no_yolo && (args.yolo || config.yolo.unwrap_or(false)),
         interactive: args.interactive,
         test_connection: args.test_connection,
@@ -1104,6 +1111,54 @@ mod tests {
     #[test]
     fn uses_the_corrected_program_name() {
         assert_eq!(CliArgs::command().get_name(), "opsx-build");
+    }
+
+    #[test]
+    fn frontier_worker_defaults_to_false_and_only_changes_planning_capacity() {
+        let default = resolve_values(args(["opsx-build"]), FileConfig::default(), None).unwrap();
+        assert!(!default.frontier_worker);
+        for request in ["bootstrap", "execute", "advance"] {
+            let cli = Cli::resolve(args([
+                "opsx-build",
+                "--no-config",
+                "--frontier-worker",
+                request,
+            ]))
+            .unwrap();
+            assert!(cli.frontier_worker);
+            assert_eq!(cli.worker_connection, default.worker_connection);
+            assert_eq!(cli.frontier_connection, default.frontier_connection);
+            assert_eq!(
+                cli.local_worker_timeout_minutes,
+                default.local_worker_timeout_minutes
+            );
+        }
+        let resume = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "--resume",
+            "--frontier-worker",
+        ]))
+        .unwrap();
+        assert!(resume.frontier_worker);
+    }
+
+    #[test]
+    fn frontier_worker_can_be_enabled_from_config_or_command_line() {
+        for (configured, flag, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let config: FileConfig =
+                toml::from_str(&format!("frontier_worker = {configured}\n")).unwrap();
+            let mut arguments = vec!["opsx-build"];
+            if flag {
+                arguments.push("--frontier-worker");
+            }
+            let cli = resolve_values(args(arguments), config, None).unwrap();
+            assert_eq!(cli.frontier_worker, expected);
+        }
     }
 
     #[test]
