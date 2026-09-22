@@ -39,6 +39,48 @@ pub fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<ChangeSnapshot> {
     parse_list_json(&output.stdout)
 }
 
+pub fn remove_empty_new_change_directories(repo: &Path, before: &ChangeSnapshot) -> Result<()> {
+    let changes = repo.join("openspec/changes");
+    let entries = match fs::read_dir(&changes) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("could not inspect rolled-back OpenSpec changes"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "archive"
+            || before.changes.contains_key(name.to_string_lossy().as_ref())
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        // Git leaves empty untracked directories behind, but OpenSpec lists them as changes.
+        remove_empty_directory_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn remove_empty_directory_tree(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        // Do not follow symlinks or delete any remaining files, including ignored files.
+        if entry.file_type()?.is_dir() {
+            remove_empty_directory_tree(&entry.path())?;
+        }
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "could not remove empty OpenSpec directory `{}`",
+                path.display()
+            )
+        }),
+    }
+}
+
 pub fn planning_status<U: Ui>(repo: &Path, change: &str, ui: &U) -> Result<PlanningStatus> {
     let spec = CommandSpec::new("openspec", repo).args(["status", "--change", change, "--json"]);
     let output = ProcessRunner::new(ui).checked(&spec, "Checking proposal completeness")?;
@@ -264,6 +306,61 @@ pub fn select_existing_change(active: &ChangeSnapshot, requested: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_cleanup_preserves_existing_changes_archive_and_remaining_files() {
+        let repo = std::env::temp_dir().join(format!(
+            "opsx-build-openspec-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let changes = repo.join("openspec/changes");
+        let before = parse_list_json(r#"{"changes":[{"name":"existing"}]}"#).unwrap();
+        for path in [
+            "existing/specs",
+            "archive/old",
+            "empty/specs/new",
+            "with-files",
+        ] {
+            fs::create_dir_all(changes.join(path)).unwrap();
+        }
+        fs::write(changes.join("with-files/.ignored"), "keep me").unwrap();
+
+        remove_empty_new_change_directories(&repo, &before).unwrap();
+
+        assert!(changes.join("existing/specs").is_dir());
+        assert!(changes.join("archive/old").is_dir());
+        assert!(!changes.join("empty").exists());
+        assert_eq!(
+            fs::read_to_string(changes.join("with-files/.ignored")).unwrap(),
+            "keep me"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_cleanup_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let repo = std::env::temp_dir().join(format!(
+            "opsx-build-openspec-links-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let changes = repo.join("openspec/changes");
+        fs::create_dir_all(changes.join("with-link")).unwrap();
+        fs::create_dir_all(repo.join("outside/empty")).unwrap();
+        symlink(repo.join("outside"), changes.join("linked-change")).unwrap();
+        symlink(repo.join("outside"), changes.join("with-link/specs")).unwrap();
+        symlink(repo.join("missing"), changes.join("with-link/broken")).unwrap();
+
+        remove_empty_new_change_directories(&repo, &ChangeSnapshot::default()).unwrap();
+
+        assert!(changes.join("linked-change").is_symlink());
+        assert!(changes.join("with-link/specs").is_symlink());
+        assert!(changes.join("with-link/broken").is_symlink());
+        assert!(repo.join("outside/empty").is_dir());
+        fs::remove_dir_all(repo).unwrap();
+    }
 
     #[test]
     fn parses_current_openspec_shape() {

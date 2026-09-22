@@ -31,10 +31,10 @@ use crate::{
     codex::{CodexBackend, CodexLauncher, build_interactive_codex_command},
     codex_server::CodexServer,
     git::{
-        SliceBaseline, baseline_matches_except, capture_slice_baseline, committed_paths_since,
-        current_head, hard_reset, head_descends_from, legacy_metadata_dir, metadata_dir,
-        release_slice_baseline, remove_metadata, repository_root, reset_to_slice_baseline,
-        resolve_commit, untracked_paths,
+        RollbackReport, SliceBaseline, baseline_matches_except, capture_slice_baseline,
+        committed_paths_since, current_head, hard_reset, head_descends_from, legacy_metadata_dir,
+        metadata_dir, release_slice_baseline, remove_metadata, repository_root,
+        reset_to_slice_baseline, resolve_commit, untracked_paths,
     },
     model_confusions::ensure_model_confusion_plugin,
     opencode::{
@@ -46,8 +46,9 @@ use crate::{
     opencode_server::OpenCodeServer,
     openspec::{
         ChangeSnapshot, identify_assigned_change, identify_change,
-        numeric_prefix_reconciliation_candidate, planning_status, rename_change_directory,
-        select_existing_change, snapshot as openspec_snapshot,
+        numeric_prefix_reconciliation_candidate, planning_status,
+        remove_empty_new_change_directories, rename_change_directory, select_existing_change,
+        snapshot as openspec_snapshot,
     },
     process::{
         CommandSpec, PauseRequested, ProcessRunner, WorkerEscalationRequested, prerequisite_exists,
@@ -1357,7 +1358,7 @@ impl<U: Ui> App<U> {
             .clone()
             .context("worker escalation has no recorded pre-Propose rollback baseline")?;
         if state.frontier_replans >= MAX_FRONTIER_REPLANS {
-            reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+            restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
             bail!(
                 "frontier subdivision reached its limit of {MAX_FRONTIER_REPLANS} successful replans for `{}` after restoring the pre-Propose baseline; the latest worker report was: {}",
                 assignment.change,
@@ -1365,7 +1366,7 @@ impl<U: Ui> App<U> {
             );
         }
 
-        let rollback = reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+        let rollback = restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
         self.ui.warn(&format!(
             "Abandoned the local {} attempt and restored pre-Propose HEAD {}",
             outcome.stage.title(),
@@ -1426,7 +1427,7 @@ impl<U: Ui> App<U> {
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier replan invocation failed; the pre-Propose baseline was restored",
                     ));
@@ -1434,12 +1435,12 @@ impl<U: Ui> App<U> {
             };
             match result.signal {
                 StageSignal::Blocked => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return blocked("frontier replan", &result.text);
                 }
                 StageSignal::Replanned => {}
                 other => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     bail!("frontier replan returned unexpected terminal status {other:?}");
                 }
             }
@@ -1483,10 +1484,10 @@ impl<U: Ui> App<U> {
                         "Frontier replan did not satisfy its repository postcondition: {}",
                         failure.as_deref().unwrap_or_default()
                     ));
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                 }
                 Err(error) => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier replan failed its repository postcondition twice; the pre-Propose baseline was restored",
                     ));
@@ -1515,7 +1516,7 @@ impl<U: Ui> App<U> {
 
         if state.terminal_remediations >= MAX_TERMINAL_REMEDIATIONS {
             if escalation.is_some() {
-                reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
             }
             bail!(
                 "terminal acceptance reached its limit of {MAX_TERMINAL_REMEDIATIONS} frontier remediation rounds; `{}` remains the terminal gate and the pre-Propose state is preserved",
@@ -1524,7 +1525,8 @@ impl<U: Ui> App<U> {
         }
 
         if let Some(outcome) = &escalation {
-            let rollback = reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+            let rollback =
+                restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
             self.ui.warn(&format!(
                 "Abandoned the terminal {} attempt and restored pre-Propose HEAD {}",
                 outcome.stage.title(),
@@ -1586,7 +1588,7 @@ impl<U: Ui> App<U> {
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier acceptance review failed; the pre-9999 baseline was restored",
                     ));
@@ -1595,7 +1597,7 @@ impl<U: Ui> App<U> {
 
             let postcondition = match result.signal {
                 StageSignal::Blocked => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return blocked("frontier acceptance review", &result.text);
                 }
                 StageSignal::Ready if escalation.is_some() => Err(anyhow::anyhow!(
@@ -1668,10 +1670,10 @@ impl<U: Ui> App<U> {
                         "Frontier acceptance review failed its repository contract: {}",
                         postcondition_failure.as_deref().unwrap_or_default()
                     ));
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                 }
                 Err(error) => {
-                    reset_to_slice_baseline(repo, &baseline, &self.ui)?;
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier acceptance review failed its repository contract twice; the pre-9999 baseline was restored",
                     ));
@@ -3174,6 +3176,17 @@ fn release_state_baseline<U: Ui>(repo: &Path, state: &mut RunState, ui: &U) {
     }
 }
 
+fn restore_slice_baseline<U: Ui>(
+    repo: &Path,
+    baseline: &SliceBaseline,
+    before_changes: &ChangeSnapshot,
+    ui: &U,
+) -> Result<RollbackReport> {
+    let report = reset_to_slice_baseline(repo, baseline, ui)?;
+    remove_empty_new_change_directories(repo, before_changes)?;
+    Ok(report)
+}
+
 fn product_repository<'a>(planning_repo: &'a Path, state: &'a RunState) -> &'a Path {
     state.product_repo.as_deref().unwrap_or(planning_repo)
 }
@@ -3701,6 +3714,81 @@ mod tests {
     struct PlanningBackend {
         name: &'static str,
         actual_session: Option<&'static str>,
+    }
+
+    fn check_rollback_removes_empty_change_directory(already_rolled_back: bool) {
+        let repo = std::env::temp_dir().join(format!("opsx-build-rollback-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        let ui = crate::ui::TerminalUi::new(false, false, false);
+        let runner = ProcessRunner::new(&ui);
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "opsx-build test"],
+            vec!["config", "user.email", "opsx-build@example.invalid"],
+        ] {
+            runner
+                .checked(
+                    &CommandSpec::new("git", &repo).args(args),
+                    "Preparing fixture",
+                )
+                .unwrap();
+        }
+        fs::write(repo.join("tracked.txt"), "baseline\n").unwrap();
+        runner
+            .checked(
+                &CommandSpec::new("git", &repo).args(["add", "tracked.txt"]),
+                "Staging fixture",
+            )
+            .unwrap();
+        runner
+            .checked(
+                &CommandSpec::new("git", &repo).args(["commit", "-qm", "baseline"]),
+                "Committing fixture",
+            )
+            .unwrap();
+        fs::write(repo.join("notes.txt"), "user notes\n").unwrap();
+        let baseline = capture_slice_baseline(&repo, &ui).unwrap();
+        let before_changes = ChangeSnapshot::default();
+        let change = repo.join("openspec/changes/0026-safe-verbose-lifecycle");
+        fs::create_dir_all(change.join("specs/logging")).unwrap();
+        fs::write(change.join("proposal.md"), "proposal\n").unwrap();
+        fs::write(change.join("specs/logging/spec.md"), "spec\n").unwrap();
+        fs::write(repo.join("notes.txt"), "worker edit\n").unwrap();
+
+        if already_rolled_back {
+            reset_to_slice_baseline(&repo, &baseline, &ui).unwrap();
+            assert!(
+                change.is_dir(),
+                "reproduce the directory left by Git rollback"
+            );
+        }
+
+        restore_slice_baseline(&repo, &baseline, &before_changes, &ui).unwrap();
+        assert!(
+            !change.exists(),
+            "OpenSpec must not see an empty failed change"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        assert_eq!(
+            crate::git::repository_status(&repo, &ui).unwrap(),
+            baseline.status
+        );
+        restore_slice_baseline(&repo, &baseline, &before_changes, &ui).unwrap();
+        assert!(!change.exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rollback_removes_empty_failed_change_directories() {
+        check_rollback_removes_empty_change_directory(false);
+    }
+
+    #[test]
+    fn resumed_rollback_removes_directories_left_by_previous_rollback() {
+        check_rollback_removes_empty_change_directory(true);
     }
 
     impl AgentBackend for PlanningBackend {
