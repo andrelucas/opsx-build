@@ -1020,12 +1020,35 @@ in the ordinary workflow checkpoint.
 
 The selected connection's environment and command prefix are applied to App
 Server. Authentication is Codex's own: a plain `command = "codex"` reuses the
-installed CLI's login and configuration. `model` is optional and overrides the
-thread model when present. `auto_compact_window`, or `context_window` combined
+installed CLI's file-based login and configuration. `model` is optional and
+overrides the thread model when present. `auto_compact_window`, or `context_window` combined
 with `auto_compact_percent`, is translated to Codex's
 `model_auto_compact_token_limit`. Codex controls the model's output-token
 limit, so `max_output_tokens` is retained in the shared profile but is not sent
 to App Server.
+
+Unattended Codex runs use `~/.codex/opsx-build` as their default `CODEX_HOME`.
+Their sessions, SQLite databases, logs, and history stay there, keeping campaign
+stages out of Codex Desktop's Recents. opsx-build reports this directory when
+starting App Server. Configuration, named configuration profiles, file-based
+credentials, instructions, rules, skills, plugins, and agent definitions are
+linked from `~/.codex`; refreshed file-based credentials remain shared. If you
+use OS-keyring credentials, you may need to sign in once with
+`CODEX_HOME="$HOME/.codex/opsx-build" codex login`.
+
+When resuming a checkpoint created before isolation, opsx-build imports just
+that session's saved rollout into the private home if needed. It retains the
+same thread ID and leaves the original history untouched. Existing Recents
+entries remain, and already-running processes continue using their original
+home until restarted. Connection tests remain ephemeral; `--interactive`
+continues to use your normal Codex home.
+
+An explicit `CODEX_HOME` in the shell environment or the connection's `env`
+table overrides automatic isolation. In that case, manage its configuration
+and authentication yourself; opsx-build does not link configuration or import
+legacy sessions into an explicitly selected home. Use this for a completely
+independent Codex setup or custom configuration assets. See the official
+[Codex state-directory documentation][codex-environment].
 
 The existing `permission_mode` setting maps onto Codex approval and sandbox
 policies. The normal `auto` mode uses `on-request`, Codex's `auto_review`
@@ -1279,6 +1302,7 @@ flags and are not read from the config file.
 [opencode-server]: https://opencode.ai/docs/server/
 [codex-app-server]: https://developers.openai.com/codex/app-server/
 [codex-permissions]: https://developers.openai.com/codex/permissions/
+[codex-environment]: https://learn.chatgpt.com/docs/config-file/environment-variables
 
 ## Interactive launcher testing
 

@@ -116,24 +116,28 @@ impl CodexServerClient {
         repo: &std::path::Path,
         ui: &U,
     ) -> Result<Self> {
-        let mut command = Command::new(&launcher.program);
+        if let Some(home) = &launcher.isolated_home {
+            home.prepare()?;
+            ui.info(&format!(
+                "Using isolated Codex state `{}`",
+                home.path.display()
+            ));
+        }
+        let spec = launcher.server_command(repo);
+        let mut command = Command::new(&spec.program);
         command
-            .args(&launcher.prefix_args)
-            .args(["app-server", "--listen", "stdio://"])
+            .args(&spec.args)
             .current_dir(repo)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for name in &launcher.unset_environment {
+        for name in &spec.env_remove {
             command.env_remove(name);
         }
-        for variable in &launcher.environment {
-            command.env(&variable.name, &variable.value);
+        for (name, value) in &spec.env {
+            command.env(name, value);
         }
-        ui.debug(&format!(
-            "Codex App Server: {}",
-            launcher.server_command(repo).display()
-        ));
+        ui.debug(&format!("Codex App Server: {}", spec.display()));
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch Codex App Server `{}`", launcher.program))?;
@@ -257,7 +261,30 @@ impl CodexServerClient {
         let mut params = launcher.thread_params(repo, permission_mode, additional_roots)?;
         params["threadId"] = json!(thread_id);
         params["excludeTurns"] = json!(true);
-        self.request("thread/resume", params, REQUEST_TIMEOUT)?;
+        if let Err(error) = self.request("thread/resume", params.clone(), REQUEST_TIMEOUT) {
+            let missing = error
+                .downcast_ref::<CodexRequestError>()
+                .is_some_and(|error| error.is_missing_thread(thread_id));
+            let imported = if missing {
+                launcher
+                    .isolated_home
+                    .as_ref()
+                    .map(|home| home.import_session(thread_id))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let Some(path) = imported else {
+                return Err(error);
+            };
+            // The newly copied file is not necessarily in Codex's index yet.
+            params["path"] = json!(path);
+            let response = self.request("thread/resume", params, REQUEST_TIMEOUT)?;
+            if response.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+                bail!("imported Codex rollout did not match requested thread `{thread_id}`");
+            }
+        }
         self.remember_thread(thread_id)
     }
 
@@ -525,6 +552,7 @@ done
             max_output_tokens: None,
             environment: Vec::new(),
             unset_environment: Vec::new(),
+            isolated_home: None,
         }
     }
 
@@ -650,6 +678,81 @@ done
     }
 
     #[test]
+    fn imports_legacy_session_before_resuming_without_starting_a_replacement() {
+        let directory = std::env::temp_dir().join(format!("opsx-codex-migrate-{}", Uuid::new_v4()));
+        let source = directory.join("codex");
+        let sessions = source.join("sessions/2026/09/22");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let thread_id = Uuid::new_v4().to_string();
+        let filename = format!("rollout-2026-09-22T12-00-00-{thread_id}.jsonl");
+        std::fs::write(sessions.join(&filename), "legacy planning history").unwrap();
+        let mut launcher = planning_test_launcher(&directory, r#""result":{}"#);
+        launcher.isolated_home = Some(crate::codex_home::IsolatedCodexHome::new(source.clone()));
+        launcher
+            .environment
+            .push(crate::codex::LauncherEnvironment {
+                name: "CODEX_SQLITE_HOME".to_owned(),
+                value: directory.join("shared-db").display().to_string(),
+                redacted: false,
+            });
+        std::fs::write(
+            directory.join("server.sh"),
+            r#"printf '%s\n' "$CODEX_HOME" "${CODEX_SQLITE_HOME-unset}" > environment.txt
+id=0
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> requests.jsonl
+  case "$request" in
+    *'"method":"initialized"'*) continue ;;
+  esac
+  id=$((id + 1))
+  case "$request" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/resume"'*'"path":'*) printf '{"id":%s,"result":{"thread":{"id":"__THREAD_ID__"}}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{"id":%s,"error":{"code":-32600,"message":"no rollout found for thread id __THREAD_ID__"}}\n' "$id" ;;
+    *) exit 1 ;;
+  esac
+done
+"#
+            .replace("__THREAD_ID__", &thread_id),
+        )
+        .unwrap();
+        let client = CodexServerClient::start(&launcher, &directory, &QuietUi).unwrap();
+        client
+            .ensure_thread(&launcher, &directory, "auto", &thread_id, &[])
+            .unwrap();
+        // Once resumed, future operations reuse the same active session.
+        client
+            .ensure_thread(&launcher, &directory, "auto", &thread_id, &[])
+            .unwrap();
+        let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2]["method"], "thread/resume");
+        assert!(requests[2]["params"].get("path").is_none());
+        let imported = source
+            .join("opsx-build/sessions/2026/09/22")
+            .join(&filename);
+        assert_eq!(
+            requests[3]["params"]["path"],
+            imported.display().to_string()
+        );
+        assert_eq!(requests[3]["params"]["threadId"], thread_id);
+        assert_eq!(
+            std::fs::read_to_string(imported).unwrap(),
+            "legacy planning history"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("environment.txt")).unwrap(),
+            format!("{}\nunset\n", source.join("opsx-build").display())
+        );
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn initializes_starts_names_and_compacts_over_json_lines() {
         let directory = std::env::temp_dir().join(format!("opsx-codex-rpc-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -684,6 +787,7 @@ read remaining
             max_output_tokens: None,
             environment: Vec::new(),
             unset_environment: Vec::new(),
+            isolated_home: None,
         };
         let client = CodexServerClient::start(&launcher, &directory, &QuietUi).unwrap();
         let thread = client

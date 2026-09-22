@@ -15,6 +15,7 @@ use crate::{
         AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, stage_result_from_text,
     },
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
+    codex_home::IsolatedCodexHome,
     codex_server::{CodexRequestError, CodexServer},
     process::{CommandSpec, PauseRequested, WorkerEscalationRequested},
     stream::{StreamControl, StreamFilter, StreamItem},
@@ -45,6 +46,7 @@ pub struct CodexLauncher {
     pub max_output_tokens: Option<u64>,
     pub(crate) environment: Vec<LauncherEnvironment>,
     pub(crate) unset_environment: Vec<String>,
+    pub(crate) isolated_home: Option<IsolatedCodexHome>,
 }
 
 impl CodexLauncher {
@@ -91,6 +93,20 @@ impl CodexLauncher {
                 redacted,
             });
         }
+        let explicit_home = environment
+            .iter()
+            .any(|variable| variable.name == "CODEX_HOME")
+            || (!unset_environment.iter().any(|name| name == "CODEX_HOME")
+                && std::env::var_os("CODEX_HOME").is_some());
+        let isolated_home = if explicit_home {
+            None
+        } else {
+            Some(IsolatedCodexHome::new(
+                std::env::home_dir()
+                    .context("cannot locate home directory for isolated Codex state")?
+                    .join(".codex"),
+            ))
+        };
         Ok(Self {
             connection_name: connection.name.clone(),
             environment_name: connection.environment_name.clone(),
@@ -104,16 +120,28 @@ impl CodexLauncher {
             max_output_tokens: connection.max_output_tokens,
             environment,
             unset_environment,
+            isolated_home,
         })
     }
 
     pub(crate) fn server_command(&self, repo: &Path) -> CommandSpec {
-        let mut spec =
-            CommandSpec::new(&self.program, repo).args(self.prefix_args.iter().cloned().chain([
-                "app-server".to_owned(),
-                "--listen".to_owned(),
-                "stdio://".to_owned(),
-            ]));
+        let mut spec = CommandSpec::new(&self.program, repo).args(self.prefix_args.iter().cloned());
+        if let Some(home) = &self.isolated_home {
+            // CLI overrides also defeat sqlite_home/log_dir in the shared config.
+            spec = spec.args([
+                "-c".to_owned(),
+                format!(
+                    "sqlite_home={}",
+                    toml::Value::String(home.path.display().to_string())
+                ),
+                "-c".to_owned(),
+                format!(
+                    "log_dir={}",
+                    toml::Value::String(home.path.join("log").display().to_string())
+                ),
+            ]);
+        }
+        spec = spec.args(["app-server", "--listen", "stdio://"]);
         for name in &self.unset_environment {
             spec = spec.remove_env(name);
         }
@@ -123,6 +151,11 @@ impl CodexLauncher {
             } else {
                 spec.env(&variable.name, &variable.value)
             };
+        }
+        if let Some(home) = &self.isolated_home {
+            spec = spec
+                .env("CODEX_HOME", home.path.to_string_lossy())
+                .remove_env("CODEX_SQLITE_HOME");
         }
         spec
     }
@@ -1040,7 +1073,7 @@ mod tests {
             max_output_tokens: None,
             env: BTreeMap::new(),
             isolate: true,
-            unset_env: Vec::new(),
+            unset_env: vec!["CODEX_HOME".to_owned()],
         };
         let launcher = CodexLauncher::from_connection(&connection).unwrap();
         assert_eq!(launcher.program, "codex");
@@ -1053,10 +1086,31 @@ mod tests {
                 .unwrap()["writableRoots"],
             json!(["/repo"])
         );
-        assert_eq!(
-            launcher.server_command(Path::new("/repo")).args,
-            ["--profile", "local", "app-server", "--listen", "stdio://"]
+        let server = launcher.server_command(Path::new("/repo"));
+        let home = launcher.isolated_home.as_ref().unwrap();
+        assert!(
+            server
+                .args
+                .starts_with(&["--profile".to_owned(), "local".to_owned()])
         );
+        assert!(server.args.ends_with(&[
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned()
+        ]));
+        assert!(
+            server
+                .env
+                .contains(&("CODEX_HOME".to_owned(), home.path.display().to_string()))
+        );
+        assert!(server.env_remove.contains(&"CODEX_SQLITE_HOME".to_owned()));
+        assert!(
+            server
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("sqlite_home="))
+        );
+        assert!(server.args.iter().any(|arg| arg.starts_with("log_dir=")));
         let interactive = build_interactive_codex_command(
             Path::new("/repo"),
             &launcher,
@@ -1066,6 +1120,33 @@ mod tests {
         )
         .unwrap();
         assert!(interactive.args.iter().any(|arg| arg == "--approve-for-me"));
+        assert!(!interactive.env.iter().any(|(name, _)| name == "CODEX_HOME"));
+        assert!(
+            !interactive
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("sqlite_home="))
+        );
+
+        let mut connection = connection;
+        connection.env.insert(
+            "CODEX_HOME".to_owned(),
+            ConnectionEnvironmentValue::Literal("/custom/codex".to_owned()),
+        );
+        let launcher = CodexLauncher::from_connection(&connection).unwrap();
+        assert!(launcher.isolated_home.is_none());
+        let server = launcher.server_command(Path::new("/repo"));
+        assert!(
+            server
+                .env
+                .contains(&("CODEX_HOME".to_owned(), "/custom/codex".to_owned()))
+        );
+        assert!(
+            !server
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("sqlite_home="))
+        );
     }
 
     #[test]

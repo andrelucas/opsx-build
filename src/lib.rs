@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+mod codex_home;
 mod codex_server;
 mod dashboard;
 pub mod git;
