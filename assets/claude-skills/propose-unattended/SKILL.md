@@ -49,24 +49,25 @@ Before creating or modifying a change, decide:
 1. Whether the requested objective is already satisfied and no coherent
    implementation work remains. If so, do not create or modify OpenSpec
    artifacts; finish with DONE.
-2. Whether the assigned slice can reliably be implemented, tested, and
-   verified as one bounded change by a substantially smaller local worker
-   model. If not, do not create or modify OpenSpec artifacts; finish with
-   TOO_LARGE.
+2. Whether targeted repository inspection establishes a concrete capacity or
+   scope constraint that prevents implementing and verifying the assigned
+   change. Return TOO_LARGE only when ordered tasks within this change would
+   not resolve that constraint; do not create or modify OpenSpec artifacts in
+   that case.
 
-A slice is TOO_LARGE when it requires substantial coordinated work across
-several subsystems or compiler stages, contains multiple independently
-testable behaviours, requires major architectural discovery, has an obvious
-independently verifiable intermediate state, or otherwise exceeds one reliable
-worker-model workflow.
-
-Do not use TOO_LARGE merely because the work is difficult or unfamiliar.
+Worker describes a workflow role, not a smaller or less capable model. Assess
+the assignment against your actual capabilities and available tools. The
+default is to propose the assigned change and organise its work into tasks.
+Multiple files, subsystems, test cases, or independently testable intermediate
+steps do not by themselves justify TOO_LARGE. Neither do difficulty,
+unfamiliarity, or the mere availability of a cleaner decomposition. Establish
+feasibility through targeted inspection without implementing product code.
 
 For TOO_LARGE, report:
 
-- why the assigned slice exceeds a reliable worker-sized change;
-- the independently verifiable boundaries causing the problem;
-- a suggested ordered decomposition into smaller slices;
+- the specific constraint and repository evidence establishing it;
+- what you inspected and why ordered tasks within this change are insufficient;
+- the minimum necessary decomposition into testable delivery slices;
 - prerequisites and acceptance criteria for each suggested slice.
 
 Otherwise:
@@ -150,8 +151,8 @@ Do not implement production code during this skill.
 Continue until exactly one of these outcomes applies.
 
 TOO_LARGE:
-The assigned slice requires decomposition before a local worker can reliably
-implement and verify it as one OpenSpec change.
+Repository evidence establishes a concrete constraint that prevents completing
+and verifying the assigned OpenSpec change within the current workflow.
 
 Return TOO_LARGE only before creating or modifying any OpenSpec change
 artifacts. Report the evidence and suggested decomposition described above.

@@ -33,30 +33,27 @@ evidence, and choosing incorrectly would materially change what is built.
 
 ## Worker capacity and decomposition
 
-This skill may be running on a substantially smaller local model after a
-frontier model assigned the requested slice.
+Worker describes your workflow role, not a smaller or less capable model.
+Assess the assignment against your actual capabilities and available tools.
+The default is to carry the assigned slice through one OpenSpec workflow.
 
-Before broad investigation, assess whether the slice can reliably be proposed,
-implemented, tested, and verified as one bounded OpenSpec change.
+Use targeted repository inspection to establish a practical implementation and
+verification plan. Multiple files, subsystems, test cases, or independently
+testable intermediate steps do not by themselves make a slice TOO_LARGE. They
+can be ordered tasks within the same change. Difficulty, unfamiliarity, and
+the mere availability of a cleaner decomposition are not capacity evidence.
 
-Return TOO_LARGE when the slice requires decomposition because it:
-
-- coordinates substantial changes across several subsystems or compiler stages;
-- contains multiple independently testable behaviours;
-- requires major architectural discovery before implementation;
-- has an obvious intermediate state that can be verified independently; or
-- cannot reasonably be completed within one worker-model workflow.
-
-Do not use TOO_LARGE merely because the work is difficult, unfamiliar, or
-requires ordinary targeted investigation. Prefer reasonable engineering
-judgement for a bounded slice.
+Return TOO_LARGE only when that inspection establishes a concrete capacity or
+scope constraint that prevents completing and verifying the assigned change,
+and sequencing its tasks within the change would not resolve the constraint.
+Keep this stage investigative; do not implement code to prove feasibility.
 
 When returning TOO_LARGE, stop before creating or modifying OpenSpec change
 artifacts. Report:
 
-- why the assigned slice exceeds a reliable worker-sized change;
-- the independently verifiable boundaries causing the problem;
-- a suggested ordered decomposition into smaller slices;
+- the specific constraint and repository evidence establishing it;
+- what you inspected and why ordered tasks within this change are insufficient;
+- the minimum necessary decomposition into testable delivery slices;
 - prerequisites and acceptance criteria for each suggested slice.
 
 ## Exploration strategy
@@ -102,8 +99,8 @@ asked to do so separately.
 Continue investigating until exactly one of these outcomes applies.
 
 TOO_LARGE:
-The assigned slice cannot reliably be completed as one bounded worker-model
-OpenSpec change and should be decomposed by the planning model.
+Repository evidence establishes a concrete constraint that prevents completing
+and verifying the assigned OpenSpec change within the current workflow.
 
 Report the evidence and suggested decomposition required by the worker-capacity
 policy above.

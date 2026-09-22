@@ -335,8 +335,8 @@ multi-change campaign.
 5. Ask Claude in a fresh session to commit the proposal with subject
    `openspec: propose <change>` and a concise artifact-derived summary body.
 6. Run the installed OpenSpec Apply workflow in a fresh session. Worker stages
-   may return `TOO_LARGE` when a frontier-assigned slice cannot reliably fit
-   one bounded local-model change.
+   may return `TOO_LARGE` when repository evidence establishes a concrete
+   capacity or scope constraint that tasks within the change cannot resolve.
 7. Run Verify in fresh sessions. A `RETRY` result starts a fresh directed
    Repair/Apply session and then verifies again.
 8. Run Archive in a fresh session after verification succeeds.
@@ -366,6 +366,14 @@ user direction, milestone HEADs, and any `TOO_LARGE` decomposition report.
 
 `TOO_LARGE` is a normal worker-routing outcome, distinct from `BLOCKED` and
 ordinary failure. It is accepted from Explore, Propose, Apply, and Repair.
+Worker is a workflow role, not an assumption that the selected model is less
+capable than the planner. The default is to complete the assigned change with
+ordered tasks. Multiple files, subsystems, test cases, and independently testable
+intermediate steps alone do not justify subdivision. Planning stages must cite
+targeted repository evidence; Apply and Repair must describe the work attempted
+and the observed constraint. The report must explain why sequencing work within
+the existing change cannot resolve that constraint.
+
 Agenda runs also escalate when a bounded worker stage exceeds
 `local_worker_timeout_minutes`, exhausts output-limit recovery, exhausts the
 Verify/Repair allowance, or receives the dashboard's `f` command.

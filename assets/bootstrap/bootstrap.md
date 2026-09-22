@@ -3,7 +3,7 @@
 Change name: `bootstrap-implementation-slices`
 
 Create the complete implementation agenda that opsx-build will subsequently
-execute with a smaller worker model. This is a planning-only change. It MUST
+execute with the configured worker model. This is a planning-only change. It MUST
 NOT implement product functionality.
 
 Treat `openspec/config.yaml` as the authoritative project goal and planning
@@ -29,17 +29,18 @@ Each implementation slice must:
 - include enough durable context for a worker without the planner's
   conversation history;
 - leave the repository buildable and its tests passing;
-- be small enough for a substantially less capable local model to reason about
-  and verify reliably.
+- be bounded enough for the configured worker to implement and verify reliably;
+  worker is a workflow role and does not imply a smaller or less capable model.
 
 The agenda must contain at least one delivery slice in addition to
 `9999-project-acceptance.md`.
 
-A slice is too large when it requires several independently testable
-behaviours, coordinated novelty across several subsystems, substantial
-architectural discovery during implementation, or has an obvious independently
-testable intermediate state. When in doubt, split it. Prefer several small
-sequential slices over one ambitious slice.
+Choose coherent delivery boundaries with practical implementation and
+verification plans. Several files, subsystems, test cases, or independently
+testable intermediate steps can be tasks within one slice. Split when a
+concrete capacity, scope, or prerequisite constraint prevents completing and
+verifying the work together; the mere ability to identify smaller steps is
+not a reason to give each its own OpenSpec cycle.
 
 Treat important third-party dependency choices as hypotheses rather than
 requirements unless `openspec/config.yaml` explicitly mandates them. When later

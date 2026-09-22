@@ -8,9 +8,13 @@
   slice or broaden it into adjacent agenda work.
 - Run OpenSpec and project commands synchronously. Do not background, detach, or
   return while a command or delegated task is still running.
-- Return `TOO_LARGE` when an assigned slice cannot reliably fit one bounded
-  worker-model change. Include concrete evidence and an ordered decomposition;
-  do not struggle onward by broadening the implementation.
+- Worker is a workflow role, not an assumption of limited model capability.
+  Complete the assigned change using ordered implementation and verification
+  tasks. Multiple files, subsystems, or test cases alone do not justify replanning.
+- Return `TOO_LARGE` only for a concrete capacity or scope constraint supported
+  by repository evidence. Explain what was inspected or attempted, why tasks
+  within the current change cannot resolve it, and the minimum necessary
+  decomposition. Keep the implementation within the assigned scope.
 - Reserve `BLOCKED` for a genuine external decision or unavailable dependency,
   not ordinary engineering failures, uncertainty between reasonable technical
   choices, or correctable test failures.
