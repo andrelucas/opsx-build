@@ -1982,12 +1982,12 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         state: &mut RunState,
     ) -> Result<()> {
-        let (session, is_new) = planning_session(state, claude.name());
+        let session = planning_session(state, claude)?;
         persist_state(repo, state, &self.ui)?;
         let subject = campaign_subject(state);
         let Some(result) = worker_result(
             claude.invoke(
-                session_mode(&session, is_new, "opsx-build-planning"),
+                session.clone(),
                 &stage_prompt(&commands.explore, &subject, StageProtocol::Worker),
                 "Worker agent is exploring the change",
                 StageProtocol::Worker,
@@ -2003,7 +2003,7 @@ impl<U: Ui> App<U> {
             .session_id
             .as_deref()
             .map(SessionId::new)
-            .unwrap_or(session);
+            .unwrap_or_else(|| session.id().clone());
         state.planning_session = Some(session.clone());
         persist_state(repo, state, &self.ui)?;
         if !handle_worker_result(
@@ -2030,7 +2030,7 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
         frontier_terminal: bool,
     ) -> Result<()> {
-        let (mut session, is_new) = planning_session(state, claude.name());
+        let mut session = planning_session(state, claude)?;
         persist_state(repo, state, &self.ui)?;
         let planning_context = if state.bootstrap {
             BOOTSTRAP_PROPOSAL_CONTEXT
@@ -2059,11 +2059,7 @@ impl<U: Ui> App<U> {
             };
             let Some(result) = worker_result(
                 claude.invoke(
-                    session_mode(
-                        &session,
-                        is_new && !retrying_postcondition,
-                        "opsx-build-planning",
-                    ),
+                    session.clone(),
                     &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
                     if retrying_postcondition && frontier_terminal {
                         "Frontier agent is correcting the terminal acceptance proposal"
@@ -2083,11 +2079,15 @@ impl<U: Ui> App<U> {
             else {
                 return Ok(());
             };
-            if let Some(actual_session) = result.session_id.as_deref() {
-                session = SessionId::new(actual_session);
-                state.planning_session = Some(session.clone());
-                persist_state(repo, state, &self.ui)?;
-            }
+            session = SessionMode::Resume {
+                id: result
+                    .session_id
+                    .as_deref()
+                    .map(SessionId::new)
+                    .unwrap_or_else(|| session.id().clone()),
+            };
+            state.planning_session = Some(session.id().clone());
+            persist_state(repo, state, &self.ui)?;
 
             let mut after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
@@ -2190,7 +2190,7 @@ impl<U: Ui> App<U> {
             self.ui.change_name(Some(&change));
             self.ui
                 .info(&format!("Selected OpenSpec change `{change}`"));
-            if let Err(error) = claude.rename_session(&session, &change) {
+            if let Err(error) = claude.rename_session(session.id(), &change) {
                 self.ui
                     .warn(&format!("Could not rename planning session: {error}"));
             }
@@ -3053,37 +3053,25 @@ fn stage_uses_frontier_model(stage: Stage, bootstrap: bool, terminal_frontier: b
             ))
 }
 
-fn planning_session(state: &mut RunState, backend: &str) -> (SessionId, bool) {
+fn planning_session(state: &mut RunState, backend: &dyn AgentBackend) -> Result<SessionMode> {
     let saved_backend = state
         .planning_backend
         .as_deref()
         .or_else(|| state.planning_session.as_ref().map(|_| "Claude"));
-    match (&state.planning_session, saved_backend == Some(backend)) {
-        (Some(id), true) => (id.clone(), false),
-        (None, _) => {
-            let id = SessionId::new(Uuid::new_v4().to_string());
-            state.planning_session = Some(id.clone());
-            state.planning_backend = Some(backend.to_owned());
-            (id, true)
-        }
-        (Some(_), false) => {
-            let id = SessionId::new(Uuid::new_v4().to_string());
-            state.planning_session = Some(id.clone());
-            state.planning_backend = Some(backend.to_owned());
-            (id, true)
-        }
-    }
-}
-
-fn session_mode(id: &SessionId, is_new: bool, name: &str) -> SessionMode {
-    if is_new {
-        SessionMode::New {
-            id: id.clone(),
-            name: Some(name.to_owned()),
-        }
-    } else {
-        SessionMode::Resume { id: id.clone() }
-    }
+    let requested = match (
+        &state.planning_session,
+        saved_backend == Some(backend.name()),
+    ) {
+        (Some(id), true) => SessionMode::Resume { id: id.clone() },
+        _ => SessionMode::New {
+            id: SessionId::new(Uuid::new_v4().to_string()),
+            name: Some("opsx-build-planning".to_owned()),
+        },
+    };
+    let session = backend.prepare_session(requested)?;
+    state.planning_session = Some(session.id().clone());
+    state.planning_backend = Some(backend.name().to_owned());
+    Ok(session)
 }
 
 fn invoke_fresh(
@@ -3709,6 +3697,44 @@ fn single_advance_continuation_command(repo: &Path, state: &RunState) -> Option<
 mod tests {
     use super::*;
 
+    struct PlanningBackend {
+        name: &'static str,
+        actual_session: Option<&'static str>,
+    }
+
+    impl AgentBackend for PlanningBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn prepare_session(&self, session: SessionMode) -> Result<SessionMode> {
+            Ok(match self.actual_session {
+                Some(id) => SessionMode::Resume {
+                    id: SessionId::new(id),
+                },
+                None => session,
+            })
+        }
+
+        fn invoke(
+            &self,
+            _: SessionMode,
+            _: &str,
+            _: &str,
+            _: StageProtocol,
+        ) -> Result<StageResult> {
+            bail!("interrupted planning turn")
+        }
+
+        fn rename_session(&self, _: &SessionId, _: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        fn compact_session(&self, _: &SessionId, _: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn direction_is_injected_as_iteration_guidance() {
         let prompt = with_direction("apply slice-m", Some("keep the AST unchanged"));
@@ -4045,11 +4071,62 @@ mod tests {
         state.planning_session = Some(SessionId::new("claude-session"));
         state.planning_backend = Some("Claude".to_owned());
 
-        let (session, is_new) = planning_session(&mut state, "OpenCode");
+        let backend = PlanningBackend {
+            name: "OpenCode",
+            actual_session: None,
+        };
+        let session = planning_session(&mut state, &backend).unwrap();
 
-        assert!(is_new);
-        assert_ne!(session.as_str(), "claude-session");
+        assert!(matches!(&session, SessionMode::New { .. }));
+        assert_ne!(session.id().as_str(), "claude-session");
         assert_eq!(state.planning_backend.as_deref(), Some("OpenCode"));
+    }
+
+    #[test]
+    fn planning_resume_preserves_an_existing_session_with_the_same_backend() {
+        let mut state = RunState::new("build it".to_owned(), ChangeSnapshot::default());
+        state.planning_session = Some(SessionId::new("claude-session"));
+        let backend = PlanningBackend {
+            name: "Claude",
+            actual_session: None,
+        };
+
+        let session = planning_session(&mut state, &backend).unwrap();
+
+        assert!(matches!(session, SessionMode::Resume { id } if id.as_str() == "claude-session"));
+    }
+
+    #[test]
+    fn planning_checkpoint_has_actual_session_before_an_interrupted_turn() {
+        let backend = PlanningBackend {
+            name: "Codex",
+            actual_session: Some("actual-thread"),
+        };
+        for saved_session in [None, Some(SessionId::new("stale-thread"))] {
+            let mut state =
+                RunState::new_campaign("advance".to_owned(), ChangeSnapshot::default(), Some(10));
+            state.stage = Stage::Propose;
+            state.change = Some("0001-pinned-contract-build".to_owned());
+            state.planning_session = saved_session;
+            state.planning_backend = Some("Codex".to_owned());
+            let mut expected = serde_json::to_value(&state).unwrap();
+            expected["planning_session"] = Value::from("actual-thread");
+
+            let session = planning_session(&mut state, &backend).unwrap();
+            let checkpoint = serde_json::to_value(&state).unwrap();
+            assert_eq!(checkpoint, expected);
+            assert!(
+                backend
+                    .invoke(
+                        session,
+                        "continue proposal",
+                        "Propose",
+                        StageProtocol::Propose
+                    )
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&state).unwrap(), checkpoint);
+        }
     }
 
     #[test]

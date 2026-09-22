@@ -194,6 +194,11 @@ pub(crate) fn stage_result_from_text(
 pub trait AgentBackend {
     fn name(&self) -> &'static str;
 
+    /// Resolve a server-assigned session ID before checkpointing planning work.
+    fn prepare_session(&self, session: SessionMode) -> Result<SessionMode> {
+        Ok(session)
+    }
+
     fn invoke(
         &self,
         session: SessionMode,

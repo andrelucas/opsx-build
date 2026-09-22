@@ -19,6 +19,34 @@ use crate::{codex::CodexLauncher, ui::Ui};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Debug)]
+pub(crate) struct CodexRequestError {
+    method: String,
+    error: Value,
+}
+
+impl CodexRequestError {
+    pub(crate) fn is_missing_thread(&self, thread_id: &str) -> bool {
+        self.method == "thread/resume"
+            && self.error.get("code").and_then(Value::as_i64) == Some(-32600)
+            && self.error.get("message").and_then(Value::as_str)
+                == Some(format!("no rollout found for thread id {thread_id}").as_str())
+    }
+}
+
+impl std::fmt::Display for CodexRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex App Server `{}` failed: {}",
+            self.method,
+            compact_json(&self.error)
+        )
+    }
+}
+
+impl std::error::Error for CodexRequestError {}
+
 pub(crate) struct CodexServer {
     repo: std::path::PathBuf,
     launcher: CodexLauncher,
@@ -344,10 +372,11 @@ impl CodexServerClient {
             };
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(error) = message.get("error") {
-                    bail!(
-                        "Codex App Server `{method}` failed: {}",
-                        compact_json(error)
-                    );
+                    return Err(CodexRequestError {
+                        method: method.to_owned(),
+                        error: error.clone(),
+                    }
+                    .into());
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -424,7 +453,8 @@ fn compact_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::{
-        codex::CodexLauncher,
+        backend::{AgentBackend, SessionId, SessionMode, StageProtocol},
+        codex::{CodexBackend, CodexLauncher},
         stream::{StreamControl, StreamItem},
         ui::Ui,
     };
@@ -456,6 +486,167 @@ mod tests {
             None
         }
         fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
+    }
+
+    fn planning_test_launcher(directory: &std::path::Path, resume_reply: &str) -> CodexLauncher {
+        let script = directory.join("server.sh");
+        std::fs::write(
+            &script,
+            r#"id=0
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> requests.jsonl
+  case "$request" in
+    *'"method":"initialized"'*) continue ;;
+  esac
+  id=$((id + 1))
+  case "$request" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{"id":%s,__RESUME_REPLY__}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"actual-thread"}}}\n' "$id" ;;
+    *'"method":"thread/name/set"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"turn/start"'*) printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id" ;;
+    *) exit 1 ;;
+  esac
+done
+"#
+            .replace("__RESUME_REPLY__", resume_reply),
+        )
+        .unwrap();
+        CodexLauncher {
+            connection_name: None,
+            environment_name: None,
+            program: "sh".to_owned(),
+            prefix_args: vec![script.display().to_string()],
+            model: None,
+            permission_profile: Some("build-permissions".to_owned()),
+            context_window: None,
+            auto_compact_window: None,
+            auto_compact_percent: None,
+            max_output_tokens: None,
+            environment: Vec::new(),
+            unset_environment: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn planning_session_is_resolved_before_a_failed_turn() {
+        for (mode, resume_reply, expected_methods) in [
+            (
+                SessionMode::New {
+                    id: SessionId::new("placeholder"),
+                    name: Some("planning".to_owned()),
+                },
+                r#""result":{}"#,
+                vec![
+                    "initialize",
+                    "initialized",
+                    "thread/start",
+                    "thread/name/set",
+                    "turn/start",
+                ],
+            ),
+            (
+                SessionMode::Resume {
+                    id: SessionId::new("actual-thread"),
+                },
+                r#""result":{"thread":{"id":"actual-thread"}}"#,
+                vec!["initialize", "initialized", "thread/resume", "turn/start"],
+            ),
+            (
+                SessionMode::Resume {
+                    id: SessionId::new("missing-thread"),
+                },
+                r#""error":{"code":-32600,"message":"no rollout found for thread id missing-thread"}"#,
+                vec![
+                    "initialize",
+                    "initialized",
+                    "thread/resume",
+                    "thread/start",
+                    "thread/name/set",
+                    "turn/start",
+                ],
+            ),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-planning-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let launcher = planning_test_launcher(&directory, resume_reply);
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi);
+            let session = backend.prepare_session(mode).unwrap();
+            assert!(
+                matches!(&session, SessionMode::Resume { id } if id.as_str() == "actual-thread")
+            );
+
+            let error = backend
+                .invoke(
+                    session,
+                    "continue existing proposal",
+                    "Propose",
+                    StageProtocol::Propose,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("simulated turn failure"));
+            let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let methods: Vec<_> = requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect();
+            assert_eq!(methods, expected_methods);
+            for request in &requests {
+                match request["method"].as_str().unwrap() {
+                    "thread/start" | "thread/resume" => {
+                        assert_eq!(
+                            request["params"]["config"]["default_permissions"],
+                            "build-permissions"
+                        );
+                        assert_eq!(
+                            request["params"]["cwd"],
+                            directory.to_string_lossy().as_ref()
+                        );
+                        assert!(request["params"].get("sandbox").is_none());
+                        if request["method"] == "thread/start" {
+                            assert_eq!(request["params"]["ephemeral"], false);
+                        }
+                    }
+                    "turn/start" => assert_eq!(request["params"]["threadId"], "actual-thread"),
+                    _ => {}
+                }
+            }
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn planning_resume_does_not_replace_threads_for_other_errors() {
+        for (code, message) in [
+            (-32600, "invalid permission profile"),
+            (-32603, "authentication failed"),
+            (-32600, "no rollout found for thread id another-thread"),
+            (-32603, "no rollout found for thread id missing-thread"),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-resume-error-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let reply = format!("\"error\":{}", json!({"code": code, "message": message}));
+            let launcher = planning_test_launcher(&directory, &reply);
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi);
+            let error = backend
+                .prepare_session(SessionMode::Resume {
+                    id: SessionId::new("missing-thread"),
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(message));
+            let requests = std::fs::read_to_string(directory.join("requests.jsonl")).unwrap();
+            assert!(!requests.contains("thread/start"));
+            assert!(!requests.contains("turn/start"));
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

@@ -388,6 +388,14 @@ starts directly at Propose. Proposal commit, Apply, Verify, Repair, Archive,
 and completion work all use disposable fresh sessions, so there is no carried
 context to compact at those boundaries.
 
+Codex planning checkpoints record the server's actual thread ID before starting
+the phase turn, so interrupted work can resume that thread. If Codex explicitly
+reports that its saved rollout is missing, opsx-build starts a fresh planning
+thread and continues the same phase from the existing repository artifacts and
+campaign assignment. The replacement ID is checkpointed before work resumes;
+the campaign position and partial proposal are preserved. Other resume errors
+are reported without replacing the thread.
+
 If an agent result reports `stop_reason: max_tokens` or a
 `max_output_tokens` API failure, opsx-build treats the turn as interrupted
 rather than failed. It best-effort compacts that same agent session and asks it

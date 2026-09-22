@@ -15,7 +15,7 @@ use crate::{
         AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, stage_result_from_text,
     },
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
-    codex_server::CodexServer,
+    codex_server::{CodexRequestError, CodexServer},
     process::{CommandSpec, PauseRequested, WorkerEscalationRequested},
     stream::{StreamControl, StreamFilter, StreamItem},
     ui::Ui,
@@ -570,6 +570,28 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
 impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
     fn name(&self) -> &'static str {
         "Codex"
+    }
+
+    fn prepare_session(&self, session: SessionMode) -> Result<SessionMode> {
+        let id = match self.start_or_resume(session.clone()) {
+            Ok(id) => id,
+            Err(error)
+                if matches!(&session, SessionMode::Resume { id }
+                    if error.downcast_ref::<CodexRequestError>()
+                        .is_some_and(|error| error.is_missing_thread(id.as_str()))) =>
+            {
+                self.ui.warn(&format!(
+                    "Codex planning thread `{}` has no saved rollout; continuing the same phase in a fresh thread from repository state",
+                    session.id()
+                ));
+                self.start_or_resume(SessionMode::New {
+                    id: session.id().clone(),
+                    name: Some("opsx-build-planning".to_owned()),
+                })?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(SessionMode::Resume { id })
     }
 
     fn invoke(
