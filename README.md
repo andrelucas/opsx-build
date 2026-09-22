@@ -491,6 +491,17 @@ current campaign change and pauses before the following iteration.
 cargo install --path . --force
 ```
 
+Before starting unattended builds, disable OpenSpec telemetry for the user
+account running opsx-build. Its optional network requests can otherwise trigger
+approval checks and distract agents during verification or review:
+
+```sh
+openspec config set telemetry.enabled false
+```
+
+This is a one-time change to OpenSpec's global user configuration and applies
+across projects. See the [OpenSpec configuration documentation](https://github.com/Fission-AI/OpenSpec/blob/main/docs/cli.md#openspec-config).
+
 ## Basic usage
 
 ```sh
