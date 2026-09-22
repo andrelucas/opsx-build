@@ -342,6 +342,28 @@ impl RunState {
     fn consume_direction(&mut self) {
         self.pending_direction = None;
     }
+
+    fn campaign_view(&self) -> Option<CampaignView> {
+        // Bootstrap carries the future campaign checkpoint, but is not iteration 1.
+        if self.bootstrap {
+            return None;
+        }
+        let campaign = self.campaign.as_ref()?;
+        Some(CampaignView {
+            iteration: campaign.iteration,
+            max_iterations: campaign.max_iterations,
+            completed: campaign
+                .completed
+                .iter()
+                .map(|entry| CampaignIterationView {
+                    iteration: entry.iteration,
+                    change: entry.change.clone(),
+                    final_head: entry.final_head.clone(),
+                    elapsed_seconds: entry.elapsed_seconds,
+                })
+                .collect(),
+        })
+    }
 }
 
 impl<U: Ui> App<U> {
@@ -1684,24 +1706,7 @@ impl<U: Ui> App<U> {
     }
 
     fn present_campaign(&self, state: &RunState) {
-        let Some(campaign) = &state.campaign else {
-            self.ui.campaign(None);
-            return;
-        };
-        self.ui.campaign(Some(CampaignView {
-            iteration: campaign.iteration,
-            max_iterations: campaign.max_iterations,
-            completed: campaign
-                .completed
-                .iter()
-                .map(|entry| CampaignIterationView {
-                    iteration: entry.iteration,
-                    change: entry.change.clone(),
-                    final_head: entry.final_head.clone(),
-                    elapsed_seconds: entry.elapsed_seconds,
-                })
-                .collect(),
-        }));
+        self.ui.campaign(state.campaign_view());
     }
 
     fn execute(
@@ -3829,6 +3834,32 @@ mod tests {
         let prompt = with_direction("apply slice-m", Some("keep the AST unchanged"));
         assert!(prompt.contains("User direction for this iteration"));
         assert!(prompt.contains("keep the AST unchanged"));
+    }
+
+    #[test]
+    fn bootstrap_display_starts_iteration_one_only_after_handoff() {
+        let mut bootstrap = RunState::bootstrap(ChangeSnapshot::default());
+        bootstrap.campaign = Some(CampaignState {
+            iteration: 1,
+            max_iterations: Some(10),
+            completed: Vec::new(),
+        });
+        assert_eq!(bootstrap.campaign_view(), None);
+
+        let resumed: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&bootstrap).unwrap()).unwrap();
+        assert_eq!(resumed.campaign_view(), None);
+
+        let mut implementation = RunState::new("advance".to_owned(), ChangeSnapshot::default());
+        implementation.campaign = resumed.campaign;
+        assert_eq!(
+            implementation.campaign_view(),
+            Some(CampaignView {
+                iteration: 1,
+                max_iterations: Some(10),
+                completed: Vec::new(),
+            })
+        );
     }
 
     #[test]

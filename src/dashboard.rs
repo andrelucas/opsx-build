@@ -1394,6 +1394,57 @@ mod tests {
     }
 
     #[test]
+    fn first_campaign_iteration_clears_bootstrap_panels() {
+        let mut dashboard = dashboard();
+        dashboard.set_change_name(Some("bootstrap-implementation-slices".to_owned()));
+        for (index, title) in [
+            "Propose",
+            "Proposal commit",
+            "Apply",
+            "Verify",
+            "Archive",
+            "Completion commit",
+        ]
+        .iter()
+        .enumerate()
+        {
+            dashboard.set_stage(StageView {
+                current: index + 1,
+                total: 6,
+                title: format!("{title} · frontier (codex-frontier, codex)"),
+                started_at: Instant::now(),
+            });
+        }
+        assert!(
+            dashboard
+                .header_text()
+                .contains("bootstrap-implementation-slices")
+        );
+
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: Vec::new(),
+        }));
+        dashboard.set_change_name(Some("0001-reproducible-go-bindings".to_owned()));
+        dashboard.set_stage(StageView {
+            current: 1,
+            total: 6,
+            title: "Propose · worker (codex-worker, codex)".to_owned(),
+            started_at: Instant::now(),
+        });
+
+        assert_eq!(dashboard.panels.len(), 1);
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert_eq!(
+            lines[0].text,
+            "  ◆ iteration 1 · current · 0001-reproducible-go-bindings"
+        );
+        assert!(lines[1].text.contains("[1/6] Propose · worker"));
+        assert!(!lines.iter().any(|line| line.text.contains("frontier")));
+    }
+
+    #[test]
     fn campaign_header_and_summary_survive_iteration_reset() {
         let mut dashboard = dashboard();
         dashboard.set_campaign(Some(CampaignDashboardView {
