@@ -527,7 +527,7 @@ impl<U: Ui> App<U> {
             return Ok(());
         }
 
-        if self.cli.bootstrap_context.is_some() {
+        if self.cli.request == "bootstrap" || self.cli.execute {
             let frontier_launcher = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
             ensure_launcher_prerequisites(&frontier_launcher, &repo, &self.ui)?;
             let worker_launcher = self
@@ -797,19 +797,20 @@ impl<U: Ui> App<U> {
         worker_launcher: &AgentLauncher,
         frontier_launcher: &AgentLauncher,
     ) -> Result<()> {
-        let context_path = self
-            .cli
-            .bootstrap_context
-            .as_deref()
-            .context("bootstrap context path was not resolved")?;
-        let scaffold = BootstrapScaffold::plan(repo, context_path, &self.cli.bootstrap_defines)?;
+        let scaffold = BootstrapScaffold::plan(
+            repo,
+            self.cli.bootstrap_context.as_deref(),
+            &self.cli.bootstrap_defines,
+        )?;
+        self.ui.info(&format!(
+            "Project context: `{}`",
+            scaffold.context_path.display()
+        ));
         let init = init_command(repo);
 
         if self.cli.dry_run {
             self.ui
                 .warn("DRY RUN — bootstrap files and subprocesses will not be created");
-            self.ui
-                .info(&format!("Project context: `{}`", context_path.display()));
             if !self.cli.bootstrap_defines.is_empty() {
                 self.ui.info(&format!(
                     "Template variables: {}",

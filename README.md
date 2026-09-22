@@ -56,14 +56,21 @@ receive the corresponding prompt guidance, but do not load the Claude plugin.
 
 ## Bootstrap a new project
 
-Create a Markdown file that states the project goal, technology choices,
-constraints, and a concrete definition of done, then run:
+Create `context.md` in the campaign repository with the project goal, technology
+choices, constraints, and a concrete definition of done, then run:
 
 ```sh
 opsx-build --repo ~/git/my-project \
   --frontier-connection openrouter-kimi \
-  bootstrap --context project.md
+  bootstrap
 ```
+
+When `--context` is omitted, `bootstrap` and `execute` use `context.md` from the
+campaign's Git repository root (selected by `--repo`, or the current directory).
+An explicit `--context PATH` takes precedence; explicit relative paths are
+relative to the directory where you invoke opsx-build. If the default file is
+absent, supply `--context PATH`. Normal runs and dry runs both print the resolved
+context file path.
 
 Project contexts may contain strict `{{name}}` placeholders. Supply each value
 with a repeatable `--define NAME=VALUE` option:

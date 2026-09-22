@@ -180,11 +180,8 @@ impl Cli {
                 anyhow::bail!("--change cannot prescribe one name for a multi-change campaign");
             }
         }
-        if cli.request == "bootstrap" {
-            if cli.bootstrap_context.is_none() {
-                anyhow::bail!("`opsx-build bootstrap` requires --context PATH");
-            }
-            if cli.interactive
+        if cli.request == "bootstrap"
+            && (cli.interactive
                 || cli.test_connection.is_some()
                 || cli.update_skills
                 || cli.resume
@@ -196,18 +193,12 @@ impl Cli {
                 || cli.change.is_some()
                 || cli.direction.is_some()
                 || cli.sidecar
-                || cli.local_only
-            {
-                anyhow::bail!(
-                    "`opsx-build bootstrap` cannot be combined with another workflow mode"
-                );
-            }
+                || cli.local_only)
+        {
+            anyhow::bail!("`opsx-build bootstrap` cannot be combined with another workflow mode");
         }
-        if cli.execute {
-            if cli.bootstrap_context.is_none() {
-                anyhow::bail!("`opsx-build execute` requires --context PATH");
-            }
-            if cli.interactive
+        if cli.execute
+            && (cli.interactive
                 || cli.test_connection.is_some()
                 || cli.update_skills
                 || cli.resume
@@ -217,10 +208,9 @@ impl Cli {
                 || cli.change.is_some()
                 || cli.direction.is_some()
                 || cli.sidecar
-                || cli.local_only
-            {
-                anyhow::bail!("`opsx-build execute` cannot be combined with another workflow mode");
-            }
+                || cli.local_only)
+        {
+            anyhow::bail!("`opsx-build execute` cannot be combined with another workflow mode");
         }
         if cli.sidecar
             && !cli.resume
@@ -260,7 +250,7 @@ struct CliArgs {
     #[arg(long)]
     yes: bool,
 
-    /// Markdown project context used by `opsx-build bootstrap` or `execute`.
+    /// Markdown project context; bootstrap/execute default to context.md in the repository root.
     #[arg(long, value_name = "PATH")]
     context: Option<PathBuf>,
 
@@ -2001,7 +1991,16 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_requires_an_explicit_markdown_context() {
+    fn bootstrap_and_execute_accept_an_omitted_context_for_repository_discovery() {
+        for command in ["bootstrap", "execute"] {
+            let cli = Cli::resolve(args(["opsx-build", "--no-config", command])).unwrap();
+            assert!(cli.bootstrap_context.is_none());
+            assert_eq!(cli.execute, command == "execute");
+        }
+    }
+
+    #[test]
+    fn bootstrap_accepts_explicit_markdown_context_and_validates_options() {
         let cli = Cli::resolve(args([
             "opsx-build",
             "--define",
@@ -2021,7 +2020,6 @@ mod tests {
             Some("Go")
         );
 
-        assert!(Cli::resolve(args(["opsx-build", "bootstrap"])).is_err());
         assert!(Cli::resolve(args(["opsx-build", "advance", "--context", "project.md"])).is_err());
         assert!(Cli::resolve(args(["opsx-build", "--define", "language=Go", "advance"])).is_err());
         assert!(
@@ -2070,7 +2068,6 @@ mod tests {
             cli.bootstrap_context.as_deref(),
             Some(std::path::Path::new("project.md"))
         );
-        assert!(Cli::resolve(args(["opsx-build", "execute"])).is_err());
         assert!(
             Cli::resolve(args([
                 "opsx-build",

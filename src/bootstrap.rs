@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -26,16 +26,36 @@ const MODEL_CONFUSIONS_PLACEHOLDER: &str = "{{OPSX_BUILD_MODEL_CONFUSIONS}}";
 
 #[derive(Debug)]
 pub struct BootstrapScaffold {
+    pub context_path: PathBuf,
     config: String,
 }
 
 impl BootstrapScaffold {
     pub fn plan(
         repo: &Path,
-        context_path: &Path,
+        context_path: Option<&Path>,
         definitions: &BTreeMap<String, String>,
     ) -> Result<Self> {
-        let context_template = fs::read_to_string(context_path).with_context(|| {
+        let context_path = match context_path {
+            Some(path) => path.to_path_buf(),
+            None => {
+                let default = repo.join("context.md");
+                if !default.is_file() {
+                    bail!(
+                        "no project context supplied and `{}` is not a file; create it or use --context PATH",
+                        default.display()
+                    );
+                }
+                default
+            }
+        };
+        let context_path = context_path.canonicalize().with_context(|| {
+            format!(
+                "could not resolve bootstrap context `{}`",
+                context_path.display()
+            )
+        })?;
+        let context_template = fs::read_to_string(&context_path).with_context(|| {
             format!(
                 "could not read bootstrap context `{}`",
                 context_path.display()
@@ -91,6 +111,7 @@ impl BootstrapScaffold {
         merge_managed_fragment(&existing_agents, AGENTS_PATH)?;
 
         Ok(Self {
+            context_path,
             config: render_project_config(&context),
         })
     }
@@ -333,6 +354,60 @@ fn merge_managed_fragment(existing: &str, file_name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn bootstrap_context_defaults_to_the_campaign_repository() {
+        let repo = std::env::temp_dir().join(format!("opsx-context-default-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        let context = repo.join("context.md");
+        fs::write(&context, "# Widget\nBuild it in {{language}}.\n").unwrap();
+
+        let scaffold = BootstrapScaffold::plan(
+            &repo,
+            None,
+            &BTreeMap::from([("language".to_owned(), "Go".to_owned())]),
+        )
+        .unwrap();
+
+        assert_eq!(scaffold.context_path, context.canonicalize().unwrap());
+        assert!(scaffold.config.contains("Build it in Go."));
+        assert!(!repo.join("openspec").exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_context_explicit_path_takes_precedence_without_fallback() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-context-override-{}", Uuid::new_v4()));
+        let repo = directory.join("campaign");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("context.md"), "Default context").unwrap();
+        let explicit = directory.join("project.md");
+        fs::write(&explicit, "Explicit context").unwrap();
+
+        let scaffold = BootstrapScaffold::plan(&repo, Some(&explicit), &BTreeMap::new()).unwrap();
+
+        assert_eq!(scaffold.context_path, explicit.canonicalize().unwrap());
+        assert!(scaffold.config.contains("Explicit context"));
+        assert!(!scaffold.config.contains("Default context"));
+        fs::remove_file(&explicit).unwrap();
+        let error = BootstrapScaffold::plan(&repo, Some(&explicit), &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("project.md"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_context_requires_a_file_when_no_path_is_supplied() {
+        let repo = std::env::temp_dir().join(format!("opsx-context-missing-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        let error = BootstrapScaffold::plan(&repo, None, &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("context.md"));
+        assert!(error.to_string().contains("--context PATH"));
+
+        fs::create_dir(repo.join("context.md")).unwrap();
+        assert!(BootstrapScaffold::plan(&repo, None, &BTreeMap::new()).is_err());
+        fs::remove_dir_all(repo).unwrap();
+    }
 
     #[test]
     fn renders_markdown_as_yaml_context() {
