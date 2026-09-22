@@ -634,8 +634,13 @@ acceptance criteria for proposal commits, then delivered behavior and checks
 that actually ran for completion commits. If the body needs a second paragraph,
 it is separated by a blank line; body lines are wrapped at 72 columns. File/task
 inventories and exhaustive implementation mechanics are excluded so the result
-reads as a conventional Git history. If the relevant work is already committed,
-Claude may report success without manufacturing an empty commit.
+reads as a conventional Git history. Message formatting is checked before each
+commit. If a formatting imperfection is found after all relevant work is
+committed, the agent preserves the commits, reports the imperfection, and
+continues without requesting permission to amend, creating a replacement
+commit, or reporting `BLOCKED` for formatting alone. If the relevant work is
+already committed, Claude may report success without manufacturing an empty
+commit.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed

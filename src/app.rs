@@ -3477,13 +3477,13 @@ fn archive_subject(change: &str) -> String {
 
 fn proposal_commit_message(change: &str) -> String {
     format!(
-        "Use commit subject exactly `openspec: propose {change}`. Add a conventional Git commit body derived from the completed OpenSpec proposal, specs, design, and tasks. Use imperative mood. Write a short first paragraph explaining the intended observable change and why it is being made. Add at most one second paragraph for an important scope boundary or acceptance condition. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, command invocations, generated boilerplate, or behavior not approved by those artifacts."
+        "Use commit subject exactly `openspec: propose {change}`. Add a conventional Git commit body derived from the completed OpenSpec proposal, specs, design, and tasks. Use imperative mood. Write a short first paragraph explaining the intended observable change and why it is being made. Add at most one second paragraph for an important scope boundary or acceptance condition. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, command invocations, generated boilerplate, or behavior not approved by those artifacts. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
     )
 }
 
 fn completion_commit_message(change: &str) -> String {
     format!(
-        "Use commit subject exactly `openspec: complete {change}`. Add a conventional Git commit body derived from the completed OpenSpec artifacts and actual verification results. Use imperative mood. Write a short first paragraph explaining the delivered observable behavior and its purpose. Add at most one second paragraph summarizing the most important validation that actually ran or a material scope boundary. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, exhaustive implementation mechanics, generated boilerplate, or claims about checks that did not run."
+        "Use commit subject exactly `openspec: complete {change}`. Add a conventional Git commit body derived from the completed OpenSpec artifacts and actual verification results. Use imperative mood. Write a short first paragraph explaining the delivered observable behavior and its purpose. Add at most one second paragraph summarizing the most important validation that actually ran or a material scope boundary. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, exhaustive implementation mechanics, generated boilerplate, or claims about checks that did not run. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
     )
 }
 
@@ -4179,6 +4179,22 @@ mod tests {
         assert!(completion.contains("validation that actually ran"));
         assert!(completion.contains("Separate paragraphs with a blank line"));
         assert!(completion.contains("checks that did not run"));
+    }
+
+    #[test]
+    fn milestone_commit_prompts_do_not_block_on_committed_message_formatting() {
+        for prompt in [
+            proposal_commit_message("slice-formatting"),
+            completion_commit_message("slice-formatting"),
+        ] {
+            assert!(
+                prompt
+                    .contains("Check the subject and body formatting before creating each commit")
+            );
+            assert!(prompt.contains("Once all relevant work is committed, message formatting alone is not a BLOCKED condition"));
+            assert!(prompt.contains("preserve the existing commits"));
+            assert!(prompt.contains("report READY without requesting permission to amend or creating a replacement commit"));
+        }
     }
 
     #[test]
