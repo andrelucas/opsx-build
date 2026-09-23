@@ -831,6 +831,11 @@ debug output. Literal variables with names containing `TOKEN`, `KEY`, `SECRET`,
 or `PASSWORD` are also redacted, but storing credentials literally is not
 recommended.
 
+Environment names are labels, not provider selectors. In particular, a Claude
+environment containing `ANTHROPIC_*` variables does not configure Codex's
+provider. See [Using Codex with OpenRouter](#using-codex-with-openrouter) for
+the separate Codex provider and environment settings.
+
 Claude connections are isolated by default: inherited Claude endpoint,
 authentication, and provider-selection variables are removed before the
 shared and inline environment is applied. `isolate` and `unset_env` may be set
@@ -855,7 +860,7 @@ isolation and the Claude auto-compaction/output-limit environment variables do
 not apply to OpenCode. A profile's `context_window` is used to add a capacity
 and percentage to the OpenCode `C` context report.
 
-A hosted connection must still be usable by Claude Code. Direct endpoints or
+A hosted Claude connection must still be usable by Claude Code. Direct endpoints or
 gateways should implement the Anthropic Messages interface expected by
 [Claude Code's LLM gateway support][claude-gateway]; opsx-build does not adapt
 an OpenAI-only chat endpoint into Claude's agent protocol.
@@ -1112,6 +1117,70 @@ experimental Codex interface; this adapter is tested against Codex CLI 0.155.1
 and follows its generated protocol schemas plus the official
 [Codex App Server documentation][codex-app-server].
 
+### Using Codex with OpenRouter
+
+Three settings have distinct jobs: `backend = "codex"` selects the Codex
+adapter, `environment` supplies variables to its process, and Codex's
+`model_provider` selects the service receiving model requests. Setting only
+`model` to an OpenRouter model or preset does not select OpenRouter. The
+Claude examples above use `ANTHROPIC_*` variables; those do not configure
+Codex's endpoint or authentication.
+
+First, add a provider to your user-level `~/.codex/config.toml` (not the
+project's `.codex/config.toml` or the opsx-build config):
+
+```toml
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "responses"
+
+[model_providers.openrouter.auth]
+command = "sh"
+args = ["-c", "printf '%s' \"$OPENROUTER_API_KEY\""]
+```
+
+This follows [OpenRouter's Codex setup][openrouter-codex], which recommends
+command-based authentication so Codex can also load provider model metadata.
+The command reads the key from the process environment. Do not also set
+`env_key` on this provider. The default isolated opsx-build Codex home shares
+the user-level config, so this definition is available there too.
+
+Then add a separate environment and connection in
+`~/.config/opsx-build/config.toml`:
+
+```toml
+[environments.openrouter-codex.env]
+OPENROUTER_API_KEY = { from_env = "OPENROUTER_API_KEY" }
+
+[connections.openrouter-codex]
+backend = "codex"
+command = "codex -c model_provider=openrouter"
+model = "provider/model-id" # Replace with your OpenRouter model or preset.
+environment = "openrouter-codex"
+```
+
+Make `OPENROUTER_API_KEY` available in the shell launching opsx-build. The
+command selects OpenRouter only for this connection; adding the provider
+definition alone does not change your normal Codex provider. The environment
+and provider names need not match: `environment` refers to the opsx-build
+table, while `model_provider` refers to the Codex table. Repeat the command
+and environment settings for any other Codex connection using OpenRouter.
+
+Check the connection before starting a campaign:
+
+```sh
+opsx-build --test-connection openrouter-codex
+```
+
+If Codex rejects the model as "not supported when using Codex with a ChatGPT
+account", check the provider selection: the request is still using the
+ChatGPT route. If `codex` instead rejects `--plugin-dir`, check that the
+connection explicitly sets `backend = "codex"`; omitting it selects the
+Claude adapter even when `command = "codex"`.
+
+See also the official [Codex custom-provider configuration][codex-providers].
+
 ## Claude launcher compatibility
 
 `opsx-build` does not call an oMLX API. It starts the configured launcher as a
@@ -1326,6 +1395,8 @@ flags and are not read from the config file.
 [codex-app-server]: https://developers.openai.com/codex/app-server/
 [codex-permissions]: https://developers.openai.com/codex/permissions/
 [codex-environment]: https://learn.chatgpt.com/docs/config-file/environment-variables
+[codex-providers]: https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers
+[openrouter-codex]: https://openrouter.ai/blog/tutorials/codex-cli-openrouter/
 
 ## Interactive launcher testing
 

@@ -39,6 +39,9 @@ claude_model = "qwen3.6-35b-a3b"
 # [connections.codex-worker]
 # backend = "codex"
 # permission_profile = "opsx-build"
+# To use OpenRouter through Codex, configure a Codex model provider and select
+# it in the command; Claude's ANTHROPIC_* environment does not route Codex.
+# See README.md, "Using Codex with OpenRouter", for both configuration files.
 
 # Uncomment these only when automatic project discovery does not match your
 # installed OpenSpec delivery profile.
