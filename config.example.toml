@@ -2,7 +2,7 @@
 
 max_verify_retries = 3
 max_output_retries = 3
-max_provider_retries = 3
+max_provider_retries = 10
 permission_mode = "auto"
 
 # Development shortcut: skip proposal commits but retain final completion

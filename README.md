@@ -437,7 +437,7 @@ Recognizable transient provider failures, including HTTP 429, temporary 5xx
 responses, timeouts, and connection resets, resume the same phase and session
 after bounded exponential backoff. This preserves completed tool work without
 restarting the OpenSpec change. `max_provider_retries` controls the number of
-recovery attempts (default 3); set it to `0` to fail immediately. Authentication,
+recovery attempts (default 10); set it to `0` to fail immediately. Authentication,
 configuration, model-selection, and terminal-protocol failures are not retried.
 
 If an Explore, Apply, Repair, or Verify turn instead ends normally but omits
@@ -704,7 +704,7 @@ Connections select a backend. Omitting `backend` preserves the existing
 # ~/.config/opsx-build/config.toml
 max_verify_retries = 3
 max_output_retries = 3
-max_provider_retries = 3
+max_provider_retries = 10
 local_worker_timeout_minutes = 60
 # Tell the planner the selected worker is a frontier-capable model:
 # frontier_worker = true
