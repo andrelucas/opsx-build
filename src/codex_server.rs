@@ -742,6 +742,138 @@ done
     }
 
     #[test]
+    fn incomplete_codex_phase_continues_once_without_provider_retries() {
+        use crate::backend::{StageSignal, is_missing_terminal_result};
+
+        let unfinished = "Now I will validate the schemas and generate the bindings.";
+        for (protocol, first, second, expected_turns, signal) in [
+            (
+                StageProtocol::Worker,
+                unfinished,
+                "OPSX_STATUS: READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (
+                StageProtocol::Verify,
+                unfinished,
+                "OPSX_STATUS: RETRY",
+                2,
+                Some(StageSignal::Retry),
+            ),
+            (StageProtocol::Worker, unfinished, unfinished, 2, None),
+            (StageProtocol::Verify, unfinished, unfinished, 2, None),
+            (
+                StageProtocol::Worker,
+                "OPSX_STATUS: BLOCKED",
+                unfinished,
+                1,
+                Some(StageSignal::Blocked),
+            ),
+            (
+                StageProtocol::Worker,
+                "OPSX_STATUS: TOO_LARGE",
+                unfinished,
+                1,
+                Some(StageSignal::TooLarge),
+            ),
+            (StageProtocol::Ready, unfinished, unfinished, 1, None),
+            (StageProtocol::Propose, unfinished, unfinished, 1, None),
+            (StageProtocol::Frontier, unfinished, unfinished, 1, None),
+            (
+                StageProtocol::TerminalReview,
+                unfinished,
+                unfinished,
+                1,
+                None,
+            ),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-incomplete-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            launcher.structured_output = false;
+            let completed = |text: &str| {
+                json!({
+                    "method": "turn/completed",
+                    "params": {"threadId": "actual-thread", "turn": {
+                        "id": "turn-%s", "status": "completed", "items": [{
+                            "type": "agentMessage", "text": text
+                        }]
+                    }}
+                })
+                .to_string()
+                .replace('\\', "\\\\")
+            };
+            let first = completed(first);
+            let second = completed(second);
+            let script = directory.join("server.sh");
+            let contents = std::fs::read_to_string(&script).unwrap().replace(
+                r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#,
+                &format!(
+                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$id"; if [ "$id" -eq 3 ]; then printf '{first}\n' "$id"; else printf '{second}\n' "$id"; fi"#,
+                ),
+            );
+            std::fs::write(script, contents).unwrap();
+            let backend =
+                CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi).with_retries(0, 0);
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new("placeholder"),
+                    name: None,
+                },
+                "complete the assigned phase",
+                "test phase",
+                protocol,
+            );
+            if let Some(signal) = signal {
+                let result = result.unwrap();
+                assert_eq!(result.signal, signal);
+                assert_eq!(result.session_id.as_deref(), Some("actual-thread"));
+            } else {
+                let error = result.unwrap_err();
+                assert!(is_missing_terminal_result(&error));
+                assert!(error.to_string().contains(unfinished));
+            }
+            let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let mut expected_methods = vec!["initialize", "initialized", "thread/start"];
+            expected_methods.extend(std::iter::repeat_n("turn/start", expected_turns));
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|r| r["method"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_methods
+            );
+            for turn in requests.iter().filter(|r| r["method"] == "turn/start") {
+                assert_eq!(turn["params"]["threadId"], "actual-thread");
+                assert!(turn["params"].get("outputSchema").is_none());
+            }
+            if expected_turns == 2 {
+                let prompt = requests.last().unwrap()["params"]["input"][0]["text"]
+                    .as_str()
+                    .unwrap();
+                assert!(prompt.contains("Preserve correct partial work"));
+                assert!(prompt.contains(protocol.json_schema()));
+                if protocol == StageProtocol::Verify {
+                    assert!(prompt.contains("Continue verification only"));
+                    assert!(prompt.contains("do not repair or modify"));
+                    assert!(prompt.contains("return RETRY with the exact finding"));
+                } else {
+                    assert!(prompt.contains("actual tools"));
+                    assert!(prompt.contains("Do not stop at a progress update"));
+                }
+            }
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn planning_session_is_resolved_before_a_failed_turn() {
         for (mode, resume_reply, expected_methods) in [
             (

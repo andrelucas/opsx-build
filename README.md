@@ -440,13 +440,15 @@ restarting the OpenSpec change. `max_provider_retries` controls the number of
 recovery attempts (default 10); set it to `0` to fail immediately. Authentication,
 configuration, model-selection, and terminal-protocol failures are not retried.
 
-If an Explore, Apply, Repair, or Verify turn instead ends normally but omits
-every terminal result, opsx-build treats it as an incomplete phase turn. It
-best-effort compacts and resumes that same session once, preserving partial
-repository work. Worker phases require actual tool use rather than another
-description of intended work; Verify is instructed to report a concrete
-`RETRY` finding rather than repairing implementation. Explicit terminal
-outcomes and narrow milestone stages do not use this incomplete-turn recovery.
+If a Claude or Codex Explore, Apply, Repair, or Verify turn instead ends normally
+but omits every terminal result, opsx-build treats it as an incomplete phase
+turn and continues that same session once, preserving partial repository work.
+Claude also best-effort compacts first; Codex retains the current conversation.
+This one continuation is separate from the provider and output retry budgets.
+Worker phases require actual tool use rather than another description of
+intended work; Verify is instructed to report a concrete `RETRY` finding rather
+than repairing implementation. Explicit terminal outcomes, Propose, frontier
+planning, and narrow milestone stages do not use this incomplete-turn recovery.
 
 ## Campaign loop
 
@@ -1471,9 +1473,11 @@ or substituting synthetic coverage. Verify may report `VERIFIED` only after the
 required real checks have executed and passed.
 
 If the agent backend finishes successfully but returns neither structured
-output nor a fallback marker, opsx-build does not rerun that potentially mutating
-stage. Archive additionally checks durable OpenSpec state so a completed
-archive is not repeated merely because its acknowledgement was malformed.
+output nor a fallback marker, opsx-build requires a valid result before advancing.
+Claude and Codex worker and verification phases get the single same-session
+continuation described above. Other phases stop on the missing result. Archive
+additionally checks durable OpenSpec state so a completed archive is not repeated
+merely because its acknowledgement was malformed.
 
 ## Prerequisites and limitations
 

@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::{
     backend::{
-        AgentBackend, SessionId, SessionMode, StageProtocol, StageResult, stage_result_from_text,
+        AgentBackend, SessionId, SessionMode, StageProtocol, StageResult,
+        is_missing_terminal_result, stage_result_from_text,
     },
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
     codex_home::IsolatedCodexHome,
@@ -24,6 +25,7 @@ use crate::{
 
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LauncherEnvironment {
@@ -652,6 +654,7 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
+        let mut incomplete_stage_recoveries = 0;
         let mut provider_retries = 0;
         let deadline = self
             .stage_timeout
@@ -695,6 +698,20 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                     current_activity = format!("{activity} (after context report)");
                 }
                 Ok(TurnOutcome::Control(_, _)) => unreachable!(),
+                Err(error)
+                    if matches!(protocol, StageProtocol::Worker | StageProtocol::Verify)
+                        && is_missing_terminal_result(&error)
+                        && incomplete_stage_recoveries < MAX_INCOMPLETE_STAGE_RECOVERIES =>
+                {
+                    incomplete_stage_recoveries += 1;
+                    self.ui.warn(
+                        "Codex ended the phase without a terminal result; continuing the same session once",
+                    );
+                    current_prompt = incomplete_stage_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                    );
+                }
                 Err(error)
                     if error
                         .downcast_ref::<CodexTurnError>()
@@ -954,6 +971,19 @@ fn continuation_prompt(protocol: StageProtocol, reason: &str) -> String {
         "{reason} Continue the same opsx-build phase in this Codex thread from its durable repository and OpenSpec state. Preserve correct partial work, do not restart completed tasks or create a duplicate change, and finish the outstanding work now. Return the required structured result with `opsx_status` set to one of: {}.",
         protocol.terminal_values()
     )
+}
+
+fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
+    let instruction = match protocol {
+        StageProtocol::Worker => {
+            "The preceding turn ended without returning a terminal result. Inspect the durable OpenSpec and working-tree state, then continue from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Do not stop at a progress update."
+        }
+        StageProtocol::Verify => {
+            "The preceding verification turn ended without returning a terminal result. Continue verification only: do not repair or modify the implementation or its tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+        }
+        _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
+    };
+    continuation_prompt(protocol, instruction)
 }
 
 fn classify_turn_error(message: String) -> CodexTurnError {
