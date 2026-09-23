@@ -2981,13 +2981,14 @@ impl<U: Ui> App<U> {
                 self.cli.stream_claude
             )),
             AgentLauncher::Codex(launcher) => self.ui.debug(&format!(
-                "Codex launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, permission profile={:?}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
+                "Codex launcher: connection={:?}, shared environment={:?}, program=`{}`, prefix args={:?}, model={:?}, permission profile={:?}, structured output={}, context window={:?}, auto-compact window={:?}, auto-compact percent={:?}, max output tokens={:?}, permission mode=`{}`, stream filter={:?}",
                 launcher.connection_name,
                 launcher.environment_name,
                 launcher.program,
                 launcher.prefix_args,
                 launcher.model,
                 launcher.permission_profile,
+                launcher.structured_output,
                 launcher.context_window,
                 launcher.auto_compact_window,
                 launcher.auto_compact_percent,

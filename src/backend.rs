@@ -160,7 +160,14 @@ pub(crate) fn stage_result_from_text(
     session_id: Option<String>,
     backend: &str,
 ) -> Result<StageResult> {
-    let structured = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+    let trimmed = text.trim();
+    let json_text = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|body| body.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let structured = serde_json::from_str::<serde_json::Value>(json_text).ok();
     let structured_signal = structured.as_ref().and_then(|value| {
         value
             .get("opsx_status")

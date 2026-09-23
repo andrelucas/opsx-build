@@ -301,14 +301,16 @@ impl CodexServerClient {
         &self,
         thread_id: &str,
         input: Value,
-        output_schema: Value,
+        output_schema: Option<Value>,
         sandbox_policy: Option<Value>,
     ) -> Result<String> {
         let mut params = json!({
             "threadId": thread_id,
-            "input": input,
-            "outputSchema": output_schema
+            "input": input
         });
+        if let Some(output_schema) = output_schema {
+            params["outputSchema"] = output_schema;
+        }
         if let Some(sandbox_policy) = sandbox_policy {
             params["sandboxPolicy"] = sandbox_policy;
         }
@@ -546,6 +548,7 @@ done
             prefix_args: vec![script.display().to_string()],
             model: None,
             permission_profile: Some("build-permissions".to_owned()),
+            structured_output: true,
             context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,
@@ -553,6 +556,93 @@ done
             environment: Vec::new(),
             unset_environment: Vec::new(),
             isolated_home: None,
+        }
+    }
+
+    #[test]
+    fn optional_output_schema_preserves_required_terminal_results() {
+        for (structured_output, reply, valid) in [
+            (true, r#"{"opsx_status":"READY","summary":"done"}"#, true),
+            (false, r#"{"opsx_status":"READY","summary":"done"}"#, true),
+            (
+                false,
+                "```json\n{\"opsx_status\":\"READY\",\"summary\":\"done\"}\n```",
+                true,
+            ),
+            (
+                false,
+                "```\n{\"opsx_status\":\"READY\",\"summary\":\"done\"}\n```",
+                true,
+            ),
+            (false, "done\nOPSX_STATUS: READY", true),
+            (false, "I think the task is complete.", false),
+            (false, "```json\n{\"summary\":\"done\"}\n```", false),
+            (
+                false,
+                "```json\n{\"opsx_status\":\"UNKNOWN\",\"summary\":\"done\"}\n```",
+                false,
+            ),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-output-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            launcher.structured_output = structured_output;
+            let script = directory.join("server.sh");
+            let completed = json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "actual-thread",
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [{"type": "agentMessage", "text": reply}]
+                    }
+                }
+            });
+            let contents = std::fs::read_to_string(&script).unwrap().replace(
+                r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#,
+                &format!(
+                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"; printf '%s\n' '{completed}'"#
+                ),
+            );
+            std::fs::write(script, contents).unwrap();
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi);
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new("placeholder"),
+                    name: None,
+                },
+                "finish the assigned change",
+                "Apply",
+                StageProtocol::Ready,
+            );
+            if valid {
+                assert_eq!(result.unwrap().signal, crate::backend::StageSignal::Ready);
+            } else {
+                assert!(crate::backend::is_missing_terminal_result(
+                    &result.unwrap_err()
+                ));
+            }
+            let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let params = &requests
+                .iter()
+                .find(|request| request["method"] == "turn/start")
+                .unwrap()["params"];
+            if structured_output {
+                assert_eq!(params["outputSchema"]["type"], "object");
+            } else {
+                assert!(params.get("outputSchema").is_none());
+                let prompt = params["input"][0]["text"].as_str().unwrap();
+                assert!(prompt.contains(StageProtocol::Ready.json_schema()));
+                assert!(prompt.contains("OPSX_STATUS: <value>"));
+            }
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -781,6 +871,7 @@ read remaining
             prefix_args: vec![script.display().to_string()],
             model: None,
             permission_profile: None,
+            structured_output: true,
             context_window: None,
             auto_compact_window: None,
             auto_compact_percent: None,

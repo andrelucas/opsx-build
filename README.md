@@ -1043,7 +1043,7 @@ replanning, and terminal acceptance. opsx-build starts a private
 `codex app-server --listen stdio://` process for each active Codex backend
 runtime and communicates with it over newline-delimited JSON-RPC. It creates,
 resumes, and names durable Codex threads; constrains every stage's final result
-with the same JSON schema used for Claude; and stores the real Codex thread ID
+with the same JSON schema used for Claude by default; and stores the real Codex thread ID
 in the ordinary workflow checkpoint.
 
 The selected connection's environment and command prefix are applied to App
@@ -1054,6 +1054,16 @@ with `auto_compact_percent`, is translated to Codex's
 `model_auto_compact_token_limit`. Codex controls the model's output-token
 limit, so `max_output_tokens` is retained in the shared profile but is not sent
 to App Server.
+
+Codex connections default to `structured_output = true`, which sends the
+stage's JSON schema to App Server for enforced output formatting. If a
+provider accepts interactive Codex requests but rejects requests with that
+schema (for example, a Gemini route returning `400 INVALID_ARGUMENT`), set
+`structured_output = false` on that connection. This omits `outputSchema`
+and supplies the result schema in the prompt instead. opsx-build still
+requires a JSON `opsx_status` result or the existing `OPSX_STATUS` terminal
+marker; prose without a status is rejected. This setting applies to campaign
+stages and both connection-test modes, and is supported only by Codex.
 
 Unattended Codex runs use `~/.codex/opsx-build` as their default `CODEX_HOME`.
 Their sessions, SQLite databases, logs, and history stay there, keeping campaign
@@ -1158,6 +1168,8 @@ backend = "codex"
 command = "codex -c model_provider=openrouter"
 model = "provider/model-id" # Replace with your OpenRouter model or preset.
 environment = "openrouter-codex"
+# If this model's route rejects enforced JSON output with 400 INVALID_ARGUMENT:
+# structured_output = false
 ```
 
 Make `OPENROUTER_API_KEY` available in the shell launching opsx-build. The

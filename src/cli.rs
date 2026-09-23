@@ -98,6 +98,7 @@ pub struct AgentConnection {
     pub command: String,
     pub model: Option<String>,
     pub permission_profile: Option<String>,
+    pub structured_output: bool,
     pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
@@ -538,6 +539,7 @@ struct FileConnection {
     command: Option<String>,
     model: Option<String>,
     permission_profile: Option<String>,
+    structured_output: Option<bool>,
     environment: Option<String>,
     context_window: Option<TokenCount>,
     auto_compact_window: Option<TokenCount>,
@@ -932,6 +934,12 @@ fn resolve_connection(
             name.as_deref().unwrap_or("unnamed")
         );
     }
+    if profile.structured_output.is_some() && backend != BackendKind::Codex {
+        anyhow::bail!(
+            "connection profile `{}` sets structured_output, which is supported only by the Codex backend",
+            name.as_deref().unwrap_or("unnamed")
+        );
+    }
     Ok(AgentConnection {
         name,
         backend,
@@ -948,6 +956,7 @@ fn resolve_connection(
             }),
         model: command_line_model.or(profile.model).or(legacy_model),
         permission_profile: profile.permission_profile,
+        structured_output: profile.structured_output.unwrap_or(true),
         context_window: profile.context_window.map(|count| count.0),
         auto_compact_window: command_line_window
             .or(profile.auto_compact_window)
@@ -1423,6 +1432,7 @@ mod tests {
                 backend = "codex"
                 model = "gpt-5.6-codex"
                 permission_profile = "opsx-build"
+                structured_output = false
                 context_window = "200k"
                 auto_compact_percent = 75
 
@@ -1441,6 +1451,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.worker_connection.backend, BackendKind::Codex);
+        assert!(!cli.worker_connection.structured_output);
+        assert!(cli.frontier_connection.structured_output);
         assert_eq!(cli.worker_connection.command, "codex");
         assert_eq!(
             cli.worker_connection.permission_profile.as_deref(),
@@ -1483,6 +1495,18 @@ mod tests {
                 .to_string()
                 .contains("supported only by the Codex backend")
         );
+    }
+
+    #[test]
+    fn structured_output_override_is_codex_only() {
+        for backend in ["claude", "opencode"] {
+            let config: FileConfig = toml::from_str(&format!(
+                "worker_connection = 'worker'\n[connections.worker]\nbackend = '{backend}'\nstructured_output = false\n"
+            ))
+            .unwrap();
+            let error = resolve_values(args(["opsx-build"]), config, None).unwrap_err();
+            assert!(error.to_string().contains("sets structured_output"));
+        }
     }
 
     #[test]

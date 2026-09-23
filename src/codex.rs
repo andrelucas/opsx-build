@@ -40,6 +40,7 @@ pub struct CodexLauncher {
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
     pub permission_profile: Option<String>,
+    pub structured_output: bool,
     pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
     pub auto_compact_percent: Option<u8>,
@@ -114,6 +115,7 @@ impl CodexLauncher {
             prefix_args: words,
             model: connection.model.clone(),
             permission_profile: connection.permission_profile.clone(),
+            structured_output: connection.structured_output,
             context_window: connection.context_window,
             auto_compact_window: connection.auto_compact_window,
             auto_compact_percent: connection.auto_compact_percent,
@@ -435,9 +437,20 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
     ) -> Result<TurnOutcome> {
         let client = self.server.client(self.ui)?;
         self.ui.debug(&format!("Codex thread: {session_id}"));
-        self.ui.debug_prompt(activity, prompt);
-        let schema = serde_json::from_str(protocol.json_schema())
+        let schema = self
+            .launcher
+            .structured_output
+            .then(|| serde_json::from_str(protocol.json_schema()))
+            .transpose()
             .context("opsx-build stage schema is invalid JSON")?;
+        let text_protocol = (!self.launcher.structured_output).then(|| {
+            format!(
+                "{prompt}\n\nReturn the final stage result as a bare JSON object, without Markdown fences, matching this schema: {}. If JSON is unavailable, finish with exactly one `OPSX_STATUS: <value>` line using an allowed status. A plain prose response without a stage status is not sufficient.",
+                protocol.json_schema()
+            )
+        });
+        let prompt = text_protocol.as_deref().unwrap_or(prompt);
+        self.ui.debug_prompt(activity, prompt);
         let turn_id = client.start_turn(
             session_id.as_str(),
             codex_turn_input(self.repo, prompt),
@@ -1067,6 +1080,7 @@ mod tests {
             command: "codex --profile local".to_owned(),
             model: Some("gpt-5.6-codex".to_owned()),
             permission_profile: None,
+            structured_output: true,
             context_window: Some(200_000),
             auto_compact_window: None,
             auto_compact_percent: Some(75),
@@ -1158,6 +1172,7 @@ mod tests {
             command: "codex".to_owned(),
             model: None,
             permission_profile: Some("opsx-build".to_owned()),
+            structured_output: true,
             context_window: None,
             auto_compact_window: Some(150_000),
             auto_compact_percent: None,
