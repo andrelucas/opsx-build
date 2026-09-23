@@ -114,9 +114,27 @@ The command:
    slice contracts, and the terminal whole-project gate
    `automation/slices/9999-project-acceptance.md`.
 
-The bootstrap planner is explicitly told to use the OpenSpec project context
-rather than rediscovering the source tree, to create no product code, and to
-cover the complete goal rather than stopping at an attractive early milestone.
+The bootstrap planner reads the supplied project context and every declared
+required input within its stated reading boundaries before decomposition. It
+creates no product code and covers the complete in-scope goal. Supplied system
+contracts and component ownership govern generated agendas; agendas govern
+subordinate change artifacts. Consistency among generated specs, code, and tests
+does not excuse contradicting their inputs. A dependency's interface contract
+does not assign its implementation to this component.
+
+Each slice cites source paths and requirement IDs or sections for its objective
+and acceptance criteria. The agenda's existing coverage map records those
+sources and ownership. The existing bootstrap verification pass checks that
+every slice belongs to the component and preserves the source requirements,
+including conditions and exceptions; it does not add another design round.
+
+Verification returns `RETRY` for correctable generated agenda or change-spec
+mistakes as well as code and test defects. Repair synchronizes the affected
+derived artifacts while preserving supplied contracts and maintainer-owned
+conformance expectations. `BLOCKED` is reserved for a genuine external decision
+or unavailable required input. These instructions guide model judgment; the
+runner's structural agenda checks cannot prove semantic conformance.
+
 Once the final `9999` slice is archived, `advance` has a concrete definition of
 DONE.
 

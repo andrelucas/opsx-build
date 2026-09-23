@@ -19,13 +19,12 @@ command or delegated task is still running.
 
 Do not ask the user to choose between reasonable technical alternatives.
 
-Resolve ambiguity using, in order:
+{{OPSX_BUILD_PROJECT_AUTHORITY}}
 
-1. conclusions already established during exploration;
-2. existing OpenSpec specifications and active changes;
-3. project documentation and CLAUDE.md files;
-4. existing architecture, implementation, tests, and conventions;
-5. the least surprising reasonable engineering choice.
+Resolve remaining engineering choices using exploration conclusions, existing
+OpenSpec artifacts, project guidance, implementation, tests, and conventions
+only where consistent with the supplied requirements. Choose the least
+surprising reasonable implementation when those sources leave a choice open.
 
 Ask only when a material product requirement or externally observable
 behaviour is genuinely ambiguous, cannot be inferred from available
@@ -84,13 +83,14 @@ Otherwise:
 
 4. Determine which artifacts are ready from the returned dependency graph.
 
-5. For every required artifact, obtain the authoritative OpenSpec
+5. For every required artifact, obtain the OpenSpec schema
    instructions before writing it:
 
        openspec instructions <artifact-id> --change "<name>" --json
 
 6. Follow the returned instructions, context, rules, template,
-   dependencies, and output path.
+   dependencies, and output path within the supplied contracts and component
+   scope. Artifact-generation instructions do not override those inputs.
 
 7. Before producing a dependent artifact, read its completed dependency
    artifacts from disk.
@@ -112,19 +112,20 @@ Otherwise:
 Do not bypass OpenSpec's dependency structure.
 
 Do not hand-invent proposal/spec/design/task formats when OpenSpec provides
-authoritative instructions for them.
+schema instructions for them.
 
 ## Repository investigation
 
 Do not repeat a full repository exploration if an unattended exploration
 has already established the relevant areas.
 
-Read only enough code and documentation to verify or elaborate the
-proposal.
+Read the declared required inputs first, then only enough code and documentation
+to verify or elaborate the proposal.
 
 Prefer:
 
-- existing exploration conclusions;
+- supplied contracts and component scope;
+- existing exploration conclusions consistent with those inputs;
 - OpenSpec artifacts;
 - CLAUDE.md/project documentation;
 - targeted symbol and text search;

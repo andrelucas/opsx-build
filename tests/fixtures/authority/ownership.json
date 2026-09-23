@@ -1,0 +1,8 @@
+{
+  "context": "Build the logical blob component. Required input: contracts/component.md. Read only this context and that contract before planning.",
+  "contract_path": "contracts/component.md",
+  "contract": "OWN-01: Blob owns logical content identity and transaction metadata. The physical adapter owns POSIX paths, descriptors, and filesystem ordering. Blob consumes the physical interface; implementing the physical adapter is outside this campaign's scope.",
+  "agenda": "# Physical storage\n\n## Objective\nImplement the POSIX physical adapter inside blob.\n\n## Prerequisites\nLogical contracts.\n\n## Acceptance Criteria\nBlob owns descriptors and enforces filesystem ordering.\n\n## Required Tests\nTests prove blob creates and synchronizes physical files.\n",
+  "expected_status": "RETRY",
+  "expected_finding": "OWN-01 assigns POSIX implementation to the physical adapter. Correct the generated objective and criteria to cover blob's integration with that dependency, retaining its identity and transaction responsibilities; synchronize the bootstrap artifacts and coverage map. Do not expand component ownership, subdivide the wrong work, or request an external decision."
+}

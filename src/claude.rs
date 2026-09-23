@@ -1277,7 +1277,7 @@ fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
             "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result."
         }
         StageProtocol::Verify => {
-            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify the implementation or its tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
         }
         _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
     };
@@ -1733,6 +1733,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         format!("{command} {subject}")
     };
     let terminal_values = protocol.terminal_values();
+    let project_authority = crate::authority::GUIDANCE.trim();
     let model_confusions = model_confusion_guidance();
     let test_execution_policy = match protocol {
         StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
@@ -1741,7 +1742,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.{test_execution_policy}\n\n{model_confusions}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -2501,6 +2502,22 @@ mod tests {
 
         let propose = stage_prompt("/propose-unattended", "change", StageProtocol::Propose);
         assert!(!propose.contains("PROJECT TEST EXECUTION POLICY"));
+    }
+
+    #[test]
+    fn every_stage_gets_the_same_supplied_input_precedence() {
+        for protocol in [
+            StageProtocol::Worker,
+            StageProtocol::Ready,
+            StageProtocol::Verify,
+            StageProtocol::Propose,
+            StageProtocol::Frontier,
+            StageProtocol::TerminalReview,
+        ] {
+            let prompt = stage_prompt("", "assigned work", protocol);
+            assert!(prompt.contains(crate::authority::GUIDANCE.trim()));
+            assert!(!prompt.contains(crate::authority::PLACEHOLDER));
+        }
     }
 
     #[test]

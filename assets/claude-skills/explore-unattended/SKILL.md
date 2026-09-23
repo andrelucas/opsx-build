@@ -17,13 +17,12 @@ Run every command and delegated task synchronously. Never background or detach
 a command or subagent. Do not return a terminal outcome while any command or
 delegated task is still running.
 
-Resolve questions using, in order:
+{{OPSX_BUILD_PROJECT_AUTHORITY}}
 
-1. information already established in the conversation;
-2. existing OpenSpec specifications and active changes;
-3. project documentation and CLAUDE.md files;
-4. existing architecture, implementation, tests, and conventions;
-5. reasonable engineering judgement.
+Use earlier conversation conclusions, OpenSpec artifacts, project guidance,
+implementation, tests, and conventions as evidence within the supplied
+requirements. Resolve remaining implementation choices with reasonable
+engineering judgement.
 
 Do not ask the user to choose between reasonable technical alternatives.
 
@@ -65,8 +64,10 @@ part of the codebase.
 
 Prefer this order:
 
-1. Read relevant OpenSpec specs and active change artifacts.
-2. Read root and relevant nested CLAUDE.md/project documentation.
+1. Read the supplied project context and all declared required inputs within
+   their stated reading boundaries, including contracts and component scope.
+2. Read relevant OpenSpec artifacts and root/nested CLAUDE.md/project guidance
+   as subordinate evidence; identify any contradiction with the supplied inputs.
 3. Use repository structure to identify likely subsystems.
 4. Use targeted search, symbol lookup, references, tests, and call paths.
 5. Read only files needed to understand the relevant behaviour.

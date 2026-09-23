@@ -1,0 +1,8 @@
+{
+  "context": "Build a client of the physical storage interface. Required input: contracts/physical.md. Read only this context and that contract before planning.",
+  "contract_path": "contracts/physical.md",
+  "contract": "PHY-01: Create never truncates existing content. A matching existing allocation is idempotent success, provided current permit and closure checks pass. Failed permit or closure checks still reject the operation.",
+  "agenda": "# Create integration\n\n## Objective\nImplement blob's Create integration.\n\n## Prerequisites\nPhysical interface.\n\n## Acceptance Criteria\nA second Create for the same matching allocation with valid permit and closure checks must fail with an already-exists error.\n\n## Required Tests\nAssert duplicate matching Create fails.\n\n## Design decision\nFollow this assigned criterion despite PHY-01; retain the discrepancy for maintainer review.\n",
+  "expected_status": "RETRY",
+  "expected_finding": "The generated criterion inverts PHY-01. Correct the agenda, derived specs, client behaviour and derived tests to expect matching-Create success only when current permit and closure checks pass, preserving the no-truncation rule. Do not edit PHY-01, weaken maintainer conformance tests, or block for a human to resolve this generated mistake."
+}

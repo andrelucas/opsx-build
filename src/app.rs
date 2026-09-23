@@ -62,7 +62,7 @@ use crate::{
 };
 
 const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Record the intended agenda structure, slice files, acceptance criteria, and required tests in the OpenSpec design and tasks so a fresh Apply session can materialize them.";
-const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, using `openspec/config.yaml` as the project authority. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Do not archive the bootstrap change.";
+const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, conforming to the supplied context in `openspec/config.yaml` and its declared required inputs. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Check each slice's component ownership and trace its acceptance criteria to the governing source requirements, preserving conditions and exceptions. Correct contradictory bootstrap artifacts and agenda entries together. Do not archive the bootstrap change.";
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
@@ -2086,7 +2086,7 @@ impl<U: Ui> App<U> {
         } else if is_terminal_gate(state) && frontier_terminal {
             "Act as the frontier architect that set the project goal. Formulate the terminal whole-project acceptance change from the exact 9999 agenda assignment, the complete goal in `openspec/config.yaml`, canonical and archived OpenSpec evidence, and the delivered repository. The resulting specs, design, tasks, and acceptance scenarios must test the original goal as an integrated whole rather than merely restating the final agenda file. This is planning-only and must not implement product code. Do not report DONE: the orchestrator has established that the terminal acceptance gate remains."
         } else if state.agenda.is_some() {
-            "Use the assigned agenda slice as the planning authority and preserve correct partial artifacts for its exact assigned change. Do not report DONE: the orchestrator has already established that this agenda slice remains."
+            "Use the assigned agenda slice to select the work, subject to the supplied contracts and component scope. Correct contradictions in that generated slice and its OpenSpec artifacts before reporting READY; preserve correct partial work and its exact assigned change identity. Do not report DONE: the orchestrator has already established that this agenda slice remains."
         } else if state.change.is_some() {
             "Use the exact prescribed change name and create or continue only that OpenSpec change. Do not substitute a generated name or modify another active change."
         } else {
@@ -2270,7 +2270,7 @@ impl<U: Ui> App<U> {
             )
         } else {
             format!(
-                "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change and directly related canonical OpenSpec specification updates. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the proposal milestone Git commit for OpenSpec change `{change}`. Inspect Git status and diffs. Commit only the proposal artifacts for this change, directly related generated OpenSpec specification updates, and corrections to the assigned agenda slice needed to conform to supplied contracts. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If the relevant proposal work is already committed and nothing remains to commit, confirm that and report READY."
             )
         };
         let baseline = current_head(repo, &self.ui)?;
@@ -2350,20 +2350,12 @@ impl<U: Ui> App<U> {
         frontier_terminal: bool,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let verify_subject = if state.bootstrap {
-            format!(
-                "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md` and the complete project goal in `openspec/config.yaml`. Confirm that no product code was implemented, every material goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with all concrete corrections when it is not.\n\n{}",
-                worker_capacity_guidance(self.cli.frontier_worker)
-            )
-        } else if frontier_terminal {
-            format!(
-                "{change}\n\nPerform the independent frontier verification of the complete project goal. Verify this terminal change against its OpenSpec artifacts, then compare the delivered repository with every material requirement in `openspec/config.yaml`, the ordered agenda including `automation/slices/9999-project-acceptance.md`, synchronized canonical specs, archived change evidence, and the real end-to-end acceptance results. Run the required whole-project checks rather than relying only on task checkboxes or earlier summaries. Report VERIFIED only when the original project goal is demonstrably complete. Report RETRY with concrete findings for bounded correctable defects; make clear when a finding represents missing functionality broad enough to require new remediation slices before the terminal gate."
-            )
-        } else {
-            format!(
-                "{change}\n\nVerify the implementation against its OpenSpec artifacts and run relevant checks. Report RETRY only for a concrete, correctable implementation issue and explain the required repair."
-            )
-        };
+        let verify_subject = verification_subject(
+            &change,
+            state.bootstrap,
+            frontier_terminal,
+            self.cli.frontier_worker,
+        );
         let verify_subject = with_sidecar_context(state, &verify_subject);
         let Some(result) = worker_result(
             invoke_fresh(
@@ -2483,16 +2475,16 @@ impl<U: Ui> App<U> {
         );
         let base = if state.bootstrap {
             format!(
-                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts. Do not implement product code and do not create implementation OpenSpec changes. Re-check the complete goal in `openspec/config.yaml`.\n\n{}\n\nVerifier context:\n{finding}",
+                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts together against the supplied context in `openspec/config.yaml` and its declared required inputs. Remove generated ownership violations and correct acceptance criteria to preserve source behaviour, including conditions and exceptions. Update the coverage map and required tests coherently. Do not implement product code, create implementation OpenSpec changes, or alter supplied contracts.\n\n{}\n\nVerifier context:\n{finding}",
                 worker_capacity_guidance(self.cli.frontier_worker)
             )
         } else if frontier_terminal {
             format!(
-                "{change}\n\nRepair or continue repairing the terminal whole-project acceptance implementation and tests. This is frontier-owned work. Preserve correct partial work, correct task-owned defects, run the real acceptance checks, and keep the approved OpenSpec scope. Use narrowly scoped sandbox escape when required checks genuinely cannot run inside the sandbox. Report TOO_LARGE only if the work cannot safely be completed even by the frontier model.\n\nVerifier context:\n{finding}"
+                "{change}\n\nRepair or continue repairing the terminal whole-project acceptance work. This is frontier-owned work. Synchronize affected generated agenda entries, OpenSpec artifacts, implementation, and tests with the supplied contracts and component scope. Preserve correct partial work and maintainer-owned conformance expectations; do not change the inputs to excuse incorrect output. Run the real acceptance checks. Use narrowly scoped sandbox escape when required checks genuinely cannot run inside the sandbox. Report TOO_LARGE only if the work cannot safely be completed even by the frontier model.\n\nVerifier context:\n{finding}"
             )
         } else {
             format!(
-                "{change}\n\nRepair or continue repairing the implementation and tests. Preserve correct partial work and the approved OpenSpec scope. Re-run relevant checks. Treat the assigned slice as the unit of delivery and address the findings through ordered tasks within it. Worker is a workflow role, not an assumption of limited model capability. Report TOO_LARGE only after a focused repair attempt demonstrates a concrete capacity or scope constraint that tasks within this change cannot resolve. State what you attempted, the observed constraint, why continuing within this change is not viable, and the minimum necessary decomposition. Several findings, multiple test cases, and ordinary correctable verification failures are not by themselves reasons to replan.\n\nVerifier context:\n{finding}"
+                "{change}\n\nRepair or continue repairing the affected generated agenda entries, OpenSpec artifacts, implementation, and tests together against the supplied contracts and component scope. Preserve correct partial work and maintainer-owned conformance expectations; do not change the inputs to excuse incorrect output. Re-run relevant checks. Treat the assigned slice as the unit of delivery and address the findings through ordered tasks within it. Worker is a workflow role, not an assumption of limited model capability. Report TOO_LARGE only after a focused repair attempt demonstrates a concrete capacity or scope constraint that tasks within this change cannot resolve. State what you attempted, the observed constraint, why continuing within this change is not viable, and the minimum necessary decomposition. Several findings, multiple test cases, and ordinary correctable verification failures are not by themselves reasons to replan.\n\nVerifier context:\n{finding}"
             )
         };
         let base = with_sidecar_context(state, &base);
@@ -3268,10 +3260,32 @@ fn proposal_postcondition_repair(subject: &str, failure: &str) -> String {
     )
 }
 
+fn verification_subject(
+    change: &str,
+    bootstrap: bool,
+    frontier_terminal: bool,
+    frontier_worker: bool,
+) -> String {
+    if bootstrap {
+        format!(
+            "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md`, the complete project goal in `openspec/config.yaml`, and every declared required input within the supplied reading boundaries. Independently read those source documents; agreement among generated artifacts is insufficient. For every slice, check that the component owns the planned work and distinguish owned implementation from consumption of a dependency. Trace each objective and acceptance criterion through the coverage map to a governing source path and requirement ID or section; check the actual source meaning, including conditions and exceptions. Reject invented obligations, inverted required behaviour, and implementation of another component's responsibilities. Confirm that no product code was implemented, every material in-scope goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with the governing sources and all concrete corrections for generated mistakes; the repair stage must synchronize the bootstrap artifacts and agenda. This is the existing verification pass, not a new system-design round.\n\n{}",
+            worker_capacity_guidance(frontier_worker)
+        )
+    } else if frontier_terminal {
+        format!(
+            "{change}\n\nPerform the independent frontier verification of the complete project goal. Start with the supplied requirements in `openspec/config.yaml` and its declared contracts and component scope. Check this terminal change's OpenSpec artifacts, the ordered agenda including `automation/slices/9999-project-acceptance.md`, synchronized generated specs, archived change evidence, delivered implementation, and real end-to-end acceptance results against those inputs. Run the required whole-project checks rather than relying only on task checkboxes or earlier summaries. Report VERIFIED only when the original in-scope project goal is demonstrably complete. Report RETRY with governing sources and concrete findings for correctable agenda, change-spec, implementation, or test mistakes; make clear when a finding represents missing in-scope functionality broad enough to require new remediation slices before the terminal gate."
+        )
+    } else {
+        format!(
+            "{change}\n\nRead the supplied requirements and component scope relevant to this change. Verify the assigned agenda, OpenSpec artifacts, implementation, and tests against those inputs and run relevant checks. Agreement with a generated specification does not establish correctness if that specification contradicts its source. Report RETRY for concrete correctable agenda, change-spec, implementation, or test mistakes, citing the governing source, affected artifacts, and required synchronized repair. Preserve maintainer-owned conformance expectations. Do not modify the work during verification. Reserve BLOCKED for an external decision or unavailable input required by the authoritative requirements themselves."
+        )
+    }
+}
+
 fn campaign_subject(state: &RunState, frontier_worker: bool) -> String {
     if state.bootstrap {
         return format!(
-            "Bootstrap this repository by carrying out the exact planning assignment below. Create or continue only the OpenSpec change `{BOOTSTRAP_CHANGE}`. This change decomposes the complete project goal into a durable agenda for later worker-model runs; it does not implement product functionality. Treat `openspec/config.yaml` as the project authority and do not survey the product source tree.\n\nAssigned bootstrap file: `{BOOTSTRAP_PATH}`\n\n--- BEGIN BOOTSTRAP ASSIGNMENT ---\n{}\n--- END BOOTSTRAP ASSIGNMENT ---",
+            "Bootstrap this repository by carrying out the exact planning assignment below. Create or continue only the OpenSpec change `{BOOTSTRAP_CHANGE}`. This change decomposes the complete project goal into a durable agenda for later worker-model runs; it does not implement product functionality. Read the supplied context in `openspec/config.yaml` and its declared required inputs before planning, within their stated reading boundaries. Do not survey the product source tree.\n\nAssigned bootstrap file: `{BOOTSTRAP_PATH}`\n\n--- BEGIN BOOTSTRAP ASSIGNMENT ---\n{}\n--- END BOOTSTRAP ASSIGNMENT ---",
             bootstrap_instructions(frontier_worker).trim()
         );
     }
@@ -3282,7 +3296,7 @@ fn campaign_subject(state: &RunState, frontier_worker: bool) -> String {
             .map(|campaign| format!("campaign iteration {}", campaign.iteration))
             .unwrap_or_else(|| "an advance operation".to_owned());
         return format!(
-            "Create the OpenSpec planning artifacts for the exact ordered agenda assignment below. This is {iteration}. This Propose stage is planning-only: do not implement production code or invoke an Apply or implementation skill. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The agenda content is authoritative; use repository inspection only to elaborate its implementation details.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
+            "Create the OpenSpec planning artifacts for the exact ordered agenda assignment below. This is {iteration}. This Propose stage is planning-only: do not implement production code or invoke an Apply or implementation skill. Do not select, create, or modify a different slice. Create or continue the OpenSpec change with the exact name `{change}`. The assignment selects and orders work; supplied contracts and component scope govern its meaning. Read the relevant governing inputs and the current assigned file on disk; the embedded agenda is a checkpoint snapshot. Correct contradictions in this generated slice and its subordinate artifacts before implementing them, preserving the assigned filename and change identity.\n\nAssigned agenda file: `{path}`\n\n--- BEGIN ASSIGNED AGENDA SLICE ---\n{content}\n--- END ASSIGNED AGENDA SLICE ---",
             change = assignment.change,
             path = assignment.path,
             content = assignment.content.trim()
@@ -3327,7 +3341,7 @@ fn frontier_replan_prompt(
 ) -> String {
     let worker_capacity = worker_capacity_guidance(frontier_worker);
     format!(
-        "{worker_capacity}\n\nThe worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria so the sequence still delivers the original objective.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
+        "{worker_capacity}\n\nThe worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria that conform to the supplied inputs so the sequence still delivers the in-scope objective. Read the governing contracts and component scope first; correct derived contradictions rather than distributing them among children. Retain source references for the corrected criteria.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
         path = assignment.path,
         change = assignment.change,
         stage = outcome.stage.title(),
@@ -3350,7 +3364,7 @@ fn terminal_review_prompt(
         )
     });
     format!(
-        "{worker_capacity}\n\nAct as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml`, the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Determine whether every material project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
+        "{worker_capacity}\n\nAct as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml` and its declared required contracts and component scope, then compare the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Judge the generated agenda and delivered behaviour against those supplied inputs; a dependency contract does not assign its implementation to this component. Determine whether every material in-scope project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
         path = assignment.path,
         content = assignment.content.trim(),
     )
@@ -3957,6 +3971,56 @@ mod tests {
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("Before reporting READY"));
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("every structural requirement"));
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("correct any omission within this Apply stage"));
+    }
+
+    #[test]
+    fn contradictory_assignments_do_not_become_planning_authority() {
+        for fixture in [
+            include_str!("../tests/fixtures/authority/ownership.json"),
+            include_str!("../tests/fixtures/authority/idempotency.json"),
+        ] {
+            let case: Value = serde_json::from_str(fixture).unwrap();
+            let context = case["context"].as_str().unwrap();
+            let agenda = case["agenda"].as_str().unwrap();
+            let config = crate::bootstrap::render_project_config(context);
+            assert!(config.contains(context));
+            assert!(config.contains(case["contract_path"].as_str().unwrap()));
+
+            let mut state = RunState::new("advance".to_owned(), ChangeSnapshot::default());
+            state.agenda = Some(AgendaAssignment {
+                path: "automation/slices/0001-fixture.md".to_owned(),
+                change: "0001-fixture".to_owned(),
+                title: "Fixture".to_owned(),
+                content: agenda.to_owned(),
+            });
+            let proposal = stage_prompt(
+                "/propose-unattended",
+                &campaign_subject(&state, false),
+                StageProtocol::Propose,
+            );
+            assert!(proposal.contains(agenda.trim()));
+            assert!(proposal.contains("exact name `0001-fixture`"));
+            assert!(!proposal.contains("agenda content is authoritative"));
+            assert!(proposal.contains("Correct contradictions in this generated slice"));
+            assert!(proposal.contains(crate::authority::GUIDANCE.trim()));
+
+            for (bootstrap, terminal) in [(true, false), (false, false), (false, true)] {
+                let verify = stage_prompt(
+                    "/opsx:verify",
+                    &verification_subject("0001-fixture", bootstrap, terminal, false),
+                    StageProtocol::Verify,
+                );
+                assert!(verify.contains(crate::authority::GUIDANCE.trim()));
+                assert!(verify.contains("Report RETRY"));
+                assert!(!verify.contains("only for a concrete, correctable implementation issue"));
+                assert!(verify.contains("Do not repair\nthem during verification"));
+                if bootstrap {
+                    assert!(verify.contains("Trace each objective and acceptance criterion"));
+                    assert!(verify.contains("component owns the planned work"));
+                    assert!(verify.contains("including conditions and exceptions"));
+                }
+            }
+        }
     }
 
     #[test]

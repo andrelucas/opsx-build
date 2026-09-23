@@ -149,7 +149,7 @@ pub fn init_command(repo: &Path) -> CommandSpec {
 }
 
 pub fn instructions(frontier_worker: bool) -> String {
-    BOOTSTRAP_INSTRUCTIONS.replace(
+    crate::authority::render(BOOTSTRAP_INSTRUCTIONS).replace(
         WORKER_CAPACITY_PLACEHOLDER,
         worker_capacity_guidance(frontier_worker),
     )
@@ -334,8 +334,8 @@ fn read_optional_text(path: &Path, label: &str) -> Result<String> {
 }
 
 fn merge_managed_fragment(existing: &str, file_name: &str) -> Result<String> {
-    let fragment =
-        CLAUDE_FRAGMENT.replace(MODEL_CONFUSIONS_PLACEHOLDER, &model_confusion_guidance());
+    let fragment = crate::authority::render(CLAUDE_FRAGMENT)
+        .replace(MODEL_CONFUSIONS_PLACEHOLDER, &model_confusion_guidance());
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
     let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
     match (starts.as_slice(), ends.as_slice()) {
@@ -470,6 +470,22 @@ mod tests {
             );
             assert_eq!(saved.contains("frontier-capable model"), frontier_worker);
             assert!(saved.contains("Several files, subsystems, test cases"));
+            crate::skills::ensure_unattended_skills(&repo, false).unwrap();
+            for path in [
+                BOOTSTRAP_PATH,
+                CLAUDE_PATH,
+                AGENTS_PATH,
+                ".claude/skills/explore-unattended/SKILL.md",
+                ".claude/skills/propose-unattended/SKILL.md",
+            ] {
+                let guidance = fs::read_to_string(repo.join(path)).unwrap();
+                assert!(
+                    guidance.contains(crate::authority::GUIDANCE.trim()),
+                    "{path}"
+                );
+                assert!(!guidance.contains(crate::authority::PLACEHOLDER), "{path}");
+                assert!(!guidance.contains("as the planning authority"), "{path}");
+            }
             fs::remove_dir_all(repo).unwrap();
         }
     }

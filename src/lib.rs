@@ -1,5 +1,6 @@
 pub mod agenda;
 pub mod app;
+mod authority;
 pub mod backend;
 pub mod bootstrap;
 pub mod campaign_config;

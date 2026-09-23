@@ -3,9 +3,10 @@
 
 - Treat OpenSpec artifacts, Git history, and `automation/slices/` as durable
   workflow state; do not rely on conversation history alone.
-- For an assigned agenda slice, use its objective, prerequisites, acceptance
-  criteria, and tests as the planning authority. Do not substitute a different
-  slice or broaden it into adjacent agenda work.
+- Use the assigned agenda slice to select and order work within the supplied
+  contracts and component scope. Do not substitute a different slice or broaden
+  it into adjacent agenda work. Correct generated criteria that contradict their
+  inputs.
 - Run OpenSpec and project commands synchronously. Do not background, detach, or
   return while a command or delegated task is still running.
 - Worker is a workflow role, not an assumption of limited model capability.
@@ -21,12 +22,14 @@
 - Preserve unrelated working-tree changes. Never reset, stash, restore,
   discard, amend, or rewrite user work merely to simplify a workflow stage.
 
+{{OPSX_BUILD_PROJECT_AUTHORITY}}
+
 {{OPSX_BUILD_MODEL_CONFUSIONS}}
 
 ### Dependency selection
 
 - Treat third-party library and framework choices as revisable design decisions
-  unless the project context or specification explicitly requires them. The
+  unless the supplied project context or contract explicitly requires them. The
   specified observable behaviour is authoritative.
 - Validate a material dependency with the smallest end-to-end use before
   building substantial work around it. If its public API does not naturally

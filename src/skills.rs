@@ -35,6 +35,7 @@ pub struct SkillInstall {
 pub fn ensure_unattended_skills(repo: &Path, dry_run: bool) -> Result<Vec<SkillInstall>> {
     let mut changes = Vec::new();
     for skill in BUNDLED_SKILLS {
+        let contents = crate::authority::render(skill.contents);
         let path = repo
             .join(".claude/skills")
             .join(skill.name)
@@ -47,7 +48,7 @@ pub fn ensure_unattended_skills(repo: &Path, dry_run: bool) -> Result<Vec<SkillI
                     .with_context(|| format!("could not read Claude skill `{}`", path.display()));
             }
         };
-        if existing.as_deref() == Some(skill.contents.as_bytes()) {
+        if existing.as_deref() == Some(contents.as_bytes()) {
             continue;
         }
 
@@ -65,7 +66,7 @@ pub fn ensure_unattended_skills(repo: &Path, dry_run: bool) -> Result<Vec<SkillI
                     parent.display()
                 )
             })?;
-            fs::write(&path, skill.contents)
+            fs::write(&path, contents)
                 .with_context(|| format!("could not install Claude skill `{}`", path.display()))?;
         }
         changes.push(SkillInstall {

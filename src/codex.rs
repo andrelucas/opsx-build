@@ -979,7 +979,7 @@ fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
             "The preceding turn ended without returning a terminal result. Inspect the durable OpenSpec and working-tree state, then continue from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Do not stop at a progress update."
         }
         StageProtocol::Verify => {
-            "The preceding verification turn ended without returning a terminal result. Continue verification only: do not repair or modify the implementation or its tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+            "The preceding verification turn ended without returning a terminal result. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
         }
         _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
     };
