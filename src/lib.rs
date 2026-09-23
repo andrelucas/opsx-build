@@ -2,6 +2,7 @@ pub mod agenda;
 pub mod app;
 pub mod backend;
 pub mod bootstrap;
+pub mod campaign_config;
 pub mod claude;
 pub mod cli;
 pub mod codex;

@@ -697,6 +697,112 @@ terminal results, missing prerequisites, and rejected frontier postconditions
 are normal errors. Their checkpoint remains at the unfinished stage for
 resume.
 
+## Configure a campaign
+
+Run this in the campaign directory, or use `--repo PATH`:
+
+```sh
+opsx-build configure
+```
+
+This opens **Claude Code with its normal defaults**, independently of the
+campaign worker and frontier. It does not set a model, reasoning effort,
+permission mode, or campaign connection environment for the conversation.
+Claude must already be installed and authenticated. Git and OpenSpec setup
+are not required to configure a new directory.
+
+The conversation receives the current CLI options, effective defaults,
+available connection profiles (without credential values), and any existing
+campaign configuration. It discusses your intent and surfaces defaults for
+acceptance or adjustment. Once you agree, exit Claude with `/exit` to let
+opsx-build validate and save the result. Cancellation, a failed Claude session,
+or invalid settings leave the previous configuration untouched; failed
+validation retains the proposal and reports its path.
+
+The result is **`opsx-build.md`**, a visible file in the campaign base directory
+(the Git root, or the requested directory when Git has not been initialized).
+It contains:
+
+- Intent and notes explaining the agreed choices and accepted defaults.
+- A marked JSON array of resolved command-line arguments, parsed as arguments,
+  never evaluated as a shell command. No second TOML file is generated.
+- The effective defaults shown during configuration, the opsx-build version,
+  configuration time, source paths and override names, and a fingerprint for
+  detecting edits.
+- A separate **Last used** record, updated when a workflow starts or resumes.
+  It records effective arguments, including one-off CLI overrides, without
+  changing the configured defaults. It records launch settings, not successful
+  completion of the run. Reconfiguration preserves the previous run record.
+
+Ordinary runs automatically read this file without invoking a configuration
+agent. Explicit CLI arguments override its settings. Selecting another named
+connection on the CLI also replaces that role's saved connection parameters;
+other explicit overrides on the same invocation still apply. `execute` always
+starts a campaign, while `--resume` retains the checkpoint's loop and iteration
+limit unless explicitly overridden. Bootstrap and interactive sessions ignore
+saved campaign loop options. Saved context paths are relative to the campaign
+base and are used for bootstrap/execute or initial sidecar setup.
+
+Edit the intent, then run `opsx-build configure` to reconcile it with the
+recorded settings. If the configuration content has changed since the last
+configuration conversation, startup warns and continues using the argument
+block currently in the file. Updating **Last used** does not trigger that
+warning. Invalid or obsolete arguments produce an actionable error; they are
+never silently guessed. `configure` can repair a document whose argument
+block is missing or malformed.
+
+Models such as `@preset/motd` are accepted. The conversation explains, and the
+file records, that an externally changed preset can alter the model and
+parameters without changing the Markdown. Explicit model names avoid that
+particular ambiguity. A model value of `default` intentionally delegates model
+selection to the harness; automatic skill discovery and named environment
+references likewise remain external dependencies. These are configuration
+records, not guarantees that a provider or model remains unchanged forever.
+
+Credentials and environment definitions remain in the global TOML file.
+The Markdown pins model, launcher and policy settings while retaining named
+connection/environment references for credentials. If you configured with an
+alternate `--config PATH`, use that global file when running the campaign too.
+
+Use `--no-campaign-config` to ignore the Markdown for one invocation.
+`--no-config` disables global TOML loading only. Connection tests, skill updates,
+forget and rewind skip campaign configuration. `configure --dry-run` shows the
+effective starting settings without opening Claude or writing files; workflow
+dry runs do not update **Last used**.
+
+### Campaign connection overrides
+
+Both roles now expose connection policy directly on the CLI:
+
+| Setting | Worker option | Frontier option |
+| --- | --- | --- |
+| Backend | `--worker-backend` | `--frontier-backend` |
+| Launcher | `--worker-command` | `--frontier-command` |
+| Model | `--worker-model` | `--frontier-model` |
+| Shared environment | `--worker-environment` | `--frontier-environment` |
+| Codex permission profile | `--worker-permission-profile` | `--frontier-permission-profile` |
+| Codex structured output | `--worker-structured-output=false` | `--frontier-structured-output=false` |
+| Environment isolation | `--worker-isolate=false` | `--frontier-isolate=false` |
+| Context capacity | `--worker-context-window` | `--frontier-context-window` |
+| Compaction window | `--worker-auto-compact-window` | `--frontier-auto-compact-window` |
+| Compaction percentage | `--worker-auto-compact-percent` | `--frontier-auto-compact-percent` |
+| Output token limit | `--worker-max-output-tokens` | `--frontier-max-output-tokens` |
+
+The existing `--claude-command`, `--claude-model`, `--auto-compact-window`,
+`--auto-compact-percent`, and `--max-output-tokens` remain worker aliases.
+Optional models, permission profiles, token policies, shared environments and
+connection selections accept `default` to clear an inherited setting. A launcher
+of `default` selects the backend's normal executable. `--max-iterations=default`
+clears the iteration limit. Skill-command overrides and `--sidecar-root` also
+accept `default` to restore automatic discovery or the standard location.
+The `default` spelling is reserved for these resets.
+
+`--no-local-only`, `--no-frontier-worker`, and `--no-sidecar` turn configured
+booleans off, alongside the existing `--no-yolo` and `--no-loop` options.
+Literal environment values and unset-variable lists remain in global named
+connections/environments, so credentials need not be copied into campaign files
+or command lines.
+
 ## Agent backends and configuration
 
 Connections select a backend. Omitting `backend` preserves the existing
@@ -920,14 +1026,17 @@ turns; output-limit recovery handles those turns.
 Configuration precedence is:
 
 ```text
-command-line or OPSX_BUILD_* field override
+explicit command-line override
+  > campaign opsx-build.md recorded arguments
+  > OPSX_BUILD_* field override
   > selected named connection profile
   > legacy flat config field
   > built-in defaults
 ```
 
-Use `--config PATH` to select another file or `--no-config` to disable config
-loading. Unknown TOML keys are errors.
+Use `--config PATH` to select another global file or `--no-config` to disable
+global TOML loading. Use `--no-campaign-config` to skip campaign Markdown.
+Unknown TOML keys are errors.
 
 For rename compatibility, if the canonical config is absent,
 `~/.config/ospx-build/config.toml` is still loaded. Legacy `OSPX_BUILD_*`

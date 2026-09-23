@@ -106,14 +106,14 @@ pub struct App<U: Ui> {
 }
 
 #[derive(Debug, Clone)]
-enum AgentLauncher {
+pub(crate) enum AgentLauncher {
     Claude(ClaudeLauncher),
     OpenCode(OpenCodeLauncher),
     Codex(CodexLauncher),
 }
 
 impl AgentLauncher {
-    fn from_connection(connection: &AgentConnection) -> Result<Self> {
+    pub(crate) fn from_connection(connection: &AgentConnection) -> Result<Self> {
         match connection.backend {
             BackendKind::Claude => ClaudeLauncher::from_connection(connection).map(Self::Claude),
             BackendKind::OpenCode => {
@@ -390,6 +390,12 @@ impl<U: Ui> App<U> {
     }
 
     fn run_inner(&self) -> Result<()> {
+        if self.cli.request == "configure" {
+            return crate::campaign_config::configure(&self.cli, &self.ui);
+        }
+        if let Some(campaign) = &self.cli.campaign_config {
+            campaign.announce(&self.ui);
+        }
         let requested_repo = self.cli.repo.canonicalize().with_context(|| {
             format!(
                 "repository path `{}` does not exist",
@@ -593,6 +599,7 @@ impl<U: Ui> App<U> {
                 self.ui
                     .warn("YOLO mode: proposal milestone commits are disabled");
             }
+            self.record_configuration()?;
             return self.run_bootstrap(
                 &repo,
                 worker_launcher.as_ref().unwrap_or(&frontier_launcher),
@@ -682,12 +689,15 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.continue_existing {
+            self.record_configuration()?;
             return self.continue_existing(&repo, &launcher, frontier_launcher.as_ref(), &commands);
         }
 
         if self.cli.dry_run {
             return self.print_new_dry_run(&repo, &launcher, frontier_launcher.as_ref(), &commands);
         }
+
+        self.record_configuration()?;
 
         let before_changes = openspec_snapshot(&repo, &self.ui)?;
         let mut state = if let Some(sidecar) = &sidecar {
@@ -773,6 +783,15 @@ impl<U: Ui> App<U> {
                 };
                 state.agenda = Some(assignment);
             }
+        }
+        Ok(())
+    }
+
+    fn record_configuration(&self) -> Result<()> {
+        if !self.cli.dry_run
+            && let Some(campaign) = &self.cli.campaign_config
+        {
+            campaign.record_used(&self.cli)?;
         }
         Ok(())
     }
@@ -1065,6 +1084,19 @@ impl<U: Ui> App<U> {
             && self.cli.max_iterations.is_some()
         {
             campaign.max_iterations = self.cli.max_iterations;
+        }
+
+        if !self.cli.dry_run
+            && let Some(configuration) = &self.cli.campaign_config
+        {
+            let mut effective = self.cli.clone();
+            effective.request = state.request.clone();
+            effective.loop_workflow = state.campaign.is_some() && !self.cli.no_loop;
+            effective.max_iterations = state
+                .campaign
+                .as_ref()
+                .and_then(|campaign| campaign.max_iterations);
+            configuration.record_used(&effective)?;
         }
 
         if state.request == "advance"

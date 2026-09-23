@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, env, fmt::Display, fs, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer};
 
 use crate::stream::StreamFilter;
@@ -14,12 +14,13 @@ const DEFAULT_PERMISSION_MODE: &str = "auto";
 const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 const DEFAULT_FRONTIER_COMMAND: &str = "claude";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     #[default]
     Claude,
     #[serde(rename = "opencode")]
+    #[value(name = "opencode")]
     OpenCode,
     Codex,
 }
@@ -88,6 +89,8 @@ pub struct Cli {
     pub verify_command: Option<String>,
     pub archive_command: Option<String>,
     pub config_path: Option<PathBuf>,
+    pub campaign_config: Option<crate::campaign_config::CampaignConfig>,
+    pub configure_inputs: Option<crate::campaign_config::ConfigureInputs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,15 +126,160 @@ pub struct EnvironmentReference {
 
 impl Cli {
     pub fn load() -> Result<Self> {
-        Self::resolve(CliArgs::parse())
+        let raw: Vec<std::ffi::OsString> = env::args_os().collect();
+        let args = CliArgs::parse();
+        Self::load_args(raw, args)
+    }
+
+    fn load_args(raw: Vec<std::ffi::OsString>, args: CliArgs) -> Result<Self> {
+        let configuring = args.request.as_deref() == Some("configure");
+        let base = crate::campaign_config::base_directory(&args.repo)?;
+        let campaign = if (args.no_campaign_config && !configuring)
+            || args.test_connection.is_some()
+            || args.forget
+            || args.update_skills
+            || args.request.as_deref() == Some("rewind")
+        {
+            None
+        } else {
+            crate::campaign_config::CampaignConfig::read(&base)?
+        };
+        let resolved_args = if let Some(campaign) = &campaign
+            && !args.no_campaign_config
+        {
+            let saved = match campaign
+                .arguments()
+                .and_then(|args| canonical_settings(&args))
+            {
+                Ok(saved) => saved,
+                Err(_) if configuring => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let explicit = CliArgs::command().try_get_matches_from(&raw)?;
+            let sidecar_context = !args.resume
+                && !args.no_sidecar
+                && (args.sidecar || saved.iter().any(|arg| arg == "--sidecar"));
+            let saved = saved
+                .into_iter()
+                .filter(|arg| {
+                    let name = arg.split('=').next().unwrap_or(arg);
+                    let bootstrap = args
+                        .request
+                        .as_deref()
+                        .is_some_and(|v| matches!(v, "bootstrap" | "execute"));
+                    if matches!(name, "--context" | "--define")
+                        && !bootstrap
+                        && !sidecar_context
+                        && !configuring
+                    {
+                        return false;
+                    }
+                    if matches!(name, "--loop" | "--no-loop" | "--max-iterations")
+                        && (args.interactive || args.request.as_deref() == Some("bootstrap"))
+                    {
+                        return false;
+                    }
+                    if matches!(name, "--loop" | "--no-loop")
+                        && (args.resume || args.request.as_deref() == Some("execute"))
+                    {
+                        return false;
+                    }
+                    if name == "--max-iterations" && args.resume {
+                        return false;
+                    }
+                    if name == "--max-iterations" && args.no_loop {
+                        return false;
+                    }
+                    for (role, selector) in [
+                        ("worker", "worker_connection"),
+                        ("frontier", "frontier_connection"),
+                    ] {
+                        if explicit.value_source(selector)
+                            == Some(clap::parser::ValueSource::CommandLine)
+                            && role_setting(name, role)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|arg| {
+                    if let Some(path) = arg.strip_prefix("--context=")
+                        && !std::path::Path::new(path).is_absolute()
+                        && !configuring
+                    {
+                        return format!("--context={}", base.join(path).display());
+                    }
+                    arg
+                });
+            let merged = std::iter::once(raw[0].clone())
+                .chain(saved.map(std::ffi::OsString::from))
+                .chain(raw.iter().skip(1).cloned());
+            CliArgs::try_parse_from(merged)?
+        } else {
+            args.clone()
+        };
+        let mut cli = match Self::resolve(resolved_args) {
+            Ok(cli) => cli,
+            // An obsolete connection or combination in the Markdown must not
+            // prevent configure from opening to repair it.
+            Err(_) if configuring => Self::resolve(args.clone())?,
+            Err(error) => return Err(error),
+        };
+        if configuring {
+            let (mut config, path) = load_config(&args)?;
+            apply_legacy_environment(&mut config)?;
+            cli.configure_inputs = Some(configure_inputs(
+                &args,
+                &config,
+                path.as_deref(),
+                &cli,
+                campaign.as_ref(),
+                &CliArgs::command().try_get_matches_from(&raw)?,
+            )?);
+            cli.repo = base;
+        }
+        if campaign.is_some() && args.resume {
+            let explicit = CliArgs::command().try_get_matches_from(&raw)?;
+            if !["loop_workflow", "no_loop"]
+                .iter()
+                .any(|id| explicit.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+            {
+                cli.loop_workflow = false;
+                cli.no_loop = false;
+            }
+            if explicit.value_source("max_iterations")
+                != Some(clap::parser::ValueSource::CommandLine)
+            {
+                cli.max_iterations = None;
+            }
+        }
+        cli.campaign_config = campaign;
+        Ok(cli)
     }
 
     fn resolve(args: CliArgs) -> Result<Self> {
         let request_was_supplied = args.request.is_some();
-        let command_line_max_iterations = args.max_iterations.is_some();
+        let command_line_max_iterations = args.max_iterations.is_some_and(|v| v.0.is_some());
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
+        if cli.request == "configure" {
+            if cli.rewind_target.is_some()
+                || cli.yes
+                || cli.interactive
+                || cli.resume
+                || cli.forget
+                || cli.continue_existing
+                || cli.change.is_some()
+                || cli.direction.is_some()
+            {
+                anyhow::bail!(
+                    "`opsx-build configure` cannot be combined with another workflow mode"
+                );
+            }
+            return Ok(cli);
+        }
         if cli.rewind_target.is_some() && cli.request != "rewind" {
             anyhow::bail!("a rewind target is only valid with `opsx-build rewind [REF]`");
         }
@@ -239,10 +387,11 @@ impl Cli {
 #[command(
     name = "opsx-build",
     version,
-    about = "Build an OpenSpec change through synchronous Claude stages"
+    about = "Build an OpenSpec change through synchronous agent stages",
+    args_override_self = true
 )]
-struct CliArgs {
-    /// Change request, `advance`, `bootstrap`, `execute`, or `rewind`. Defaults to `advance`.
+pub(crate) struct CliArgs {
+    /// Change request, `configure`, `advance`, `bootstrap`, `execute`, or `rewind`.
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
@@ -265,27 +414,43 @@ struct CliArgs {
     repo: PathBuf,
 
     /// Keep OpenSpec and its history in an external native OpenSpec store.
-    #[arg(long, env = "OPSX_BUILD_SIDECAR")]
+    #[arg(long, env = "OPSX_BUILD_SIDECAR", overrides_with = "no_sidecar")]
     sidecar: bool,
+
+    /// Disable a configured sidecar default.
+    #[arg(long, overrides_with = "sidecar")]
+    no_sidecar: bool,
 
     /// Parent directory for automatically named sidecar stores.
     #[arg(long, env = "OPSX_BUILD_SIDECAR_ROOT", value_name = "PATH")]
     sidecar_root: Option<PathBuf>,
 
     /// Use only the worker connection and never invoke frontier fallback.
-    #[arg(long, env = "OPSX_BUILD_LOCAL_ONLY")]
+    #[arg(long, env = "OPSX_BUILD_LOCAL_ONLY", overrides_with = "no_local_only")]
     local_only: bool,
 
+    /// Enable frontier fallback when local-only is configured.
+    #[arg(long, overrides_with = "local_only")]
+    no_local_only: bool,
+
     /// Plan delivery slices for a frontier-capable worker instead of a smaller local model.
-    #[arg(long, env = "OPSX_BUILD_FRONTIER_WORKER")]
+    #[arg(
+        long,
+        env = "OPSX_BUILD_FRONTIER_WORKER",
+        overrides_with = "no_frontier_worker"
+    )]
     frontier_worker: bool,
 
+    /// Plan for a smaller worker when frontier-worker is configured.
+    #[arg(long, overrides_with = "frontier_worker")]
+    no_frontier_worker: bool,
+
     /// Skip proposal milestone commits, retaining only the final completion commit.
-    #[arg(long, env = "OPSX_BUILD_YOLO", conflicts_with = "no_yolo")]
+    #[arg(long, env = "OPSX_BUILD_YOLO", overrides_with = "no_yolo")]
     yolo: bool,
 
     /// Restore proposal milestone commits when yolo is enabled in configuration.
-    #[arg(long)]
+    #[arg(long, overrides_with = "yolo")]
     no_yolo: bool,
 
     /// Open an interactive session with the selected worker backend.
@@ -355,17 +520,18 @@ struct CliArgs {
     #[arg(
         long = "loop",
         env = "OPSX_BUILD_LOOP",
+        overrides_with = "no_loop",
         conflicts_with_all = ["interactive", "forget", "continue_existing"]
     )]
     loop_workflow: bool,
 
     /// Disable a campaign loop enabled by the config file.
-    #[arg(long, conflicts_with = "loop_workflow")]
+    #[arg(long, overrides_with = "loop_workflow")]
     no_loop: bool,
 
     /// Stop with an incomplete-campaign error after this many completed changes.
     #[arg(long, env = "OPSX_BUILD_MAX_ITERATIONS", value_name = "N")]
-    max_iterations: Option<std::num::NonZeroU32>,
+    max_iterations: Option<Setting<std::num::NonZeroU32>>,
 
     /// Prescribe a new change name, or select one used by --continue-existing.
     #[arg(
@@ -390,6 +556,10 @@ struct CliArgs {
     /// Do not load the default or environment-selected config file.
     #[arg(long)]
     no_config: bool,
+
+    /// Ignore opsx-build.md for this invocation (global configuration still applies).
+    #[arg(long)]
+    no_campaign_config: bool,
 
     /// Maximum repair/verify cycles after the first verification attempt.
     #[arg(long, env = "OPSX_BUILD_MAX_VERIFY_RETRIES", value_name = "N")]
@@ -440,12 +610,22 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_PERMISSION_MODE", value_name = "MODE")]
     permission_mode: Option<String>,
 
-    /// Command prefix used to launch Claude (for example, "omlx launch claude").
-    #[arg(long, env = "OPSX_BUILD_CLAUDE_COMMAND", value_name = "COMMAND")]
+    /// Worker launcher prefix; `default` uses the selected backend's command.
+    #[arg(
+        long,
+        visible_alias = "worker-command",
+        env = "OPSX_BUILD_CLAUDE_COMMAND",
+        value_name = "COMMAND"
+    )]
     claude_command: Option<String>,
 
-    /// Model passed to the configured Claude launcher as `--model MODEL`.
-    #[arg(long, env = "OPSX_BUILD_CLAUDE_MODEL", value_name = "MODEL")]
+    /// Worker model; `default` restores the harness default.
+    #[arg(
+        long,
+        visible_alias = "worker-model",
+        env = "OPSX_BUILD_CLAUDE_MODEL",
+        value_name = "MODEL"
+    )]
     claude_model: Option<String>,
 
     /// Named connection profile used for ordinary worker stages.
@@ -464,17 +644,92 @@ struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_FRONTIER_CONNECTION", value_name = "NAME")]
     frontier_connection: Option<String>,
 
+    /// Worker backend, overriding the named connection.
+    #[arg(long, value_enum)]
+    worker_backend: Option<BackendKind>,
+
+    /// Frontier backend, overriding the named connection.
+    #[arg(long, value_enum)]
+    frontier_backend: Option<BackendKind>,
+
+    /// Shared worker environment profile; `default` clears the selection.
+    #[arg(long)]
+    worker_environment: Option<String>,
+
+    /// Shared frontier environment profile; `default` clears the selection.
+    #[arg(long)]
+    frontier_environment: Option<String>,
+
+    /// Codex worker permission profile; `default` uses inline permissions.
+    #[arg(long)]
+    worker_permission_profile: Option<String>,
+
+    /// Codex frontier permission profile; `default` uses inline permissions.
+    #[arg(long)]
+    frontier_permission_profile: Option<String>,
+
+    /// Enforce Codex worker stage schemas (true or false).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    worker_structured_output: Option<bool>,
+
+    /// Enforce Codex frontier stage schemas (true or false).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    frontier_structured_output: Option<bool>,
+
+    /// Isolate worker provider environment variables (true or false).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    worker_isolate: Option<bool>,
+
+    /// Isolate frontier provider environment variables (true or false).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    frontier_isolate: Option<bool>,
+
+    /// Worker context capacity; accepts k/m suffixes or `default`.
+    #[arg(long)]
+    worker_context_window: Option<Setting<TokenCount>>,
+
+    /// Frontier context capacity; accepts k/m suffixes or `default`.
+    #[arg(long)]
+    frontier_context_window: Option<Setting<TokenCount>>,
+
+    /// Frontier auto-compaction window; accepts k/m suffixes or `default`.
+    #[arg(long)]
+    frontier_auto_compact_window: Option<Setting<TokenCount>>,
+
+    /// Frontier auto-compaction percentage, or `default`.
+    #[arg(long)]
+    frontier_auto_compact_percent: Option<Setting<Percentage>>,
+
+    /// Frontier output token limit; accepts k/m suffixes or `default`.
+    #[arg(long)]
+    frontier_max_output_tokens: Option<Setting<TokenCount>>,
+
     /// Context capacity used for Claude auto-compaction (supports binary k/m suffixes).
-    #[arg(long, env = "OPSX_BUILD_AUTO_COMPACT_WINDOW", value_name = "TOKENS")]
-    auto_compact_window: Option<TokenCount>,
+    #[arg(
+        long,
+        visible_alias = "worker-auto-compact-window",
+        env = "OPSX_BUILD_AUTO_COMPACT_WINDOW",
+        value_name = "TOKENS"
+    )]
+    auto_compact_window: Option<Setting<TokenCount>>,
 
     /// Percentage of the effective context capacity at which Claude auto-compacts.
-    #[arg(long, env = "OPSX_BUILD_AUTO_COMPACT_PERCENT", value_name = "PERCENT")]
-    auto_compact_percent: Option<Percentage>,
+    #[arg(
+        long,
+        visible_alias = "worker-auto-compact-percent",
+        env = "OPSX_BUILD_AUTO_COMPACT_PERCENT",
+        value_name = "PERCENT"
+    )]
+    auto_compact_percent: Option<Setting<Percentage>>,
 
     /// Maximum Claude output tokens per request (supports binary k/m suffixes).
-    #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_TOKENS", value_name = "TOKENS")]
-    max_output_tokens: Option<TokenCount>,
+    #[arg(
+        long,
+        visible_alias = "worker-max-output-tokens",
+        env = "OPSX_BUILD_MAX_OUTPUT_TOKENS",
+        value_name = "TOKENS"
+    )]
+    max_output_tokens: Option<Setting<TokenCount>>,
 
     /// Override the exploration slash command.
     #[arg(long, env = "OPSX_BUILD_EXPLORE_COMMAND", value_name = "COMMAND")]
@@ -698,20 +953,22 @@ where
 
 fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf>) -> Result<Cli> {
     let bootstrap_defines = parse_bootstrap_defines(&args.define)?;
-    let worker_profile = selected_connection(
+    let mut worker_profile = selected_connection(
         args.test_connection.as_deref().or(args
             .worker_connection
             .as_deref()
             .or(config.worker_connection.as_deref())),
         &config.connections,
     )?;
-    let frontier_profile = selected_connection(
+    let mut frontier_profile = selected_connection(
         args.frontier_connection
             .as_deref()
             .or(config.frontier_connection.as_deref()),
         &config.connections,
     )?;
-    let worker_connection = resolve_connection(
+    apply_connection_overrides(&args, &mut worker_profile, false);
+    apply_connection_overrides(&args, &mut frontier_profile, true);
+    let mut worker_connection = resolve_connection(
         worker_profile,
         &config.environments,
         args.claude_command.clone(),
@@ -726,21 +983,27 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         config.max_output_tokens,
         DEFAULT_CLAUDE_COMMAND,
     )?;
-    let frontier_connection = resolve_connection(
+    let mut frontier_connection = resolve_connection(
         frontier_profile,
         &config.environments,
         args.frontier_command.clone(),
         args.frontier_model.clone(),
         config.frontier_command.clone(),
         config.frontier_model.clone(),
-        None,
-        None,
-        None,
+        args.frontier_auto_compact_window,
+        args.frontier_auto_compact_percent,
+        args.frontier_max_output_tokens,
         None,
         None,
         None,
         DEFAULT_FRONTIER_COMMAND,
     )?;
+    if let Some(value) = args.worker_context_window {
+        worker_connection.context_window = value.0.map(|v| v.0);
+    }
+    if let Some(value) = args.frontier_context_window {
+        frontier_connection.context_window = value.0.map(|v| v.0);
+    }
     let request = match args.request.as_deref() {
         Some(value) if value.trim().eq_ignore_ascii_case("next slice") => "advance".to_owned(),
         Some(value) => value.to_owned(),
@@ -756,6 +1019,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         None => "advance".to_owned(),
     };
     let execute = request == "execute";
+    let uses_campaign_defaults = request != "bootstrap" && !args.interactive;
     let request = if execute {
         "advance".to_owned()
     } else {
@@ -778,10 +1042,14 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         bootstrap_context: args.context,
         bootstrap_defines,
         repo: args.repo,
-        sidecar: args.sidecar || config.sidecar.unwrap_or(false),
-        sidecar_root: args.sidecar_root.or(config.sidecar_root),
-        local_only: args.local_only || config.local_only.unwrap_or(false),
-        frontier_worker: args.frontier_worker || config.frontier_worker.unwrap_or(false),
+        sidecar: !args.no_sidecar && (args.sidecar || config.sidecar.unwrap_or(false)),
+        sidecar_root: args
+            .sidecar_root
+            .or(config.sidecar_root)
+            .filter(|v| v != std::path::Path::new("default")),
+        local_only: !args.no_local_only && (args.local_only || config.local_only.unwrap_or(false)),
+        frontier_worker: !args.no_frontier_worker
+            && (args.frontier_worker || config.frontier_worker.unwrap_or(false)),
         yolo: !args.no_yolo && (args.yolo || config.yolo.unwrap_or(false)),
         interactive: args.interactive,
         test_connection: args.test_connection,
@@ -791,12 +1059,15 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         forget: args.forget,
         continue_existing: args.continue_existing,
         loop_workflow: !args.no_loop
-            && (execute || args.loop_workflow || config.loop_workflow.unwrap_or(false)),
+            && (execute
+                || args.loop_workflow
+                || (uses_campaign_defaults && config.loop_workflow.unwrap_or(false))),
         no_loop: args.no_loop,
-        max_iterations: args
-            .max_iterations
-            .or(config.max_iterations)
-            .map(std::num::NonZeroU32::get),
+        max_iterations: setting(
+            args.max_iterations,
+            config.max_iterations.filter(|_| uses_campaign_defaults),
+        )
+        .map(std::num::NonZeroU32::get),
         change: args.change,
         direction: args.direction,
         interactive_args: args.interactive_args,
@@ -827,13 +1098,90 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_owned()),
         worker_connection,
         frontier_connection,
-        explore_command: args.explore_command.or(config.explore_command),
-        propose_command: args.propose_command.or(config.propose_command),
-        apply_command: args.apply_command.or(config.apply_command),
-        verify_command: args.verify_command.or(config.verify_command),
-        archive_command: args.archive_command.or(config.archive_command),
+        explore_command: concrete_string(args.explore_command.or(config.explore_command)),
+        propose_command: concrete_string(args.propose_command.or(config.propose_command)),
+        apply_command: concrete_string(args.apply_command.or(config.apply_command)),
+        verify_command: concrete_string(args.verify_command.or(config.verify_command)),
+        archive_command: concrete_string(args.archive_command.or(config.archive_command)),
         config_path,
+        campaign_config: None,
+        configure_inputs: None,
     })
+}
+
+/// Explicit `default` suppresses lower-priority values, including named profiles.
+#[derive(Debug, Clone, Copy)]
+struct Setting<T>(Option<T>);
+
+impl<T: FromStr> FromStr for Setting<T>
+where
+    T::Err: Display,
+{
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "default" {
+            Ok(Self(None))
+        } else {
+            value
+                .parse()
+                .map(|v| Self(Some(v)))
+                .map_err(|e: T::Err| e.to_string())
+        }
+    }
+}
+
+fn setting<T>(value: Option<Setting<T>>, fallback: Option<T>) -> Option<T> {
+    value.map_or(fallback, |value| value.0)
+}
+
+fn concrete_string(value: Option<String>) -> Option<String> {
+    value.filter(|value| value != "default")
+}
+
+fn apply_connection_overrides(
+    args: &CliArgs,
+    profile: &mut Option<(String, FileConnection)>,
+    frontier: bool,
+) {
+    let (_, profile) = profile.get_or_insert_with(|| (String::new(), FileConnection::default()));
+    let (backend, environment, permission, structured, isolate) = if frontier {
+        (
+            args.frontier_backend,
+            &args.frontier_environment,
+            &args.frontier_permission_profile,
+            args.frontier_structured_output,
+            args.frontier_isolate,
+        )
+    } else {
+        (
+            args.worker_backend,
+            &args.worker_environment,
+            &args.worker_permission_profile,
+            args.worker_structured_output,
+            args.worker_isolate,
+        )
+    };
+    if let Some(backend) = backend {
+        if backend != profile.backend {
+            profile.command = Some("default".to_owned());
+            profile.permission_profile = None;
+            profile.structured_output = None;
+        }
+        profile.backend = backend;
+    }
+    if let Some(environment) = environment {
+        profile.environment = concrete_string(Some(environment.clone()));
+    }
+    if let Some(permission) = permission {
+        profile.permission_profile = concrete_string(Some(permission.clone()));
+    }
+    if let Some(structured) = structured {
+        profile.structured_output = Some(structured);
+    }
+    if let Some(isolate) = isolate {
+        profile.isolate = Some(isolate);
+    }
 }
 
 fn parse_bootstrap_defines(values: &[String]) -> Result<BTreeMap<String, String>> {
@@ -857,6 +1205,323 @@ fn parse_bootstrap_defines(values: &[String]) -> Result<BTreeMap<String, String>
     Ok(definitions)
 }
 
+fn settings_command() -> clap::Command {
+    let mut command = CliArgs::command();
+    let ids: Vec<_> = command
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+    for id in ids {
+        command = command.mut_arg(id, |arg| arg.env(None::<&str>));
+    }
+    command
+}
+
+fn campaign_setting(id: &str) -> bool {
+    !matches!(
+        id,
+        "request"
+            | "rewind_target"
+            | "yes"
+            | "repo"
+            | "interactive"
+            | "interactive_args"
+            | "test_connection"
+            | "basic_connection_test"
+            | "update_skills"
+            | "resume"
+            | "forget"
+            | "continue_existing"
+            | "change"
+            | "direction"
+            | "config"
+            | "no_config"
+            | "no_campaign_config"
+            | "dry_run"
+            | "help"
+            | "version"
+    )
+}
+
+/// The Markdown stores argv, never shell code. Parse with the real CLI and reject actions.
+pub(crate) fn canonical_settings(values: &[String]) -> Result<Vec<String>> {
+    let command = settings_command();
+    let matches = command
+        .clone()
+        .try_get_matches_from(
+            std::iter::once("opsx-build".to_owned()).chain(values.iter().cloned()),
+        )
+        .context(
+            "invalid settings in opsx-build.md; run `opsx-build configure` to reconcile them",
+        )?;
+    let mut result = Vec::new();
+    for arg in command.get_arguments() {
+        let id = arg.get_id().as_str();
+        if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+            continue;
+        }
+        if !campaign_setting(id) {
+            anyhow::bail!("`{id}` is an invocation action, not a campaign setting");
+        }
+        let name = arg
+            .get_long()
+            .context("campaign settings must be named options")?;
+        if matches!(arg.get_action(), clap::ArgAction::SetTrue) {
+            result.push(format!("--{name}"));
+        } else if let Some(values) = matches.get_raw(id) {
+            result.extend(values.map(|value| format!("--{name}={}", value.to_string_lossy())));
+        }
+    }
+    Ok(result)
+}
+
+fn role_setting(name: &str, role: &str) -> bool {
+    name.starts_with(&format!("--{role}-"))
+        || (role == "worker"
+            && matches!(
+                name,
+                "--claude-command"
+                    | "--claude-model"
+                    | "--auto-compact-window"
+                    | "--auto-compact-percent"
+                    | "--max-output-tokens"
+            ))
+}
+
+/// A complete, non-secret snapshot. `default` explicitly prevents profile inheritance.
+pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
+    let mut args = Vec::new();
+    for (name, value) in [
+        ("sidecar", cli.sidecar),
+        ("local-only", cli.local_only),
+        ("frontier-worker", cli.frontier_worker),
+        ("yolo", cli.yolo),
+        ("loop", cli.loop_workflow),
+    ] {
+        args.push(format!("--{}{name}", if value { "" } else { "no-" }));
+    }
+    for (name, value) in [
+        ("max-verify-retries", cli.max_verify_retries.to_string()),
+        ("max-output-retries", cli.max_output_retries.to_string()),
+        ("max-provider-retries", cli.max_provider_retries.to_string()),
+        (
+            "local-worker-timeout-minutes",
+            cli.local_worker_timeout_minutes.to_string(),
+        ),
+        ("max-iterations", optional_number(cli.max_iterations)),
+        ("permission-mode", cli.permission_mode.clone()),
+        (
+            "sidecar-root",
+            cli.sidecar_root
+                .as_ref()
+                .map_or("default".to_owned(), |v| v.display().to_string()),
+        ),
+        (
+            "stream-agent",
+            match cli.stream_claude.unwrap_or_default() {
+                StreamFilter::Activity => "activity",
+                StreamFilter::Full => "full",
+                StreamFilter::Raw => "raw",
+            }
+            .to_owned(),
+        ),
+    ] {
+        args.push(format!("--{name}={value}"));
+    }
+    for (role, connection) in [
+        ("worker", &cli.worker_connection),
+        ("frontier", &cli.frontier_connection),
+    ] {
+        for (name, value) in [
+            (
+                "connection",
+                connection.name.clone().unwrap_or("default".to_owned()),
+            ),
+            ("backend", connection.backend.to_string()),
+            ("command", connection.command.clone()),
+            (
+                "model",
+                connection.model.clone().unwrap_or("default".to_owned()),
+            ),
+            (
+                "environment",
+                connection
+                    .environment_name
+                    .clone()
+                    .unwrap_or("default".to_owned()),
+            ),
+            ("isolate", connection.isolate.to_string()),
+            ("context-window", optional_number(connection.context_window)),
+            (
+                "auto-compact-window",
+                optional_number(connection.auto_compact_window),
+            ),
+            (
+                "auto-compact-percent",
+                optional_number(connection.auto_compact_percent),
+            ),
+            (
+                "max-output-tokens",
+                optional_number(connection.max_output_tokens),
+            ),
+        ] {
+            args.push(format!("--{role}-{name}={value}"));
+        }
+        if connection.backend == BackendKind::Codex {
+            args.push(format!(
+                "--{role}-permission-profile={}",
+                connection
+                    .permission_profile
+                    .as_deref()
+                    .unwrap_or("default")
+            ));
+            args.push(format!(
+                "--{role}-structured-output={}",
+                connection.structured_output
+            ));
+        }
+    }
+    for (name, value) in [
+        ("explore", &cli.explore_command),
+        ("propose", &cli.propose_command),
+        ("apply", &cli.apply_command),
+        ("verify", &cli.verify_command),
+        ("archive", &cli.archive_command),
+    ] {
+        args.push(format!(
+            "--{name}-command={}",
+            value.as_deref().unwrap_or("default")
+        ));
+    }
+    if let Some(path) = &cli.bootstrap_context {
+        args.push(format!("--context={}", path.display()));
+    } else if let Ok(base) = crate::campaign_config::base_directory(&cli.repo)
+        && base.join("context.md").is_file()
+    {
+        args.push("--context=context.md".to_owned());
+    }
+    for (name, value) in &cli.bootstrap_defines {
+        args.push(format!("--define={name}={value}"));
+    }
+    if cli.verbose {
+        args.push("--verbose".to_owned());
+    }
+    if cli.debug {
+        args.push("--debug".to_owned());
+    }
+    args
+}
+
+fn optional_number<T: Display>(value: Option<T>) -> String {
+    value.map_or("default".to_owned(), |value| value.to_string())
+}
+
+fn configure_inputs(
+    args: &CliArgs,
+    config: &FileConfig,
+    path: Option<&std::path::Path>,
+    cli: &Cli,
+    campaign: Option<&crate::campaign_config::CampaignConfig>,
+    matches: &clap::ArgMatches,
+) -> Result<crate::campaign_config::ConfigureInputs> {
+    let defaults = settings_snapshot(cli);
+    let builtin = resolve_values(
+        CliArgs::from_arg_matches(
+            &settings_command().try_get_matches_from(["opsx-build", "configure"])?,
+        )?,
+        FileConfig::default(),
+        None,
+    )?;
+    let mut connections = Vec::new();
+    for (name, profile) in &config.connections {
+        // Environment contents stay in the user's global configuration, including literal credentials.
+        connections.push(serde_json::json!({
+            "name": name, "backend": profile.backend.to_string(), "command": profile.command,
+            "model": profile.model, "environment": profile.environment,
+            "permission_profile": profile.permission_profile, "structured_output": profile.structured_output,
+            "context_window": profile.context_window.map(|v| v.0),
+            "auto_compact_window": profile.auto_compact_window.map(|v| v.0),
+            "auto_compact_percent": profile.auto_compact_percent.map(|v| v.0),
+            "max_output_tokens": profile.max_output_tokens.map(|v| v.0),
+            "environment_variables": profile.env.keys().collect::<Vec<_>>(),
+            "isolate": profile.isolate, "unset_env": profile.unset_env,
+        }));
+    }
+    let mut help = Vec::new();
+    CliArgs::command().write_long_help(&mut help)?;
+    Ok(crate::campaign_config::ConfigureInputs {
+        defaults,
+        sources: serde_json::json!({
+            "global_config": path,
+            "campaign_file": campaign.map(|v| &v.path),
+            "worker_connection": cli.worker_connection.name,
+            "frontier_connection": cli.frontier_connection.name,
+            "command_line_overrides": matches.ids().filter(|id| campaign_setting(id.as_str()) && matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)).map(|id| id.as_str()).collect::<Vec<_>>(),
+            "environment_overrides": env::vars_os().filter_map(|(key, _)| key.into_string().ok()).filter(|key| key.starts_with("OPSX_BUILD_") || key.starts_with("OSPX_BUILD_")).collect::<Vec<_>>(),
+        }),
+        global_config: path
+            .map(|path| fs::read_to_string(path).map(|text| (path.to_path_buf(), text)))
+            .transpose()?,
+        reference: format!(
+            "Global configuration: {}\nEffective defaults (global/environment/CLI resolved):\n{}\nBuilt-in defaults for comparison:\n{}\nAvailable connections (secrets omitted):\n{}\nShared environment names: {:?}\nCurrent campaign document:\n{}\nCLI option reference:\n{}",
+            path.map_or("none".to_owned(), |v| v.display().to_string()),
+            serde_json::to_string_pretty(&settings_snapshot(cli))?,
+            serde_json::to_string_pretty(&settings_snapshot(&builtin))?,
+            serde_json::to_string_pretty(&connections)?,
+            config.environments.keys().collect::<Vec<_>>(),
+            campaign.map_or("Not configured yet.", |v| v.contents.as_str()),
+            String::from_utf8(help)?
+        ),
+        // Retain the original selection so validation uses exactly the same global config.
+        config_selection: if args.no_config {
+            vec!["--no-config".to_owned()]
+        } else {
+            path.map_or(vec!["--no-config".to_owned()], |v| {
+                vec![format!("--config={}", v.display())]
+            })
+        },
+    })
+}
+
+pub(crate) fn resolve_configured_settings(
+    values: &[String],
+    selection: &[String],
+    repo: &std::path::Path,
+) -> Result<Cli> {
+    let canonical = canonical_settings(values)?;
+    let mut argv = vec![
+        "opsx-build".to_owned(),
+        "configure".to_owned(),
+        format!("--repo={}", repo.display()),
+    ];
+    argv.extend(selection.iter().cloned());
+    argv.extend(canonical);
+    let cli = Cli::resolve(CliArgs::try_parse_from(argv)?)?;
+    // Validate launcher syntax without requiring campaign credentials to be
+    // available in the configurator's environment. Connections are tested separately.
+    for connection in [&cli.worker_connection, &cli.frontier_connection] {
+        let mut syntax_only = connection.clone();
+        syntax_only.env.clear();
+        crate::app::AgentLauncher::from_connection(&syntax_only)?;
+    }
+    Ok(cli)
+}
+
+pub(crate) fn merge_settings(defaults: &[String], overrides: &[String]) -> Result<Vec<String>> {
+    let overrides = canonical_settings(overrides)?;
+    let mut merged = canonical_settings(defaults)?;
+    for role in ["worker", "frontier"] {
+        if overrides
+            .iter()
+            .any(|arg| arg.starts_with(&format!("--{role}-connection=")))
+        {
+            merged.retain(|arg| !role_setting(arg.split('=').next().unwrap_or(arg), role));
+        }
+    }
+    merged.extend(overrides);
+    canonical_settings(&merged)
+}
+
 fn valid_template_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -873,6 +1538,9 @@ fn selected_connection(
         return Ok(None);
     };
     let name = name.trim();
+    if name == "default" {
+        return Ok(None);
+    }
     if name.is_empty() {
         anyhow::bail!("connection profile name cannot be empty");
     }
@@ -898,9 +1566,9 @@ fn resolve_connection(
     command_line_model: Option<String>,
     legacy_command: Option<String>,
     legacy_model: Option<String>,
-    command_line_window: Option<TokenCount>,
-    command_line_percentage: Option<Percentage>,
-    command_line_output_tokens: Option<TokenCount>,
+    command_line_window: Option<Setting<TokenCount>>,
+    command_line_percentage: Option<Setting<Percentage>>,
+    command_line_output_tokens: Option<Setting<TokenCount>>,
     legacy_window: Option<TokenCount>,
     legacy_percentage: Option<Percentage>,
     legacy_output_tokens: Option<TokenCount>,
@@ -909,6 +1577,7 @@ fn resolve_connection(
     let (name, profile) = profile
         .map(|(name, profile)| (Some(name), profile))
         .unwrap_or_default();
+    let name = name.filter(|name| !name.is_empty());
     let (environment_name, shared_environment) = selected_environment(
         profile.environment.as_deref(),
         environments,
@@ -916,11 +1585,10 @@ fn resolve_connection(
     )?;
     let mut environment = shared_environment.env;
     environment.extend(profile.env);
-    let isolate = name.is_some()
-        && profile
-            .isolate
-            .or(shared_environment.isolate)
-            .unwrap_or(true);
+    let isolate = profile
+        .isolate
+        .or(shared_environment.isolate)
+        .unwrap_or(name.is_some() || environment_name.is_some());
     let mut unset_env = shared_environment.unset_env;
     for variable in profile.unset_env {
         if !unset_env.contains(&variable) {
@@ -944,9 +1612,7 @@ fn resolve_connection(
         name,
         backend,
         environment_name,
-        command: command_line_command
-            .or(profile.command)
-            .or(legacy_command)
+        command: concrete_string(command_line_command.or(profile.command).or(legacy_command))
             .unwrap_or_else(|| {
                 if backend == BackendKind::Claude {
                     default_command.to_owned()
@@ -954,22 +1620,25 @@ fn resolve_connection(
                     backend.default_command().to_owned()
                 }
             }),
-        model: command_line_model.or(profile.model).or(legacy_model),
+        model: concrete_string(command_line_model.or(profile.model).or(legacy_model)),
         permission_profile: profile.permission_profile,
         structured_output: profile.structured_output.unwrap_or(true),
         context_window: profile.context_window.map(|count| count.0),
-        auto_compact_window: command_line_window
-            .or(profile.auto_compact_window)
-            .or(legacy_window)
-            .map(|count| count.0),
-        auto_compact_percent: command_line_percentage
-            .or(profile.auto_compact_percent)
-            .or(legacy_percentage)
-            .map(|percentage| percentage.0),
-        max_output_tokens: command_line_output_tokens
-            .or(profile.max_output_tokens)
-            .or(legacy_output_tokens)
-            .map(|count| count.0),
+        auto_compact_window: setting(
+            command_line_window,
+            profile.auto_compact_window.or(legacy_window),
+        )
+        .map(|count| count.0),
+        auto_compact_percent: setting(
+            command_line_percentage,
+            profile.auto_compact_percent.or(legacy_percentage),
+        )
+        .map(|percentage| percentage.0),
+        max_output_tokens: setting(
+            command_line_output_tokens,
+            profile.max_output_tokens.or(legacy_output_tokens),
+        )
+        .map(|count| count.0),
         env: environment,
         isolate,
         unset_env,
@@ -1115,6 +1784,184 @@ mod tests {
 
     fn args(values: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> CliArgs {
         CliArgs::try_parse_from(values).unwrap()
+    }
+
+    #[test]
+    fn exposes_connection_policy_overrides_for_both_roles_and_can_clear_them() {
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "configure",
+            "--worker-backend=codex",
+            "--frontier-backend=codex",
+            "--worker-structured-output=false",
+            "--frontier-structured-output=false",
+            "--worker-permission-profile=build",
+            "--frontier-permission-profile=review",
+            "--worker-context-window=128k",
+            "--frontier-context-window=256k",
+            "--frontier-auto-compact-window=192k",
+            "--frontier-auto-compact-percent=75",
+            "--frontier-max-output-tokens=16k",
+        ]))
+        .unwrap();
+        assert_eq!(cli.worker_connection.command, "codex");
+        assert!(!cli.worker_connection.structured_output);
+        assert_eq!(cli.worker_connection.context_window, Some(128 * 1024));
+        assert_eq!(
+            cli.frontier_connection.permission_profile.as_deref(),
+            Some("review")
+        );
+        assert_eq!(cli.frontier_connection.auto_compact_percent, Some(75));
+        assert_eq!(cli.frontier_connection.max_output_tokens, Some(16 * 1024));
+        let config: FileConfig = toml::from_str(
+            r#"
+            local_only = true
+            frontier_worker = true
+            worker_connection = "worker"
+            [connections.worker]
+            backend = "codex"
+            model = "old-model"
+            environment = "remote"
+            permission_profile = "old"
+            context_window = "128k"
+            auto_compact_window = "64k"
+            [environments.remote.env]
+            TOKEN = "secret"
+        "#,
+        )
+        .unwrap();
+        let cleared = resolve_values(
+            args([
+                "opsx-build",
+                "configure",
+                "--no-local-only",
+                "--no-frontier-worker",
+                "--worker-model=default",
+                "--worker-environment=default",
+                "--worker-permission-profile=default",
+                "--worker-context-window=default",
+                "--worker-auto-compact-window=default",
+            ]),
+            config,
+            None,
+        )
+        .unwrap();
+        assert!(!cleared.local_only && !cleared.frontier_worker);
+        assert_eq!(cleared.worker_connection.model, None);
+        assert_eq!(cleared.worker_connection.context_window, None);
+        assert_eq!(cleared.worker_connection.auto_compact_window, None);
+        assert_eq!(cleared.worker_connection.permission_profile, None);
+        assert!(cleared.worker_connection.env.is_empty());
+    }
+
+    #[test]
+    fn snapshot_pins_absent_settings_and_rejects_invocation_actions() {
+        let original = resolve_values(
+            args(["opsx-build", "configure"]),
+            FileConfig::default(),
+            None,
+        )
+        .unwrap();
+        let snapshot = canonical_settings(&settings_snapshot(&original)).unwrap();
+        let changed: FileConfig = toml::from_str("claude_model = 'changed'\nauto_compact_window = '128k'\nlocal_only = true\nmax_provider_retries = 99\n").unwrap();
+        let argv = std::iter::once("opsx-build".to_owned()).chain(snapshot);
+        let frozen = resolve_values(args(argv), changed, None).unwrap();
+        assert_eq!(frozen.worker_connection.model, None);
+        assert_eq!(frozen.worker_connection.auto_compact_window, None);
+        assert_eq!(frozen.max_provider_retries, 10);
+        assert!(!frozen.local_only);
+        for forbidden in [
+            "--forget",
+            "--resume",
+            "--repo=/elsewhere",
+            "--config=secrets.toml",
+            "--dry-run",
+            "execute",
+            "--made-up=1",
+        ] {
+            assert!(
+                canonical_settings(&[forbidden.to_owned()]).is_err(),
+                "{forbidden}"
+            );
+        }
+        assert!(canonical_settings(&["--frontier-auto-compact-percent=101".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn markdown_precedence_modes_context_and_profile_switching() {
+        let base = env::temp_dir().join(format!("opsx-campaign-cli-{}", Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        let config = base.join("global.toml");
+        fs::write(
+            &config,
+            r#"
+            max_provider_retries = 3
+            [connections.alternative]
+            backend = "codex"
+            model = "alternative-model"
+        "#,
+        )
+        .unwrap();
+        let stored = serde_json::json!([
+            "--max-provider-retries=8",
+            "--no-loop",
+            "--max-iterations=default",
+            "--worker-backend=claude",
+            "--worker-model=saved-model",
+            "--context=context.md"
+        ]);
+        fs::write(base.join("opsx-build.md"), format!("Intent\n<!-- opsx-build:arguments -->\n```json\n{stored}\n```\n<!-- /opsx-build:arguments -->")).unwrap();
+        let load = |extra: &[&str]| {
+            let mut raw = vec![
+                OsString::from("opsx-build"),
+                OsString::from(format!("--repo={}", base.display())),
+                OsString::from(format!("--config={}", config.display())),
+            ];
+            raw.extend(extra.iter().map(OsString::from));
+            Cli::load_args(raw.clone(), args(raw))
+        };
+        let cli = load(&["--max-provider-retries=12", "--worker-model=override"]).unwrap();
+        assert_eq!(cli.max_provider_retries, 12);
+        assert_eq!(cli.worker_connection.model.as_deref(), Some("override"));
+        assert!(cli.bootstrap_context.is_none());
+        let execute = load(&["execute"]).unwrap();
+        assert!(execute.execute && execute.loop_workflow && !execute.no_loop);
+        assert_eq!(execute.bootstrap_context, Some(base.join("context.md")));
+        assert!(load(&["bootstrap"]).is_ok());
+        let global = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!("loop = true\nmax_iterations = 6\n{global}"),
+        )
+        .unwrap();
+        assert!(load(&["bootstrap"]).is_ok());
+        let resume = load(&["--resume"]).unwrap();
+        assert!(!resume.no_loop && !resume.loop_workflow);
+        assert_eq!(resume.max_iterations, None);
+        assert!(load(&["--resume", "--no-loop"]).unwrap().no_loop);
+        assert!(load(&["--interactive"]).is_ok());
+        let changed = load(&["--worker-connection=alternative"]).unwrap();
+        assert_eq!(changed.worker_connection.backend, BackendKind::Codex);
+        assert_eq!(
+            changed.worker_connection.model.as_deref(),
+            Some("alternative-model")
+        );
+        assert_eq!(
+            load(&["--no-campaign-config"])
+                .unwrap()
+                .max_provider_retries,
+            3
+        );
+        fs::write(
+            base.join("opsx-build.md"),
+            "prose with no valid arguments yet",
+        )
+        .unwrap();
+        assert!(load(&["configure"]).is_ok());
+        assert!(load(&[]).is_err());
+        assert!(load(&["--forget"]).is_ok());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
