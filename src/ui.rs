@@ -336,6 +336,7 @@ impl Ui for TerminalUi {
             StreamItem::Assistant(text) => ("claude", Style::new().cyan(), text),
             StreamItem::OpenCode(text) => ("opencode", Style::new().cyan(), text),
             StreamItem::Codex(text) => ("codex", Style::new().cyan(), text),
+            StreamItem::Reasoning(text) => ("thinking", Style::new().dim(), text),
             StreamItem::Subagent(text) => ("agent", Style::new().blue(), text),
             StreamItem::Tool(text) => ("tool", Style::new().yellow(), text),
             StreamItem::ToolResult(text) => ("result", Style::new().dim(), text),

@@ -589,7 +589,7 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     debug: bool,
 
-    /// Stream agent activity; optionally select activity, full, or raw filtering.
+    /// Stream agent activity; optionally select activity, reasoning, full, or raw filtering.
     #[arg(
         long,
         visible_alias = "stream-agent",
@@ -925,10 +925,11 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
         })?;
         config.stream_claude = Some(match value.as_str() {
             "activity" => StreamFilter::Activity,
+            "reasoning" => StreamFilter::Reasoning,
             "full" => StreamFilter::Full,
             "raw" => StreamFilter::Raw,
             _ => anyhow::bail!(
-                "invalid legacy environment variable OSPX_BUILD_STREAM_CLAUDE={value:?}; expected activity, full, or raw"
+                "invalid legacy environment variable OSPX_BUILD_STREAM_CLAUDE={value:?}; expected activity, reasoning, full, or raw"
             ),
         });
     }
@@ -1320,6 +1321,7 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
             "stream-agent",
             match cli.stream_claude.unwrap_or_default() {
                 StreamFilter::Activity => "activity",
+                StreamFilter::Reasoning => "reasoning",
                 StreamFilter::Full => "full",
                 StreamFilter::Raw => "raw",
             }
@@ -2881,6 +2883,27 @@ mod tests {
                 "build something"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn reasoning_stream_filter_survives_config_and_campaign_snapshots() {
+        let config: FileConfig = toml::from_str("stream_claude = 'reasoning'").unwrap();
+        assert_eq!(config.stream_claude, Some(StreamFilter::Reasoning));
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--no-config",
+            "--stream-agent=reasoning",
+            "advance",
+        ]))
+        .unwrap();
+        assert_eq!(cli.stream_claude, Some(StreamFilter::Reasoning));
+        let saved = settings_snapshot(&cli);
+        assert!(saved.contains(&"--stream-agent=reasoning".to_owned()));
+        assert!(
+            canonical_settings(&saved)
+                .unwrap()
+                .contains(&"--stream-claude=reasoning".to_owned())
         );
     }
 

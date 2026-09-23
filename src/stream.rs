@@ -19,8 +19,15 @@ pub enum StreamControl {
 pub enum StreamFilter {
     #[default]
     Activity,
+    Reasoning,
     Full,
     Raw,
+}
+
+impl StreamFilter {
+    pub(crate) fn includes_reasoning(self) -> bool {
+        matches!(self, Self::Reasoning | Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +35,7 @@ pub enum StreamItem {
     Assistant(String),
     OpenCode(String),
     Codex(String),
+    Reasoning(String),
     Subagent(String),
     Tool(String),
     ToolResult(String),

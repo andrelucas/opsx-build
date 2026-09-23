@@ -1519,14 +1519,35 @@ a pipe—opsx-build uses ordinary linear output and does not write cursor-contro
 sequences. If `--stream-claude` is enabled there, its selected filtered stream
 is emitted as linear text.
 
-`--stream-claude` filters are:
+`--stream-agent` (also named `--stream-claude`) filters are:
 
 - `activity` (used when the flag has no value): assistant/subagent text and
   concise tool calls;
-- `full`: activity plus tool results and lifecycle events;
-- `raw`: original Claude `stream-json` lines.
+- `reasoning`: activity plus readable Codex reasoning summaries, labelled
+  `thinking`;
+- `full`: activity, reasoning summaries, tool results, and lifecycle events;
+- `raw`: original backend events, without display filtering.
 
-Select one with `--stream-claude=full` or `--stream-claude=raw`.
+For activity with more context, use:
+
+```sh
+opsx-build --stream-agent=reasoning --resume
+```
+
+Reasoning summaries appear as complete paragraphs between tool calls. Each
+summary section is limited to 600 characters, with an ellipsis when truncated,
+in both the dashboard and linear output. Streamed summaries are not repeated
+when the completed reasoning item arrives. Codex shell commands appear when
+they start; failures remain visible on completion. `full` also shows command
+output on completion.
+
+The reasoning and full filters request Codex's automatic reasoning summaries
+without changing model or reasoning effort. Availability depends on the model
+and provider. If no summaries are supplied, or the backend is Claude/OpenCode,
+`reasoning` shows ordinary activity. This uses the readable summaries supplied
+by Codex, with no extra summarization call. The display does not show raw
+reasoning blocks. These modes can also be saved by `configure`, or set globally
+with `stream_claude = "reasoning"`.
 
 `--debug` displays resolved commands, session IDs, and complete prompts.
 `--verbose` displays captured subprocess stdout and stderr. These are transient

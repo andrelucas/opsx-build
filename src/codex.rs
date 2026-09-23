@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -463,11 +464,15 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                 self.permission_mode,
                 &self.additional_roots,
             )?,
+            self.stream_filter
+                .is_some_and(StreamFilter::includes_reasoning)
+                .then_some("auto"),
         )?;
         let started = Instant::now();
         let mut response = String::new();
         let mut context_report = None;
         let mut pending_control = None;
+        let mut stream = CodexStream::default();
         self.ui.start_stream(activity);
         loop {
             if timeout.is_some_and(|limit| started.elapsed() >= limit) {
@@ -491,6 +496,11 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                 }
                 if event.pointer("/params/threadId").and_then(Value::as_str)
                     == Some(session_id.as_str())
+                    && event
+                        .pointer("/params/turnId")
+                        .or_else(|| event.pointer("/params/turn/id"))
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id == turn_id)
                 {
                     if event.get("method").and_then(Value::as_str) == Some("error")
                         && event.pointer("/params/turnId").and_then(Value::as_str)
@@ -515,7 +525,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                         response = text.to_owned();
                     }
                     if let Some(filter) = self.stream_filter {
-                        for item in filter_codex_event(&event, filter) {
+                        for item in stream.filter_event(&event, filter) {
                             self.ui.stream_item(&item);
                         }
                     }
@@ -904,55 +914,205 @@ fn context_usage_report(event: &Value) -> Option<String> {
     ))
 }
 
-fn filter_codex_event(event: &Value, filter: StreamFilter) -> Vec<StreamItem> {
-    if filter == StreamFilter::Raw {
-        return vec![StreamItem::Raw(event.to_string())];
+const MAX_REASONING_SUMMARY_CHARS: usize = 600;
+
+#[derive(Default)]
+struct ReasoningSummary {
+    text: String,
+    emitted: usize,
+    truncated: bool,
+}
+
+impl ReasoningSummary {
+    fn append(&mut self, delta: &str) -> Vec<StreamItem> {
+        if self.truncated {
+            return Vec::new();
+        }
+        let remaining = MAX_REASONING_SUMMARY_CHARS.saturating_sub(self.text.chars().count());
+        self.text.extend(delta.chars().take(remaining));
+        if delta.chars().count() > remaining {
+            self.text.push('…');
+            self.truncated = true;
+        }
+        self.drain(self.truncated)
     }
-    let method = event
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("event");
-    match method {
-        "item/completed" => {
-            let Some(item) = event.pointer("/params/item") else {
-                return Vec::new();
+
+    fn complete(&mut self, text: &str) -> Vec<StreamItem> {
+        // Completed items repeat the deltas, but may include a missing final suffix.
+        let mut items = if text.starts_with(&self.text) {
+            self.append(&text[self.text.len()..])
+        } else {
+            Vec::new()
+        };
+        items.extend(self.drain(true));
+        items
+    }
+
+    fn drain(&mut self, complete: bool) -> Vec<StreamItem> {
+        let mut items = Vec::new();
+        loop {
+            let pending = &self.text[self.emitted..];
+            let (end, consumed) = match pending.find("\n\n") {
+                Some(end) => (end, end + 2),
+                None if complete && !pending.is_empty() => (pending.len(), pending.len()),
+                _ => break,
             };
-            match item.get("type").and_then(Value::as_str) {
-                Some("agentMessage") => item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(|text| vec![StreamItem::Codex(text.to_owned())])
-                    .unwrap_or_default(),
-                Some("commandExecution") => {
-                    let command = item
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("command");
-                    let mut items = vec![StreamItem::Tool(format!("Shell: {}", one_line(command)))];
-                    if filter == StreamFilter::Full
-                        && let Some(output) = item.get("aggregatedOutput").and_then(Value::as_str)
-                        && !output.trim().is_empty()
-                    {
-                        items.push(StreamItem::ToolResult(output.to_owned()));
-                    }
-                    items
-                }
-                Some("fileChange") => vec![StreamItem::Tool("Applied file changes".to_owned())],
-                Some(kind) if filter == StreamFilter::Full => {
-                    vec![StreamItem::Lifecycle(format!("Codex item: {kind}"))]
-                }
-                _ => Vec::new(),
+            let paragraph = pending[..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.emitted += consumed;
+            if !paragraph.is_empty() {
+                items.push(StreamItem::Reasoning(paragraph));
             }
         }
-        "thread/compacted" => vec![StreamItem::Lifecycle("Codex context compacted".to_owned())],
-        "turn/completed" if filter == StreamFilter::Full => {
-            let status = event
-                .pointer("/params/turn/status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            vec![StreamItem::Lifecycle(format!("Codex turn: {status}"))]
+        items
+    }
+}
+
+#[derive(Default)]
+struct CodexStream {
+    summaries: BTreeMap<(String, u64), ReasoningSummary>,
+    started_commands: HashSet<String>,
+}
+
+impl CodexStream {
+    fn finish_summaries(&mut self, item_id: Option<&str>) -> Vec<StreamItem> {
+        self.summaries
+            .iter_mut()
+            .filter(|((id, _), _)| item_id.is_none_or(|wanted| id == wanted))
+            .flat_map(|(_, summary)| summary.drain(true))
+            .collect()
+    }
+
+    fn filter_event(&mut self, event: &Value, filter: StreamFilter) -> Vec<StreamItem> {
+        if filter == StreamFilter::Raw {
+            return vec![StreamItem::Raw(event.to_string())];
         }
-        _ => Vec::new(),
+        let method = event
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("event");
+        let mut items = Vec::new();
+        if filter.includes_reasoning() {
+            match method {
+                "item/reasoning/summaryTextDelta" => {
+                    if let (Some(id), Some(index), Some(delta)) = (
+                        event.pointer("/params/itemId").and_then(Value::as_str),
+                        event
+                            .pointer("/params/summaryIndex")
+                            .and_then(Value::as_u64),
+                        event.pointer("/params/delta").and_then(Value::as_str),
+                    ) {
+                        return self
+                            .summaries
+                            .entry((id.to_owned(), index))
+                            .or_default()
+                            .append(delta);
+                    }
+                }
+                "item/reasoning/summaryPartAdded" => {
+                    if let Some(id) = event.pointer("/params/itemId").and_then(Value::as_str) {
+                        return self.finish_summaries(Some(id));
+                    }
+                }
+                "item/started" | "item/completed"
+                    if event.pointer("/params/item/type").and_then(Value::as_str)
+                        != Some("reasoning") =>
+                {
+                    items.extend(self.finish_summaries(None));
+                }
+                "turn/completed" => items.extend(self.finish_summaries(None)),
+                _ => {}
+            }
+        }
+        match method {
+            "item/started" | "item/completed" => {
+                let Some(item) = event.pointer("/params/item") else {
+                    return items;
+                };
+                let completed = method == "item/completed";
+                match item.get("type").and_then(Value::as_str) {
+                    Some("commandExecution") => {
+                        let id = item.get("id").and_then(Value::as_str);
+                        let already_started =
+                            id.is_some_and(|id| self.started_commands.contains(id));
+                        if !already_started {
+                            let command = item
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .unwrap_or("command");
+                            items.push(StreamItem::Tool(format!("Shell: {}", one_line(command))));
+                            if !completed && let Some(id) = id {
+                                self.started_commands.insert(id.to_owned());
+                            }
+                        }
+                        if completed {
+                            let exit = item.get("exitCode").and_then(Value::as_i64);
+                            let status = item.get("status").and_then(Value::as_str);
+                            if exit.is_some_and(|code| code != 0) {
+                                items.push(StreamItem::Tool(format!(
+                                    "Shell exited with code {}",
+                                    exit.unwrap()
+                                )));
+                            } else if matches!(status, Some("failed" | "declined" | "interrupted"))
+                            {
+                                items.push(StreamItem::Tool(format!("Shell {}", status.unwrap())));
+                            }
+                            if filter == StreamFilter::Full
+                                && let Some(output) =
+                                    item.get("aggregatedOutput").and_then(Value::as_str)
+                                && !output.trim().is_empty()
+                            {
+                                items.push(StreamItem::ToolResult(output.to_owned()));
+                            }
+                        }
+                    }
+                    Some("reasoning") if completed && filter.includes_reasoning() => {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                                for (index, text) in summary.iter().enumerate() {
+                                    if let Some(text) = text.as_str() {
+                                        items.extend(
+                                            self.summaries
+                                                .entry((id.to_owned(), index as u64))
+                                                .or_default()
+                                                .complete(text),
+                                        );
+                                    }
+                                }
+                            }
+                            items.extend(self.finish_summaries(Some(id)));
+                        }
+                    }
+                    Some("reasoning") => {}
+                    Some("agentMessage") if completed => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            items.push(StreamItem::Codex(text.to_owned()));
+                        }
+                    }
+                    Some("fileChange") if completed => {
+                        items.push(StreamItem::Tool("Applied file changes".to_owned()))
+                    }
+                    Some(kind) if completed && filter == StreamFilter::Full => {
+                        items.push(StreamItem::Lifecycle(format!("Codex item: {kind}")))
+                    }
+                    _ => {}
+                }
+            }
+            "thread/compacted" => {
+                items.push(StreamItem::Lifecycle("Codex context compacted".to_owned()))
+            }
+            "turn/completed" if filter == StreamFilter::Full => {
+                let status = event
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                items.push(StreamItem::Lifecycle(format!("Codex turn: {status}")));
+            }
+            _ => {}
+        }
+        items
     }
 }
 
@@ -1301,7 +1461,7 @@ mod tests {
             }
         });
 
-        let items = filter_codex_event(&event, StreamFilter::Activity);
+        let items = CodexStream::default().filter_event(&event, StreamFilter::Activity);
         let [StreamItem::Tool(summary)] = items.as_slice() else {
             panic!("expected one tool summary, got {items:?}");
         };
@@ -1310,6 +1470,151 @@ mod tests {
         assert_eq!(summary.chars().count(), "Shell: ".chars().count() + 240);
         assert!(!summary.contains('\n'));
         assert!(!summary.contains("full output remains hidden"));
+    }
+
+    #[test]
+    fn reasoning_stream_emits_paragraphs_once_and_finishes_partial_summaries() {
+        let mut stream = CodexStream::default();
+        let delta = |id: &str, index: u64, text: &str| {
+            json!({
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {"itemId": id, "summaryIndex": index, "delta": text}
+            })
+        };
+        let filter = StreamFilter::Reasoning;
+        assert!(
+            stream
+                .filter_event(&delta("r1", 0, "Checking retry"), filter)
+                .is_empty()
+        );
+        assert_eq!(
+            stream.filter_event(&delta("r1", 0, " reset.\n\nSuccess resets"), filter),
+            [StreamItem::Reasoning("Checking retry reset.".to_owned())]
+        );
+        let completed = json!({"method":"item/completed", "params":{"item":{
+            "id":"r1", "type":"reasoning",
+            "summary":["Checking retry reset.\n\nSuccess resets the counter.", "Adding coverage."],
+            "content":["Raw reasoning must not appear"]
+        }}});
+        assert_eq!(
+            stream.filter_event(&completed, filter),
+            [
+                StreamItem::Reasoning("Success resets the counter.".to_owned()),
+                StreamItem::Reasoning("Adding coverage.".to_owned()),
+            ]
+        );
+        assert!(stream.filter_event(&completed, filter).is_empty());
+
+        assert!(
+            stream
+                .filter_event(&delta("r2", 0, "Checking cancellation."), filter)
+                .is_empty()
+        );
+        assert_eq!(stream.filter_event(&json!({
+            "method":"item/reasoning/summaryPartAdded", "params":{"itemId":"r2", "summaryIndex":1}
+        }), filter), [StreamItem::Reasoning("Checking cancellation.".to_owned())]);
+        assert!(
+            stream
+                .filter_event(&delta("r2", 1, "Cancellation is separate."), filter)
+                .is_empty()
+        );
+        assert_eq!(
+            stream.filter_event(&json!({"method":"turn/completed"}), filter),
+            [StreamItem::Reasoning(
+                "Cancellation is separate.".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn reasoning_stream_is_opt_in_bounded_and_ignores_raw_reasoning() {
+        let event = json!({"method":"item/completed", "params":{"item":{
+            "id":"r1", "type":"reasoning", "summary":["Public summary."], "content":["Raw text"]
+        }}});
+        assert!(
+            CodexStream::default()
+                .filter_event(&event, StreamFilter::Activity)
+                .is_empty()
+        );
+        assert_eq!(
+            CodexStream::default().filter_event(&event, StreamFilter::Raw),
+            [StreamItem::Raw(event.to_string())]
+        );
+        for filter in [StreamFilter::Reasoning, StreamFilter::Full] {
+            let mut stream = CodexStream::default();
+            assert_eq!(
+                stream.filter_event(&event, filter),
+                [StreamItem::Reasoning("Public summary.".to_owned())]
+            );
+            assert!(stream.filter_event(&json!({
+                "method":"item/reasoning/textDelta", "params":{"itemId":"r1", "delta":"Raw text"}
+            }), filter).is_empty());
+            let long = "é".repeat(900);
+            let delta = json!({"method":"item/reasoning/summaryTextDelta", "params":{
+                "itemId":"long", "summaryIndex":0, "delta":long
+            }});
+            let items = stream.filter_event(&delta, filter);
+            assert_eq!(
+                items,
+                [StreamItem::Reasoning(format!(
+                    "{}…",
+                    "é".repeat(MAX_REASONING_SUMMARY_CHARS)
+                ))]
+            );
+            assert!(stream.filter_event(&delta, filter).is_empty());
+            assert!(
+                stream
+                    .filter_event(
+                        &json!({"method":"item/completed", "params":{"item":{
+                            "id":"long", "type":"reasoning", "summary":[long]
+                        }}}),
+                        filter
+                    )
+                    .is_empty()
+            );
+            assert!(
+                stream.summaries[&("long".to_owned(), 0)].text.len()
+                    <= MAX_REASONING_SUMMARY_CHARS * 4 + 3
+            );
+        }
+    }
+
+    #[test]
+    fn command_starts_follow_pending_context_without_duplicate_completion_chatter() {
+        for filter in [
+            StreamFilter::Activity,
+            StreamFilter::Reasoning,
+            StreamFilter::Full,
+        ] {
+            let mut stream = CodexStream::default();
+            stream.filter_event(
+                &json!({"method":"item/reasoning/summaryTextDelta", "params":{
+                    "itemId":"r1", "summaryIndex":0, "delta":"Running the integration checks."
+                }}),
+                filter,
+            );
+            let started = json!({"method":"item/started", "params":{"item":{
+                "type":"commandExecution", "id":"cmd1", "command":"cargo test"
+            }}});
+            let mut expected = Vec::new();
+            if filter.includes_reasoning() {
+                expected.push(StreamItem::Reasoning(
+                    "Running the integration checks.".to_owned(),
+                ));
+            }
+            expected.push(StreamItem::Tool("Shell: cargo test".to_owned()));
+            assert_eq!(stream.filter_event(&started, filter), expected);
+            assert!(stream.filter_event(&started, filter).is_empty());
+            let completed = json!({"method":"item/completed", "params":{"item":{
+                "type":"commandExecution", "id":"cmd1", "command":"cargo test", "exitCode":1,
+                "status":"completed", "aggregatedOutput":"a test failed"
+            }}});
+            let mut expected = vec![StreamItem::Tool("Shell exited with code 1".to_owned())];
+            if filter == StreamFilter::Full {
+                expected.push(StreamItem::ToolResult("a test failed".to_owned()));
+            }
+            assert_eq!(stream.filter_event(&completed, filter), expected);
+        }
     }
 
     #[test]

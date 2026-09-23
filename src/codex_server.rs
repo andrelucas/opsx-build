@@ -303,6 +303,7 @@ impl CodexServerClient {
         input: Value,
         output_schema: Option<Value>,
         sandbox_policy: Option<Value>,
+        reasoning_summary: Option<&str>,
     ) -> Result<String> {
         let mut params = json!({
             "threadId": thread_id,
@@ -313,6 +314,9 @@ impl CodexServerClient {
         }
         if let Some(sandbox_policy) = sandbox_policy {
             params["sandboxPolicy"] = sandbox_policy;
+        }
+        if let Some(summary) = reasoning_summary {
+            params["summary"] = json!(summary);
         }
         let response = self.request("turn/start", params, REQUEST_TIMEOUT)?;
         response
@@ -556,6 +560,57 @@ done
             environment: Vec::new(),
             unset_environment: Vec::new(),
             isolated_home: None,
+        }
+    }
+
+    #[test]
+    fn reasoning_summaries_are_requested_only_for_reasoning_and_full_streams() {
+        use crate::stream::StreamFilter;
+
+        for filter in [
+            None,
+            Some(StreamFilter::Activity),
+            Some(StreamFilter::Reasoning),
+            Some(StreamFilter::Full),
+            Some(StreamFilter::Raw),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-summary-request-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            let backend = CodexBackend::new(&directory, &launcher, "auto", filter, &QuietUi);
+            let error = backend
+                .invoke(
+                    SessionMode::New {
+                        id: SessionId::new("placeholder"),
+                        name: None,
+                    },
+                    "inspect retry handling",
+                    "Verify",
+                    StageProtocol::Verify,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("simulated turn failure"));
+            let requests = std::fs::read_to_string(directory.join("requests.jsonl")).unwrap();
+            let turn: Value = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|request| request["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(
+                turn["params"].get("summary"),
+                filter
+                    .filter(|filter| filter.includes_reasoning())
+                    .map(|_| json!("auto"))
+                    .as_ref()
+            );
+            assert_eq!(
+                turn["params"]["outputSchema"],
+                serde_json::from_str::<Value>(StageProtocol::Verify.json_schema()).unwrap()
+            );
+            assert!(turn["params"].get("effort").is_none());
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 

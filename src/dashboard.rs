@@ -378,6 +378,7 @@ impl StreamDashboard {
                 unreachable!("assistant messages returned above")
             }
             StreamItem::Subagent(text) => ("agent", Color::Blue, text),
+            StreamItem::Reasoning(text) => ("thinking", Color::DarkGrey, text),
             StreamItem::Tool(text) => ("tool", Color::Yellow, text),
             StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
             StreamItem::Lifecycle(text) => ("event", Color::Magenta, text),
@@ -1363,6 +1364,21 @@ mod tests {
         );
         assert_eq!(lines[CLAUDE_MESSAGE_HEAD_LINES + 1].text, "line 170");
         assert_eq!(lines.back().unwrap().text, "line 249");
+    }
+
+    #[test]
+    fn reasoning_summaries_have_a_distinct_thinking_label() {
+        let mut dashboard = dashboard();
+        dashboard.push(&StreamItem::Reasoning("Checking retry resets.".to_owned()));
+        let line = &dashboard.panels[0].lines[0];
+        assert_eq!(line.text, "Checking retry resets.");
+        assert_eq!(
+            line.source,
+            Some(SourceLabel {
+                text: "thinking".to_owned(),
+                color: Color::DarkGrey,
+            })
+        );
     }
 
     #[test]
