@@ -647,6 +647,101 @@ done
     }
 
     #[test]
+    fn model_turn_recovery_continues_same_thread_and_obeys_retry_budget() {
+        let model_turn_error = json!({
+            "error": {"code": 400, "metadata": {"raw":
+                "Requests ending with a model turn are not supported."}}
+        })
+        .to_string();
+        for (message, failures, retries, expected_turns, succeeds) in [
+            (model_turn_error.as_str(), 1, 1, 2, true),
+            (model_turn_error.as_str(), 2, 1, 2, false),
+            (model_turn_error.as_str(), 1, 0, 1, false),
+            ("Request contains an invalid argument.", 1, 2, 1, false),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-user-turn-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            launcher.structured_output = false;
+            let script = directory.join("server.sh");
+            let failure = json!({
+                "method": "turn/completed",
+                "params": {"threadId": "actual-thread", "turn": {
+                    "id": "turn-%s", "status": "failed", "error": {"message": message}
+                }}
+            })
+            .to_string()
+            .replace('\\', "\\\\");
+            let success = json!({
+                "method": "turn/completed",
+                "params": {"threadId": "actual-thread", "turn": {
+                    "id": "turn-%s", "status": "completed", "items": [{
+                        "type": "agentMessage",
+                        "text": "{\"opsx_status\":\"READY\",\"summary\":\"done\"}"
+                    }]
+                }}
+            })
+            .to_string()
+            .replace('\\', "\\\\");
+            let contents = std::fs::read_to_string(&script).unwrap().replace(
+                r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#,
+                &format!(
+                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$id"; if [ "$id" -le {} ]; then printf '{failure}\n' "$id"; else printf '{success}\n' "$id"; fi"#,
+                    failures + 2
+                ),
+            );
+            std::fs::write(script, contents).unwrap();
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi)
+                .with_retries(0, retries);
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new("placeholder"),
+                    name: None,
+                },
+                "complete the assigned change",
+                "Apply",
+                StageProtocol::Ready,
+            );
+            if succeeds {
+                let result = result.unwrap();
+                assert_eq!(result.session_id.as_deref(), Some("actual-thread"));
+                assert_eq!(result.signal, crate::backend::StageSignal::Ready);
+            } else {
+                assert!(result.unwrap_err().to_string().contains(message));
+            }
+            let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["method"] == "thread/start")
+                    .count(),
+                1
+            );
+            let turns: Vec<_> = requests
+                .iter()
+                .filter(|r| r["method"] == "turn/start")
+                .collect();
+            assert_eq!(turns.len(), expected_turns);
+            for turn in &turns {
+                assert_eq!(turn["params"]["threadId"], "actual-thread");
+            }
+            if let Some(recovery) = turns.get(1) {
+                let prompt = recovery["params"]["input"][0]["text"].as_str().unwrap();
+                assert!(prompt.contains("This user message supplies the required continuation"));
+                assert!(prompt.contains("Preserve correct partial work"));
+                assert!(prompt.contains(StageProtocol::Ready.json_schema()));
+            }
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn planning_session_is_resolved_before_a_failed_turn() {
         for (mode, resume_reply, expected_methods) in [
             (

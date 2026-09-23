@@ -1065,6 +1065,12 @@ requires a JSON `opsx_status` result or the existing `OPSX_STATUS` terminal
 marker; prose without a status is rejected. This setting applies to campaign
 stages and both connection-test modes, and is supported only by Codex.
 
+If a provider rejects an internal continuation with "Requests ending with a
+model turn are not supported", opsx-build sends a user continuation in the
+same Codex thread. Existing work and session history are retained. This exact
+error shares the `max_provider_retries` budget with transient provider
+failures; unrelated invalid-request errors are not retried by this recovery.
+
 Unattended Codex runs use `~/.codex/opsx-build` as their default `CODEX_HOME`.
 Their sessions, SQLite databases, logs, and history stay there, keeping campaign
 stages out of Codex Desktop's Recents. opsx-build reports this directory when

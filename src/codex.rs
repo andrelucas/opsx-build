@@ -314,6 +314,7 @@ struct CodexTurnError {
     message: String,
     transient: bool,
     output_limit: bool,
+    requires_user_turn: bool,
 }
 
 impl fmt::Display for CodexTurnError {
@@ -717,6 +718,26 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                 Err(error)
                     if error
                         .downcast_ref::<CodexTurnError>()
+                        .is_some_and(|error| error.requires_user_turn)
+                        && provider_retries < self.max_provider_retries =>
+                {
+                    provider_retries += 1;
+                    self.ui.warn(&format!(
+                        "Codex provider requires a user turn; continuing the same thread ({provider_retries}/{})",
+                        self.max_provider_retries
+                    ));
+                    current_prompt = continuation_prompt(
+                        protocol,
+                        "The provider rejected a request ending with an assistant message. This user message supplies the required continuation.",
+                    );
+                    current_activity = format!(
+                        "{activity} (provider recovery {provider_retries}/{})",
+                        self.max_provider_retries
+                    );
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<CodexTurnError>()
                         .is_some_and(|error| error.transient)
                         && provider_retries < self.max_provider_retries =>
                 {
@@ -937,6 +958,8 @@ fn continuation_prompt(protocol: StageProtocol, reason: &str) -> String {
 
 fn classify_turn_error(message: String) -> CodexTurnError {
     let lowercase = message.to_ascii_lowercase();
+    let requires_user_turn =
+        lowercase.contains("requests ending with a model turn are not supported");
     let output_limit = [
         "max_output_tokens",
         "max output tokens",
@@ -966,6 +989,7 @@ fn classify_turn_error(message: String) -> CodexTurnError {
         message: format!("Codex turn failed: {message}"),
         transient,
         output_limit,
+        requires_user_turn,
     }
 }
 
