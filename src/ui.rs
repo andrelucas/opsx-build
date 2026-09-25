@@ -14,6 +14,7 @@ use crate::{
     },
     stream::{StreamControl, StreamItem},
     stream_style::{self, TextFormat},
+    terminal_progress::{self, TerminalProgress},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,8 @@ pub struct TerminalUi {
     interactive: bool,
     dashboard_enabled: bool,
     state: Mutex<TerminalState>,
+    // Drop after the dashboard has restored the terminal screen.
+    _terminal_progress: TerminalProgress<std::io::Stderr>,
 }
 
 #[derive(Default)]
@@ -85,6 +88,13 @@ struct TerminalState {
 impl TerminalUi {
     pub fn new(verbose: bool, debug: bool, workflow_dashboard: bool) -> Self {
         let stderr_terminal = std::io::stderr().is_terminal();
+        let progress_enabled = workflow_dashboard
+            && terminal_progress::supported(
+                stderr_terminal,
+                std::env::var("TERM_PROGRAM").ok().as_deref(),
+                std::env::var("TERM_PROGRAM_VERSION").ok().as_deref(),
+                std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some(),
+            );
         Self {
             verbose,
             debug,
@@ -93,6 +103,7 @@ impl TerminalUi {
                 && stderr_terminal
                 && std::io::stdin().is_terminal(),
             state: Mutex::new(TerminalState::default()),
+            _terminal_progress: TerminalProgress::new(std::io::stderr(), progress_enabled),
         }
     }
 

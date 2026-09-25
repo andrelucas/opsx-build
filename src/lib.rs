@@ -21,4 +21,5 @@ pub mod skills;
 pub mod state;
 pub mod stream;
 mod stream_style;
+mod terminal_progress;
 pub mod ui;

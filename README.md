@@ -1483,6 +1483,13 @@ summary row for every completed change. The active iteration continues to use
 the existing phase disclosures; starting the next iteration clears the old
 phase chatter while preserving its summary.
 
+On iTerm2 3.6.6 or later, workflow runs also show the terminal's animated busy
+indicator. It remains active across stages and automatic retries, then clears
+when the runner exits, including dashboard pause, interruption, and error exits.
+This is enabled automatically for a terminal stderr with `TERM_PROGRAM=iTerm.app`
+and a supported `TERM_PROGRAM_VERSION`, outside tmux/screen. Redirected stderr,
+interactive agent sessions, and `configure` do not enable it.
+
 Controls:
 
 - `p`, followed by `y`, immediately stops the active agent turn and exits
