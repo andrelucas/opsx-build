@@ -732,10 +732,14 @@ are not required to configure a new directory.
 The conversation receives the current CLI options, effective defaults,
 available connection profiles (without credential values), and any existing
 campaign configuration. It discusses your intent and surfaces defaults for
-acceptance or adjustment. Once you agree, exit Claude with `/exit` to let
-opsx-build validate and save the result. Cancellation, a failed Claude session,
-or invalid settings leave the previous configuration untouched; failed
-validation retains the proposal and reports its path.
+acceptance or adjustment. Claude writes your agreed intent, notes and settings
+into a temporary configuration proposal. Once that proposal is ready, exit
+Claude with `/exit`: **opsx-build reads the proposal, validates the settings,
+and creates or updates `opsx-build.md` in the campaign directory.** This is why
+Claude is instructed to write the proposal and leave the final file to
+opsx-build. Cancellation, a failed Claude session, or invalid settings leave
+the previous configuration untouched; failed validation retains the proposal
+and reports its path.
 
 The result is **`opsx-build.md`**, a visible file in the campaign base directory
 (the Git root, or the requested directory when Git has not been initialized).
