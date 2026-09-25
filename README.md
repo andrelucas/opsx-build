@@ -1550,6 +1550,12 @@ is emitted as linear text.
 - `full`: activity, reasoning summaries, tool results, and lifecycle events;
 - `raw`: original backend events, without display filtering.
 
+In terminal output, agent text and reasoning summaries render basic Markdown:
+bold, emphasis, inline code, and simple headings. Lists and other syntax retain
+their source layout. Tool summaries emphasize the tool name and colour the literal
+command or path; shell globs, underscores, and backticks are preserved. Raw
+events, tool results, and redirected output retain their original text.
+
 For activity with more context, use:
 
 ```sh

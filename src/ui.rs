@@ -13,6 +13,7 @@ use crate::{
         CampaignDashboardView, CampaignIterationDashboardView, StageView, StreamDashboard,
     },
     stream::{StreamControl, StreamItem},
+    stream_style::{self, TextFormat},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +345,11 @@ impl Ui for TerminalUi {
             StreamItem::Raw(text) => ("json", Style::new().dim(), text),
         };
         let label = style.bold().apply_to(label);
+        let text = stream_style::render(
+            text,
+            TextFormat::for_item(item),
+            self.interactive && console::colors_enabled_stderr(),
+        );
         for (index, line) in text.lines().enumerate() {
             if index == 0 {
                 self.write_line(&format!("  {label} {line}"));

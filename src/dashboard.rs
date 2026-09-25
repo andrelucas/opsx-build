@@ -16,7 +16,10 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::stream::{StreamControl, StreamItem};
+use crate::{
+    stream::{StreamControl, StreamItem},
+    stream_style::{self, TextFormat},
+};
 
 const MAX_DISPLAY_LINES: usize = 20_000;
 const MAX_CLAUDE_MESSAGE_LINES: usize = 200;
@@ -344,9 +347,25 @@ impl StreamDashboard {
     }
 
     pub(crate) fn push_message(&mut self, label: &str, color: Color, text: &str) {
+        self.push_formatted_message(label, color, text, TextFormat::Plain);
+    }
+
+    fn push_formatted_message(
+        &mut self,
+        label: &str,
+        color: Color,
+        text: &str,
+        format: TextFormat,
+    ) {
+        let text = text
+            .split('\n')
+            .map(sanitize)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = stream_style::render(&text, format, true);
         for (index, line) in text.lines().enumerate() {
             self.push_line(DisplayLine {
-                text: sanitize(line),
+                text: line.to_owned(),
                 color: Color::White,
                 source: Some(SourceLabel {
                     text: if index == 0 {
@@ -384,13 +403,13 @@ impl StreamDashboard {
             StreamItem::Lifecycle(text) => ("event", Color::Magenta, text),
             StreamItem::Raw(text) => ("json", Color::DarkGrey, text),
         };
-        self.push_message(label, color, text);
+        self.push_formatted_message(label, color, text, TextFormat::for_item(item));
     }
 
     fn push_agent_message(&mut self, label: &str, display_name: &str, text: &str) {
         let lines = text.lines().collect::<Vec<_>>();
         if lines.len() <= MAX_CLAUDE_MESSAGE_LINES {
-            self.push_message(label, Color::Cyan, text);
+            self.push_formatted_message(label, Color::Cyan, text, TextFormat::Markdown);
             return;
         }
 
@@ -399,7 +418,12 @@ impl StreamDashboard {
         let marker = format!("… {omitted} lines omitted from this {display_name} message …");
         displayed.push(&marker);
         displayed.extend_from_slice(&lines[lines.len() - CLAUDE_MESSAGE_TAIL_LINES..]);
-        self.push_message(label, Color::Cyan, &displayed.join("\n"));
+        self.push_formatted_message(
+            label,
+            Color::Cyan,
+            &displayed.join("\n"),
+            TextFormat::Markdown,
+        );
     }
 
     fn push_line(&mut self, line: DisplayLine) {
@@ -1139,7 +1163,11 @@ fn draw_render_row<W: Write>(
     let prefix = format!("{label:>SOURCE_LABEL_WIDTH$} ");
     let prefix = truncate_str(&prefix, width as usize, "…");
     let message_width = usize::from(width).saturating_sub(SOURCE_LABEL_WIDTH + 1);
-    let message = truncate_str(&line.text, message_width, "…");
+    let message = if message_width == 0 {
+        "".into()
+    } else {
+        truncate_str(&line.text, message_width, "…")
+    };
     queue!(
         output,
         MoveTo(0, row),
@@ -1150,6 +1178,7 @@ fn draw_render_row<W: Write>(
         SetAttribute(Attribute::Reset),
         SetForegroundColor(line.color),
         Print(message),
+        SetAttribute(Attribute::Reset),
         ResetColor
     )?;
     Ok(())
@@ -1379,6 +1408,42 @@ mod tests {
                 color: Color::DarkGrey,
             })
         );
+    }
+
+    #[test]
+    fn markdown_and_tool_styling_survive_dashboard_width_limits() {
+        let mut dashboard = dashboard();
+        dashboard.push(&StreamItem::Reasoning("**Checking** `cargo test`".into()));
+        dashboard.push(&StreamItem::Tool("Shell: rg '**/*.rs' src/my_file".into()));
+        let lines = dashboard.render_lines_at(Instant::now());
+        let messages = lines
+            .iter()
+            .filter(|line| line.source.is_some())
+            .collect::<Vec<_>>();
+        for width in [1, 8, 9, 16, 25, 80] {
+            for line in &messages {
+                let mut output = Vec::new();
+                draw_render_row(&mut output, 0, width, line).unwrap();
+                let rendered = String::from_utf8(output).unwrap();
+                assert!(
+                    console::measure_text_width(&rendered) <= usize::from(width),
+                    "width {width}: {rendered:?}"
+                );
+                assert!(rendered.ends_with(&format!(
+                    "{}{}",
+                    SetAttribute(Attribute::Reset),
+                    ResetColor
+                )));
+                if width == 80 {
+                    let visible = console::strip_ansi_codes(&rendered);
+                    match line.source.as_ref().unwrap().text.as_str() {
+                        "thinking" => assert_eq!(visible, "thinking Checking cargo test"),
+                        "tool" => assert_eq!(visible, "    tool Shell: rg '**/*.rs' src/my_file"),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

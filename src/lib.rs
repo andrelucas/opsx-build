@@ -20,4 +20,5 @@ pub mod sidecar;
 pub mod skills;
 pub mod state;
 pub mod stream;
+mod stream_style;
 pub mod ui;

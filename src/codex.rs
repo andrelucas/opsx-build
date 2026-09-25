@@ -1473,6 +1473,31 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_markdown_is_assembled_before_terminal_styling() {
+        let mut stream = CodexStream::default();
+        let mut items = Vec::new();
+        for chunk in ["**Check", "ing** `car", "go test`", "\n\n"] {
+            let emitted = stream.filter_event(
+                &json!({"method":"item/reasoning/summaryTextDelta", "params":{
+                    "itemId":"r1", "summaryIndex":0, "delta":chunk
+                }}),
+                StreamFilter::Reasoning,
+            );
+            if chunk != "\n\n" {
+                assert!(emitted.is_empty());
+            }
+            items.extend(emitted);
+        }
+        let [StreamItem::Reasoning(text)] = items.as_slice() else {
+            panic!("expected one complete summary: {items:?}");
+        };
+        assert_eq!(text, "**Checking** `cargo test`");
+        let rendered =
+            crate::stream_style::render(text, crate::stream_style::TextFormat::Markdown, true);
+        assert_eq!(console::strip_ansi_codes(&rendered), "Checking cargo test");
+    }
+
+    #[test]
     fn reasoning_stream_emits_paragraphs_once_and_finishes_partial_summaries() {
         let mut stream = CodexStream::default();
         let delta = |id: &str, index: u64, text: &str| {
