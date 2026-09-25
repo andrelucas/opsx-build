@@ -259,6 +259,31 @@ impl CodexServerClient {
             return Ok(());
         }
         let mut params = launcher.thread_params(repo, permission_mode, additional_roots)?;
+        // A resumed thread otherwise keeps its last model even when the selected
+        // connection now uses a different provider or the harness default.
+        let effective = self.request(
+            "config/read",
+            json!({"cwd": repo, "includeLayers": false}),
+            REQUEST_TIMEOUT,
+        )?;
+        let config = effective
+            .get("config")
+            .context("Codex config/read omitted config")?;
+        if launcher.model.is_none() {
+            params["model"] = match config.get("model").and_then(Value::as_str) {
+                Some(model) => json!(model),
+                None => json!(self.default_model()?),
+            };
+        }
+        if let Some(provider) = config.get("model_provider").and_then(Value::as_str) {
+            params["modelProvider"] = json!(provider);
+        }
+        if let Some(effort) = config.get("model_reasoning_effort").and_then(Value::as_str) {
+            if params.get("config").is_none() {
+                params["config"] = json!({});
+            }
+            params["config"]["model_reasoning_effort"] = json!(effort);
+        }
         params["threadId"] = json!(thread_id);
         params["excludeTurns"] = json!(true);
         if let Err(error) = self.request("thread/resume", params.clone(), REQUEST_TIMEOUT) {
@@ -286,6 +311,30 @@ impl CodexServerClient {
             }
         }
         self.remember_thread(thread_id)
+    }
+
+    fn default_model(&self) -> Result<String> {
+        let mut params = json!({"limit": 100});
+        loop {
+            let response = self.request("model/list", params.clone(), REQUEST_TIMEOUT)?;
+            let models = response
+                .get("data")
+                .and_then(Value::as_array)
+                .context("Codex model/list omitted data")?;
+            if let Some(model) = models.iter().find(|model| model["isDefault"] == true) {
+                return model
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .context("Codex default model omitted its model id");
+            }
+            let Some(cursor) = response.get("nextCursor").and_then(Value::as_str) else {
+                bail!(
+                    "Codex did not identify a default model; set model explicitly on the connection"
+                );
+            };
+            params["cursor"] = json!(cursor);
+        }
     }
 
     pub(crate) fn rename_thread(&self, thread_id: &str, name: &str) -> Result<()> {
@@ -534,6 +583,8 @@ while IFS= read -r request; do
   id=$((id + 1))
   case "$request" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"config/read"'*) printf '{"id":%s,"result":{"config":{"model":null,"model_provider":"openai","model_reasoning_effort":"medium"}}}\n' "$id" ;;
+    *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[{"model":"test-default","isDefault":true}],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/resume"'*) printf '{"id":%s,__RESUME_REPLY__}\n' "$id" ;;
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"actual-thread"}}}\n' "$id" ;;
     *'"method":"thread/name/set"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
@@ -950,7 +1001,14 @@ done
                     id: SessionId::new("actual-thread"),
                 },
                 r#""result":{"thread":{"id":"actual-thread"}}"#,
-                vec!["initialize", "initialized", "thread/resume", "turn/start"],
+                vec![
+                    "initialize",
+                    "initialized",
+                    "config/read",
+                    "model/list",
+                    "thread/resume",
+                    "turn/start",
+                ],
             ),
             (
                 SessionMode::Resume {
@@ -960,6 +1018,8 @@ done
                 vec![
                     "initialize",
                     "initialized",
+                    "config/read",
+                    "model/list",
                     "thread/resume",
                     "thread/start",
                     "thread/name/set",
@@ -1022,6 +1082,79 @@ done
     }
 
     #[test]
+    fn resume_applies_current_connection_defaults_without_replacing_the_session() {
+        for (explicit, configured, provider, effort, expected_model) in [
+            (None, None, "openai", "medium", "new-default"),
+            (None, None, "openai", "max", "new-default"),
+            (
+                None,
+                Some("configured-model"),
+                "custom",
+                "high",
+                "configured-model",
+            ),
+            (
+                Some("explicit-model"),
+                Some("old-model"),
+                "openai",
+                "max",
+                "explicit-model",
+            ),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-resume-defaults-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut launcher = planning_test_launcher(
+                &directory,
+                r#""result":{"thread":{"id":"existing-thread"}}"#,
+            );
+            launcher.model = explicit.map(str::to_owned);
+            let path = directory.join("server.sh");
+            let config = json!({"model": configured, "model_provider": provider, "model_reasoning_effort": effort});
+            let script = std::fs::read_to_string(&path).unwrap()
+                .replace(r#"{"model":null,"model_provider":"openai","model_reasoning_effort":"medium"}"#, &config.to_string())
+                .replace(r#"[{"model":"test-default","isDefault":true}]"#, r#"[{"model":"first-is-not-default","isDefault":false},{"model":"new-default","isDefault":true}]"#);
+            std::fs::write(path, script).unwrap();
+            let client = CodexServerClient::start(&launcher, &directory, &QuietUi).unwrap();
+            for _ in 0..2 {
+                client
+                    .ensure_thread(&launcher, &directory, "auto", "existing-thread", &[])
+                    .unwrap();
+            }
+            let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let resumes: Vec<_> = requests
+                .iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .collect();
+            assert_eq!(resumes.len(), 1);
+            let params = &resumes[0]["params"];
+            assert_eq!(params["threadId"], "existing-thread");
+            assert_eq!(params["model"], expected_model);
+            assert_eq!(params["modelProvider"], provider);
+            assert_eq!(params["config"]["model_reasoning_effort"], effort);
+            assert_eq!(params["config"]["default_permissions"], "build-permissions");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["method"] == "model/list")
+                    .count(),
+                usize::from(explicit.is_none() && configured.is_none())
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| matches!(r["method"].as_str(), Some("thread/start" | "turn/start")))
+            );
+            drop(client);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn planning_resume_does_not_replace_threads_for_other_errors() {
         for (code, message) in [
             (-32600, "invalid permission profile"),
@@ -1079,6 +1212,7 @@ while IFS= read -r request; do
   id=$((id + 1))
   case "$request" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"config/read"'*) printf '{"id":%s,"result":{"config":{"model":"test-default","model_provider":"openai"}}}\n' "$id" ;;
     *'"method":"thread/resume"'*'"path":'*) printf '{"id":%s,"result":{"thread":{"id":"__THREAD_ID__"}}}\n' "$id" ;;
     *'"method":"thread/resume"'*) printf '{"id":%s,"error":{"code":-32600,"message":"no rollout found for thread id __THREAD_ID__"}}\n' "$id" ;;
     *) exit 1 ;;
@@ -1101,17 +1235,18 @@ done
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2]["method"], "thread/resume");
-        assert!(requests[2]["params"].get("path").is_none());
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[2]["method"], "config/read");
+        assert_eq!(requests[3]["method"], "thread/resume");
+        assert!(requests[3]["params"].get("path").is_none());
         let imported = source
             .join("opsx-build/sessions/2026/09/22")
             .join(&filename);
         assert_eq!(
-            requests[3]["params"]["path"],
+            requests[4]["params"]["path"],
             imported.display().to_string()
         );
-        assert_eq!(requests[3]["params"]["threadId"], thread_id);
+        assert_eq!(requests[4]["params"]["threadId"], thread_id);
         assert_eq!(
             std::fs::read_to_string(imported).unwrap(),
             "legacy planning history"

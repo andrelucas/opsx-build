@@ -1178,7 +1178,29 @@ in the ordinary workflow checkpoint.
 The selected connection's environment and command prefix are applied to App
 Server. Authentication is Codex's own: a plain `command = "codex"` reuses the
 installed CLI's file-based login and configuration. `model` is optional and
-overrides the thread model when present. `auto_compact_window`, or `context_window` combined
+overrides the thread model when present. On resume, opsx-build reapplies the
+current connection's effective model, provider, and configured reasoning effort
+instead of inheriting a previous session's model. If no model is configured,
+it asks Codex's model catalog for the current default; no model name is pinned.
+The saved thread and conversation history are retained.
+
+For OpenAI connections with different reasoning levels, use:
+
+```toml
+[connections.codex-worker]
+backend = "codex"
+command = "codex -c model_provider=openai -c model_reasoning_effort=medium"
+
+[connections.codex-frontier]
+backend = "codex"
+command = "codex -c model_provider=openai -c model_reasoning_effort=max"
+```
+
+These commands still inherit a `model` selection from Codex's own configuration.
+To follow OpenAI's default model, remove any stale third-party `model` selection
+from that configuration. Connection names are labels, not built-in model presets.
+
+`auto_compact_window`, or `context_window` combined
 with `auto_compact_percent`, is translated to Codex's
 `model_auto_compact_token_limit`. Codex controls the model's output-token
 limit, so `max_output_tokens` is retained in the shared profile but is not sent
