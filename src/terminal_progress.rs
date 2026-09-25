@@ -3,7 +3,7 @@ use std::io::Write;
 const BUSY: &[u8] = b"\x1b]9;4;3\x07";
 const CLEAR: &[u8] = b"\x1b]9;4;0\x07";
 
-/// iTerm2 owns the animation; this guard owns its lifetime across stages/retries.
+/// The terminal owns the animation; this guard owns its lifetime across stages/retries.
 pub(crate) struct TerminalProgress<W: Write> {
     output: W,
     enabled: bool,
@@ -37,9 +37,13 @@ pub(crate) fn supported(
     terminal: bool,
     program: Option<&str>,
     version: Option<&str>,
-    multiplexed: bool,
+    in_tmux: bool,
+    in_screen: bool,
 ) -> bool {
-    if !terminal || program != Some("iTerm.app") || multiplexed {
+    // tmux 3.7+ tracks progress per pane and forwards it to capable clients.
+    // Let it handle routing; passthrough would bypass its pane bookkeeping.
+    let expected_program = if in_tmux { "tmux" } else { "iTerm.app" };
+    if !terminal || program != Some(expected_program) || in_screen {
         return false;
     }
     let Some(version) = version else {
@@ -47,13 +51,14 @@ pub(crate) fn supported(
     };
     let mut parts = version.split(|character: char| !character.is_ascii_digit());
     let mut numbers = [0_u32; 3];
-    for number in &mut numbers {
+    let components = if in_tmux { 2 } else { 3 };
+    for number in &mut numbers[..components] {
         let Some(value) = parts.next().and_then(|part| part.parse().ok()) else {
             return false;
         };
         *number = value;
     }
-    numbers >= [3, 6, 6]
+    numbers >= if in_tmux { [3, 7, 0] } else { [3, 6, 6] }
 }
 
 #[cfg(test)]
@@ -65,16 +70,53 @@ mod tests {
     #[test]
     fn requires_a_direct_supported_iterm_terminal() {
         for version in ["3.6.6", "3.7.0beta1", "3.7.2", "3.10.0", "4.0.0"] {
-            assert!(supported(true, Some("iTerm.app"), Some(version), false));
+            assert!(supported(
+                true,
+                Some("iTerm.app"),
+                Some(version),
+                false,
+                false
+            ));
         }
         for version in [None, Some(""), Some("3.6.5"), Some("3.7"), Some("unknown")] {
-            assert!(!supported(true, Some("iTerm.app"), version, false));
+            assert!(!supported(true, Some("iTerm.app"), version, false, false));
         }
         for program in [None, Some("Apple_Terminal"), Some("ghostty"), Some("tmux")] {
-            assert!(!supported(true, program, Some("3.7.2"), false));
+            assert!(!supported(true, program, Some("3.7.2"), false, false));
         }
-        assert!(!supported(false, Some("iTerm.app"), Some("3.7.2"), false));
-        assert!(!supported(true, Some("iTerm.app"), Some("3.7.2"), true));
+        assert!(!supported(
+            false,
+            Some("iTerm.app"),
+            Some("3.7.2"),
+            false,
+            false
+        ));
+        assert!(!supported(
+            true,
+            Some("iTerm.app"),
+            Some("3.7.2"),
+            true,
+            false
+        ));
+        assert!(!supported(
+            true,
+            Some("iTerm.app"),
+            Some("3.7.2"),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn tmux_uses_its_own_version_and_native_progress_support() {
+        for version in ["3.7", "3.7c", "3.8", "4.0"] {
+            assert!(supported(true, Some("tmux"), Some(version), true, false));
+        }
+        for version in [None, Some("3.6b"), Some("3"), Some("next-3.7")] {
+            assert!(!supported(true, Some("tmux"), version, true, false));
+        }
+        assert!(!supported(false, Some("tmux"), Some("3.7c"), true, false));
+        assert!(!supported(true, Some("tmux"), Some("3.7c"), true, true));
     }
 
     #[test]

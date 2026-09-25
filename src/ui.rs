@@ -93,7 +93,8 @@ impl TerminalUi {
                 stderr_terminal,
                 std::env::var("TERM_PROGRAM").ok().as_deref(),
                 std::env::var("TERM_PROGRAM_VERSION").ok().as_deref(),
-                std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some(),
+                std::env::var_os("TMUX").is_some(),
+                std::env::var_os("STY").is_some(),
             );
         Self {
             verbose,

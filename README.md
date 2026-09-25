@@ -1487,8 +1487,11 @@ On iTerm2 3.6.6 or later, workflow runs also show the terminal's animated busy
 indicator. It remains active across stages and automatic retries, then clears
 when the runner exits, including dashboard pause, interruption, and error exits.
 This is enabled automatically for a terminal stderr with `TERM_PROGRAM=iTerm.app`
-and a supported `TERM_PROGRAM_VERSION`, outside tmux/screen. Redirected stderr,
-interactive agent sessions, and `configure` do not enable it.
+and a supported `TERM_PROGRAM_VERSION`. Inside tmux 3.7 or later, opsx-build uses
+tmux's native progress support instead: tmux forwards the active pane's status
+to compatible attached terminals. No `allow-passthrough` setting is needed.
+Older tmux versions, screen, redirected stderr, interactive agent sessions, and
+`configure` do not enable it.
 
 Controls:
 
