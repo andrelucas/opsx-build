@@ -27,6 +27,7 @@ use crate::{
     },
     stream::{StreamFilter, context_report_items, filter_line},
     ui::Ui,
+    usage::{Attempt, Identity},
 };
 
 const AUTO_COMPACT_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
@@ -867,6 +868,8 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         let mut output_recoveries = 0;
         let mut incomplete_stage_recoveries = 0;
         let mut provider_retries = 0;
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut attempt_number = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -877,13 +880,38 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
             });
+            attempt_number += 1;
+            let mut usage = Attempt::new(
+                self.ui,
+                self.repo,
+                Identity {
+                    backend: "claude",
+                    connection: self.launcher.connection_name.as_deref(),
+                    model: self.launcher.model.as_deref(),
+                    session: current_session.id().as_str(),
+                    invocation: &invocation,
+                    attempt: attempt_number,
+                    fresh: matches!(current_session, SessionMode::New { .. }),
+                },
+                &current_activity,
+            );
             let attempt = self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 protocol,
                 remaining,
+                &mut usage,
             );
+            let outcome = match &attempt {
+                Ok(ClaudeAttempt::Complete(result)) => {
+                    format!("{:?}", result.signal).to_lowercase()
+                }
+                Ok(ClaudeAttempt::OutputLimit) => "output_limit".to_owned(),
+                Err(error) if is_transient_api_error(error) => "provider_error".to_owned(),
+                Err(error) => crate::usage::error_outcome(error).to_owned(),
+            };
+            usage.finish(&outcome);
             match attempt {
                 Err(error)
                     if is_transient_api_error(&error)
@@ -972,6 +1000,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         activity: &str,
         protocol: StageProtocol,
         timeout: Option<Duration>,
+        usage: &mut Attempt<'_, U>,
     ) -> Result<ClaudeAttempt> {
         self.ui
             .debug(&format!("Claude session: {}", session_description(session)));
@@ -1005,7 +1034,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 spec
             };
             let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
-                self.run_stage_command(&spec, activity, timeout)?
+                self.run_stage_command(&spec, activity, timeout, usage)?
             } else {
                 self.runner.run(
                     &spec,
@@ -1016,6 +1045,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                     },
                 )?
             };
+            usage.output(&output.stdout);
             first_attempt = false;
 
             if output.success {
@@ -1070,9 +1100,11 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         spec: &CommandSpec,
         activity: &str,
         timeout: Option<Duration>,
+        usage: &mut Attempt<'_, U>,
     ) -> Result<ProcessOutput> {
         self.runner
             .run_streaming_with_timeout(spec, activity, timeout, |line| {
+                usage.line(line);
                 if let Some(filter) = self.stream_filter {
                     for item in filter_line(line, filter) {
                         self.ui.stream_item(&item);
@@ -1111,7 +1143,24 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         } else {
             spec
         };
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut usage = Attempt::new(
+            self.ui,
+            self.repo,
+            Identity {
+                backend: "claude",
+                connection: self.launcher.connection_name.as_deref(),
+                model: self.launcher.model.as_deref(),
+                session: session_id.as_str(),
+                invocation: &invocation,
+                attempt: 1,
+                fresh: false,
+            },
+            "Naming Claude session",
+        );
         let output = self.runner.run(&spec, "Naming Claude session")?;
+        usage.output(&output.stdout);
+        usage.finish(if output.success { "completed" } else { "error" });
         if !output.success {
             bail!("session rename failed: {}", diagnostic_text(&output));
         }
@@ -1143,11 +1192,34 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         } else {
             spec
         };
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut usage = Attempt::new(
+            self.ui,
+            self.repo,
+            Identity {
+                backend: "claude",
+                connection: self.launcher.connection_name.as_deref(),
+                model: self.launcher.model.as_deref(),
+                session: session_id.as_str(),
+                invocation: &invocation,
+                attempt: 1,
+                fresh: false,
+            },
+            &activity,
+        );
         let result = if self.stream_transport {
-            self.run_stage_command(&spec, &activity, None)
+            self.run_stage_command(&spec, &activity, None, &mut usage)
         } else {
             self.runner.run(&spec, &activity)
         };
+        if let Ok(output) = &result {
+            usage.output(&output.stdout);
+        }
+        usage.finish(if result.as_ref().is_ok_and(|output| output.success) {
+            "completed"
+        } else {
+            "error"
+        });
         match result {
             Ok(output) if output.success => Ok(()),
             Ok(output) => {
@@ -2959,8 +3031,8 @@ printf '%s\n' "$((count + 1))" > "$state"
 state='__STATE__'
 if [ -f "$state" ]; then count=$(sed -n '1p' "$state"); else count=0; fi
 case "$count" in
-  0) printf '%s\n' '{"is_error":true,"session_id":"00000000-0000-0000-0000-000000000000","result":"API Error: Request rejected (429) · Provider returned error"}' ;;
-  *) printf '%s\n' '{"is_error":false,"session_id":"00000000-0000-0000-0000-000000000000","structured_output":{"opsx_status":"READY","summary":"continued after throttling"}}' ;;
+  0) printf '%s\n' '{"type":"result","uuid":"first","total_cost_usd":0.01,"modelUsage":{"test-model":{"inputTokens":40,"outputTokens":5,"cacheReadInputTokens":20,"cacheCreationInputTokens":5}},"is_error":true,"session_id":"00000000-0000-0000-0000-000000000000","result":"API Error: Request rejected (429) · Provider returned error"}' ;;
+  *) printf '%s\n' '{"type":"result","uuid":"second","total_cost_usd":0.03,"modelUsage":{"test-model":{"inputTokens":100,"outputTokens":10,"cacheReadInputTokens":20,"cacheCreationInputTokens":5}},"is_error":false,"session_id":"00000000-0000-0000-0000-000000000000","structured_output":{"opsx_status":"READY","summary":"continued after throttling"}}' ;;
 esac
 printf '%s\n' "$((count + 1))" > "$state"
 "#
@@ -2968,7 +3040,7 @@ printf '%s\n' "$((count + 1))" > "$state"
         std::fs::write(&script, source).unwrap();
 
         let launcher = shell_launcher(&script);
-        let ui = QuietUi;
+        let ui = crate::usage::tests::RecordingUi::default();
         let mut client = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 3, &ui)
             .with_provider_retries(1);
         client.provider_retry_base_delay = Duration::ZERO;
@@ -2987,6 +3059,15 @@ printf '%s\n' "$((count + 1))" > "$state"
         assert_eq!(result.signal, StageSignal::Ready);
         assert_eq!(result.text, "continued after throttling");
         assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "2");
+        let records = ui.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].outcome, "provider_error");
+        assert_eq!(records[0].tokens.input, Some(65));
+        assert_eq!(records[1].tokens.input, Some(60));
+        assert_eq!(records[1].attempt, 2);
+        assert_eq!(records[0].invocation_id, records[1].invocation_id);
+        assert_eq!(records[1].outcome, "ready");
+        assert!((records[1].reported_cost_usd.unwrap() - 0.02).abs() < 1e-10);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

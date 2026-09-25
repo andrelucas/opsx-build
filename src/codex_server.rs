@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -90,6 +90,7 @@ struct CodexClientInner {
     deferred: Mutex<VecDeque<Value>>,
     next_request_id: AtomicU64,
     active_threads: Mutex<HashSet<String>>,
+    thread_models: Mutex<HashMap<String, String>>,
     stderr: Arc<Mutex<String>>,
 }
 
@@ -198,6 +199,7 @@ impl CodexServerClient {
                 deferred: Mutex::new(VecDeque::new()),
                 next_request_id: AtomicU64::new(1),
                 active_threads: Mutex::new(HashSet::new()),
+                thread_models: Mutex::new(HashMap::new()),
                 stderr,
             }),
         };
@@ -235,6 +237,7 @@ impl CodexServerClient {
             .context("Codex thread/start response omitted thread.id")?
             .to_owned();
         self.remember_thread(&thread_id)?;
+        self.remember_model(&thread_id, &response);
         if let Some(name) = name.filter(|_| !ephemeral) {
             self.rename_thread(&thread_id, name)?;
         }
@@ -286,31 +289,53 @@ impl CodexServerClient {
         }
         params["threadId"] = json!(thread_id);
         params["excludeTurns"] = json!(true);
-        if let Err(error) = self.request("thread/resume", params.clone(), REQUEST_TIMEOUT) {
-            let missing = error
-                .downcast_ref::<CodexRequestError>()
-                .is_some_and(|error| error.is_missing_thread(thread_id));
-            let imported = if missing {
-                launcher
-                    .isolated_home
-                    .as_ref()
-                    .map(|home| home.import_session(thread_id))
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
-            let Some(path) = imported else {
-                return Err(error);
-            };
-            // The newly copied file is not necessarily in Codex's index yet.
-            params["path"] = json!(path);
-            let response = self.request("thread/resume", params, REQUEST_TIMEOUT)?;
-            if response.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
-                bail!("imported Codex rollout did not match requested thread `{thread_id}`");
+        let response = match self.request("thread/resume", params.clone(), REQUEST_TIMEOUT) {
+            Ok(response) => response,
+            Err(error) => {
+                let missing = error
+                    .downcast_ref::<CodexRequestError>()
+                    .is_some_and(|error| error.is_missing_thread(thread_id));
+                let imported = if missing {
+                    launcher
+                        .isolated_home
+                        .as_ref()
+                        .map(|home| home.import_session(thread_id))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
+                let Some(path) = imported else {
+                    return Err(error);
+                };
+                // The newly copied file is not necessarily in Codex's index yet.
+                params["path"] = json!(path);
+                let response = self.request("thread/resume", params, REQUEST_TIMEOUT)?;
+                if response.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+                    bail!("imported Codex rollout did not match requested thread `{thread_id}`");
+                }
+                response
             }
-        }
+        };
+        self.remember_model(thread_id, &response);
         self.remember_thread(thread_id)
+    }
+
+    fn remember_model(&self, thread_id: &str, response: &Value) {
+        if let Some(model) = response.get("model").and_then(Value::as_str)
+            && let Ok(mut models) = self.inner.thread_models.lock()
+        {
+            models.insert(thread_id.to_owned(), model.to_owned());
+        }
+    }
+
+    pub(crate) fn reported_model(&self, thread_id: &str) -> Option<String> {
+        self.inner
+            .thread_models
+            .lock()
+            .ok()?
+            .get(thread_id)
+            .cloned()
     }
 
     fn default_model(&self) -> Result<String> {
@@ -397,7 +422,11 @@ impl CodexServerClient {
         Ok(())
     }
 
-    pub(crate) fn compact_thread(&self, thread_id: &str) -> Result<()> {
+    pub(crate) fn compact_thread(
+        &self,
+        thread_id: &str,
+        mut observe: impl FnMut(&Value),
+    ) -> Result<()> {
         self.request(
             "thread/compact/start",
             json!({"threadId": thread_id}),
@@ -410,6 +439,11 @@ impl CodexServerClient {
                 bail!("Codex did not confirm compaction of thread `{thread_id}`");
             }
             let event = self.next_event(remaining.min(Duration::from_millis(250)))?;
+            if let Some(event) = &event
+                && event.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+            {
+                observe(event);
+            }
             if event.as_ref().is_some_and(|event| {
                 event.get("method").and_then(Value::as_str) == Some("thread/compacted")
                     && event.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
@@ -586,7 +620,7 @@ while IFS= read -r request; do
     *'"method":"config/read"'*) printf '{"id":%s,"result":{"config":{"model":null,"model_provider":"openai","model_reasoning_effort":"medium"}}}\n' "$id" ;;
     *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[{"model":"test-default","isDefault":true}],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/resume"'*) printf '{"id":%s,__RESUME_REPLY__}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"actual-thread"}}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"actual-thread"},"model":"test-default"}}\n' "$id" ;;
     *'"method":"thread/name/set"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id" ;;
     *) exit 1 ;;
@@ -793,12 +827,13 @@ done
             let contents = std::fs::read_to_string(&script).unwrap().replace(
                 r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#,
                 &format!(
-                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$id"; if [ "$id" -le {} ]; then printf '{failure}\n' "$id"; else printf '{success}\n' "$id"; fi"#,
+                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$id"; printf '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"actual-thread","turnId":"turn-%s","tokenUsage":{{"total":{{"inputTokens":%s,"outputTokens":10}}}}}}}}\n' "$id" "$((id * 100))"; if [ "$id" -le {} ]; then printf '{failure}\n' "$id"; else printf '{success}\n' "$id"; fi"#,
                     failures + 2
                 ),
             );
             std::fs::write(script, contents).unwrap();
-            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &QuietUi)
+            let ui = crate::usage::tests::RecordingUi::default();
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &ui)
                 .with_retries(0, retries);
             let result = backend.invoke(
                 SessionMode::New {
@@ -833,6 +868,18 @@ done
                 .filter(|r| r["method"] == "turn/start")
                 .collect();
             assert_eq!(turns.len(), expected_turns);
+            let records = ui.records.lock().unwrap();
+            assert_eq!(records.len(), expected_turns);
+            assert_eq!(records[0].tokens.input, Some(300));
+            assert_eq!(records[0].reported_models, ["test-default"]);
+            assert_eq!(
+                records.iter().filter_map(|r| r.tokens.input).sum::<u64>(),
+                (expected_turns as u64 + 2) * 100
+            );
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record.attempt as usize, index + 1);
+                assert_eq!(record.invocation_id, records[0].invocation_id);
+            }
             for turn in &turns {
                 assert_eq!(turn["params"]["threadId"], "actual-thread");
             }
@@ -1302,7 +1349,13 @@ read remaining
             .start_thread(&launcher, &directory, "dontAsk", Some("slice"), &[], false)
             .unwrap();
         assert_eq!(thread, "thread-1");
-        client.compact_thread(&thread).unwrap();
+        assert_eq!(client.reported_model(&thread).as_deref(), Some("test"));
+        let mut observed = Vec::new();
+        client
+            .compact_thread(&thread, |event| observed.push(event.clone()))
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0]["method"], "thread/compacted");
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();
     }

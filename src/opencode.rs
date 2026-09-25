@@ -24,6 +24,7 @@ use crate::{
     },
     stream::{StreamControl, StreamFilter, StreamItem},
     ui::Ui,
+    usage::{Attempt, Identity},
 };
 
 const CONNECTION_TOOL_MARKER: &str = "OPSX_TOOL_ROUNDTRIP_OK";
@@ -388,12 +389,38 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         self
     }
 
+    fn observed_compaction(&self, session: &SessionId) -> Result<()> {
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let usage = Attempt::new(
+            self.ui,
+            self.repo,
+            Identity {
+                backend: "opencode",
+                connection: self.launcher.connection_name.as_deref(),
+                model: self.launcher.model.as_deref(),
+                session: session.as_str(),
+                invocation: &invocation,
+                attempt: 1,
+                fresh: false,
+            },
+            "Compacting OpenCode session",
+        );
+        // The existing summarize response exposes no usage; do not query the model again.
+        let result = self
+            .server
+            .client(self.ui)?
+            .compact_session(session.as_str());
+        usage.finish(if result.is_ok() { "completed" } else { "error" });
+        result
+    }
+
     fn invoke_once(
         &self,
         session_id: &SessionId,
         prompt: &str,
         activity: &str,
         timeout: Option<Duration>,
+        usage: &mut Attempt<'_, U>,
     ) -> Result<OpenCodeAttempt> {
         self.ui
             .debug(&format!("OpenCode session: resume {session_id}"));
@@ -417,6 +444,7 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
                 activity,
                 timeout,
                 |line| {
+                    usage.line(line);
                     if let Some(filter) = self.stream_filter {
                         for item in filter_opencode_line(line, filter) {
                             self.ui.stream_item(&item);
@@ -455,6 +483,7 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         } else {
             self.runner.run(&spec, activity)?
         };
+        usage.output(&output.stdout);
         if output_hit_token_limit(&output) {
             let session_id =
                 output_session_id(&output.stdout).unwrap_or_else(|| session_id.clone());
@@ -494,6 +523,8 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
         let mut provider_retries = 0;
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut attempt_number = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -504,12 +535,44 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
             });
-            match self.invoke_once(
+            attempt_number += 1;
+            let mut usage = Attempt::new(
+                self.ui,
+                self.repo,
+                Identity {
+                    backend: "opencode",
+                    connection: self.launcher.connection_name.as_deref(),
+                    model: self.launcher.model.as_deref(),
+                    session: current_session.as_str(),
+                    invocation: &invocation,
+                    attempt: attempt_number,
+                    fresh: false,
+                },
+                &current_activity,
+            );
+            let attempt = self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 remaining,
-            ) {
+                &mut usage,
+            );
+            let outcome = match &attempt {
+                Ok(OpenCodeAttempt::Complete(result)) => {
+                    format!("{:?}", result.signal).to_lowercase()
+                }
+                Ok(OpenCodeAttempt::OutputLimit(_)) => "output_limit".to_owned(),
+                Err(error)
+                    if error
+                        .downcast_ref::<OpenCodeApiError>()
+                        .is_some_and(|e| e.transient) =>
+                {
+                    "provider_error".to_owned()
+                }
+                Err(error) => crate::usage::error_outcome(error).to_owned(),
+            };
+            usage.finish(&outcome);
+            match attempt {
                 Err(error)
                     if error
                         .downcast_ref::<BackendStreamControlRequested>()
@@ -522,7 +585,7 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                         .clone();
                     match &control {
                         StreamControl::Compact => {
-                            client.compact_session(current_session.as_str())?;
+                            self.observed_compaction(&current_session)?;
                             self.ui.stream_item(&StreamItem::Lifecycle(format!(
                                 "OpenCode compacted session {current_session}"
                             )));
@@ -617,9 +680,7 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         self.ui.info(&format!(
             "Hard-compacting OpenCode session after {completed_phase}"
         ));
-        self.server
-            .client(self.ui)?
-            .compact_session(session_id.as_str())?;
+        self.observed_compaction(session_id)?;
         self.ui
             .success(&format!("Compacted OpenCode session {session_id}"));
         Ok(())
@@ -1378,10 +1439,12 @@ state='__STATE__'
 arguments='__ARGUMENTS__'
 if [ ! -f "$state" ]; then
   : > "$state"
+  printf '%s\n' '{"type":"step_finish","sessionID":"ses_actual","part":{"id":"step1","cost":0.01,"tokens":{"input":10,"output":20,"reasoning":30,"cache":{"read":40,"write":5}}}}'
   printf '%s\n' '{"type":"error","sessionID":"ses_actual","error":{"name":"APIError","data":{"message":"provider overloaded","statusCode":503,"isRetryable":true}}}'
   exit 1
 fi
 printf '%s\n' "$*" > "$arguments"
+printf '%s\n' '{"type":"step_finish","sessionID":"ses_actual","part":{"id":"step2","cost":0.02,"tokens":{"input":20,"output":30,"reasoning":40,"cache":{"read":50,"write":5}}}}'
 printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","text":"continued\nOPSX_STATUS: READY"}}'
 "#
         .replace("__STATE__", &state.display().to_string())
@@ -1397,9 +1460,9 @@ printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","te
             environment: Vec::new(),
             unset_environment: Vec::new(),
         };
-        let ui = QuietUi;
+        let ui = crate::usage::tests::RecordingUi::default();
         let mut backend =
-            OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(0, 1);
+            OpenCodeBackend::new(&directory, &launcher, true, None, &ui).with_retries(0, 1);
         let (server_url, server) = fake_session_server();
         backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, server_url));
         backend.provider_retry_base_delay = Duration::from_millis(1);
@@ -1419,6 +1482,16 @@ printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","te
         assert_eq!(result.signal, StageSignal::Ready);
         let resumed_arguments = fs::read_to_string(arguments).unwrap();
         assert!(resumed_arguments.contains("--session ses_actual"));
+        let records = ui.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].outcome, "provider_error");
+        assert_eq!(records[0].session_id, "ses_actual");
+        assert_eq!(records[0].tokens.input, Some(55));
+        assert_eq!(records[1].tokens.input, Some(75));
+        assert_eq!(records[1].tokens.output, Some(70));
+        assert_eq!(records[1].attempt, 2);
+        assert_eq!(records[0].invocation_id, records[1].invocation_id);
+        assert_eq!(records[1].outcome, "ready");
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }

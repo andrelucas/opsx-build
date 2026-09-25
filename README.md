@@ -1604,6 +1604,68 @@ flags and are not read from the config file.
 [codex-providers]: https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers
 [openrouter-codex]: https://openrouter.ai/blog/tutorials/codex-cli-openrouter/
 
+## Local usage records
+
+Workflow stages automatically show a short usage summary and append records to
+`$(git rev-parse --git-path opsx-build/usage.jsonl)` in the campaign repository.
+For an ordinary checkout this is `.git/opsx-build/usage.jsonl`; linked worktrees
+use their own Git metadata directory. No flag or configuration change is needed.
+Only newly started opsx-build processes collect these records.
+
+This is passive observation of the backend responses already used by the
+runner. It makes no additional model calls and does not change prompts, tools,
+commit checks, retries, model selection, or workflow decisions. A logging error
+warns once and the workflow continues. Records stay on this machine and are
+not committed with the project.
+
+Each JSON line describes one stage invocation attempt, including failed or
+interrupted attempts, with:
+
+- Stage, change, campaign iteration, backend, connection, session, requested
+  model, and any model names reported by the harness. A preset is not resolved
+  through an extra provider lookup.
+- Start time, elapsed time, outcome, and an invocation ID that groups retries.
+  Explicit compaction and Claude session naming have separate records because
+  they can also invoke the harness.
+- Input, output, cache-read, cache-write and reasoning tokens when available,
+  plus a harness-reported cost estimate when supplied.
+- Observed tool calls, completion/error indicators, result character counts,
+  recognized truncation markers, and fingerprints for repeated-call analysis.
+  Tool arguments and result text are not stored. Matching fingerprints are
+  candidates for inspection, not proof of wasted work; a repeated check can be
+  necessary after an edit. The `repeated` flag compares calls within one attempt.
+
+Input totals **include** cache reads/writes. Output totals **include** reasoning
+where the backend exposes it; do not add those component fields again. Missing
+values are JSON `null` and display as `unknown`, never as zero. Costs are the
+harness's estimates, not provider invoices or subscription-limit percentages.
+
+Coverage depends on what the harness and provider report:
+
+| Backend | Usage source and scope |
+| --- | --- |
+| Claude | Differences between cumulative `modelUsage` and cost results, including reported subagent usage. Legacy result usage is labelled as the main agent's last result only. If a final total is missing, deduplicated assistant input can be retained as partial usage; placeholder assistant output is excluded. |
+| Codex | Differences between cumulative thread token notifications. Tool calls and model names come from existing App Server events/responses. Hidden subagent or approval-model usage is not inferred. |
+| OpenCode | Deduplicated `step_finish` events. Cache counts are included in input, and separately reported reasoning is included in output. The current explicit-compaction response exposes no usage, so that operation is recorded as unknown. |
+
+The normalization follows [Claude's usage semantics](https://code.claude.com/docs/en/agent-sdk/cost-tracking),
+[Codex's App Server events][codex-app-server], and
+[OpenCode's usage calculation](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/session.ts).
+
+Cumulative baselines are saved with the records and reused on resume. When an
+older session has no recorded baseline, its previous lifetime spend is not
+charged to the new stage: Claude establishes a baseline at its next result;
+Codex can count updates after its first observed total. The record's
+`usage_scope` and `notes` identify partial observations. A partial attempt with
+no cumulative total invalidates the previous baseline, avoiding overlap with
+the following attempt. Clearing this file also clears those baselines.
+
+Records are written when an attempt ends. A forced process kill or machine
+failure can lose the active attempt. Text-only compatibility output and
+backend-hidden work can leave gaps. Inspect coverage and unsuccessful attempts
+alongside completed stages when comparing campaigns; do not add the raw
+`cumulative` snapshots to the per-attempt `tokens` or cost fields.
+
 ## Interactive launcher testing
 
 Open an ordinary interactive session using the configured worker backend, model,

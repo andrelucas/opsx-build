@@ -15,6 +15,7 @@ use crate::{
     stream::{StreamControl, StreamItem},
     stream_style::{self, TextFormat},
     terminal_progress::{self, TerminalProgress},
+    usage::{Snapshot, UsageContext, UsageLog, UsageRecord},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,19 @@ pub struct CampaignIterationView {
 }
 
 pub trait Ui {
+    fn usage_context(&self) -> UsageContext {
+        UsageContext::default()
+    }
+    fn usage_baseline(
+        &self,
+        _repo: &std::path::Path,
+        _backend: &str,
+        _session: &str,
+    ) -> Option<Snapshot> {
+        None
+    }
+    fn usage_session_started(&self, _repo: &std::path::Path, _backend: &str, _session: &str) {}
+    fn record_usage(&self, _record: &UsageRecord) {}
     /// Whether agent stages should expose interactive stream controls.
     fn supports_stream_input(&self) -> bool {
         false
@@ -71,6 +85,8 @@ pub struct TerminalUi {
     interactive: bool,
     dashboard_enabled: bool,
     state: Mutex<TerminalState>,
+    usage: Mutex<UsageLog>,
+    usage_warning: std::sync::atomic::AtomicBool,
     // Drop after the dashboard has restored the terminal screen.
     _terminal_progress: TerminalProgress<std::io::Stderr>,
 }
@@ -104,6 +120,8 @@ impl TerminalUi {
                 && stderr_terminal
                 && std::io::stdin().is_terminal(),
             state: Mutex::new(TerminalState::default()),
+            usage: Mutex::new(UsageLog::default()),
+            usage_warning: std::sync::atomic::AtomicBool::new(false),
             _terminal_progress: TerminalProgress::new(std::io::stderr(), progress_enabled),
         }
     }
@@ -123,6 +141,54 @@ impl TerminalUi {
 }
 
 impl Ui for TerminalUi {
+    fn usage_context(&self) -> UsageContext {
+        let Ok(state) = self.state.lock() else {
+            return UsageContext::default();
+        };
+        UsageContext {
+            stage: state
+                .stage
+                .as_ref()
+                .map(|s| s.title.split(" · ").next().unwrap_or(&s.title).to_owned()),
+            stage_label: state.stage.as_ref().map(|s| s.title.clone()),
+            change: state.change_name.clone(),
+            iteration: state.campaign.as_ref().map(|c| c.iteration),
+        }
+    }
+
+    fn usage_baseline(
+        &self,
+        repo: &std::path::Path,
+        backend: &str,
+        session: &str,
+    ) -> Option<Snapshot> {
+        self.usage.lock().ok()?.baseline(repo, backend, session)
+    }
+
+    fn usage_session_started(&self, repo: &std::path::Path, backend: &str, session: &str) {
+        if let Ok(mut usage) = self.usage.lock() {
+            usage.fresh(repo, backend, session);
+        }
+    }
+
+    fn record_usage(&self, record: &UsageRecord) {
+        if record.context.stage.is_none() {
+            return;
+        }
+        let saved = self
+            .usage
+            .lock()
+            .ok()
+            .is_some_and(|mut usage| usage.append(record).is_ok());
+        if !saved
+            && !self
+                .usage_warning
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.warn("Could not save local usage records; the workflow will continue.");
+        }
+        self.info(&crate::usage::summary(record));
+    }
     fn supports_stream_input(&self) -> bool {
         self.dashboard_enabled
     }

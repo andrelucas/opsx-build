@@ -22,6 +22,7 @@ use crate::{
     process::{CommandSpec, PauseRequested, WorkerEscalationRequested},
     stream::{StreamControl, StreamFilter, StreamItem},
     ui::Ui,
+    usage::{Attempt, Identity},
 };
 
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
@@ -417,7 +418,10 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                     &self.additional_roots,
                     !self.persist_threads,
                 )
-                .map(SessionId::new),
+                .map(|id| {
+                    self.ui.usage_session_started(self.repo, "codex", &id);
+                    SessionId::new(id)
+                }),
             SessionMode::Resume { id } => {
                 client.ensure_thread(
                     self.launcher,
@@ -431,6 +435,29 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         }
     }
 
+    fn observed_compaction(&self, session: &SessionId) -> Result<()> {
+        let client = self.server.client(self.ui)?;
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut usage = Attempt::new(
+            self.ui,
+            self.repo,
+            Identity {
+                backend: "codex",
+                connection: self.launcher.connection_name.as_deref(),
+                model: self.launcher.model.as_deref(),
+                session: session.as_str(),
+                invocation: &invocation,
+                attempt: 1,
+                fresh: false,
+            },
+            "Compacting Codex session",
+        );
+        usage.model(client.reported_model(session.as_str()).as_deref());
+        let result = client.compact_thread(session.as_str(), |event| usage.event(event));
+        usage.finish(if result.is_ok() { "completed" } else { "error" });
+        result
+    }
+
     fn invoke_once(
         &self,
         session_id: &SessionId,
@@ -438,8 +465,10 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         activity: &str,
         protocol: StageProtocol,
         timeout: Option<Duration>,
+        usage: &mut Attempt<'_, U>,
     ) -> Result<TurnOutcome> {
         let client = self.server.client(self.ui)?;
+        usage.model(client.reported_model(session_id.as_str()).as_deref());
         self.ui.debug(&format!("Codex thread: {session_id}"));
         let schema = self
             .launcher
@@ -502,6 +531,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                         .and_then(Value::as_str)
                         .is_none_or(|id| id == turn_id)
                 {
+                    usage.event(&event);
                     if event.get("method").and_then(Value::as_str) == Some("error")
                         && event.pointer("/params/turnId").and_then(Value::as_str)
                             == Some(turn_id.as_str())
@@ -666,6 +696,8 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
         let mut output_recoveries = 0;
         let mut incomplete_stage_recoveries = 0;
         let mut provider_retries = 0;
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let mut attempt_number = 0;
         let deadline = self
             .stage_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -675,18 +707,53 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
             });
-            match self.invoke_once(
+            attempt_number += 1;
+            let mut usage = Attempt::new(
+                self.ui,
+                self.repo,
+                Identity {
+                    backend: "codex",
+                    connection: self.launcher.connection_name.as_deref(),
+                    model: self.launcher.model.as_deref(),
+                    session: current_session.as_str(),
+                    invocation: &invocation,
+                    attempt: attempt_number,
+                    fresh: false,
+                },
+                &current_activity,
+            );
+            let attempt = self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 protocol,
                 remaining,
-            ) {
+                &mut usage,
+            );
+            let outcome = match &attempt {
+                Ok(TurnOutcome::Complete(result)) => format!("{:?}", result.signal).to_lowercase(),
+                Ok(TurnOutcome::Control(_, _)) => "operator_control".to_owned(),
+                Err(error)
+                    if error
+                        .downcast_ref::<CodexTurnError>()
+                        .is_some_and(|e| e.output_limit) =>
+                {
+                    "output_limit".to_owned()
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<CodexTurnError>()
+                        .is_some_and(|e| e.transient || e.requires_user_turn) =>
+                {
+                    "provider_error".to_owned()
+                }
+                Err(error) => crate::usage::error_outcome(error).to_owned(),
+            };
+            usage.finish(&outcome);
+            match attempt {
                 Ok(TurnOutcome::Complete(result)) => return Ok(result),
                 Ok(TurnOutcome::Control(StreamControl::Compact, _)) => {
-                    self.server
-                        .client(self.ui)?
-                        .compact_thread(current_session.as_str())?;
+                    self.observed_compaction(&current_session)?;
                     self.ui.stream_item(&StreamItem::Lifecycle(format!(
                         "Codex compacted thread {current_session}"
                     )));
@@ -820,7 +887,7 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
         self.ui.info(&format!(
             "Hard-compacting Codex thread after {completed_phase}"
         ));
-        client.compact_thread(session_id.as_str())?;
+        self.observed_compaction(session_id)?;
         self.ui
             .success(&format!("Compacted Codex thread {session_id}"));
         Ok(())
