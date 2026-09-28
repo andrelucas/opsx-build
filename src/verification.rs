@@ -13,7 +13,7 @@ use crate::{
     ui::Ui,
 };
 
-type Files = BTreeMap<String, (String, bool)>;
+pub(crate) type Files = BTreeMap<String, (String, bool)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RepositoryEvidence {
@@ -136,7 +136,7 @@ fn changed_paths<'a>(before: &'a Files, after: &'a Files) -> Vec<&'a str> {
         .collect()
 }
 
-fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
+pub(crate) fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
     let runner = ProcessRunner::new(ui);
     let output = runner.checked(
         &CommandSpec::new("git", repo).args([

@@ -54,6 +54,7 @@ pub trait Ui {
     fn banner(&self, repo: &str);
     fn change_name(&self, change: Option<&str>);
     fn campaign(&self, _campaign: Option<CampaignView>) {}
+    fn bootstrap_continues(&self, _continues: bool) {}
     fn frontier_enabled(&self, _enabled: bool) {}
     fn stop_after_iteration_requested(&self) -> bool {
         false
@@ -97,6 +98,7 @@ struct TerminalState {
     change_name: Option<String>,
     stage: Option<StageView>,
     campaign: Option<CampaignView>,
+    bootstrap_continues: bool,
     dashboard: Option<StreamDashboard>,
     frontier_disabled: bool,
 }
@@ -241,6 +243,14 @@ impl Ui for TerminalUi {
         }
     }
 
+    fn bootstrap_continues(&self, continues: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.bootstrap_continues = continues;
+        if let Some(dashboard) = state.dashboard.as_mut() {
+            dashboard.set_bootstrap_continues(continues);
+        }
+    }
+
     fn stop_after_iteration_requested(&self) -> bool {
         self.state
             .lock()
@@ -268,10 +278,12 @@ impl Ui for TerminalUi {
             let change_name = state.change_name.clone();
             let campaign = state.campaign.as_ref().map(campaign_dashboard_view);
             let frontier_enabled = !state.frontier_disabled;
+            let bootstrap_continues = state.bootstrap_continues;
             drop(state);
             match StreamDashboard::enter(repo, change_name, campaign) {
                 Ok(mut dashboard) => {
                     dashboard.set_frontier_enabled(frontier_enabled);
+                    dashboard.set_bootstrap_continues(bootstrap_continues);
                     dashboard.set_stage(stage);
                     self.state.lock().unwrap().dashboard = Some(dashboard);
                     return;
@@ -358,7 +370,7 @@ impl Ui for TerminalUi {
             self.info(message);
             return;
         }
-        let (repo, change_name, stage, campaign, frontier_enabled) = {
+        let (repo, change_name, stage, campaign, frontier_enabled, bootstrap_continues) = {
             let mut state = self.state.lock().unwrap();
             if let Some(dashboard) = state.dashboard.as_mut() {
                 dashboard.start_stream(message);
@@ -370,11 +382,13 @@ impl Ui for TerminalUi {
                 state.stage.clone(),
                 state.campaign.as_ref().map(campaign_dashboard_view),
                 !state.frontier_disabled,
+                state.bootstrap_continues,
             )
         };
         match StreamDashboard::enter(repo, change_name, campaign) {
             Ok(mut dashboard) => {
                 dashboard.set_frontier_enabled(frontier_enabled);
+                dashboard.set_bootstrap_continues(bootstrap_continues);
                 if let Some(stage) = stage {
                     dashboard.set_stage(stage);
                 }

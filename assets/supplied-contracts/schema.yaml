@@ -1,0 +1,52 @@
+name: opsx-supplied-contracts
+version: 1
+description: Implement supplied contracts through source references, design and tasks.
+artifacts:
+  - id: proposal
+    generates: proposal.md
+    description: Map supplied requirements to this slice's implementation work.
+    template: proposal.md
+    instruction: |
+      Read the governing original contracts and component scope before planning.
+      Identify the supplied requirements this change implements using Markdown
+      links under ## Supplied requirements. Use paths relative to proposal.md or
+      absolute paths; include a heading anchor or exact requirement ID where available.
+      Associate each reference with implementation work and supplied scenarios.
+      Do not write replacement requirements or spec deltas. Explain scope and impact
+      briefly; put internal choices in design.md and testable steps in tasks.md.
+      Correct any contradictory generated agenda while keeping its slice identity.
+      Never edit supplied contracts or maintainer-owned acceptance expectations.
+    requires: []
+  - id: design
+    generates: design.md
+    description: Internal implementation decisions constrained by supplied contracts.
+    template: design.md
+    instruction: |
+      Read the proposal's original source references, including their conditions
+      and exceptions. Explain internal decisions, dependencies and implementation
+      risks. Reference requirements instead of restating externally observable
+      behaviour. Resolve implementation choices yourself. Report BLOCKED only
+      for an authoritative-input gap requiring an external decision.
+    requires: [proposal]
+  - id: tasks
+    generates: tasks.md
+    description: Coherent, testable implementation steps and contract checks.
+    template: tasks.md
+    instruction: |
+      Read the original requirements referenced by the proposal and the design.
+      Write checkboxes with numbered tasks, e.g. - [ ] 1.1 Implement ... .
+      Group implementation and checks into practical testable steps within this
+      change; do not subdivide merely because several steps are identifiable.
+      Reference supplied acceptance scenarios and preserve their expected results.
+      Add relevant implementation tests, including failure paths. Do not invent
+      substitute acceptance expectations or copy requirements into a new spec.
+    requires: [proposal, design]
+apply:
+  requires: [tasks]
+  tracks: tasks.md
+  instruction: |
+    Read the original contracts linked by the proposal before implementing.
+    Work through tasks in testable steps, mark completed checkboxes, and run
+    relevant checks. Preserve supplied contracts and acceptance expectations.
+    Correct mistaken derived plans, implementation and tests together. No spec
+    deltas are required; this workflow implements existing supplied requirements.

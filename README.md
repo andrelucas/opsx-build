@@ -137,6 +137,111 @@ conformance expectations. `BLOCKED` is reserved for a genuine external decision
 or unavailable required input. These instructions guide model judgment; the
 runner's structural agenda checks cannot prove semantic conformance.
 
+### Implementing supplied contracts
+
+For campaigns whose behaviour and component scope are already specified, select
+the optional supplied-contract workflow:
+
+```sh
+opsx-build execute --supplied-contracts \
+  --contract context.md \
+  --contract contracts/component.md \
+  --acceptance-file acceptance/scenarios.md \
+  --acceptance-file acceptance/check.sh \
+  --acceptance-command 'sh acceptance/check.sh'
+```
+
+`--contract` and `--acceptance-file` are repeatable file paths, relative to the
+campaign root or absolute. List every authoritative contract/scope file and
+every maintainer-owned acceptance input that must be preserved; directories
+and globs are not expanded. Contracts must be nonempty UTF-8 files. Include
+fixtures and check drivers whose contents determine supplied expectations.
+The ordinary specification workflow remains the default. These options are
+campaign/CLI settings, rather than global TOML defaults. Sidecar operation is
+not supported by this workflow yet.
+
+This installs the bundled `opsx-supplied-contracts` OpenSpec schema. Propose
+creates **proposal, design and tasks**, with no generated spec deltas. The
+proposal maps source references to implementation work; design records internal
+decisions; tasks describe coherent, testable steps. Bootstrap assigns those same
+source requirements to slices and a coverage index. Acceptance criteria refer
+to supplied expectations instead of rewriting them. Apply and Verify read the
+governing original sources, and Archive has no spec synchronization to perform.
+
+Each proposal, slice and agenda README contains a `## Supplied requirements`
+section with Markdown links to declared source files and the work that covers
+them. Links are relative to that document or absolute; `#fragment` can identify
+a Markdown heading anchor or an exact requirement/scenario ID in the source.
+For example, from `openspec/changes/0001-delivery/proposal.md`:
+
+```markdown
+## Supplied requirements
+
+- [REQ-01](../../../contracts/component.md#REQ-01) — implement in task 1.1.
+- [Acceptance scenarios](../../../acceptance/scenarios.md) — check in task 2.1.
+```
+
+Before accepting Propose, the runner checks the selected schema, absence of a
+generated `specs/` directory, and the source references. A rejected proposal gets
+one corrective turn in its existing planning session before the runner stops;
+it cannot proceed to the proposal commit or Apply. Bootstrap's existing Verify
+pass also checks source links in the generated agenda. Link validation proves
+that the file and referenced heading/ID exist, not that the plan interprets them
+correctly or covers every requirement; semantic review remains part of Verify.
+
+The checkpoint records content fingerprints, resolved paths and executable bits
+for the declared inputs. The runner checks them between stages and on resume.
+If a protected input changes or disappears, the run stops and preserves the work;
+restore the approved input or deliberately start a new run with revised inputs.
+Resumes retain the recorded workflow and versions even without repeating flags;
+an existing ordinary run cannot be converted by adding this option to `--resume`.
+`--no-supplied-contracts` selects the ordinary workflow for a new run.
+For separate `bootstrap` and `advance` invocations, record the options with
+configure or supply them to both invocations; `advance` starts a new run.
+
+`--acceptance-file` protects supplied checks and expectations. Repeatable
+`--acceptance-command 'COMMAND'` runs the agreed checks independently of the
+model's success report. This requires the supplied-contract workflow and at
+least one acceptance file; list all supplied tests, drivers and fixtures the
+commands depend on. Compare files with any supplied provenance manifest before
+starting: the runner records the selected files as they exist at run creation,
+not the original hashes from a project-specific manifest.
+
+Commands run sequentially through `/bin/sh -c` from the campaign root, using the
+runner's environment and outer sandbox (including nono when used), not an agent
+harness or its connection environment. Each must exit zero within
+`--acceptance-timeout-seconds` (default 600 per command). Prefer a supplied script
+over a pipeline that might hide the test process's exit status. Do not put
+credentials in command strings. Configure records agreed commands without
+executing them.
+
+The runner executes the gate after successful Verify on the terminal `9999`
+slice, or on a standalone change without an agenda, before Archive. It does not
+run final checks during bootstrap or intermediate slices. A failing check goes
+to Repair, with its actual exit status and a bounded output excerpt; the same
+gate must pass afterward. Repair attempts use the configured verification repair
+limit; exhaustion stops with work preserved. An early DONE also requires the
+gate to pass. If there is no active change to repair, failure stops for maintainer
+review instead of accepting DONE.
+
+The checkpoint pins commands, timeout and input fingerprints. Plain resume
+retains them; changed commands/timeouts are rejected. `--no-acceptance-checks`
+clears commands only for a new run. An existing run cannot acquire a new gate
+through resume. Full stdout/stderr, command outcomes, working directory and Git
+HEAD are retained under the repository's Git metadata directory at
+`opsx-build/acceptance/<attempt>/result.json` and adjacent logs, including failed
+or interrupted attempts. Pause stops the checks; resume reruns the gate.
+
+Before reporting completion, the runner compares tracked and non-ignored
+product files with the passing snapshot. Moving this change's planning artifacts
+into the archive or committing unchanged files does not rerun the checks;
+changes to product files do. Late failures are repaired with the existing archive
+and commits preserved, then checked and committed again. Checks must leave
+these inputs unchanged; generate sources in Apply/Repair and keep disposable
+test output ignored. Snapshots do not cover ignored dependencies, external
+services or environment changes. The gate proves only the coverage of the
+supplied checks; the project's maintainer owns scenario meaning and completeness.
+
 Once the final `9999` slice is archived, `advance` has a concrete definition of
 DONE.
 
@@ -521,7 +626,12 @@ workflow and then continues its campaign. A crash after a completion commit but
 before the next Explore is reconciled without repeating the completed change.
 
 In the TTY dashboard, press `q` to finish the current change and then pause the
-campaign cleanly. Ctrl-C still interrupts the active phase immediately and
+campaign cleanly. During `execute` bootstrap, `q` is shown as **pause after
+bootstrap**: confirm with `y` to finish verification, archive, and the completion
+commit, then stop before the first implementation slice. `--resume` continues
+into the generated agenda without repeating bootstrap. Standalone `bootstrap`
+already stops at that boundary and does not show this option.
+Ctrl-C still interrupts the active phase immediately and
 leaves it resumable.
 
 Press `p` to pause immediately during any streamed agent phase. opsx-build
@@ -766,6 +876,14 @@ Claude is instructed to write the proposal and leave the final file to
 opsx-build. Cancellation, a failed Claude session, or invalid settings leave
 the previous configuration untouched; failed validation retains the proposal
 and reports its path.
+
+Configure reads the available campaign context and may suggest
+`--supplied-contracts` when it describes precise existing contracts. It explains
+the choice and identifies the contract files, protected acceptance inputs and
+runner-executed acceptance commands for agreement,
+then records the accepted selection in `opsx-build.md`. It preserves an existing
+workflow choice unless you change it. Later runs use the recorded settings;
+they do not infer the workflow again from the context.
 
 The result is **`opsx-build.md`**, a visible file in the campaign base directory
 (the Git root, or the requested directory when Git has not been initialized).

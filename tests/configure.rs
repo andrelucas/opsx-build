@@ -105,6 +105,13 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
         String::from_utf8_lossy(&result.stderr)
     );
     let saved = fixture.markdown();
+    let launcher = fs::read_to_string(fixture.root.join("launcher.txt")).unwrap();
+    assert!(launcher.contains("suggest --supplied-contracts"));
+    assert!(launcher.contains("never silently switch an existing choice"));
+    assert!(launcher.contains("contract_test.go is an acceptance input"));
+    assert!(launcher.contains("Never run builds or checks during configure"));
+    assert!(saved.contains("--no-supplied-contracts"));
+    assert!(saved.contains("--no-acceptance-checks"));
     assert!(saved.contains("--max-provider-retries=7"));
     assert!(saved.contains("--claude-model=@preset/motd"));
     assert!(saved.contains("This preset is managed externally"));
@@ -124,6 +131,42 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
             "{mode} must preserve the last accepted configuration"
         );
     }
+}
+
+#[test]
+fn configure_persists_an_accepted_supplied_contract_workflow_and_validates_inputs() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("campaign/contract.md"),
+        "# Contract\nREQ-1: Required behaviour.\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("campaign/check.sh"),
+        "touch should-not-run\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("proposal.json"), serde_json::to_string(&serde_json::json!({
+        "accepted": true, "intent": "Implement the supplied contract.", "notes": "Accepted the suggested workflow.",
+        "arguments": ["--supplied-contracts", "--contract=contract.md", "--acceptance-file=check.sh", "--acceptance-command=sh check.sh", "--acceptance-timeout-seconds=45"]
+    })).unwrap()).unwrap();
+    let result = fixture.run("accept", &["configure"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let saved = fixture.markdown();
+    assert!(saved.contains("--supplied-contracts"));
+    assert!(saved.contains("--contract=contract.md"));
+    assert!(saved.contains("--acceptance-file=check.sh"));
+    assert!(saved.contains("--acceptance-command=sh check.sh"));
+    assert!(saved.contains("--acceptance-timeout-seconds=45"));
+    assert!(!fixture.root.join("campaign/should-not-run").exists());
+    fs::remove_file(fixture.root.join("campaign/contract.md")).unwrap();
+    let result = fixture.run("accept", &["configure"]);
+    assert!(!result.status.success());
+    assert_eq!(fixture.markdown(), saved);
 }
 
 #[test]

@@ -1,3 +1,4 @@
+mod acceptance;
 pub mod agenda;
 pub mod app;
 mod authority;
@@ -9,6 +10,7 @@ pub mod cli;
 pub mod codex;
 mod codex_home;
 mod codex_server;
+mod contracts;
 mod dashboard;
 pub mod git;
 pub mod model_confusions;

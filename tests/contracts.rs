@@ -1,0 +1,420 @@
+//! Exercise the Propose boundary without a real model or provider.
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::{Command, Output},
+};
+
+struct Fixture {
+    root: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root =
+            std::env::temp_dir().join(format!("opsx-contract-boundary-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("repo/openspec")).unwrap();
+        fs::create_dir_all(root.join("repo/automation/slices")).unwrap();
+        fs::write(
+            root.join("repo/contract.md"),
+            "# Contract\nREQ-01: Original required behaviour.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("repo/openspec/config.yaml"),
+            "schema: spec-driven\n",
+        )
+        .unwrap();
+        fs::write(root.join("repo/automation/slices/0001-delivery.md"), "# Delivery\n\n## Supplied requirements\n- [REQ-01](../../contract.md#REQ-01) — implement this slice.\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "Supplied inputs"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root.join("repo"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(
+            root.join("bin/openspec"),
+            r#"#!/bin/sh
+case "$1" in
+ --version) echo '1.13.2';;
+ list)
+  if [ -f openspec/changes/0001-delivery/proposal.md ]; then
+   echo '{"changes":[{"name":"0001-delivery","lastModified":"written"}]}'
+  else echo '{"changes":[]}' ; fi;;
+ status)
+  schema=opsx-supplied-contracts
+  if [ -f openspec/changes/0001-delivery/wrong-schema ]; then schema=spec-driven; fi
+  printf '{"isPlanningComplete":true,"schemaName":"%s","nextSteps":[]}\n' "$schema";;
+ *) exit 80;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+printf '%s\n' "$@" > "$CONTRACT_TEST_ROOT/args-$count"
+printf '%s\n' "$prompt" >> "$CONTRACT_TEST_ROOT/args-$count"
+change=openspec/changes/0001-delivery
+mkdir -p "$change"
+status=READY
+summary='Fixture proposal'
+case "$CONTRACT_TEST_MODE:$count" in
+ edit:1) printf 'Changed expectation\n' > contract.md;;
+ repair:1|reject:*|wrong-schema:1)
+  printf '## Supplied requirements\n- [Invented](../../../contract.md#REQ-99)\n' > "$change/proposal.md"
+  if [ "$CONTRACT_TEST_MODE" = wrong-schema ]; then touch "$change/wrong-schema"; fi;;
+ repair:2|wrong-schema:2)
+  rm -f "$change/wrong-schema"
+  printf '## Supplied requirements\n- [REQ-01](../../../contract.md#REQ-01) — implement task 1.1\n' > "$change/proposal.md";;
+ *) status=BLOCKED; summary='Fixture reached proposal commit';;
+esac
+printf '{"type":"result","subtype":"success","session_id":"fixture-session","result":"%s","structured_output":{"opsx_status":"%s","summary":"%s"}}\n' "$summary" "$status" "$summary"
+"#).unwrap();
+        for name in ["openspec", "claude"] {
+            fs::set_permissions(
+                root.join("bin").join(name),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        Self { root }
+    }
+    fn run(&self, mode: &str, resume: bool) -> Output {
+        self.run_with(mode, resume, &[])
+    }
+    fn run_with(&self, mode: &str, resume: bool, extra: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opsx-build"));
+        command
+            .current_dir(self.root.join("repo"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("CONTRACT_TEST_ROOT", &self.root)
+            .env("CONTRACT_TEST_MODE", mode)
+            .args([
+                "--no-config",
+                "--no-campaign-config",
+                "--worker-command",
+                "claude",
+                "--worker-backend",
+                "claude",
+                "--apply-command",
+                "noop",
+                "--verify-command",
+                "noop",
+                "--archive-command",
+                "noop",
+            ]);
+        if resume {
+            command.arg("--resume");
+        } else {
+            command.args(["--supplied-contracts", "--contract=contract.md", "advance"]);
+        }
+        command.args(extra).output().unwrap()
+    }
+    fn calls(&self) -> usize {
+        fs::read_to_string(self.root.join("calls"))
+            .unwrap()
+            .lines()
+            .count()
+    }
+    fn state(&self) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(self.root.join("repo/.git/opsx-build/last-run.json")).unwrap(),
+        )
+        .unwrap()
+    }
+    fn save_state(&self, state: &serde_json::Value) {
+        fs::write(
+            self.root.join("repo/.git/opsx-build/last-run.json"),
+            serde_json::to_vec(state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn acceptance(&self, script: &str) {
+        fs::write(self.root.join("repo/contract_test.sh"), script).unwrap();
+        let first = self.run_with(
+            "repair",
+            false,
+            &[
+                "--acceptance-file=contract_test.sh",
+                "--acceptance-command=sh contract_test.sh",
+                "--acceptance-timeout-seconds=2",
+            ],
+        );
+        assert!(String::from_utf8_lossy(&first.stderr).contains("Fixture reached proposal commit"));
+        let mut state = self.state();
+        state["stage"] = "archive".into();
+        state["agenda"] = serde_json::Value::Null;
+        self.save_state(&state);
+        fs::remove_file(self.root.join("calls")).unwrap();
+        fs::write(self.root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"
+status=READY
+action=blocked
+case "$CONTRACT_TEST_MODE:$count" in
+ pass:1|late:1|mutate-test:1|repair-gate:3) action=archive;;
+ pass:2|late:2|mutate-test:2|repair-gate:4|late:4) action=commit;;
+ repair-gate:1|late:3) action=repair;;
+ repair-gate:2) status=VERIFIED; action=verify;;
+esac
+case "$action" in
+ archive) mkdir -p openspec/changes/archive; mv openspec/changes/0001-delivery openspec/changes/archive/2026-09-28-0001-delivery;;
+ commit)
+  if [ "$CONTRACT_TEST_MODE:$count" = late:2 ]; then rm implementation.ready; fi
+  if [ "$CONTRACT_TEST_MODE" = mutate-test ]; then printf 'exit 0\n' > contract_test.sh; fi
+  git add .; git commit -qm 'Fixture completion' || exit 90;;
+ repair) touch implementation.ready;;
+ blocked) status=BLOCKED;;
+esac
+printf '{"type":"result","subtype":"success","session_id":"fixture-session","result":"%s","structured_output":{"opsx_status":"%s","summary":"%s"}}\n' "$action" "$status" "$action"
+"#).unwrap();
+    }
+
+    fn acceptance_reports(&self) -> Vec<serde_json::Value> {
+        fs::read_dir(self.root.join("repo/.git/opsx-build/acceptance"))
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice(
+                    &fs::read(entry.unwrap().path().join("result.json")).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn invalid_references_are_repaired_in_propose_before_the_commit_stage() {
+    for mode in ["repair", "wrong-schema"] {
+        let fixture = Fixture::new();
+        let result = fixture.run(mode, false);
+        let output = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success()); // The fixture deliberately stops at commit.
+        assert!(
+            output.contains("Fixture reached proposal commit"),
+            "{output}"
+        );
+        assert_eq!(fixture.calls(), 3);
+        let correction = fs::read_to_string(fixture.root.join("args-2")).unwrap();
+        assert!(correction.contains("POSTCONDITION REPAIR"));
+        assert!(correction.contains(if mode == "repair" {
+            "REQ-99"
+        } else {
+            "must use schema"
+        }));
+        assert_eq!(fixture.state()["stage"], "proposal-commit");
+        assert!(fixture.state()["contracts"].is_object());
+    }
+}
+
+#[test]
+fn unrepaired_proposal_never_reaches_commit() {
+    let fixture = Fixture::new();
+    let result = fixture.run("reject", false);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("after one corrective turn"));
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(fixture.state()["stage"], "propose");
+}
+
+#[test]
+fn input_mutation_stops_propose_and_plain_resume_cannot_recapture_it() {
+    let fixture = Fixture::new();
+    for resume in [false, true] {
+        let result = fixture.run("edit", resume);
+        let output = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(
+            output.contains("protected supplied input changed"),
+            "{output}"
+        );
+        assert_eq!(fixture.calls(), 1);
+        assert_eq!(fixture.state()["stage"], "propose");
+    }
+}
+
+#[test]
+fn completed_bootstrap_handoff_keeps_the_original_input_versions() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("repo/public-check.sh"), "exit 99\n").unwrap();
+    fixture.run_with(
+        "repair",
+        false,
+        &[
+            "--acceptance-file=public-check.sh",
+            "--acceptance-command=sh public-check.sh",
+        ],
+    );
+    let mut state = fixture.state();
+    let recorded = state["contracts"].clone();
+    state["stage"] = "complete".into();
+    state["bootstrap"] = true.into();
+    state["change"] = "bootstrap-implementation-slices".into();
+    state["agenda"] = serde_json::Value::Null;
+    state["campaign"] =
+        serde_json::json!({"iteration": 1, "max_iterations": null, "completed": []});
+    fs::write(
+        fixture.root.join("repo/.git/opsx-build/last-run.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    fs::remove_dir_all(fixture.root.join("repo/openspec/changes/0001-delivery")).unwrap();
+    fs::remove_file(fixture.root.join("calls")).unwrap();
+    let result = fixture.run("edit", true);
+    let output = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        output.contains("protected supplied input changed"),
+        "{output}"
+    );
+    let state = fixture.state();
+    assert_eq!(state["contracts"], recorded);
+    assert_eq!(state["bootstrap"], false);
+    assert_eq!(state["change"], "0001-delivery");
+    assert_eq!(state["campaign"]["iteration"], 1);
+    assert!(
+        !fixture
+            .root
+            .join("repo/.git/opsx-build/acceptance")
+            .exists()
+    );
+}
+
+#[test]
+fn supplied_acceptance_failure_repairs_then_reruns_before_archive() {
+    let fixture = Fixture::new();
+    fixture.acceptance("echo 'fixed public expectation'\ntest -f implementation.ready\n");
+    let result = fixture.run("repair-gate", true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fixture.calls(), 4);
+    assert_eq!(fixture.state()["stage"], "complete");
+    let reports = fixture.acceptance_reports();
+    assert_eq!(reports.len(), 2); // Archive and commit alone do not rerun checks.
+    assert!(
+        reports
+            .iter()
+            .any(|r| r["outcome"] == "failed" && r["results"][0]["exit_code"] == 1)
+    );
+    assert!(reports.iter().any(|r| r["outcome"] == "passed"));
+    let repair = fs::read_to_string(fixture.root.join("args-1")).unwrap();
+    assert!(repair.contains("fixed public expectation"));
+    assert!(repair.contains("Keep maintainer-owned acceptance inputs unchanged"));
+}
+
+#[test]
+fn completion_mutation_invalidates_acceptance_and_gets_repaired() {
+    let fixture = Fixture::new();
+    fixture.acceptance("test -f implementation.ready\n");
+    fs::write(fixture.root.join("repo/implementation.ready"), "").unwrap();
+    let result = fixture.run("late", true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fixture.acceptance_reports().len(), 3);
+    assert_eq!(fixture.calls(), 4);
+    assert!(fixture.root.join("repo/implementation.ready").is_file());
+    assert_eq!(fixture.state()["stage"], "complete");
+    assert!(
+        fs::read_to_string(fixture.root.join("args-3"))
+            .unwrap()
+            .contains("after change `0001-delivery` was archived")
+    );
+}
+
+#[test]
+fn resumed_gate_cannot_be_replaced_or_waived_and_test_mutation_stops_completion() {
+    let fixture = Fixture::new();
+    fixture.acceptance("exit 0\n# Maintainer test\n");
+    let result = fixture.run_with("pass", true, &["--acceptance-command=true"]);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("differ from the checkpoint"));
+    let result = fixture.run_with("mutate-test", true, &["--no-acceptance-checks"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("protected supplied input changed"));
+    assert_eq!(fixture.acceptance_reports().len(), 1);
+    let result = fixture.run("pass", true);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("protected supplied input changed"));
+}
+
+#[test]
+fn done_does_not_bypass_checks_and_timeout_is_retained() {
+    let fixture = Fixture::new();
+    fixture.acceptance("echo 'waiting for public check' >&2\nsleep 30\n");
+    let mut state = fixture.state();
+    state["stage"] = "done".into();
+    state["change"] = serde_json::Value::Null;
+    fixture.save_state(&state);
+    let started = std::time::Instant::now();
+    let result = fixture.run("pass", true);
+    assert!(!result.status.success());
+    assert!(started.elapsed().as_secs() < 10);
+    assert_eq!(fixture.state()["stage"], "acceptance");
+    let reports = fixture.acceptance_reports();
+    assert_eq!(reports[0]["results"][0]["outcome"], "timed out");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("waiting for public check"));
+    assert!(!fixture.root.join("calls").exists());
+}
+
+#[test]
+fn intermediate_slice_does_not_run_final_acceptance() {
+    let fixture = Fixture::new();
+    fixture.acceptance("exit 9\n");
+    let mut state = fixture.state();
+    state["agenda"] = serde_json::json!({"path":"automation/slices/0001-delivery.md", "change":"0001-delivery", "title":"Delivery", "content":"# Delivery", "ordinal":[1]});
+    fixture.save_state(&state);
+    let result = fixture.run("pass", true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !fixture
+            .root
+            .join("repo/.git/opsx-build/acceptance")
+            .exists()
+    );
+}

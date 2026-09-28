@@ -29,6 +29,7 @@ const WORKER_CAPACITY_PLACEHOLDER: &str = "{{OPSX_BUILD_WORKER_CAPACITY}}";
 pub struct BootstrapScaffold {
     pub context_path: PathBuf,
     config: String,
+    supplied_contracts: bool,
 }
 
 impl BootstrapScaffold {
@@ -114,7 +115,14 @@ impl BootstrapScaffold {
         Ok(Self {
             context_path,
             config: render_project_config(&context),
+            supplied_contracts: false,
         })
+    }
+
+    pub fn use_supplied_contracts(&mut self) {
+        self.supplied_contracts = true;
+        self.config = self.config.replacen("schema: spec-driven\n", "schema: opsx-supplied-contracts\n", 1)
+            .replace("  specs:\n    - Specify observable behaviour rather than implementation details.\n", "");
     }
 
     pub fn write(&self, repo: &Path, frontier_worker: bool) -> Result<()> {
@@ -124,8 +132,11 @@ impl BootstrapScaffold {
             .context("could not create the implementation-agenda directory")?;
         fs::write(repo.join(CONFIG_PATH), &self.config)
             .context("could not write openspec/config.yaml")?;
-        fs::write(repo.join(BOOTSTRAP_PATH), instructions(frontier_worker))
-            .context("could not write automation/bootstrap.md")?;
+        fs::write(
+            repo.join(BOOTSTRAP_PATH),
+            instructions_for(frontier_worker, self.supplied_contracts),
+        )
+        .context("could not write automation/bootstrap.md")?;
         let existing_claude = match fs::read_to_string(repo.join(CLAUDE_PATH)) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -149,7 +160,16 @@ pub fn init_command(repo: &Path) -> CommandSpec {
 }
 
 pub fn instructions(frontier_worker: bool) -> String {
-    crate::authority::render(BOOTSTRAP_INSTRUCTIONS).replace(
+    instructions_for(frontier_worker, false)
+}
+
+pub fn instructions_for(frontier_worker: bool, supplied_contracts: bool) -> String {
+    let instructions = if supplied_contracts {
+        include_str!("../assets/supplied-contracts/bootstrap.md")
+    } else {
+        BOOTSTRAP_INSTRUCTIONS
+    };
+    crate::authority::render(instructions).replace(
         WORKER_CAPACITY_PLACEHOLDER,
         worker_capacity_guidance(frontier_worker),
     )
@@ -365,6 +385,18 @@ fn merge_managed_fragment(existing: &str, file_name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supplied_contract_bootstrap_assigns_original_requirements_without_spec_deltas() {
+        let instructions = instructions_for(true, true);
+        assert!(instructions.contains("opsx-supplied-contracts"));
+        assert!(instructions.contains("## Supplied requirements"));
+        assert!(instructions.contains("does not author replacement behavioural specifications"));
+        assert!(instructions.contains("frontier-capable"));
+        assert!(!instructions.contains("define observable acceptance criteria"));
+        assert!(instructions.contains(crate::authority::GUIDANCE.trim()));
+        assert!(instructions_for(false, false).contains("define observable acceptance criteria"));
+    }
     use uuid::Uuid;
 
     #[test]

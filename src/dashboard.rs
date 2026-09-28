@@ -75,6 +75,7 @@ enum PhaseStatus {
 enum PendingConfirmation {
     Pause,
     StopAfterIteration,
+    StopAfterBootstrap,
     Escalate,
     Compact,
     Context,
@@ -85,6 +86,9 @@ impl PendingConfirmation {
         match self {
             Self::Pause => "Pause now and stop the current agent process?",
             Self::StopAfterIteration => "Pause after the current OpenSpec change completes?",
+            Self::StopAfterBootstrap => {
+                "Finish bootstrap, then pause before the first implementation slice?"
+            }
             Self::Escalate => "Stop the local worker and request frontier replanning?",
             Self::Compact => "Interrupt the active agent, compact, and restart the current phase?",
             Self::Context => "Interrupt the active agent and request a context report?",
@@ -132,6 +136,7 @@ pub(crate) struct StreamDashboard {
     repo: String,
     change_name: Option<String>,
     campaign: Option<CampaignDashboardView>,
+    bootstrap_continues: bool,
     activity: String,
     panels: Vec<PhasePanel>,
     selected_panel: usize,
@@ -203,6 +208,7 @@ impl StreamDashboard {
             injection_input: None,
             pending_confirmation: None,
             stop_after_iteration: false,
+            bootstrap_continues: false,
             frontier_enabled: true,
         };
         dashboard.draw()?;
@@ -233,6 +239,21 @@ impl StreamDashboard {
     pub(crate) fn set_frontier_enabled(&mut self, enabled: bool) {
         self.frontier_enabled = enabled;
         self.dirty = true;
+    }
+
+    pub(crate) fn set_bootstrap_continues(&mut self, continues: bool) {
+        self.bootstrap_continues = continues;
+        self.dirty = true;
+    }
+
+    fn deferred_pause_hint(&self) -> &'static str {
+        if self.bootstrap_continues {
+            " · q pause after bootstrap"
+        } else if self.campaign.is_some() {
+            " · q pause after slice"
+        } else {
+            ""
+        }
     }
 
     pub(crate) fn stop_after_iteration_requested(&self) -> bool {
@@ -502,6 +523,9 @@ impl StreamDashboard {
 
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') if self.bootstrap_continues => {
+                    self.request_confirmation(PendingConfirmation::StopAfterBootstrap);
+                }
                 KeyCode::Char('q') if self.campaign.is_some() => {
                     self.request_confirmation(PendingConfirmation::StopAfterIteration);
                 }
@@ -610,12 +634,16 @@ impl StreamDashboard {
                 );
                 StreamControl::Pause
             }
-            PendingConfirmation::StopAfterIteration => {
+            PendingConfirmation::StopAfterIteration | PendingConfirmation::StopAfterBootstrap => {
                 self.stop_after_iteration = true;
                 self.push_message(
                     "campaign",
                     Color::Magenta,
-                    "Will pause after the current OpenSpec change completes",
+                    if action == PendingConfirmation::StopAfterBootstrap {
+                        "Will pause after bootstrap completes, before the first implementation slice"
+                    } else {
+                        "Will pause after the current OpenSpec change completes"
+                    },
                 );
                 StreamControl::None
             }
@@ -1049,11 +1077,7 @@ impl StreamDashboard {
             } else {
                 self.injection_input.as_ref().map_or_else(
                     || {
-                    let campaign = if self.campaign.is_some() {
-                        " · q pause after slice"
-                    } else {
-                        ""
-                    };
+                    let campaign = self.deferred_pause_hint();
                     let frontier = if self.frontier_enabled { " · f frontier" } else { "" };
                     format!("p pause{frontier} · c compact · C context · i steer{campaign} · click/Enter/Space toggle · Tab/←→ select · ↑↓/Pg scroll · Ctrl-C stop")
                 },
@@ -1335,6 +1359,7 @@ mod tests {
             injection_input: None,
             pending_confirmation: None,
             stop_after_iteration: false,
+            bootstrap_continues: false,
             frontier_enabled: true,
         };
         dashboard.set_stage(StageView {
@@ -1591,6 +1616,64 @@ mod tests {
                 .text
                 .contains("pause after")
         );
+    }
+
+    #[test]
+    fn execute_bootstrap_pause_requires_confirmation_and_survives_stage_changes() {
+        let mut dashboard = dashboard();
+        dashboard.set_change_name(Some("bootstrap-implementation-slices".to_owned()));
+        dashboard.set_bootstrap_continues(true);
+        assert_eq!(
+            dashboard.deferred_pause_hint(),
+            " · q pause after bootstrap"
+        );
+        assert!(!dashboard.header_text().contains("iteration 1"));
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+
+        dashboard.handle_event(key('q'));
+        assert_eq!(
+            dashboard.pending_confirmation,
+            Some(PendingConfirmation::StopAfterBootstrap)
+        );
+        assert!(!dashboard.stop_after_iteration_requested());
+        dashboard.handle_event(key('n'));
+        assert!(!dashboard.stop_after_iteration_requested());
+
+        dashboard.handle_event(key('q'));
+        assert_eq!(dashboard.handle_event(key('y')), StreamControl::None);
+        assert!(dashboard.stop_after_iteration_requested());
+        // Re-presenting bootstrap and proceeding to its next stage must retain q.
+        dashboard.set_campaign(None);
+        dashboard.set_bootstrap_continues(true);
+        dashboard.set_stage(StageView {
+            current: 6,
+            total: 6,
+            title: "Completion commit".to_owned(),
+            started_at: Instant::now(),
+        });
+        assert!(dashboard.stop_after_iteration_requested());
+
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: Vec::new(),
+        }));
+        dashboard.set_bootstrap_continues(false);
+        assert!(!dashboard.stop_after_iteration_requested());
+        assert_eq!(dashboard.deferred_pause_hint(), " · q pause after slice");
+    }
+
+    #[test]
+    fn standalone_bootstrap_does_not_offer_a_redundant_deferred_pause() {
+        let mut dashboard = dashboard();
+        dashboard.set_change_name(Some("bootstrap-implementation-slices".to_owned()));
+        assert_eq!(dashboard.deferred_pause_hint(), "");
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(dashboard.pending_confirmation.is_none());
+        assert!(!dashboard.stop_after_iteration_requested());
     }
 
     #[test]

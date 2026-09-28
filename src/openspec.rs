@@ -22,6 +22,7 @@ pub struct ChangeSnapshot {
 pub struct PlanningStatus {
     pub is_complete: bool,
     pub next_steps: Vec<String>,
+    pub schema_name: Option<String>,
 }
 
 impl ChangeSnapshot {
@@ -105,6 +106,10 @@ pub fn parse_planning_status_json(json: &str) -> Result<PlanningStatus> {
     Ok(PlanningStatus {
         is_complete,
         next_steps,
+        schema_name: value
+            .get("schemaName")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 

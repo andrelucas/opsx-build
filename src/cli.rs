@@ -53,6 +53,11 @@ pub struct Cli {
     pub yes: bool,
     pub bootstrap_context: Option<PathBuf>,
     pub bootstrap_defines: BTreeMap<String, String>,
+    pub supplied_contracts: bool,
+    pub contract_files: Vec<PathBuf>,
+    pub acceptance_files: Vec<PathBuf>,
+    pub acceptance_commands: Vec<String>,
+    pub acceptance_timeout_seconds: Option<u64>,
     pub repo: PathBuf,
     pub sidecar: bool,
     pub sidecar_root: Option<PathBuf>,
@@ -164,6 +169,18 @@ impl Cli {
                 .into_iter()
                 .filter(|arg| {
                     let name = arg.split('=').next().unwrap_or(arg);
+                    for (option, id) in [
+                        ("--contract", "contract"),
+                        ("--acceptance-file", "acceptance_file"),
+                        ("--acceptance-command", "acceptance_command"),
+                    ] {
+                        if name == option
+                            && explicit.value_source(id)
+                                == Some(clap::parser::ValueSource::CommandLine)
+                        {
+                            return false;
+                        }
+                    }
                     let bootstrap = args
                         .request
                         .as_deref()
@@ -281,6 +298,15 @@ impl Cli {
             }
             return Ok(cli);
         }
+        if cli.supplied_contracts && cli.contract_files.is_empty() && !cli.resume {
+            anyhow::bail!("--supplied-contracts requires at least one --contract PATH");
+        }
+        if cli.supplied_contracts && cli.sidecar {
+            anyhow::bail!(
+                "supplied-contract campaigns currently require an in-repository OpenSpec project"
+            );
+        }
+        validate_acceptance_options(&cli)?;
         if cli.rewind_target.is_some() && cli.request != "rewind" {
             anyhow::bail!("a rewind target is only valid with `opsx-build rewind [REF]`");
         }
@@ -409,6 +435,34 @@ pub(crate) struct CliArgs {
     /// Substitute one {{name}} placeholder in bootstrap context (repeatable).
     #[arg(long, value_name = "NAME=VALUE")]
     define: Vec<String>,
+
+    /// Implement supplied contracts without generating replacement behaviour specifications.
+    #[arg(long, overrides_with = "no_supplied_contracts")]
+    supplied_contracts: bool,
+
+    /// Use the ordinary specification workflow for a new run (resumes retain their workflow).
+    #[arg(long, overrides_with = "supplied_contracts")]
+    no_supplied_contracts: bool,
+
+    /// Authoritative UTF-8 contract file, relative to the campaign root (repeatable).
+    #[arg(long, value_name = "PATH")]
+    contract: Vec<PathBuf>,
+
+    /// Maintainer-owned acceptance file to protect; does not run it (repeatable).
+    #[arg(long, value_name = "PATH")]
+    acceptance_file: Vec<PathBuf>,
+
+    /// Maintainer acceptance command run via /bin/sh -c from the campaign root (repeatable).
+    #[arg(long, value_name = "COMMAND", overrides_with = "no_acceptance_checks")]
+    acceptance_command: Vec<String>,
+
+    /// Clear configured acceptance commands for a new run; resumes retain their gate.
+    #[arg(long, overrides_with = "acceptance_command")]
+    no_acceptance_checks: bool,
+
+    /// Time limit for each supplied acceptance command (default: 600 seconds).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    acceptance_timeout_seconds: Option<u64>,
 
     /// Repository containing .git, openspec/, and Claude skills.
     #[arg(long, default_value = ".", value_name = "PATH")]
@@ -1059,6 +1113,11 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         yes: args.yes,
         bootstrap_context: args.context,
         bootstrap_defines,
+        supplied_contracts: args.supplied_contracts && !args.no_supplied_contracts,
+        contract_files: args.contract,
+        acceptance_files: args.acceptance_file,
+        acceptance_commands: args.acceptance_command,
+        acceptance_timeout_seconds: args.acceptance_timeout_seconds,
         repo: args.repo,
         sidecar: !args.no_sidecar && (args.sidecar || config.sidecar.unwrap_or(false)),
         sidecar_root: args
@@ -1316,6 +1375,7 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
     let mut args = Vec::new();
     for (name, value) in [
         ("sidecar", cli.sidecar),
+        ("supplied-contracts", cli.supplied_contracts),
         ("local-only", cli.local_only),
         ("frontier-worker", cli.frontier_worker),
         ("yolo", cli.yolo),
@@ -1428,6 +1488,30 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
     for (name, value) in &cli.bootstrap_defines {
         args.push(format!("--define={name}={value}"));
     }
+    for (name, files) in [
+        ("contract", &cli.contract_files),
+        ("acceptance-file", &cli.acceptance_files),
+    ] {
+        args.extend(
+            files
+                .iter()
+                .map(|path| format!("--{name}={}", path.display())),
+        );
+    }
+    if cli.acceptance_commands.is_empty() {
+        args.push("--no-acceptance-checks".to_owned());
+    } else {
+        args.extend(
+            cli.acceptance_commands
+                .iter()
+                .map(|command| format!("--acceptance-command={command}")),
+        );
+    }
+    args.push(format!(
+        "--acceptance-timeout-seconds={}",
+        cli.acceptance_timeout_seconds
+            .unwrap_or(crate::acceptance::DEFAULT_TIMEOUT_SECONDS)
+    ));
     if cli.verbose {
         args.push("--verbose".to_owned());
     }
@@ -1508,6 +1592,25 @@ fn configure_inputs(
     })
 }
 
+fn validate_acceptance_options(cli: &Cli) -> Result<()> {
+    if !cli.acceptance_commands.is_empty() && !cli.supplied_contracts && !cli.resume {
+        anyhow::bail!("--acceptance-command requires --supplied-contracts");
+    }
+    if !cli.acceptance_commands.is_empty() && cli.acceptance_files.is_empty() && !cli.resume {
+        anyhow::bail!(
+            "--acceptance-command requires at least one --acceptance-file naming the supplied check or fixture to protect"
+        );
+    }
+    if cli
+        .acceptance_commands
+        .iter()
+        .any(|command| command.trim().is_empty() || command.contains('\0'))
+    {
+        anyhow::bail!("acceptance commands must be nonempty and contain no NUL bytes");
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_configured_settings(
     values: &[String],
     selection: &[String],
@@ -1522,6 +1625,19 @@ pub(crate) fn resolve_configured_settings(
     argv.extend(selection.iter().cloned());
     argv.extend(canonical);
     let cli = Cli::resolve(CliArgs::try_parse_from(argv)?)?;
+    validate_acceptance_options(&cli)?;
+    if cli.supplied_contracts {
+        if cli.sidecar {
+            anyhow::bail!(
+                "supplied-contract campaigns currently require an in-repository OpenSpec project"
+            );
+        }
+        crate::contracts::SuppliedContracts::capture(
+            repo,
+            &cli.contract_files,
+            &cli.acceptance_files,
+        )?;
+    }
     // Validate launcher syntax without requiring campaign credentials to be
     // available in the configurator's environment. Connections are tested separately.
     for connection in [&cli.worker_connection, &cli.frontier_connection] {
@@ -1535,6 +1651,11 @@ pub(crate) fn resolve_configured_settings(
 pub(crate) fn merge_settings(defaults: &[String], overrides: &[String]) -> Result<Vec<String>> {
     let overrides = canonical_settings(overrides)?;
     let mut merged = canonical_settings(defaults)?;
+    for name in ["--contract=", "--acceptance-file=", "--acceptance-command="] {
+        if overrides.iter().any(|arg| arg.starts_with(name)) {
+            merged.retain(|arg| !arg.starts_with(name));
+        }
+    }
     for role in ["worker", "frontier"] {
         if overrides
             .iter()
@@ -1990,8 +2111,64 @@ mod tests {
     }
 
     #[test]
+    fn supplied_contract_paths_round_trip_and_explicit_lists_replace_saved_lists() {
+        let defaults = vec![
+            "--supplied-contracts".to_owned(),
+            "--contract=old.md".to_owned(),
+            "--acceptance-file=old-test.md".to_owned(),
+        ];
+        let overrides = vec![
+            "--contract=scope.md".to_owned(),
+            "--contract=contracts/api.md".to_owned(),
+            "--acceptance-file=scenarios.md".to_owned(),
+        ];
+        let merged = merge_settings(&defaults, &overrides).unwrap();
+        let args = CliArgs::try_parse_from(std::iter::once("opsx-build".to_owned()).chain(merged))
+            .unwrap();
+        let cli = resolve_values(args, FileConfig::default(), None).unwrap();
+        assert!(cli.supplied_contracts);
+        assert_eq!(
+            cli.contract_files,
+            [PathBuf::from("scope.md"), PathBuf::from("contracts/api.md")]
+        );
+        assert_eq!(cli.acceptance_files, [PathBuf::from("scenarios.md")]);
+        let snapshot = settings_snapshot(&cli);
+        assert!(
+            canonical_settings(&snapshot)
+                .unwrap()
+                .contains(&"--contract=contracts/api.md".to_owned())
+        );
+        let disabled = merge_settings(&snapshot, &["--no-supplied-contracts".to_owned()]).unwrap();
+        assert!(disabled.contains(&"--no-supplied-contracts".to_owned()));
+        assert!(!disabled.contains(&"--supplied-contracts".to_owned()));
+    }
+
+    #[test]
     fn uses_the_corrected_program_name() {
         assert_eq!(CliArgs::command().get_name(), "opsx-build");
+    }
+
+    #[test]
+    fn acceptance_commands_replace_saved_lists_and_can_be_cleared_for_new_runs() {
+        let initial = vec![
+            "--acceptance-command=old check".to_owned(),
+            "--acceptance-command=other check".to_owned(),
+        ];
+        let updated =
+            merge_settings(&initial, &["--acceptance-command=sh checks.sh".to_owned()]).unwrap();
+        assert_eq!(updated, ["--acceptance-command=sh checks.sh"]);
+        let cleared = merge_settings(&updated, &["--no-acceptance-checks".to_owned()]).unwrap();
+        assert_eq!(cleared, ["--no-acceptance-checks"]);
+        let restored = merge_settings(&cleared, &updated).unwrap();
+        assert_eq!(restored, updated);
+        let cli = resolve_values(
+            args(["opsx-build", "--acceptance-command=sh checks.sh"]),
+            FileConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(validate_acceptance_options(&cli).is_err());
+        assert!(CliArgs::try_parse_from(["opsx-build", "--acceptance-timeout-seconds=0"]).is_err());
     }
 
     #[test]
