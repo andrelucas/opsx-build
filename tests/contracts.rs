@@ -418,3 +418,88 @@ fn intermediate_slice_does_not_run_final_acceptance() {
             .exists()
     );
 }
+
+#[test]
+fn bootstrap_reference_preflight_repairs_before_model_verify_and_preserves_exhaustion() {
+    for budget in [0, 3] {
+        let fixture = Fixture::new();
+        fixture.run("repair", false);
+        let baseline_calls = fixture.calls();
+        let mut state = fixture.state();
+        state["stage"] = "verify".into();
+        state["bootstrap"] = true.into();
+        state["change"] = "bootstrap-implementation-slices".into();
+        state["agenda"] = serde_json::Value::Null;
+        fixture.save_state(&state);
+        let active_change = fixture
+            .root
+            .join("repo/openspec/changes/bootstrap-implementation-slices");
+        fs::create_dir_all(&active_change).unwrap();
+        fs::write(active_change.join("proposal.md"), "Bootstrap planning").unwrap();
+        let agenda = fixture.root.join("repo/automation/slices");
+        let original = "## Supplied requirements\n- [REQ-01](../../contract.md#REQ-01)\n";
+        fs::write(agenda.join("README.md"), original).unwrap();
+        let headings = "# Slice\n## Objective\nImplement.\n## Prerequisites\nNone.\n## Acceptance Criteria\nSource requirements.\n## Required Tests\nSource tests.\n";
+        fs::write(
+            agenda.join("0001-delivery.md"),
+            format!("{headings}{original}"),
+        )
+        .unwrap();
+        let terminal = agenda.join("9999-project-acceptance.md");
+        let navigation = "- [Proposal](../../openspec/changes/0001-delivery/proposal.md)\n- [Coverage](README.md)\n- [Coverage again](README.md)\n";
+        fs::write(&terminal, format!("{headings}{original}{navigation}\n## Project Goal Coverage\nAll source requirements.\n")).unwrap();
+        let budget_arg = format!("--max-verify-retries={budget}");
+        let result = fixture.run_with("repair", true, &[&budget_arg]);
+        assert!(!result.status.success());
+        let state = fixture.state();
+        assert_eq!(state["verify_retries"], 1);
+        assert!(
+            state["pending_repair"]
+                .as_str()
+                .unwrap()
+                .contains("3 issue(s)")
+        );
+        assert!(
+            state["pending_repair"]
+                .as_str()
+                .unwrap()
+                .contains("## Planning references")
+        );
+        if budget == 0 {
+            assert_eq!(fixture.calls(), baseline_calls); // No expensive Verify or Repair turn.
+            assert_eq!(state["stage"], "verify");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("Latest findings are saved"));
+            // A maintainer correction can resume semantic verification without resetting.
+            fs::write(&terminal, format!("{headings}{original}\n## Planning references\n{navigation}\n## Project Goal Coverage\nAll source requirements.\n")).unwrap();
+            fixture.run_with("repair", true, &[&budget_arg]);
+            assert_eq!(fixture.calls(), baseline_calls + 1);
+            let prompt =
+                fs::read_to_string(fixture.root.join(format!("args-{}", baseline_calls + 1)))
+                    .unwrap();
+            assert!(prompt.contains("VERIFIED"));
+            assert!(!prompt.contains("Repair the planning-only implementation agenda"));
+            // Premature archival must also stop before a model Verify turn.
+            let archive = fixture.root.join("repo/openspec/changes/archive");
+            fs::create_dir_all(&archive).unwrap();
+            fs::rename(&active_change, archive.join("2026-09-28-bootstrap")).unwrap();
+            let result = fixture.run_with("repair", true, &[&budget_arg]);
+            assert!(!result.status.success());
+            assert_eq!(fixture.calls(), baseline_calls + 1);
+            assert!(
+                fixture.state()["pending_repair"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restore the generated bootstrap artifacts")
+            );
+        } else {
+            assert_eq!(fixture.calls(), baseline_calls + 1); // Goes directly to Repair.
+            assert_eq!(state["stage"], "repair");
+            let prompt =
+                fs::read_to_string(fixture.root.join(format!("args-{}", baseline_calls + 1)))
+                    .unwrap();
+            assert!(prompt.contains("Repair the planning-only implementation agenda"));
+            assert!(prompt.contains("Do not archive or commit it"));
+            assert!(prompt.contains("3 issue(s)"));
+        }
+    }
+}

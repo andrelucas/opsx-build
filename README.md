@@ -172,6 +172,11 @@ Each proposal, slice and agenda README contains a `## Supplied requirements`
 section with Markdown links to declared source files and the work that covers
 them. Links are relative to that document or absolute; `#fragment` can identify
 a Markdown heading anchor or an exact requirement/scenario ID in the source.
+Every link in this section must target a declared supplied input directly.
+Keep links to generated proposals, other slices and the agenda README under a
+separate heading such as `## Planning references`; they cannot substitute for
+the original requirement references. The runner reports source-link errors
+across the whole agenda together so Repair can correct them in one pass.
 For example, from `openspec/changes/0001-delivery/proposal.md`:
 
 ```markdown
@@ -184,8 +189,13 @@ For example, from `openspec/changes/0001-delivery/proposal.md`:
 Before accepting Propose, the runner checks the selected schema, absence of a
 generated `specs/` directory, and the source references. A rejected proposal gets
 one corrective turn in its existing planning session before the runner stops;
-it cannot proceed to the proposal commit or Apply. Bootstrap's existing Verify
-pass also checks source links in the generated agenda. Link validation proves
+it cannot proceed to the proposal commit or Apply. Bootstrap checks agenda
+structure, source links and that its change is still active before spending a
+model Verify turn, and checks again before accepting its result. Apply and
+Repair must leave archiving to the runner's Archive stage. All source-link
+findings are reported together with line numbers. Exhausted repairs retain their latest findings in
+the checkpoint; correcting the generated agenda allows resume without resetting
+the campaign or changing protected inputs. Link validation proves
 that the file and referenced heading/ID exist, not that the plan interprets them
 correctly or covers every requirement; semantic review remains part of Verify.
 

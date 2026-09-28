@@ -31,6 +31,11 @@ During Apply, materialize the agenda under `automation/slices/`:
   links to declared original contracts, with heading anchors or exact IDs where
   available. Paths are relative to that document or absolute. Beside each link
   identify the work/slices that cover it; do not restate the requirement.
+- Every link in that section must target a declared supplied input directly.
+  Do not cite the bootstrap proposal, another slice, or the generated README
+  as a requirement source. Put planning/navigation links under a separate
+  level-two heading such as `## Planning references`, while retaining direct
+  source links for every requirement being assigned.
 - Acceptance criteria reference supplied expectations and scenarios. Required
   tests reference those scenarios and describe implementation-specific checks
   without replacing their expected outcomes. Link supplied acceptance files.
@@ -43,10 +48,15 @@ During Apply, materialize the agenda under `automation/slices/`:
   all supplied in-scope requirements, including integration and required checks.
   It cannot define different acceptance expectations.
 
+Apply and Repair leave the bootstrap change active. Do not archive it or create
+completion commits in either stage; the runner invokes Archive and completion
+commit only after successful verification.
+
 Use the existing Verify pass to check agenda structure, ownership, source
 references, conditions, exceptions and complete goal coverage. Return RETRY for
 correctable derived-plan mistakes. Repair bootstrap artifacts and agenda
 together; never change supplied contracts or acceptance expectations. Use
 BLOCKED only for authoritative-input gaps requiring an external decision.
 
-Archive proposal, design and tasks without specification synchronization.
+During the runner's Archive stage, archive proposal, design and tasks without
+specification synchronization.

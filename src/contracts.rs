@@ -11,6 +11,7 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA: &str = "opsx-supplied-contracts";
+const SOURCE_REFERENCE_GUIDANCE: &str = "Every Markdown link inside `## Supplied requirements` must point directly to a declared supplied input. Generated proposals (including archived proposals), agenda READMEs, coverage tables and other slices are planning artifacts, not supplied inputs. Keep navigation or planning-evidence links under a separate level-two heading such as `## Planning references`. Replace indirect requirement references with links to the original declared files; moving a link must not remove its requirements from coverage. Do not add generated artifacts to the protected-input list or edit supplied inputs to satisfy this check. Correct all reported references together.";
 pub(crate) const CONFIGURE_GUIDANCE: &str = "\n\nWorkflow choice: read the campaign context file (the selected --context, otherwise context.md if present) and its declared relevant inputs. When these supply precise existing behavioural contracts and component ownership, suggest --supplied-contracts and explain that it plans implementation through original source references, design and tasks without generating replacement specifications. For exploratory work that still develops requirements, suggest the ordinary workflow. Let the user accept the suggestion in the configuration conversation; never silently switch an existing choice. Record the agreed workflow, repeatable --contract PATH arguments naming the exact authoritative files, and optional --acceptance-file PATH arguments naming maintainer-owned checks/fixtures to preserve. Paths are relative to the campaign root; files must already exist, and directories/globs are not supported. Identify supplied acceptance expectations separately from tests the campaign should implement. Acceptance files are protected inputs; listing them does not execute checks. If input completeness or ownership is unclear, explain that uncertainty rather than assuming it. The actual runner uses only the recorded selection and never infers its workflow from context at launch. Disabling this option for a new run does not change the workflow recorded by an existing resumable run.";
 const ASSETS: &[(&str, &str)] = &[
     (
@@ -166,6 +167,8 @@ impl SuppliedContracts {
             ));
         }
         text.push_str("\nAuthoring rules above apply only to the owning stage: Propose plans, Apply/Repair implement, Verify reads and checks, and Archive archives. Commit stages preserve these inputs and include the bundled workflow schema when it is new; they do not create new plans.\n");
+        text.push_str(SOURCE_REFERENCE_GUIDANCE);
+        text.push('\n');
         if let Some(gate) = &self.acceptance {
             text.push_str(&gate.guidance());
         }
@@ -221,7 +224,7 @@ impl SuppliedContracts {
 
     pub fn check_agenda(&self, repo: &Path) -> Result<()> {
         let root = repo.join("automation/slices");
-        self.check_references(&root.join("README.md"))?;
+        let mut documents = vec![root.join("README.md")];
         for entry in fs::read_dir(root)? {
             let entry = entry?;
             if entry
@@ -229,19 +232,35 @@ impl SuppliedContracts {
                 .to_str()
                 .is_some_and(|name| crate::agenda::parse_slice_name(name).is_some())
             {
-                self.check_references(&entry.path())?;
+                documents.push(entry.path());
             }
         }
-        Ok(())
+        documents.sort();
+        let mut errors = Vec::new();
+        for document in documents {
+            match self.reference_errors(&document) {
+                Ok(issues) => errors.extend(issues),
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        check_reference_errors(errors)
     }
 
     pub fn check_references(&self, document: &Path) -> Result<()> {
-        let text = fs::read_to_string(document)?;
+        check_reference_errors(self.reference_errors(document)?)
+    }
+
+    fn reference_errors(&self, document: &Path) -> Result<Vec<String>> {
+        let text = fs::read_to_string(document).with_context(|| {
+            format!("cannot read source references in `{}`", document.display())
+        })?;
         let mut in_section = false;
         let mut section = String::new();
-        for line in text.lines() {
+        let mut first_line = 1;
+        for (index, line) in text.lines().enumerate() {
             if line.trim_end() == "## Supplied requirements" {
                 in_section = true;
+                first_line = index + 2;
             } else if in_section && (line.starts_with("## ") || line.starts_with("# ")) {
                 break;
             } else if in_section {
@@ -250,56 +269,80 @@ impl SuppliedContracts {
             }
         }
         let mut contract_link = false;
-        for event in Parser::new(&section) {
+        let mut errors = Vec::new();
+        for (event, range) in Parser::new(&section).into_offset_iter() {
             let Event::Start(Tag::Link { dest_url, .. }) = event else {
                 continue;
             };
-            let (file, fragment) = dest_url
-                .split_once('#')
-                .map_or((dest_url.as_ref(), None), |(file, fragment)| {
-                    (file, Some(fragment))
-                });
-            let path = document
-                .parent()
-                .unwrap()
-                .join(decode_link(file)?)
-                .canonicalize()
-                .with_context(|| {
-                    format!(
-                        "unresolved source reference `{dest_url}` in `{}`",
-                        document.display()
-                    )
-                })?;
-            let input = self
-                .inputs
-                .iter()
-                .find(|input| input.resolved == path)
-                .with_context(|| {
-                    format!(
-                        "reference `{dest_url}` in `{}` is not a declared supplied input",
-                        document.display()
-                    )
-                })?;
-            if let Some(fragment) = fragment {
-                let fragment = decode_link(fragment)?;
-                if !has_fragment(&fs::read_to_string(&path)?, &fragment) {
-                    bail!(
-                        "unresolved requirement/section `{fragment}` in `{}` (referenced by `{}`)",
-                        path.display(),
-                        document.display()
-                    );
+            match self.check_reference(document, &dest_url) {
+                Ok(is_contract) => contract_link |= is_contract,
+                Err(error) => {
+                    let line = first_line
+                        + section[..range.start]
+                            .bytes()
+                            .filter(|b| *b == b'\n')
+                            .count();
+                    errors.push(format!("{error:#} (line {line})"));
                 }
             }
-            contract_link |= input.contract;
         }
         if !contract_link {
-            bail!(
+            errors.push(format!(
                 "`{}` needs `## Supplied requirements` with Markdown links to governing declared contracts",
                 document.display()
-            );
+            ));
         }
-        Ok(())
+        Ok(errors)
     }
+
+    fn check_reference(&self, document: &Path, dest_url: &str) -> Result<bool> {
+        let (file, fragment) = dest_url
+            .split_once('#')
+            .map_or((dest_url, None), |(file, fragment)| (file, Some(fragment)));
+        let path = document
+            .parent()
+            .unwrap()
+            .join(decode_link(file)?)
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "unresolved source reference `{dest_url}` in `{}`",
+                    document.display()
+                )
+            })?;
+        let input = self
+            .inputs
+            .iter()
+            .find(|input| input.resolved == path)
+            .with_context(|| {
+                format!(
+                    "reference `{dest_url}` in `{}` is not a declared supplied input",
+                    document.display()
+                )
+            })?;
+        if let Some(fragment) = fragment {
+            let fragment = decode_link(fragment)?;
+            if !has_fragment(&fs::read_to_string(&path)?, &fragment) {
+                bail!(
+                    "unresolved requirement/section `{fragment}` in `{}` (referenced by `{}`)",
+                    path.display(),
+                    document.display()
+                );
+            }
+        }
+        Ok(input.contract)
+    }
+}
+
+fn check_reference_errors(errors: Vec<String>) -> Result<()> {
+    if !errors.is_empty() {
+        bail!(
+            "source-reference check found {} issue(s):\n- {}\n\n{SOURCE_REFERENCE_GUIDANCE}",
+            errors.len(),
+            errors.join("\n- ")
+        );
+    }
+    Ok(())
 }
 
 fn schema_root(repo: &Path) -> PathBuf {
@@ -518,6 +561,61 @@ mod tests {
                 .check_proposal(&fixture.0, "slice", Some(SCHEMA))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn agenda_reports_all_bad_source_links_and_allows_separate_planning_navigation() {
+        let fixture = Fixture::new();
+        let inputs = fixture.inputs();
+        let agenda = fixture.0.join("automation/slices");
+        let archive = fixture
+            .0
+            .join("openspec/changes/archive/2026-09-28-bootstrap");
+        fs::create_dir_all(&agenda).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("proposal.md"), "Derived plan").unwrap();
+        let source = "## Supplied requirements\n- [REQ-01](../../contract.md#REQ-01)\n";
+        fs::write(agenda.join("README.md"), source).unwrap();
+        fs::write(
+            agenda.join("0001-delivery.md"),
+            format!("{source}- [Missing](../../contract.md#REQ-99)\n"),
+        )
+        .unwrap();
+        let generated = "- [Bootstrap](../../openspec/changes/archive/2026-09-28-bootstrap/proposal.md)\n- [Coverage](README.md)\n- [Coverage again](README.md)\n";
+        fs::write(
+            agenda.join("9999-project-acceptance.md"),
+            format!("{source}{generated}"),
+        )
+        .unwrap();
+        let error = inputs.check_agenda(&fixture.0).unwrap_err().to_string();
+        assert!(error.contains("4 issue(s)"), "{error}");
+        for expected in [
+            "0001-delivery.md",
+            "REQ-99",
+            "9999-project-acceptance.md",
+            "archive/2026-09-28-bootstrap/proposal.md",
+            "reference `README.md`",
+            "## Planning references",
+            "Correct all reported references together",
+            "(line 3)",
+            "(line 4)",
+            "(line 5)",
+        ] {
+            assert!(error.contains(expected), "missing {expected}: {error}");
+        }
+        fs::write(agenda.join("0001-delivery.md"), source).unwrap();
+        fs::write(
+            agenda.join("9999-project-acceptance.md"),
+            format!("{source}\n## Planning references\n{generated}"),
+        )
+        .unwrap();
+        inputs.check_agenda(&fixture.0).unwrap();
+        fs::write(
+            agenda.join("9999-project-acceptance.md"),
+            format!("## Supplied requirements\n{generated}\n## Planning references\n{source}"),
+        )
+        .unwrap();
+        assert!(inputs.check_agenda(&fixture.0).is_err());
     }
 
     #[test]

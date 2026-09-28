@@ -2588,6 +2588,9 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         state.verification = None;
+        if !self.check_bootstrap_for_verify(repo, state)? {
+            return Ok(());
+        }
         let verification_inputs =
             verification::capture(repo, state.product_repo.as_deref(), &self.ui);
         let verify_subject = verification_subject(
@@ -2622,36 +2625,8 @@ impl<U: Ui> App<U> {
         };
         match result.signal {
             StageSignal::Verified => {
-                if state.bootstrap {
-                    match validate_bootstrap_agenda(repo).and_then(|count| {
-                        if let Some(contracts) = &state.contracts {
-                            contracts.check_agenda(repo)?;
-                        }
-                        Ok(count)
-                    }) {
-                        Ok(count) => self.ui.success(&format!(
-                            "Bootstrap agenda passed structural checks ({count} slices)"
-                        )),
-                        Err(error) => {
-                            state.verify_retries += 1;
-                            if state.verify_retries > self.cli.max_verify_retries {
-                                bail!(
-                                    "bootstrap agenda still failed its structural postcondition after {} repair cycle(s): {error}",
-                                    self.cli.max_verify_retries
-                                );
-                            }
-                            state.pending_repair = Some(format!(
-                                "OpenSpec verification reported success, but the deterministic bootstrap agenda check failed: {error}. Correct the agenda without implementing product code."
-                            ));
-                            state.stage = Stage::Repair;
-                            persist_state(repo, state, &self.ui)?;
-                            self.ui.warn(&format!(
-                                "Bootstrap agenda requires structural repair {}/{}: {error}",
-                                state.verify_retries, self.cli.max_verify_retries
-                            ));
-                            return Ok(());
-                        }
-                    }
+                if !self.check_bootstrap_for_verify(repo, state)? {
+                    return Ok(());
                 }
                 self.ui.success("Verification passed");
                 state.verification = Some(VerificationEvidence::finish(
@@ -2700,6 +2675,54 @@ impl<U: Ui> App<U> {
                 )
             }
         }
+    }
+
+    fn check_bootstrap_for_verify(&self, repo: &Path, state: &mut RunState) -> Result<bool> {
+        if !state.bootstrap {
+            return Ok(true);
+        }
+        let mut errors = Vec::new();
+        if let Err(error) = validate_bootstrap_agenda(repo) {
+            errors.push(format!("{error:#}"));
+        }
+        if let Some(contracts) = &state.contracts
+            && let Err(error) = contracts.check_agenda(repo)
+        {
+            errors.push(format!("{error:#}"));
+        }
+        let active_change = repo.join("openspec/changes").join(require_change(state)?);
+        if !active_change.is_dir() {
+            errors.push(format!(
+                "bootstrap change must remain active at `{}` until Verify succeeds. If it was prematurely archived, restore the generated bootstrap artifacts to this active location; leave supplied inputs unchanged",
+                active_change.display()
+            ));
+        }
+        if errors.is_empty() {
+            return Ok(true);
+        }
+        let error = errors.join("\n\n");
+        state.verify_retries += 1;
+        state.pending_repair = Some(format!(
+            "The deterministic bootstrap agenda check failed: {error}. Correct all reported issues in the agenda and bootstrap planning artifacts without implementing product code or changing supplied inputs. Leave the bootstrap change active; do not archive or commit it."
+        ));
+        let exhausted = state.verify_retries > self.cli.max_verify_retries;
+        state.stage = if exhausted {
+            Stage::Verify
+        } else {
+            Stage::Repair
+        };
+        persist_state(repo, state, &self.ui)?;
+        if exhausted {
+            bail!(
+                "bootstrap agenda still failed its structural check after {} repair cycle(s): {error}. Latest findings are saved in the checkpoint",
+                self.cli.max_verify_retries
+            );
+        }
+        self.ui.warn(&format!(
+            "Bootstrap agenda requires structural repair {}/{}: {error}",
+            state.verify_retries, self.cli.max_verify_retries
+        ));
+        Ok(false)
     }
 
     fn run_repair(
@@ -2759,7 +2782,7 @@ impl<U: Ui> App<U> {
         );
         let base = if state.bootstrap {
             format!(
-                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts together against the supplied context in `openspec/config.yaml` and its declared required inputs. Remove generated ownership violations and correct acceptance criteria to preserve source behaviour, including conditions and exceptions. Update the coverage map and required tests coherently. Do not implement product code, create implementation OpenSpec changes, or alter supplied contracts.\n\n{}\n\nVerifier context:\n{finding}",
+                "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts together against the supplied context in `openspec/config.yaml` and its declared required inputs. Remove generated ownership violations and correct acceptance criteria to preserve source behaviour, including conditions and exceptions. Update the coverage map and required tests coherently. Do not implement product code, create implementation OpenSpec changes, or alter supplied contracts. Leave the bootstrap change active for Verify. Do not archive or commit it; the runner owns those later stages.\n\n{}\n\nVerifier context:\n{finding}",
                 worker_capacity_guidance(self.cli.frontier_worker)
             )
         } else if frontier_terminal {
