@@ -469,6 +469,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
     ) -> Result<TurnOutcome> {
         let client = self.server.client(self.ui)?;
         usage.model(client.reported_model(session_id.as_str()).as_deref());
+        usage.observe_codex_transcript(client.transcript_path(session_id.as_str()).as_deref());
         self.ui.debug(&format!("Codex thread: {session_id}"));
         let schema = self
             .launcher
@@ -497,6 +498,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                 .is_some_and(StreamFilter::includes_reasoning)
                 .then_some("auto"),
         )?;
+        usage.codex_turn(&turn_id);
         let started = Instant::now();
         let mut response = String::new();
         let mut context_report = None;

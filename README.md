@@ -9,8 +9,10 @@ and lets the repository, OpenSpec artifacts, and selected agent do their own
 jobs. Claude Code is the default backend; OpenCode and Codex are available as
 explicit worker or frontier backends.
 
-During an ordinary run it deliberately does **not** infer file ownership,
-fingerprint dirty files, or police Git HEAD. By default, the selected worker agent creates
+During an ordinary run it deliberately does **not** infer file ownership or
+require a clean working tree. Read-only file fingerprints support the handoff
+from Verify to completion commit; they do not determine commit scope.
+By default, the selected worker agent creates
 proposal and completion milestone commits under explicit non-destructive instructions.
 Development runs can use `--yolo` to skip the proposal commit and retain only
 the completion commit. This saves one fresh worker-agent invocation per change,
@@ -707,7 +709,28 @@ committed, the agent preserves the commits, reports the imperfection, and
 continues without requesting permission to amend, creating a replacement
 commit, or reporting `BLOCKED` for formatting alone. If the relevant work is
 already committed, Claude may report success without manufacturing an empty
-commit.
+commit. Commit inspection stays focused on the assigned change and relevant
+diffs. The agent prepares one complete message file under Git's metadata
+directory and passes it to `git commit -F`, avoiding repeated formatting and
+temporary-file work.
+
+Successful Verify summaries record the checks run, working directories,
+outcomes and limitations. The checkpoint carries this evidence into completion
+commit, along with a list of files changed since verification. Read-only Git
+content hashes cover tracked and non-ignored untracked files, including file
+additions, deletions and executable-mode changes. Sidecar runs cover both
+repositories. No index, working-tree content or Git history is changed by this
+measurement.
+
+The completion agent reuses successful checks when their relevant inputs are
+unchanged. It still inspects commit scope and archive completion. Changes to
+code, tests, fixtures, dependencies, build configuration or governing
+requirements require reassessing and rerunning affected checks. Ignored files,
+external inputs and environment changes remain the agent's responsibility;
+repository policies requiring fresh checks still apply. Missing/old evidence,
+changes during Verify, unreadable inputs, symlinks or submodules fall back to
+normal evidence inspection rather than certifying unchanged inputs. This
+handoff does not weaken Verify or introduce another verification stage.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
@@ -1638,6 +1661,21 @@ interrupted attempts, with:
   Tool arguments and result text are not stored. Matching fingerprints are
   candidates for inspection, not proof of wasted work; a repeated check can be
   necessary after an edit. The `repeated` flag compares calls within one attempt.
+  Schema version 2 also records `execution_fingerprint` and
+  `repeated_execution`: shell-tool descriptions are excluded from that separate
+  comparison, while commands and execution options remain significant. The
+  terminal repeat-candidate count uses this execution comparison.
+- For Codex, `codex_tool_results` separately records outer tool-result IDs,
+  text character counts and recognized clipping notices from the saved session
+  transcript. These are not additional tool calls: a single outer response can
+  combine many inner commands. They do not prove that every inner command's
+  output reached the model. No output text or reasoning is copied into the
+  journal. Collection reads only the transcript tail for the current attempt
+  and turn, without making another model or App Server request. A missing
+  transcript is `null`, not zero clipping; `turn_complete: false` identifies
+  observations made before the completion marker was saved. These are retained
+  transcript observations, not provider wire measurements. Positive clipping
+  counts also appear in the terminal usage summary.
 
 Input totals **include** cache reads/writes. Output totals **include** reasoning
 where the backend exposes it; do not add those component fields again. Missing

@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -167,11 +167,30 @@ pub struct ToolUsage {
     pub name: String,
     pub fingerprint: Option<String>,
     pub repeated: bool,
+    #[serde(default)]
+    pub execution_fingerprint: Option<String>,
+    #[serde(default)]
+    pub repeated_execution: bool,
     pub completed: bool,
     pub failed: Option<bool>,
     pub exit_code: Option<i64>,
     pub result_chars: Option<usize>,
     pub truncated: Option<bool>,
+}
+
+/// Outer results are distinct from the inner tool operations in `tools`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexToolResults {
+    pub turn_id: String,
+    pub turn_complete: bool,
+    pub results: Vec<OuterToolResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OuterToolResult {
+    pub call_id: String,
+    pub result_chars: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +216,8 @@ pub struct UsageRecord {
     pub notes: Vec<String>,
     pub tool_events_observed: bool,
     pub tools: Vec<ToolUsage>,
+    #[serde(default)]
+    pub codex_tool_results: Option<CodexToolResults>,
     pub cumulative: Option<Snapshot>,
 }
 
@@ -210,6 +231,9 @@ pub(crate) struct Attempt<'a, U: Ui> {
     partial_baseline: bool,
     seen: HashSet<String>,
     fingerprints: HashSet<String>,
+    execution_fingerprints: HashSet<String>,
+    codex_transcript: Option<(PathBuf, u64)>,
+    codex_turn_id: Option<String>,
     messages: BTreeMap<String, Tokens>,
     finished: bool,
 }
@@ -239,10 +263,13 @@ impl<'a, U: Ui> Attempt<'a, U> {
             partial_baseline: false,
             seen: HashSet::new(),
             fingerprints: HashSet::new(),
+            execution_fingerprints: HashSet::new(),
+            codex_transcript: None,
+            codex_turn_id: None,
             messages: BTreeMap::new(),
             finished: false,
             record: UsageRecord {
-                schema_version: 1,
+                schema_version: 2,
                 id: Uuid::new_v4().to_string(),
                 invocation_id: identity.invocation.to_owned(),
                 attempt: identity.attempt,
@@ -266,6 +293,7 @@ impl<'a, U: Ui> Attempt<'a, U> {
                 notes: Vec::new(),
                 tool_events_observed: false,
                 tools: Vec::new(),
+                codex_tool_results: None,
                 cumulative: None,
             },
         }
@@ -298,11 +326,27 @@ impl<'a, U: Ui> Attempt<'a, U> {
         let repeated = fingerprint
             .as_ref()
             .is_some_and(|key| !self.fingerprints.insert(key.clone()));
+        let mut execution = input.clone();
+        if matches!(name, "Bash" | "bash")
+            && let Some(fields) = execution.as_object_mut()
+        {
+            fields.remove("description");
+        }
+        let execution_fingerprint = (!execution.is_null()).then(|| {
+            let mut hasher = DefaultHasher::new();
+            (name, execution.to_string()).hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        });
+        let repeated_execution = execution_fingerprint
+            .as_ref()
+            .is_some_and(|key| !self.execution_fingerprints.insert(key.clone()));
         self.record.tools.push(ToolUsage {
             id: id.to_owned(),
             name: name.to_owned(),
             fingerprint,
             repeated,
+            execution_fingerprint,
+            repeated_execution,
             completed: false,
             failed: None,
             exit_code: None,
@@ -676,11 +720,42 @@ impl<'a, U: Ui> Attempt<'a, U> {
         self.flush();
     }
 
+    pub fn observe_codex_transcript(&mut self, path: Option<&Path>) {
+        let Some(path) = path else {
+            self.note("Codex outer tool results unavailable: no transcript path was reported.");
+            return;
+        };
+        match fs::metadata(path) {
+            Ok(metadata) => self.codex_transcript = Some((path.to_owned(), metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.codex_transcript = Some((path.to_owned(), 0));
+            }
+            Err(_) => self.note("Codex outer tool results unavailable: transcript cannot be read."),
+        }
+    }
+
+    pub fn codex_turn(&mut self, turn_id: &str) {
+        self.codex_turn_id = Some(turn_id.to_owned());
+    }
+
     fn flush(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
+        if let Some((path, offset)) = &self.codex_transcript
+            && let Some(turn) = &self.codex_turn_id
+        {
+            match codex_outer_results(path, *offset, turn) {
+                Ok(Some(results)) => {
+                    if !results.turn_complete {
+                        self.note("Codex outer tool results are partial: the turn's completion marker was not yet saved.");
+                    }
+                    self.record.codex_tool_results = Some(results);
+                }
+                _ => self.note("Codex outer tool results unavailable: this turn's transcript was not readable or not yet saved."),
+            }
+        }
         if self.record.usage_scope == "unavailable" && !self.messages.is_empty() {
             self.record.tokens = Tokens::zero();
             for usage in self.messages.values() {
@@ -692,6 +767,64 @@ impl<'a, U: Ui> Attempt<'a, U> {
         self.record.elapsed_ms = self.started.elapsed().as_millis() as u64;
         self.ui.record_usage(&self.record);
     }
+}
+
+fn codex_outer_results(
+    path: &Path,
+    offset: u64,
+    turn: &str,
+) -> std::io::Result<Option<CodexToolResults>> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() < offset {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut active = false;
+    let mut observed = false;
+    let mut seen = HashSet::new();
+    let mut result = CodexToolResults {
+        turn_id: turn.to_owned(),
+        turn_complete: false,
+        results: Vec::new(),
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let payload = &event["payload"];
+        if event["type"] == "turn_context"
+            || (event["type"] == "event_msg" && payload["type"] == "task_started")
+        {
+            active = payload["turn_id"].as_str() == Some(turn);
+            observed |= active;
+        }
+        if !active {
+            continue;
+        }
+        if event["type"] == "event_msg"
+            && payload["type"] == "task_complete"
+            && payload["turn_id"].as_str() == Some(turn)
+        {
+            result.turn_complete = true;
+        }
+        if event["type"] == "response_item"
+            && matches!(
+                payload["type"].as_str(),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+            && let Some(id) = payload["call_id"].as_str()
+            && let Some(output) = text_content(&payload["output"])
+            && seen.insert(id.to_owned())
+        {
+            result.results.push(OuterToolResult {
+                call_id: id.to_owned(),
+                result_chars: output.chars().count(),
+                truncated: output.contains("Warning: truncated output"),
+            });
+        }
+    }
+    Ok(observed.then_some(result))
 }
 
 impl<U: Ui> Drop for Attempt<'_, U> {
@@ -805,7 +938,11 @@ pub(crate) fn summary(record: &UsageRecord) -> String {
     } else {
         "unknown".to_owned()
     };
-    let repeated = record.tools.iter().filter(|tool| tool.repeated).count();
+    let repeated = record
+        .tools
+        .iter()
+        .filter(|tool| tool.repeated_execution)
+        .count();
     let repeats = if repeated == 0 {
         String::new()
     } else {
@@ -814,6 +951,18 @@ pub(crate) fn summary(record: &UsageRecord) -> String {
     let cost = record
         .reported_cost_usd
         .map_or_else(String::new, |cost| format!(", estimated ${cost:.4}"));
+    let clipped = record.codex_tool_results.as_ref().map_or(0, |results| {
+        results
+            .results
+            .iter()
+            .filter(|result| result.truncated)
+            .count()
+    });
+    let clipping = if clipped == 0 {
+        String::new()
+    } else {
+        format!(", {clipped} clipped outer results")
+    };
     let coverage = match record.usage_scope.as_str() {
         "thread_delta" | "session_tree_delta" | "observed_steps" => "",
         "main_agent_last_result" => " (main agent's last result only)",
@@ -821,7 +970,7 @@ pub(crate) fn summary(record: &UsageRecord) -> String {
         _ => " (partial usage)",
     };
     format!(
-        "Usage (attempt {}): {} input ({} cached), {} output tokens; {tools} tool calls{repeats}{cost}{coverage}",
+        "Usage (attempt {}): {} input ({} cached), {} output tokens; {tools} tool calls{repeats}{clipping}{cost}{coverage}",
         record.attempt,
         count(record.tokens.input),
         count(record.tokens.cache_read),
@@ -1163,6 +1312,120 @@ pub(crate) mod tests {
         );
         assert_eq!(usage.record.tokens, Tokens::default());
         assert!(summary(&usage.record).contains("unknown input"));
+    }
+
+    #[test]
+    fn execution_repeats_ignore_shell_descriptions_but_preserve_execution_options() {
+        let ui = RecordingUi::default();
+        for backend in ["claude", "opencode"] {
+            let mut usage = attempt(&ui, backend, true);
+            let tool = if backend == "claude" { "Bash" } else { "bash" };
+            usage.tool(
+                "one",
+                tool,
+                &json!({"command":"go test ./...", "description":"Test code", "timeout":1000}),
+            );
+            usage.tool(
+                "two",
+                tool,
+                &json!({"command":"go test ./...", "description":"Check tests", "timeout":1000}),
+            );
+            usage.tool(
+                "three",
+                tool,
+                &json!({"command":"go test ./...", "description":"Check tests", "timeout":2000}),
+            );
+            assert!(!usage.record.tools[1].repeated);
+            assert!(usage.record.tools[1].repeated_execution);
+            assert!(!usage.record.tools[2].repeated_execution);
+            assert!(summary(&usage.record).contains("1 repeat candidates"));
+            let serialized = serde_json::to_string(&usage.record).unwrap();
+            assert!(!serialized.contains("go test"));
+            assert!(!serialized.contains("Check tests"));
+        }
+    }
+
+    #[test]
+    fn outer_codex_results_are_turn_scoped_deduplicated_and_content_free() {
+        let path =
+            std::env::temp_dir().join(format!("opsx-outer-results-{}.jsonl", Uuid::new_v4()));
+        fs::write(&path, "old records\n").unwrap();
+        let ui = RecordingUi::default();
+        let mut usage = attempt(&ui, "codex", true);
+        usage.observe_codex_transcript(Some(&path));
+        usage.codex_turn("current");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for event in [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"previous"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"old","output":"Warning: truncated output"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"current"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"batch","output":[{"type":"output_text","text":"secret result\nWarning: truncated output"}]}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"batch","output":"duplicate"}}),
+            json!({"type":"response_item","payload":{"type":"reasoning","content":"private reasoning"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"plain","output":"short result"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"current"}}),
+            json!({"type":"turn_context","payload":{"turn_id":"next"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"next","output":"ignored"}}),
+        ] {
+            writeln!(file, "{event}").unwrap();
+        }
+        usage.finish("ready");
+        let records = ui.records.lock().unwrap();
+        let record = &records[0];
+        let outer = record.codex_tool_results.as_ref().unwrap();
+        assert!(outer.turn_complete);
+        assert_eq!(outer.results.len(), 2);
+        assert_eq!(outer.results[0].call_id, "batch");
+        assert!(outer.results[0].truncated);
+        assert!(!outer.results[1].truncated);
+        assert!(
+            record.tools.is_empty(),
+            "outer results must not inflate inner tool counts"
+        );
+        assert!(summary(record).contains("1 clipped outer results"));
+        let serialized = serde_json::to_string(record).unwrap();
+        for secret in ["secret result", "private reasoning", "short result"] {
+            assert!(!serialized.contains(secret));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_or_incomplete_transcripts_are_not_reported_as_complete_zeroes() {
+        let path =
+            std::env::temp_dir().join(format!("opsx-outer-results-{}.jsonl", Uuid::new_v4()));
+        let ui = RecordingUi::default();
+        let mut usage = attempt(&ui, "codex", true);
+        usage.observe_codex_transcript(Some(&path));
+        usage.codex_turn("turn");
+        usage.finish("error");
+        assert!(ui.records.lock().unwrap()[0].codex_tool_results.is_none());
+        fs::write(
+            &path,
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn\"}}\n{incomplete",
+        )
+        .unwrap();
+        let partial = codex_outer_results(&path, 0, "turn").unwrap().unwrap();
+        assert!(!partial.turn_complete);
+        assert!(partial.results.is_empty());
+        assert!(codex_outer_results(&path, 0, "other").unwrap().is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_usage_records_remain_readable() {
+        let ui = RecordingUi::default();
+        let mut usage = attempt(&ui, "claude", true);
+        usage.tool("one", "Bash", &json!({"command":"true"}));
+        let mut value = serde_json::to_value(&usage.record).unwrap();
+        value["schema_version"] = json!(1);
+        value.as_object_mut().unwrap().remove("codex_tool_results");
+        let tool = value["tools"][0].as_object_mut().unwrap();
+        tool.remove("execution_fingerprint");
+        tool.remove("repeated_execution");
+        let restored: UsageRecord = serde_json::from_value(value).unwrap();
+        assert!(restored.codex_tool_results.is_none());
+        assert!(restored.tools[0].execution_fingerprint.is_none());
     }
 
     fn git(repo: &Path, args: &[&str]) {

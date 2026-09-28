@@ -24,3 +24,4 @@ mod stream_style;
 mod terminal_progress;
 pub mod ui;
 pub mod usage;
+mod verification;

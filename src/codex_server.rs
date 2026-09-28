@@ -91,6 +91,7 @@ struct CodexClientInner {
     next_request_id: AtomicU64,
     active_threads: Mutex<HashSet<String>>,
     thread_models: Mutex<HashMap<String, String>>,
+    thread_paths: Mutex<HashMap<String, std::path::PathBuf>>,
     stderr: Arc<Mutex<String>>,
 }
 
@@ -200,6 +201,7 @@ impl CodexServerClient {
                 next_request_id: AtomicU64::new(1),
                 active_threads: Mutex::new(HashSet::new()),
                 thread_models: Mutex::new(HashMap::new()),
+                thread_paths: Mutex::new(HashMap::new()),
                 stderr,
             }),
         };
@@ -322,6 +324,12 @@ impl CodexServerClient {
     }
 
     fn remember_model(&self, thread_id: &str, response: &Value) {
+        if let Some(path) = response.pointer("/thread/path").and_then(Value::as_str)
+            && std::path::Path::new(path).is_absolute()
+            && let Ok(mut paths) = self.inner.thread_paths.lock()
+        {
+            paths.insert(thread_id.to_owned(), path.into());
+        }
         if let Some(model) = response.get("model").and_then(Value::as_str)
             && let Ok(mut models) = self.inner.thread_models.lock()
         {
@@ -336,6 +344,10 @@ impl CodexServerClient {
             .ok()?
             .get(thread_id)
             .cloned()
+    }
+
+    pub(crate) fn transcript_path(&self, thread_id: &str) -> Option<std::path::PathBuf> {
+        self.inner.thread_paths.lock().ok()?.get(thread_id).cloned()
     }
 
     fn default_model(&self) -> Result<String> {

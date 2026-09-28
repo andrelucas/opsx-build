@@ -59,6 +59,7 @@ use crate::{
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::{CampaignIterationView, CampaignView, Ui},
+    verification::{self, VerificationEvidence},
 };
 
 const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Record the intended agenda structure, slice files, acceptance criteria, and required tests in the OpenSpec design and tasks so a fresh Apply session can materialize them.";
@@ -176,6 +177,8 @@ struct RunState {
     #[serde(default)]
     planning_backend: Option<String>,
     pending_repair: Option<String>,
+    #[serde(default)]
+    verification: Option<VerificationEvidence>,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
@@ -247,6 +250,7 @@ impl RunState {
             planning_session: None,
             planning_backend: None,
             pending_repair: None,
+            verification: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -291,6 +295,7 @@ impl RunState {
             planning_session: None,
             planning_backend: None,
             pending_repair: None,
+            verification: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -2350,6 +2355,9 @@ impl<U: Ui> App<U> {
         frontier_terminal: bool,
     ) -> Result<()> {
         let change = require_change(state)?;
+        state.verification = None;
+        let verification_inputs =
+            verification::capture(repo, state.product_repo.as_deref(), &self.ui);
         let verify_subject = verification_subject(
             &change,
             state.bootstrap,
@@ -2357,6 +2365,9 @@ impl<U: Ui> App<U> {
             self.cli.frontier_worker,
         );
         let verify_subject = with_sidecar_context(state, &verify_subject);
+        let verify_subject = format!(
+            "{verify_subject}\n\nIn the final summary, record the checks actually run, their working directories, outcomes and any limitations concisely, so completion commit can reuse the evidence. Preserve the check process's own exit status when piping or summarizing output; a successful tail/echo command is not proof that the check passed. Keep this evidence in the summary; do not edit files just to record it."
+        );
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
@@ -2405,6 +2416,12 @@ impl<U: Ui> App<U> {
                     }
                 }
                 self.ui.success("Verification passed");
+                state.verification = Some(VerificationEvidence::finish(
+                    &change,
+                    result.text.clone(),
+                    verification_inputs,
+                    &self.ui,
+                ));
                 state.pending_repair = None;
                 state.stage = state.stage.after_verified()?;
                 persist_state(repo, state, &self.ui)
@@ -2588,6 +2605,12 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         let commit_message = completion_commit_message(&change);
+        let handoff = state
+            .verification
+            .as_ref()
+            .filter(|evidence| evidence.change == change)
+            .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
+            .unwrap_or_else(verification::missing_handoff);
         let planning_baseline = current_head(repo, &self.ui)?;
         let product_repo = state.product_repo.clone();
         let product_baseline = product_repo
@@ -2612,7 +2635,7 @@ impl<U: Ui> App<U> {
         let result = invoke_fresh(
             claude,
             &format!("{change}-completion-commit"),
-            &stage_prompt("", &task, StageProtocol::Ready),
+            &stage_prompt("", &format!("{task}{handoff}"), StageProtocol::Ready),
             "Worker agent is committing the completed change",
             StageProtocol::Ready,
         );
@@ -3557,13 +3580,13 @@ fn archive_subject(change: &str) -> String {
 fn proposal_commit_message(change: &str) -> String {
     format!(
         "Use commit subject exactly `openspec: propose {change}`. Add a conventional Git commit body derived from the completed OpenSpec proposal, specs, design, and tasks. Use imperative mood. Write a short first paragraph explaining the intended observable change and why it is being made. Add at most one second paragraph for an important scope boundary or acceptance condition. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, command invocations, generated boilerplate, or behavior not approved by those artifacts. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
-    )
+    ) + " Keep inspection focused on the assigned change's proposal artifacts and the diff being committed. Consult governing sources where needed to resolve scope or a contradiction; do not repeat the whole planning or implementation workflow. This is a planning-artifact commit: run required artifact validation, not product tests merely to create the commit. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
 }
 
 fn completion_commit_message(change: &str) -> String {
     format!(
         "Use commit subject exactly `openspec: complete {change}`. Add a conventional Git commit body derived from the completed OpenSpec artifacts and actual verification results. Use imperative mood. Write a short first paragraph explaining the delivered observable behavior and its purpose. Add at most one second paragraph summarizing the most important validation that actually ran or a material scope boundary. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, exhaustive implementation mechanics, generated boilerplate, or claims about checks that did not run. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
-    )
+    ) + " Keep inspection focused on the assigned change, the diff being committed, verification evidence, and archive completion. Consult governing sources when needed to resolve a concrete issue. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
 }
 
 fn queue_direction(state: &mut RunState, direction: &str) {
@@ -3730,6 +3753,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         pending_direction: None,
+        verification: None,
         proposal_head: value
             .get("proposal_commit")
             .and_then(Value::as_str)
@@ -4495,6 +4519,21 @@ mod tests {
         )
         .unwrap();
         assert!(migrate_v2(value).is_err());
+    }
+
+    #[test]
+    fn checkpoints_without_verification_handoff_remain_resumable() {
+        let mut value = serde_json::to_value(RunState::new(
+            "build it".to_owned(),
+            ChangeSnapshot::default(),
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("verification");
+        value["stage"] = serde_json::json!("final-commit");
+        let state: RunState = serde_json::from_value(value).unwrap();
+        assert!(state.verification.is_none());
+        assert_eq!(state.stage, Stage::FinalCommit);
+        assert!(verification::missing_handoff().contains("otherwise run the necessary checks"));
     }
 
     #[test]
