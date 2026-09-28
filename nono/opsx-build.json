@@ -19,6 +19,10 @@
     "allow": [
       "$HOME/.claude",
       "$HOME/.codex",
+      "$HOME/go/pkg/mod",
+      "$HOME/.cargo/registry",
+      "$HOME/.cargo/git",
+      "$HOME/.dap-cli",
       "$XDG_CONFIG_HOME/opencode",
       "$XDG_DATA_HOME/opencode",
       "$XDG_STATE_HOME/opencode",
@@ -27,7 +31,8 @@
       "$XDG_DATA_HOME/openspec",
       "$XDG_DATA_HOME/opsx-build"
     ],
-    "allow_file": ["$HOME/.claude.json"]
+    "allow_file": ["$HOME/.claude.json"],
+    "unix_socket_subtree": ["$HOME/.dap-cli"]
   },
   "network": {
     "block": false
@@ -35,7 +40,11 @@
   "platform_overrides": {
     "macos": {
       "filesystem": {
-        "allow": ["$HOME/Library/Keychains"],
+        "allow": [
+          "$HOME/Library/Keychains",
+          "$HOME/Library/Caches/go-build",
+          "$HOME/Library/Caches/pip"
+        ],
         "bypass_protection": ["$HOME/Library/Keychains"]
       }
     }
