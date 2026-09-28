@@ -44,6 +44,7 @@ pub struct CodexLauncher {
     pub prefix_args: Vec<String>,
     pub model: Option<String>,
     pub permission_profile: Option<String>,
+    pub harness_sandbox: bool,
     pub structured_output: bool,
     pub context_window: Option<u64>,
     pub auto_compact_window: Option<u64>,
@@ -119,6 +120,7 @@ impl CodexLauncher {
             prefix_args: words,
             model: connection.model.clone(),
             permission_profile: connection.permission_profile.clone(),
+            harness_sandbox: true,
             structured_output: connection.structured_output,
             context_window: connection.context_window,
             auto_compact_window: connection.auto_compact_window,
@@ -186,7 +188,11 @@ impl CodexLauncher {
             "runtimeWorkspaceRoots": roots,
         });
         if !self.uses_permission_profile(permission_mode) {
-            params["sandbox"] = json!(sandbox);
+            params["sandbox"] = json!(if self.harness_sandbox {
+                sandbox
+            } else {
+                "danger-full-access"
+            });
         }
         if let Some(model) = &self.model {
             params["model"] = json!(model);
@@ -209,7 +215,8 @@ impl CodexLauncher {
     }
 
     fn uses_permission_profile(&self, permission_mode: &str) -> bool {
-        self.permission_profile.is_some()
+        self.harness_sandbox
+            && self.permission_profile.is_some()
             && matches!(
                 permission_mode,
                 "auto" | "acceptEdits" | "default" | "dontAsk"
@@ -230,6 +237,9 @@ impl CodexLauncher {
         permission_mode: &str,
         additional_roots: &[PathBuf],
     ) -> Result<Option<Value>> {
+        if !self.harness_sandbox {
+            return Ok(Some(json!({"type": "dangerFullAccess"})));
+        }
         if self.uses_permission_profile(permission_mode) {
             return Ok(None);
         }
@@ -267,7 +277,18 @@ pub fn build_interactive_codex_command(
     if let Some(model) = &launcher.model {
         args.extend(["--model".to_owned(), model.clone()]);
     }
-    if launcher.uses_permission_profile(permission_mode) {
+    if !launcher.harness_sandbox {
+        let (approval_policy, approvals_reviewer, _) = codex_permissions(permission_mode)?;
+        args.extend([
+            "--sandbox".to_owned(),
+            "danger-full-access".to_owned(),
+            "--ask-for-approval".to_owned(),
+            approval_policy.to_owned(),
+            "-c".to_owned(),
+            format!("approvals_reviewer={}", json!(approvals_reviewer)),
+            "--no-daemon".to_owned(),
+        ]);
+    } else if launcher.uses_permission_profile(permission_mode) {
         let (approval_policy, approvals_reviewer, _) = codex_permissions(permission_mode)?;
         let profile = launcher
             .permission_profile
@@ -1489,6 +1510,47 @@ mod tests {
         );
         assert!(!interactive.args.iter().any(|arg| arg == "--sandbox"));
         assert!(!interactive.args.iter().any(|arg| arg == "--approve-for-me"));
+
+        let mut launcher = launcher;
+        launcher.harness_sandbox = false;
+        for mode in ["auto", "dontAsk", "plan", "bypassPermissions"] {
+            let (approval, reviewer, _) = codex_permissions(mode).unwrap();
+            let params = launcher
+                .thread_params(Path::new("/repo"), mode, &[])
+                .unwrap();
+            assert_eq!(params["sandbox"], "danger-full-access");
+            assert_eq!(params["approvalPolicy"], approval);
+            assert_eq!(params["approvalsReviewer"], reviewer);
+            assert!(params["config"].get("default_permissions").is_none());
+            assert_eq!(params["config"]["model_auto_compact_token_limit"], 150_000);
+            assert_eq!(
+                launcher
+                    .turn_sandbox_policy(Path::new("/repo"), mode, &[])
+                    .unwrap(),
+                Some(json!({"type": "dangerFullAccess"}))
+            );
+            let command =
+                build_interactive_codex_command(Path::new("/repo"), &launcher, mode, &[], None)
+                    .unwrap();
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--sandbox", "danger-full-access"])
+            );
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--ask-for-approval", approval])
+            );
+            assert!(command.args.contains(&"--no-daemon".to_owned()));
+            assert!(
+                !command
+                    .args
+                    .contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned())
+            );
+        }
     }
 
     #[test]

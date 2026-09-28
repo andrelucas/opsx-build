@@ -157,7 +157,13 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
     let reference = directory.join("reference.md");
     let proposal = directory.join("proposal.json");
     fs::write(&reference, &inputs.reference)?;
-    let spec = configure_command(&base, &directory, &reference, &proposal);
+    let spec = configure_command(
+        &base,
+        &directory,
+        &reference,
+        &proposal,
+        cli.harness_sandbox,
+    );
     ui.info("Claude prepares a configuration proposal containing your agreed intent, notes and settings");
     ui.info("When you're happy with the proposal, exit Claude (/exit); opsx-build validates it and writes opsx-build.md in this campaign directory");
     if let Err(error) = ProcessRunner::new(ui).run_interactive(&spec) {
@@ -241,9 +247,14 @@ fn configure_command(
     directory: &Path,
     reference: &Path,
     proposal: &Path,
+    harness_sandbox: bool,
 ) -> CommandSpec {
     // Deliberately independent of all worker/frontier launchers and token policies.
-    CommandSpec::new("claude", base).args([
+    let mut spec = CommandSpec::new("claude", base);
+    if !harness_sandbox {
+        spec = spec.args(["--settings", crate::claude::DISABLE_SANDBOX_SETTINGS]);
+    }
+    spec.args([
         "--add-dir".to_owned(), directory.display().to_string(),
         "--tools".to_owned(), "Read,Write,Edit".to_owned(),
         "--append-system-prompt".to_owned(), format!(
@@ -477,6 +488,7 @@ mod tests {
             Path::new("/tmp/config"),
             Path::new("/tmp/config/reference.md"),
             Path::new("/tmp/config/proposal.json"),
+            true,
         );
         assert_eq!(command.program, "claude");
         assert!(command.env.is_empty());

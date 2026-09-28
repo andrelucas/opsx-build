@@ -114,13 +114,29 @@ pub(crate) enum AgentLauncher {
 }
 
 impl AgentLauncher {
-    pub(crate) fn from_connection(connection: &AgentConnection) -> Result<Self> {
+    pub(crate) fn from_connection(
+        connection: &AgentConnection,
+        harness_sandbox: bool,
+    ) -> Result<Self> {
         match connection.backend {
-            BackendKind::Claude => ClaudeLauncher::from_connection(connection).map(Self::Claude),
+            BackendKind::Claude => {
+                let mut launcher = ClaudeLauncher::from_connection(connection)?;
+                if !harness_sandbox {
+                    launcher.prefix_args.extend([
+                        "--settings".to_owned(),
+                        crate::claude::DISABLE_SANDBOX_SETTINGS.to_owned(),
+                    ]);
+                }
+                Ok(Self::Claude(launcher))
+            }
             BackendKind::OpenCode => {
                 OpenCodeLauncher::from_connection(connection).map(Self::OpenCode)
             }
-            BackendKind::Codex => CodexLauncher::from_connection(connection).map(Self::Codex),
+            BackendKind::Codex => {
+                let mut launcher = CodexLauncher::from_connection(connection)?;
+                launcher.harness_sandbox = harness_sandbox;
+                Ok(Self::Codex(launcher))
+            }
         }
     }
 
@@ -410,7 +426,10 @@ impl<U: Ui> App<U> {
 
         if self.cli.test_connection.is_some() {
             self.ui.banner(&requested_repo.display().to_string());
-            let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+            let launcher = AgentLauncher::from_connection(
+                &self.cli.worker_connection,
+                self.cli.harness_sandbox,
+            )?;
             ensure_launcher_prerequisites(&launcher, &requested_repo, &self.ui)?;
             self.debug_configuration(&requested_repo, &launcher);
             if let Some(path) = &self.cli.config_path {
@@ -491,7 +510,10 @@ impl<U: Ui> App<U> {
                 return Ok(());
             }
             prerequisite_exists("openspec", &product_repo, &self.ui)?;
-            let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+            let launcher = AgentLauncher::from_connection(
+                &self.cli.worker_connection,
+                self.cli.harness_sandbox,
+            )?;
             ensure_launcher_prerequisites(&launcher, &product_repo, &self.ui)?;
             let runner = ProcessRunner::new(&self.ui);
             if plan.needs_setup() {
@@ -570,12 +592,20 @@ impl<U: Ui> App<U> {
         }
 
         if self.cli.request == "bootstrap" || self.cli.execute {
-            let frontier_launcher = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
+            let frontier_launcher = AgentLauncher::from_connection(
+                &self.cli.frontier_connection,
+                self.cli.harness_sandbox,
+            )?;
             ensure_launcher_prerequisites(&frontier_launcher, &repo, &self.ui)?;
             let worker_launcher = self
                 .cli
                 .execute
-                .then(|| AgentLauncher::from_connection(&self.cli.worker_connection))
+                .then(|| {
+                    AgentLauncher::from_connection(
+                        &self.cli.worker_connection,
+                        self.cli.harness_sandbox,
+                    )
+                })
                 .transpose()?;
             if let Some(worker_launcher) = worker_launcher.as_ref() {
                 ensure_launcher_prerequisites(worker_launcher, &repo, &self.ui)?;
@@ -612,7 +642,8 @@ impl<U: Ui> App<U> {
             );
         }
 
-        let launcher = AgentLauncher::from_connection(&self.cli.worker_connection)?;
+        let launcher =
+            AgentLauncher::from_connection(&self.cli.worker_connection, self.cli.harness_sandbox)?;
         ensure_launcher_prerequisites(&launcher, &repo, &self.ui)?;
 
         self.debug_configuration(&repo, &launcher);
@@ -636,7 +667,10 @@ impl<U: Ui> App<U> {
         let frontier_launcher = if local_only {
             None
         } else {
-            let frontier = AgentLauncher::from_connection(&self.cli.frontier_connection)?;
+            let frontier = AgentLauncher::from_connection(
+                &self.cli.frontier_connection,
+                self.cli.harness_sandbox,
+            )?;
             ensure_launcher_prerequisites(&frontier, &repo, &self.ui)?;
             self.debug_configuration(&repo, &frontier);
             Some(frontier)

@@ -74,6 +74,7 @@ OPENROUTER_API_KEY = "secret-do-not-copy"
             .env("CONFIGURE_TEST_ROOT", &self.root)
             .env("CONFIGURE_TEST_MODE", mode)
             .env_remove("OPSX_BUILD_CONFIG")
+            .env_remove("OPSX_BUILD_HARNESS_SANDBOX")
             .arg(format!(
                 "--config={}",
                 self.root.join("global.toml").display()
@@ -136,6 +137,69 @@ fn configure_dry_run_does_not_start_claude_or_create_markdown() {
     );
     assert!(!fixture.root.join("launcher.txt").exists());
     assert!(!fixture.root.join("campaign/opsx-build.md").exists());
+}
+
+#[test]
+fn configure_honors_and_persists_the_harness_sandbox_override() {
+    let fixture = Fixture::new();
+    let result = fixture.run("accept", &["configure", "--no-harness-sandbox"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let launch = fs::read_to_string(fixture.root.join("launcher.txt")).unwrap();
+    assert!(launch.contains("--settings\n{\"sandbox\":{\"enabled\":false}}\n"));
+    assert!(!launch.contains("--permission-mode"));
+    assert!(fixture.markdown().contains("--no-harness-sandbox"));
+
+    let result = fixture.run("accept", &["configure"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("launcher.txt"))
+            .unwrap()
+            .contains("--settings")
+    );
+
+    let result = fixture.run("accept", &["configure", "--harness-sandbox"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !fs::read_to_string(fixture.root.join("launcher.txt"))
+            .unwrap()
+            .contains("--settings")
+    );
+    assert!(!fixture.markdown().contains("--no-harness-sandbox"));
+}
+
+#[test]
+fn harness_sandbox_environment_can_be_overridden_on_the_command_line() {
+    let fixture = Fixture::new();
+    for (extra, disabled) in [(vec![], true), (vec!["--harness-sandbox"], false)] {
+        let result = Command::new(env!("CARGO_BIN_EXE_opsx-build"))
+            .current_dir(fixture.root.join("campaign"))
+            .env("OPSX_BUILD_HARNESS_SANDBOX", "false")
+            .args(["--no-config", "configure", "--dry-run"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stderr).contains("--no-harness-sandbox"),
+            disabled
+        );
+    }
 }
 
 #[test]

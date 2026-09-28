@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "name": "opsx-build",
+    "description": "Filesystem access for the runner and its three agent backends"
+  },
+  "extends": "default",
+  "workdir": {
+    "access": "readwrite"
+  },
+  "groups": {
+    "include": ["git_config", "node_runtime", "python_runtime", "rust_runtime", "go_runtime"]
+  },
+  "filesystem": {
+    "read": [
+      "$XDG_CONFIG_HOME/opsx-build",
+      "$XDG_CONFIG_HOME/openspec",
+      "$HOME/.local/share/claude"
+    ],
+    "allow": [
+      "$HOME/.claude",
+      "$HOME/.codex",
+      "$XDG_CONFIG_HOME/opencode",
+      "$XDG_DATA_HOME/opencode",
+      "$XDG_STATE_HOME/opencode",
+      "$XDG_CACHE_HOME/opencode",
+      "$XDG_DATA_HOME/opentui",
+      "$XDG_DATA_HOME/openspec",
+      "$XDG_DATA_HOME/opsx-build"
+    ],
+    "allow_file": ["$HOME/.claude.json"]
+  },
+  "network": {
+    "block": false
+  },
+  "platform_overrides": {
+    "macos": {
+      "filesystem": {
+        "allow": ["$HOME/Library/Keychains"],
+        "bypass_protection": ["$HOME/Library/Keychains"]
+      }
+    }
+  }
+}

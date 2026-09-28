@@ -59,6 +59,7 @@ pub struct Cli {
     pub local_only: bool,
     pub frontier_worker: bool,
     pub yolo: bool,
+    pub harness_sandbox: bool,
     pub interactive: bool,
     pub test_connection: Option<String>,
     pub basic_connection_test: bool,
@@ -453,6 +454,21 @@ pub(crate) struct CliArgs {
     #[arg(long, overrides_with = "yolo")]
     no_yolo: bool,
 
+    /// Use the harness's normal sandbox policy (approval policy is configured separately).
+    #[arg(
+        long,
+        env = "OPSX_BUILD_HARNESS_SANDBOX",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        overrides_with = "no_harness_sandbox"
+    )]
+    harness_sandbox: Option<bool>,
+
+    /// Disable the harness OS sandbox for external isolation such as nono; keep approval policy.
+    #[arg(long, overrides_with = "harness_sandbox")]
+    no_harness_sandbox: bool,
+
     /// Open an interactive session with the selected worker backend.
     #[arg(long)]
     interactive: bool,
@@ -764,6 +780,7 @@ struct FileConfig {
     local_only: Option<bool>,
     frontier_worker: Option<bool>,
     yolo: Option<bool>,
+    harness_sandbox: Option<bool>,
     #[serde(rename = "loop")]
     loop_workflow: Option<bool>,
     max_iterations: Option<std::num::NonZeroU32>,
@@ -1052,6 +1069,11 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         frontier_worker: !args.no_frontier_worker
             && (args.frontier_worker || config.frontier_worker.unwrap_or(false)),
         yolo: !args.no_yolo && (args.yolo || config.yolo.unwrap_or(false)),
+        harness_sandbox: !args.no_harness_sandbox
+            && args
+                .harness_sandbox
+                .or(config.harness_sandbox)
+                .unwrap_or(true),
         interactive: args.interactive,
         test_connection: args.test_connection,
         basic_connection_test: args.basic_connection_test,
@@ -1297,6 +1319,7 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
         ("local-only", cli.local_only),
         ("frontier-worker", cli.frontier_worker),
         ("yolo", cli.yolo),
+        ("harness-sandbox", cli.harness_sandbox),
         ("loop", cli.loop_workflow),
     ] {
         args.push(format!("--{}{name}", if value { "" } else { "no-" }));
@@ -1504,7 +1527,7 @@ pub(crate) fn resolve_configured_settings(
     for connection in [&cli.worker_connection, &cli.frontier_connection] {
         let mut syntax_only = connection.clone();
         syntax_only.env.clear();
-        crate::app::AgentLauncher::from_connection(&syntax_only)?;
+        crate::app::AgentLauncher::from_connection(&syntax_only, cli.harness_sandbox)?;
     }
     Ok(cli)
 }
@@ -2714,6 +2737,108 @@ mod tests {
         let cli =
             resolve_values(args(["opsx-build", "--no-yolo", "advance"]), config, None).unwrap();
         assert!(!cli.yolo);
+    }
+
+    #[test]
+    fn harness_sandbox_overrides_persist_without_changing_approvals_or_commits() {
+        for (options, configured, expected) in [
+            (vec![], None, true),
+            (vec![], Some(false), false),
+            (vec!["--no-harness-sandbox"], Some(true), false),
+            (vec!["--harness-sandbox"], Some(false), true),
+            (vec!["--harness-sandbox=false"], Some(true), false),
+            (
+                vec!["--no-harness-sandbox", "--harness-sandbox"],
+                None,
+                true,
+            ),
+            (
+                vec!["--harness-sandbox", "--no-harness-sandbox"],
+                None,
+                false,
+            ),
+        ] {
+            let config = configured.map_or_else(FileConfig::default, |value| {
+                toml::from_str(&format!("harness_sandbox = {value}")).unwrap()
+            });
+            let cli = resolve_values(
+                args(std::iter::once("opsx-build").chain(options)),
+                config,
+                None,
+            )
+            .unwrap();
+            assert_eq!(cli.harness_sandbox, expected);
+            assert_eq!(cli.permission_mode, "auto");
+            assert!(!cli.yolo);
+            let saved = canonical_settings(&settings_snapshot(&cli)).unwrap();
+            let restored = resolve_values(
+                args(std::iter::once("opsx-build".to_owned()).chain(saved)),
+                FileConfig {
+                    harness_sandbox: Some(!expected),
+                    ..FileConfig::default()
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(restored.harness_sandbox, expected);
+        }
+    }
+
+    #[test]
+    fn disabled_harness_sandbox_reaches_both_claude_launchers_and_all_command_modes() {
+        use crate::{
+            app::AgentLauncher,
+            backend::{SessionId, SessionMode},
+            claude::{
+                ClaudeOutputFormat, ConnectionTestMode, DISABLE_SANDBOX_SETTINGS,
+                build_claude_command, build_connection_test_command,
+                build_interactive_claude_command,
+            },
+        };
+        let cli = resolve_values(
+            args(["opsx-build", "--no-harness-sandbox"]),
+            FileConfig::default(),
+            None,
+        )
+        .unwrap();
+        for connection in [&cli.worker_connection, &cli.frontier_connection] {
+            let AgentLauncher::Claude(launcher) =
+                AgentLauncher::from_connection(connection, cli.harness_sandbox).unwrap()
+            else {
+                panic!("expected Claude");
+            };
+            let repo = std::path::Path::new("/repo");
+            let resumed = SessionMode::Resume {
+                id: SessionId::new("session"),
+            };
+            let commands = [
+                build_claude_command(
+                    repo,
+                    &launcher,
+                    "auto",
+                    &resumed,
+                    "continue",
+                    ClaudeOutputFormat::Text,
+                    None,
+                ),
+                build_interactive_claude_command(repo, &launcher, "auto", &[], None),
+                build_connection_test_command(repo, &launcher, "auto", ConnectionTestMode::Basic),
+            ];
+            for command in commands {
+                assert!(
+                    command
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["--settings", DISABLE_SANDBOX_SETTINGS])
+                );
+                assert!(
+                    command
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["--permission-mode", "auto"])
+                );
+            }
+        }
     }
 
     #[test]

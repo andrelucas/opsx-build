@@ -751,6 +751,9 @@ campaign worker and frontier. It does not set a model, reasoning effort,
 permission mode, or campaign connection environment for the conversation.
 Claude must already be installed and authenticated. Git and OpenSpec setup
 are not required to configure a new directory.
+The `harness_sandbox` setting also applies to this configuration session;
+`--no-harness-sandbox` disables Claude's inner sandbox without changing its
+normal approval behaviour.
 
 The conversation receives the current CLI options, effective defaults,
 available connection profiles (without credential values), and any existing
@@ -849,6 +852,40 @@ connections/environments, so credentials need not be copied into campaign files
 or command lines.
 
 ## Agent backends and configuration
+
+### Running inside nono or another external sandbox
+
+Use `--no-harness-sandbox` when the enclosing environment supplies the
+filesystem boundary:
+
+```sh
+# Run from the campaign repository root.
+nono run --profile /path/to/opsx-build/nono/opsx-build.json --allow-cwd -- \
+  opsx-build --no-harness-sandbox execute
+```
+
+The same setting is available as `harness_sandbox = false` in the TOML config,
+`OPSX_BUILD_HARNESS_SANDBOX=false` in the environment, or a recorded campaign
+setting through `opsx-build configure`. It applies to worker and frontier
+stages, resumed runs, connection tests, interactive sessions and `configure`.
+`--harness-sandbox` restores the harness's normal sandbox policy for a run.
+The default preserves existing harness behaviour; opsx-build does not detect
+or start an external sandbox automatically.
+
+Claude receives the session-only setting `sandbox.enabled=false`. Codex uses
+`danger-full-access` at both thread and turn level, overriding a named
+permission profile while retaining its approval policy and reviewer. Interactive
+Codex runs also use `--no-daemon` so execution stays in the wrapped process tree.
+These native switches disable the harness's filesystem and network sandbox;
+the enclosing environment must provide the intended restrictions. Codex's
+private opsx-build home and session storage are unchanged.
+
+OpenCode has no equivalent built-in OS sandbox switch, so its existing
+permission configuration and unattended `--auto` behaviour are unchanged.
+This setting leaves `permission_mode` unchanged and is independent of
+`--yolo`, which controls proposal milestone commits.
+
+### Connection configuration
 
 Connections select a backend. Omitting `backend` preserves the existing
 `claude` default. oMLX Claude mode can be configured with:
