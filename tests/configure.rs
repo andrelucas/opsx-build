@@ -87,6 +87,28 @@ OPENROUTER_API_KEY = "secret-do-not-copy"
     fn markdown(&self) -> String {
         fs::read_to_string(self.root.join("campaign/opsx-build.md")).unwrap()
     }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(self.root.join("campaign"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn init_git(&self) {
+        self.git(&["init", "-q"]);
+        self.git(&["config", "user.name", "Fixture"]);
+        self.git(&["config", "user.email", "fixture@example.invalid"]);
+        self.git(&["config", "commit.gpgsign", "false"]);
+        self.git(&["config", "core.hooksPath", ".git/hooks"]);
+    }
 }
 
 impl Drop for Fixture {
@@ -105,6 +127,8 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
         String::from_utf8_lossy(&result.stderr)
     );
     let saved = fixture.markdown();
+    assert!(String::from_utf8_lossy(&result.stderr).contains("was not committed"));
+    assert!(!fixture.root.join("campaign/.git").exists());
     let launcher = fs::read_to_string(fixture.root.join("launcher.txt")).unwrap();
     assert!(launcher.contains("suggest --supplied-contracts"));
     assert!(launcher.contains("never silently switch an existing choice"));
@@ -131,6 +155,106 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
             "{mode} must preserve the last accepted configuration"
         );
     }
+}
+
+#[test]
+fn configure_commits_only_its_file_and_preserves_staged_and_unstaged_work() {
+    for existing_head in [false, true] {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        let other = fixture.root.join("campaign/other.txt");
+        if existing_head {
+            fs::write(&other, "original\n").unwrap();
+            fixture.git(&["add", "other.txt"]);
+            fixture.git(&["commit", "-qm", "Original work"]);
+        }
+        fs::write(&other, "staged work\n").unwrap();
+        fixture.git(&["add", "other.txt"]);
+        fs::write(&other, "unstaged work\n").unwrap();
+        fs::write(
+            fixture.root.join("campaign/untracked.txt"),
+            "untracked work\n",
+        )
+        .unwrap();
+        let staged = fixture.git(&["diff", "--cached", "--binary"]);
+        let unstaged = fixture.git(&["diff", "--binary"]);
+        let untracked = fixture.git(&["ls-files", "--others", "--exclude-standard"]);
+
+        for intent in ["First configuration", "Updated configuration"] {
+            let path = fixture.root.join("proposal.json");
+            let mut proposal: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            proposal["intent"] = intent.into();
+            fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+            let result = fixture.run("accept", &["configure"]);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                fixture.git(&["show", "HEAD:opsx-build.md"]),
+                fixture.markdown()
+            );
+            assert_eq!(
+                fixture.git(&[
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "HEAD"
+                ]),
+                "opsx-build.md\n"
+            );
+            assert_eq!(
+                fixture.git(&["log", "-1", "--format=%s"]),
+                "opsx: configure campaign\n"
+            );
+            assert_eq!(fixture.git(&["diff", "--cached", "--binary"]), staged);
+            assert_eq!(fixture.git(&["diff", "--binary"]), unstaged);
+            assert_eq!(
+                fixture.git(&["ls-files", "--others", "--exclude-standard"]),
+                untracked
+            );
+        }
+        let head = fixture.git(&["rev-parse", "HEAD"]);
+        for mode in ["cancel", "fail", "invalid"] {
+            fixture.run(mode, &["configure"]);
+            assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+        }
+    }
+}
+
+#[test]
+fn configure_keeps_saved_configuration_when_a_commit_hook_rejects_it() {
+    let fixture = Fixture::new();
+    fixture.init_git();
+    fs::write(fixture.root.join("campaign/other.txt"), "staged work\n").unwrap();
+    fixture.git(&["add", "other.txt"]);
+    let staged = fixture.git(&["diff", "--cached", "--binary", "--", "other.txt"]);
+    let hook = fixture.root.join("campaign/.git/hooks/pre-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho 'Fixture rejects commit' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let result = fixture.run("accept", &["configure"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(fixture.markdown().contains("Test transactions"));
+    let message = String::from_utf8_lossy(&result.stderr);
+    assert!(message.contains("was not committed"), "{message}");
+    assert!(message.contains("Fixture rejects commit"), "{message}");
+    assert_eq!(
+        fixture.git(&["diff", "--cached", "--binary", "--", "other.txt"]),
+        staged
+    );
+    assert!(!fixture.root.join("campaign/.git/index.lock").exists());
 }
 
 #[test]

@@ -887,6 +887,13 @@ opsx-build. Cancellation, a failed Claude session, or invalid settings leave
 the previous configuration untouched; failed validation retains the proposal
 and reports its path.
 
+After saving, opsx-build commits just `opsx-build.md` with the message
+`opsx: configure campaign`, preserving unrelated staged work. No model turn is
+needed for this commit. If no Git repository exists or committing fails, the
+saved configuration remains available and the runner reports that it was not
+committed. The `Last used` section still updates at launch without creating an
+automatic commit.
+
 Configure reads the available campaign context and may suggest
 `--supplied-contracts` when it describes precise existing contracts. It explains
 the choice and identifies the contract files, protected acceptance inputs and

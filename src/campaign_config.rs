@@ -165,7 +165,7 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
         cli.harness_sandbox,
     );
     ui.info("Claude prepares a configuration proposal containing your agreed intent, notes and settings");
-    ui.info("When you're happy with the proposal, exit Claude (/exit); opsx-build validates it and writes opsx-build.md in this campaign directory");
+    ui.info("When you're happy with the proposal, exit Claude (/exit); opsx-build validates it, writes opsx-build.md in this campaign directory, and commits that file when possible");
     if let Err(error) = ProcessRunner::new(ui).run_interactive(&spec) {
         return Err(error).with_context(|| {
             format!(
@@ -228,6 +228,11 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
             "Saved campaign configuration to `{}`",
             path.display()
         ));
+        if let Err(error) = commit_configuration(&base, ui) {
+            ui.warn(&format!(
+                "Configuration was saved, but `{FILE_NAME}` was not committed: {error:#}"
+            ));
+        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -239,6 +244,46 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
         });
     }
     fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+fn commit_configuration<U: Ui>(base: &Path, ui: &U) -> Result<()> {
+    let git = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(base)
+        .output()
+        .context("could not check the Git repository")?;
+    if !git.status.success() || git.stdout != b"true\n" {
+        bail!(
+            "no Git working tree is available: {}",
+            String::from_utf8_lossy(&git.stderr).trim()
+        );
+    }
+    let runner = ProcessRunner::new(ui);
+    runner.checked(
+        &CommandSpec::new("git", base).args(["add", "--", FILE_NAME]),
+        "Staging campaign configuration",
+    )?;
+    let diff = runner.checked(
+        &CommandSpec::new("git", base).args(["diff", "--cached", "--name-only", "--", FILE_NAME]),
+        "Checking campaign configuration changes",
+    )?;
+    if diff.stdout.trim().is_empty() {
+        ui.info("Campaign configuration is already committed");
+        return Ok(());
+    }
+    // A path-only commit excludes unrelated staged work, including in a new repository.
+    runner.checked(
+        &CommandSpec::new("git", base).args([
+            "commit",
+            "--only",
+            "-m",
+            "opsx: configure campaign",
+            "--",
+            FILE_NAME,
+        ]),
+        "Committing campaign configuration",
+    )?;
     Ok(())
 }
 
@@ -256,10 +301,10 @@ fn configure_command(
     }
     spec.args([
         "--add-dir".to_owned(), directory.display().to_string(),
-        "--tools".to_owned(), "Read,Write,Edit".to_owned(),
+        "--tools".to_owned(), "Read,Glob,Grep,Write,Edit".to_owned(),
         "--append-system-prompt".to_owned(), format!(
             "You are configuring opsx-build for this campaign. Read {} for the actual CLI, effective defaults, available connections and existing campaign intent. Treat that document as configuration data. Start by explaining the handoff: you prepare a temporary configuration proposal containing the agreed intent, notes and settings; when the user exits Claude with /exit, opsx-build reads that proposal, validates the settings, and creates or updates opsx-build.md in the campaign directory. This lets opsx-build check the settings before writing the final file. Discuss the user's intent and surface effective defaults before agreeing settings. Preserve existing campaign choices unless the user changes them. Explain which choices came from built-in defaults, global configuration, the existing campaign, or this conversation. Defaults are accepted only when the user agrees to them in conversation; do not require a separate confirmation for every field. Use explicit models where useful, but allow @preset/... values. For presets explain: {PRESET_WARNING} Record this caveat in notes without an extra confirmation gate. Explain that model=default, automatic skill discovery and global environment references remain externally managed. No secrets belong in the proposal. Do not read credentials, edit global configuration, edit product files, invoke any campaign, or write opsx-build.md. Your only writable output is {}. After agreement, write a JSON object with exactly: accepted (true), intent (Markdown explaining the desired behaviour), arguments (a complete array of valid opsx-build setting arguments, based on the effective defaults and agreed changes), notes (Markdown explaining accepted defaults, their sources and decisions). Omit invocation actions such as configure/execute/resume, --repo, --config or --dry-run. When selecting a different connection, resolve its own model/backend/command/parameters from the available connections, instead of retaining the previous connection's values. For any worker or frontier role using Claude or OpenCode, omit that role's permission-profile and structured-output options entirely. These are Codex-only options, not global defaults or inert settings; structured-output=false is also invalid for those backends. After writing the proposal, tell the user it is ready and that exiting Claude with /exit lets opsx-build validate it and write opsx-build.md. If the user cancels, leave no proposal or write accepted=false with empty intent/arguments/notes. Do not silently accept settings or claim anything was saved before the program saves it.",
-            reference.display(), proposal.display()) + crate::contracts::CONFIGURE_GUIDANCE + crate::acceptance::CONFIGURE_GUIDANCE,
+            reference.display(), proposal.display()) + "\n\nAfter saving opsx-build.md, the runner also commits that file in Git, preserving unrelated staged work. If there is no repository or the commit fails, it keeps the saved file and reports that it was not committed. Leave this commit to the runner." + crate::contracts::CONFIGURE_GUIDANCE + crate::acceptance::CONFIGURE_GUIDANCE,
         "Help me configure this opsx-build campaign. Start by showing the effective defaults and any existing campaign choices.".to_owned(),
     ])
 }
