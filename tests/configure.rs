@@ -40,6 +40,7 @@ esac
             root.join("global.toml"),
             r#"
 max_provider_retries = 7
+max_terminal_remediations = 5
 worker_connection = "remote"
 frontier_connection = "remote"
 [connections.remote]
@@ -137,11 +138,13 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
     assert!(saved.contains("--no-supplied-contracts"));
     assert!(saved.contains("--no-acceptance-checks"));
     assert!(saved.contains("--max-provider-retries=7"));
+    assert!(saved.contains("--max-terminal-remediations=5"));
     assert!(saved.contains("--claude-model=@preset/motd"));
     assert!(saved.contains("This preset is managed externally"));
     assert!(saved.contains("Test transactions"));
     assert!(!saved.contains("secret-do-not-copy"));
     let reference = fs::read_to_string(fixture.root.join("reference.md")).unwrap();
+    assert!(reference.contains("--max-terminal-remediations=5"));
     assert!(!reference.contains("secret-do-not-copy"));
     assert!(reference.contains("Effective defaults"));
     assert!(reference.contains("Built-in defaults"));

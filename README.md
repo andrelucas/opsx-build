@@ -538,6 +538,29 @@ Recursive fallback is capped at three successful frontier replans for one
 in-progress slice; reaching the cap restores the baseline and stops as an
 ordinary error rather than looping forever.
 
+Terminal acceptance has a separate limit of three frontier remediation rounds
+per campaign by default. Set `--max-terminal-remediations N` to change it, including
+on resume. This is the total campaign allowance, not a fresh retry count: raising
+it from 3 to 10 permits seven more rounds. Set it to 0 to permit readiness review
+without automatic remediation. This controls additional slices before the terminal
+gate; `--max-verify-retries` controls repair/verify cycles within a change.
+For example:
+
+```sh
+opsx-build --resume --max-terminal-remediations 10
+```
+
+The global TOML setting is `max_terminal_remediations`, and the environment
+variable is `OPSX_BUILD_MAX_TERMINAL_REMEDIATIONS`. Configure mode shows the
+effective value and records the agreed allowance in `opsx-build.md`; explicit
+CLI options override that value for one invocation.
+
+After the final allowed round's slices finish, the frontier still reviews
+readiness for `9999-project-acceptance`. That review may approve proceeding or
+report remaining gaps, but cannot add another round without a higher allowance.
+A campaign stopped by an older runner at this boundary can use `--resume` with the updated
+runner; no checkpoint reset is needed.
+
 With live streaming enabled, opsx-build uses Claude Code's documented
 [bidirectional `stream-json` transport][claude-streaming]. It keeps the current
 Claude process's stdin open until the phase and any interactively queued turns
@@ -1028,6 +1051,7 @@ Connections select a backend. Omitting `backend` preserves the existing
 ```toml
 # ~/.config/opsx-build/config.toml
 max_verify_retries = 3
+max_terminal_remediations = 3
 max_output_retries = 3
 max_provider_retries = 10
 local_worker_timeout_minutes = 60

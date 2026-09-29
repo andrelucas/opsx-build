@@ -69,7 +69,6 @@ const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_FRONTIER_REPLANS: u32 = 3;
-const MAX_TERMINAL_REMEDIATIONS: u32 = 3;
 
 fn stage_after_propose(yolo: bool) -> Stage {
     if yolo {
@@ -1722,14 +1721,20 @@ impl<U: Ui> App<U> {
             .clone()
             .context("terminal review has no recorded pre-Propose rollback baseline")?;
 
-        if state.terminal_remediations >= MAX_TERMINAL_REMEDIATIONS {
-            if escalation.is_some() {
-                restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
-            }
+        let limit = self.cli.max_terminal_remediations;
+        let remediation_allowed = state.terminal_remediations < limit;
+        if !remediation_allowed && escalation.is_some() {
+            restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
             bail!(
-                "terminal acceptance reached its limit of {MAX_TERMINAL_REMEDIATIONS} frontier remediation rounds; `{}` remains the terminal gate and the pre-Propose state is preserved",
+                "terminal acceptance reached its limit of {limit} frontier remediation rounds; `{}` remains the terminal gate and the pre-Propose state is preserved. Raise --max-terminal-remediations and resume to allow more rounds",
                 assignment.change
             );
+        }
+        if !remediation_allowed {
+            self.ui.info(&format!(
+                "Terminal remediation limit reached ({}/{limit}); reviewing readiness only. Raise --max-terminal-remediations on --resume if further remediation is needed",
+                state.terminal_remediations
+            ));
         }
 
         if let Some(outcome) = &escalation {
@@ -1767,7 +1772,12 @@ impl<U: Ui> App<U> {
         );
         let base_prompt = with_contract_context(
             &state,
-            &terminal_review_prompt(&assignment, escalation.as_ref(), self.cli.frontier_worker),
+            &terminal_review_prompt(
+                &assignment,
+                escalation.as_ref(),
+                self.cli.frontier_worker,
+                remediation_allowed,
+            ),
         );
         let mut postcondition_failure = None;
 
@@ -1822,6 +1832,13 @@ impl<U: Ui> App<U> {
                     &self.ui,
                 )
                 .map(|_| None),
+                StageSignal::Replanned if !remediation_allowed => {
+                    restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
+                    bail!(
+                        "terminal acceptance reached its limit of {limit} frontier remediation rounds; further remediation was not accepted and the pre-Propose state was restored. Raise --max-terminal-remediations and resume to allow more rounds. Latest findings: {}",
+                        result.text.trim()
+                    );
+                }
                 StageSignal::Replanned => terminal_remediation_postcondition(
                     repo,
                     &baseline,
@@ -3747,6 +3764,7 @@ fn terminal_review_prompt(
     assignment: &AgendaAssignment,
     escalation: Option<&TooLargeOutcome>,
     frontier_worker: bool,
+    remediation_allowed: bool,
 ) -> String {
     let worker_capacity = worker_capacity_guidance(frontier_worker);
     let failure = escalation.map_or_else(String::new, |outcome| {
@@ -3756,8 +3774,18 @@ fn terminal_review_prompt(
             outcome.summary.trim()
         )
     });
+    let remediation = if remediation_allowed {
+        format!(
+            "If material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.",
+            path = assignment.path,
+        )
+    } else {
+        String::from(
+            "The configured limit of frontier remediation rounds has been reached. This is a readiness review only: do not add remediation slices, modify files, or create commits. Return READY if the completed remediation has satisfied the supplied requirements. If material functionality or validation is still missing, return BLOCKED with concrete findings and governing sources, explaining that further remediation needs a maintainer decision. Leave the repository, index, working tree, and Git history exactly unchanged.",
+        )
+    };
     format!(
-        "{worker_capacity}\n\nAct as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml` and its declared required contracts and component scope, then compare the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Judge the generated agenda and delivered behaviour against those supplied inputs; a dependency contract does not assign its implementation to this component. Determine whether every material in-scope project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\nIf material functionality or validation is missing, preserve `{path}` byte-for-byte as the terminal gate. Add one or more bounded, independently implementable remediation slice files under `automation/slices/` whose numeric ordinals sort after every existing nonterminal slice and before `9999`. Update the agenda README so the new execution order and project-goal coverage remain accurate. Each remediation slice must satisfy the existing agenda contract and be small enough for the worker model. Modify only files under `automation/slices/`; do not modify source, tests, OpenSpec state, CLAUDE.md, or any other path. Commit the agenda-only remediation with subject exactly `opsx: add acceptance remediation`. Preserve pre-existing user work and never reset, stash, restore, discard, amend, or rewrite history. Return REPLANNED only after the remediation agenda is committed and the working state outside the permitted agenda paths is unchanged.\n\nReturn BLOCKED only when this review or safe remediation genuinely requires a human decision or unavailable external input.\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
+        "{worker_capacity}\n\nAct as the frontier architect's independent whole-project acceptance reviewer before the terminal agenda slice. Re-read the complete goal in `openspec/config.yaml` and its declared required contracts and component scope, then compare the ordered agenda and its README, the unchanged terminal gate `{path}`, canonical and archived OpenSpec evidence, existing implementation, and real tests. Use targeted inspection and run relevant existing end-to-end checks where practical. Judge the generated agenda and delivered behaviour against those supplied inputs; a dependency contract does not assign its implementation to this component. Determine whether every material in-scope project goal is implemented and the repository is ready for the terminal acceptance change. Do not create or modify any OpenSpec change and do not implement product code.{failure}\n\nIf the project is ready, leave the repository, index, working tree, and Git history exactly unchanged and return READY.\n\n{remediation}\n\n--- BEGIN TERMINAL ACCEPTANCE SLICE ---\n{content}\n--- END TERMINAL ACCEPTANCE SLICE ---",
         path = assignment.path,
         content = assignment.content.trim(),
     )
@@ -4579,7 +4607,7 @@ mod tests {
             for prompt in [
                 campaign_subject(&bootstrap, frontier_worker),
                 frontier_replan_prompt(&assignment, &failure, frontier_worker),
-                terminal_review_prompt(&assignment, Some(&failure), frontier_worker),
+                terminal_review_prompt(&assignment, Some(&failure), frontier_worker, true),
             ] {
                 assert!(prompt.contains(worker_capacity_guidance(frontier_worker)));
                 assert_eq!(
@@ -4607,7 +4635,7 @@ mod tests {
             content: "# Project acceptance\n\n## Objective\n\nAccept it.".to_owned(),
         };
 
-        let ready = terminal_review_prompt(&assignment, None, false);
+        let ready = terminal_review_prompt(&assignment, None, false, true);
         assert!(ready.contains("complete goal in `openspec/config.yaml`"));
         assert!(ready.contains(
             "leave the repository, index, working tree, and Git history exactly unchanged"
@@ -4623,7 +4651,7 @@ mod tests {
             stage: Stage::Verify,
             summary: "TLS hostname rejection is not implemented".to_owned(),
         };
-        let remediation = terminal_review_prompt(&assignment, Some(&failure), false);
+        let remediation = terminal_review_prompt(&assignment, Some(&failure), false, true);
         assert!(remediation.contains("READY is not a valid result"));
         assert!(remediation.contains("TLS hostname rejection is not implemented"));
     }

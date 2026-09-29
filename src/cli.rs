@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer};
 use crate::stream::StreamFilter;
 
 const DEFAULT_MAX_VERIFY_RETRIES: u32 = 3;
+const DEFAULT_MAX_TERMINAL_REMEDIATIONS: u32 = 3;
 const DEFAULT_MAX_OUTPUT_RETRIES: u32 = 3;
 const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 10;
 const DEFAULT_LOCAL_WORKER_TIMEOUT_MINUTES: u32 = 60;
@@ -79,6 +80,7 @@ pub struct Cli {
     pub direction: Option<String>,
     pub interactive_args: Vec<String>,
     pub max_verify_retries: u32,
+    pub max_terminal_remediations: u32,
     pub max_output_retries: u32,
     pub max_provider_retries: u32,
     pub local_worker_timeout_minutes: u32,
@@ -635,6 +637,10 @@ pub(crate) struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_MAX_VERIFY_RETRIES", value_name = "N")]
     max_verify_retries: Option<u32>,
 
+    /// Maximum total frontier remediation rounds per campaign; may be raised on resume (default 3; 0 allows readiness review only).
+    #[arg(long, env = "OPSX_BUILD_MAX_TERMINAL_REMEDIATIONS", value_name = "N")]
+    max_terminal_remediations: Option<u32>,
+
     /// Maximum same-session continuations after Claude reaches its output token limit.
     #[arg(long, env = "OPSX_BUILD_MAX_OUTPUT_RETRIES", value_name = "N")]
     max_output_retries: Option<u32>,
@@ -826,6 +832,7 @@ pub(crate) struct CliArgs {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     max_verify_retries: Option<u32>,
+    max_terminal_remediations: Option<u32>,
     max_output_retries: Option<u32>,
     max_provider_retries: Option<u32>,
     local_worker_timeout_minutes: Option<std::num::NonZeroU32>,
@@ -944,6 +951,11 @@ fn apply_legacy_environment(config: &mut FileConfig) -> Result<()> {
     }
 
     override_from_legacy!(max_verify_retries, "OSPX_BUILD_MAX_VERIFY_RETRIES", u32);
+    override_from_legacy!(
+        max_terminal_remediations,
+        "OSPX_BUILD_MAX_TERMINAL_REMEDIATIONS",
+        u32
+    );
     override_from_legacy!(max_output_retries, "OSPX_BUILD_MAX_OUTPUT_RETRIES", u32);
     override_from_legacy!(max_provider_retries, "OSPX_BUILD_MAX_PROVIDER_RETRIES", u32);
     override_from_legacy!(
@@ -1157,6 +1169,10 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .max_verify_retries
             .or(config.max_verify_retries)
             .unwrap_or(DEFAULT_MAX_VERIFY_RETRIES),
+        max_terminal_remediations: args
+            .max_terminal_remediations
+            .or(config.max_terminal_remediations)
+            .unwrap_or(DEFAULT_MAX_TERMINAL_REMEDIATIONS),
         max_output_retries: args
             .max_output_retries
             .or(config.max_output_retries)
@@ -1386,6 +1402,10 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
     }
     for (name, value) in [
         ("max-verify-retries", cli.max_verify_retries.to_string()),
+        (
+            "max-terminal-remediations",
+            cli.max_terminal_remediations.to_string(),
+        ),
         ("max-output-retries", cli.max_output_retries.to_string()),
         ("max-provider-retries", cli.max_provider_retries.to_string()),
         (
@@ -2010,12 +2030,13 @@ mod tests {
         )
         .unwrap();
         let snapshot = canonical_settings(&settings_snapshot(&original)).unwrap();
-        let changed: FileConfig = toml::from_str("claude_model = 'changed'\nauto_compact_window = '128k'\nlocal_only = true\nmax_provider_retries = 99\n").unwrap();
+        let changed: FileConfig = toml::from_str("claude_model = 'changed'\nauto_compact_window = '128k'\nlocal_only = true\nmax_provider_retries = 99\nmax_terminal_remediations = 99\n").unwrap();
         let argv = std::iter::once("opsx-build".to_owned()).chain(snapshot);
         let frozen = resolve_values(args(argv), changed, None).unwrap();
         assert_eq!(frozen.worker_connection.model, None);
         assert_eq!(frozen.worker_connection.auto_compact_window, None);
         assert_eq!(frozen.max_provider_retries, 10);
+        assert_eq!(frozen.max_terminal_remediations, 3);
         assert!(!frozen.local_only);
         for forbidden in [
             "--forget",
@@ -2032,6 +2053,27 @@ mod tests {
             );
         }
         assert!(canonical_settings(&["--frontier-auto-compact-percent=101".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn terminal_remediation_limit_resolves_config_and_cli_including_zero() {
+        let config: FileConfig = toml::from_str("max_terminal_remediations = 7\n").unwrap();
+        let configured = resolve_values(args(["opsx-build"]), config.clone(), None).unwrap();
+        assert_eq!(configured.max_terminal_remediations, 7);
+        for value in [0, 10] {
+            let cli = resolve_values(
+                args([
+                    "opsx-build",
+                    "--resume",
+                    &format!("--max-terminal-remediations={value}"),
+                ]),
+                config.clone(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(cli.max_terminal_remediations, value);
+        }
+        assert!(CliArgs::try_parse_from(["opsx-build", "--max-terminal-remediations=-1"]).is_err());
     }
 
     #[test]
