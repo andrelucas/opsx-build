@@ -1022,6 +1022,15 @@ nono run --profile /path/to/opsx-build/nono/opsx-build.json --allow-cwd -- \
   opsx-build --no-harness-sandbox execute
 ```
 
+The bundled profile allows network access and Go's default module downloads,
+checksum database (`~/go/pkg/sumdb`), installed tools (`~/go/bin`), and build
+cache on macOS and Linux. Go still writes checksum state under `GOPATH/pkg/sumdb`
+when `GOMODCACHE` points elsewhere. Campaign-local caches and tool directories
+are covered by the working-directory grant. Custom `GOPATH`, `GOMODCACHE`,
+`GOCACHE` or `GOBIN` paths outside those locations need their own grants.
+Restart the nono invocation after changing its profile; existing sandboxed
+processes keep their original permissions.
+
 The same setting is available as `harness_sandbox = false` in the TOML config,
 `OPSX_BUILD_HARNESS_SANDBOX=false` in the environment, or a recorded campaign
 setting through `opsx-build configure`. It applies to worker and frontier
@@ -1042,6 +1051,56 @@ OpenCode has no equivalent built-in OS sandbox switch, so its existing
 permission configuration and unattended `--auto` behaviour are unchanged.
 This setting leaves `permission_mode` unchanged and is independent of
 `--yolo`, which controls proposal milestone commits.
+
+#### Validate the nono profile
+
+Run the standalone provisioning and harness smoke tests from this checkout,
+outside nono:
+
+```sh
+python3 nono/smoke_test.py
+```
+
+The full suite requires nono, Go, Cargo/Rust, Python 3.9+ with `venv`/pip, and
+configured, authenticated Claude Code, Codex and OpenCode installations. It
+launches each check under the bundled profile, with no extra filesystem grants,
+and verifies:
+
+- Go module downloads into fresh and normal caches, checksum/build-cache write
+  access, installation of a uniquely named tool into the normal Go binary
+  directory, and execution of that tool. The tool is removed afterward.
+- Rust crate downloads with a fresh Cargo home, then compilation, installation
+  and execution of a fixture using the normal Cargo cache and a temporary
+  installation directory.
+- Python virtual-environment creation, normal pip-cache write access, a package
+  installation with the download cache disabled, and an import/version check.
+- Claude, Codex and OpenCode startup, a real model turn, and one shell command
+  that writes a proof file in the temporary workspace. Both the final response
+  and the proof file must match the expected markers. Models, providers and
+  credentials come from each harness's normal configuration and environment,
+  not opsx-build connection settings. Claude and Codex use non-persistent
+  sessions; Codex also avoids its shared daemon so it remains inside nono.
+  Claude's and Codex's inner sandboxes are disabled for these checks; nono
+  supplies the sandbox. OpenCode creates a session titled `nono harness smoke test`.
+
+These checks use `github.com/google/uuid@v1.6.0`, `itoa=1.0.15` and
+`packaging==24.2`. They require network access, may populate normal toolchain
+caches, and retain temporary fixtures and per-check logs at the printed path.
+No campaign is invoked. Harness checks make real model requests and use the
+corresponding account's normal usage allowance. A failed command, missing tool,
+provider/authentication failure or timeout makes the script exit nonzero;
+remaining checks still run. Each check has a 300-second limit.
+
+Use `--only go` (or `rust`, `python`, `claude`, `codex`, `opencode`) for a focused
+check. Repeat it to select several, for example:
+
+```sh
+python3 nono/smoke_test.py --only claude --only codex --only opencode
+```
+
+Use `--profile /path/to/profile.json` to test another profile, and `--timeout SECONDS`
+to change the limit. This checks provisioning and harness capabilities, not
+whether the sandbox blocks every forbidden action.
 
 ### Connection configuration
 
