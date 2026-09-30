@@ -2797,7 +2797,12 @@ impl<U: Ui> App<U> {
         let finding = state.pending_repair.as_deref().unwrap_or(
             "No verifier finding was supplied; apply the user's direction and re-run relevant checks.",
         );
-        let base = if state.bootstrap {
+        let base = if state.bootstrap && state.contracts.is_none() {
+            format!(
+                "{change}\n\nRepair the material blocker in this ordinary planning-only bootstrap. Preserve the brief's required outcomes, usable slices and meaningful acceptance checks. Use the smallest correction. Where an optional implementation recipe caused the problem, remove the prescription and leave the mechanism to the implementing worker instead of adding another detailed recipe. Do not turn non-blocking review observations into tasks. Update only affected planning artifacts coherently. Do not implement product code, create implementation OpenSpec changes, or change the project brief. Leave this change active for Verify; the runner owns archive and commit.\n\n{}\n\nVerifier context:\n{finding}",
+                worker_capacity_guidance(self.cli.frontier_worker)
+            )
+        } else if state.bootstrap {
             format!(
                 "{change}\n\nRepair the planning-only implementation agenda and its bootstrap OpenSpec artifacts together against the supplied context in `openspec/config.yaml` and its declared required inputs. Remove generated ownership violations and correct acceptance criteria to preserve source behaviour, including conditions and exceptions. Update the coverage map and required tests coherently. Do not implement product code, create implementation OpenSpec changes, or alter supplied contracts. Leave the bootstrap change active for Verify. Do not archive or commit it; the runner owns those later stages.\n\n{}\n\nVerifier context:\n{finding}",
                 worker_capacity_guidance(self.cli.frontier_worker)
@@ -3653,9 +3658,14 @@ fn verification_subject(
     frontier_worker: bool,
     supplied_contracts: bool,
 ) -> String {
-    if bootstrap {
+    let subject = if bootstrap && supplied_contracts {
         format!(
             "{change}\n\nVerify the generated implementation agenda against `automation/bootstrap.md`, the complete project goal in `openspec/config.yaml`, and every declared required input within the supplied reading boundaries. Independently read those source documents; agreement among generated artifacts is insufficient. For every slice, check that the component owns the planned work and distinguish owned implementation from consumption of a dependency. Trace each objective and acceptance criterion through the coverage map to a governing source path and requirement ID or section; check the actual source meaning, including conditions and exceptions. Reject invented obligations, inverted required behaviour, and implementation of another component's responsibilities. Confirm that no product code was implemented, every material in-scope goal is assigned, each slice is independently bounded for the worker model, and `9999-project-acceptance.md` is a genuine whole-project DONE gate. Report RETRY with the governing sources and all concrete corrections for generated mistakes; the repair stage must synchronize the bootstrap artifacts and agenda. This is the existing verification pass, not a new system-design round.\n\n{}",
+            worker_capacity_guidance(frontier_worker)
+        )
+    } else if bootstrap {
+        format!(
+            "{change}\n\nVerify that the planning-only agenda covers the complete project goal in `openspec/config.yaml`, follows the structure in `automation/bootstrap.md`, has coherent slices suited to the configured worker, and ends with a meaningful `9999-project-acceptance.md` whole-project gate. Check observable acceptance criteria and meaningful planned tests; confirm that no product code was implemented. Apply the ordinary review policy below even if older bootstrap artifacts demand exhaustive contract-style review. Do not require per-criterion source citations, verbatim requirement tables, or proof of implementation mechanics. Leave detailed algorithms and test design to implementation. A missing requirement, an unworkable dependency, or an acceptance criterion that cannot establish a required outcome is a material blocker. If optional implementation guidance is flawed, recommend removing the prescription while retaining the outcome and test rather than designing its replacement during bootstrap. Report all material blockers together; keep non-blocking observations out of mandatory repair instructions.\n\n{}",
             worker_capacity_guidance(frontier_worker)
         )
     } else if supplied_contracts {
@@ -3669,12 +3679,17 @@ fn verification_subject(
         )
     } else if frontier_terminal {
         format!(
-            "{change}\n\nPerform the independent frontier verification of the complete project goal. Start with the supplied requirements in `openspec/config.yaml` and its declared contracts and component scope. Check this terminal change's OpenSpec artifacts, the ordered agenda including `automation/slices/9999-project-acceptance.md`, synchronized generated specs, archived change evidence, delivered implementation, and real end-to-end acceptance results against those inputs. Run the required whole-project checks rather than relying only on task checkboxes or earlier summaries. Report VERIFIED only when the original in-scope project goal is demonstrably complete. Report RETRY with governing sources and concrete findings for correctable agenda, change-spec, implementation, or test mistakes; make clear when a finding represents missing in-scope functionality broad enough to require new remediation slices before the terminal gate."
+            "{change}\n\nPerform the independent frontier verification of the complete project goal in `openspec/config.yaml` and its required inputs. Compare delivered behaviour and real end-to-end acceptance results with that goal, using the agenda and OpenSpec artifacts as supporting evidence. Run required whole-project checks rather than relying only on task checkboxes or earlier summaries. Report VERIFIED when the requested goal is demonstrably complete. Report RETRY for material missing functionality, incorrect behaviour or inadequate required validation; explain when missing work needs remediation slices before the terminal gate."
         )
     } else {
         format!(
-            "{change}\n\nRead the supplied requirements and component scope relevant to this change. Verify the assigned agenda, OpenSpec artifacts, implementation, and tests against those inputs and run relevant checks. Agreement with a generated specification does not establish correctness if that specification contradicts its source. Report RETRY for concrete correctable agenda, change-spec, implementation, or test mistakes, citing the governing source, affected artifacts, and required synchronized repair. Preserve maintainer-owned conformance expectations. Do not modify the work during verification. Reserve BLOCKED for an external decision or unavailable input required by the authoritative requirements themselves."
+            "{change}\n\nVerify that the assigned change delivers the requested behaviour and run its required checks. Use the agenda and OpenSpec artifacts as supporting evidence; generated plans cannot override the project brief. Report RETRY for concrete material correctness defects or missing required validation, identifying the affected outcome and minimum repair. Do not modify work during verification. Reserve BLOCKED for a necessary external decision or unavailable input."
         )
+    };
+    if supplied_contracts {
+        subject
+    } else {
+        format!("{subject}\n\n{}", crate::authority::ORDINARY_REVIEW)
     }
 }
 
@@ -4442,11 +4457,50 @@ mod tests {
                 assert!(verify.contains(crate::authority::GUIDANCE.trim()));
                 assert!(verify.contains("Report RETRY"));
                 assert!(!verify.contains("only for a concrete, correctable implementation issue"));
-                assert!(verify.contains("Do not repair\nthem during verification"));
+                assert!(verify.contains("Do not repair work during verification"));
+                assert!(verify.contains(crate::authority::ORDINARY_REVIEW));
+            }
+        }
+    }
+
+    #[test]
+    fn review_policy_is_selected_by_contract_mode_not_worker_capacity_or_stage() {
+        for frontier_worker in [false, true] {
+            for (bootstrap, terminal) in [(true, false), (false, false), (false, true)] {
+                let ordinary = verification_subject(
+                    "test-change",
+                    bootstrap,
+                    terminal,
+                    frontier_worker,
+                    false,
+                );
+                assert!(ordinary.contains(crate::authority::ORDINARY_REVIEW));
+                assert!(!ordinary.contains("Trace each objective and acceptance criterion"));
                 if bootstrap {
-                    assert!(verify.contains("Trace each objective and acceptance criterion"));
-                    assert!(verify.contains("component owns the planned work"));
-                    assert!(verify.contains("including conditions and exceptions"));
+                    assert!(
+                        ordinary.contains(
+                            "Leave detailed algorithms and test design to implementation"
+                        )
+                    );
+                    assert!(
+                        ordinary.contains(
+                            "acceptance criterion that cannot establish a required outcome"
+                        )
+                    );
+                    assert!(ordinary.contains("older bootstrap artifacts"));
+                }
+
+                let contracts =
+                    verification_subject("test-change", bootstrap, terminal, frontier_worker, true);
+                assert!(!contracts.contains(crate::authority::ORDINARY_REVIEW));
+                assert!(contracts.contains("conditions and exceptions"));
+                if bootstrap {
+                    assert!(contracts.contains("Trace each objective and acceptance criterion"));
+                    assert!(
+                        contracts.contains("governing source path and requirement ID or section")
+                    );
+                } else {
+                    assert!(contracts.contains("original contracts and acceptance scenarios"));
                 }
             }
         }

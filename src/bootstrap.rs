@@ -397,6 +397,26 @@ mod tests {
         assert!(instructions.contains(crate::authority::GUIDANCE.trim()));
         assert!(instructions_for(false, false).contains("define observable acceptance criteria"));
     }
+
+    #[test]
+    fn ordinary_bootstrap_uses_outcomes_without_contract_bookkeeping() {
+        for frontier_worker in [false, true] {
+            let ordinary = instructions_for(frontier_worker, false);
+            assert!(ordinary.contains("Leave implementation\nmechanics and detailed test design"));
+            assert!(ordinary.contains(
+                "missing outcomes, unworkable dependencies and unusable acceptance criteria block"
+            ));
+            assert!(!ordinary.contains("cite the governing source paths and requirement IDs"));
+            assert!(!ordinary.contains("## Supplied requirements"));
+
+            let contracts = instructions_for(frontier_worker, true);
+            assert!(contracts.contains("## Supplied requirements"));
+            assert!(contracts.contains(
+                "Every link in that section must target a declared supplied input directly"
+            ));
+            assert!(!contracts.contains("Keep this ordinary context bootstrap proportionate"));
+        }
+    }
     use uuid::Uuid;
 
     #[test]

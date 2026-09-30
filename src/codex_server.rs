@@ -1028,7 +1028,17 @@ done
                 if protocol == StageProtocol::Verify {
                     assert!(prompt.contains("Continue verification only"));
                     assert!(prompt.contains("do not repair or modify"));
-                    assert!(prompt.contains("return RETRY with the exact finding"));
+                    assert!(
+                        prompt
+                            .contains("Return RETRY only for a blocking finding under that policy")
+                    );
+                    assert!(prompt.contains(
+                        "ordinary context reviews apply the anti-Karen materiality threshold"
+                    ));
+                    assert!(
+                        prompt
+                            .contains("supplied-contract reviews enforce their source obligations")
+                    );
                 } else {
                     assert!(prompt.contains("actual tools"));
                     assert!(prompt.contains("Do not stop at a progress update"));

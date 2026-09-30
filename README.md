@@ -124,18 +124,27 @@ subordinate change artifacts. Consistency among generated specs, code, and tests
 does not excuse contradicting their inputs. A dependency's interface contract
 does not assign its implementation to this component.
 
-Each slice cites source paths and requirement IDs or sections for its objective
-and acceptance criteria. The agenda's existing coverage map records those
-sources and ownership. The existing bootstrap verification pass checks that
-every slice belongs to the component and preserves the source requirements,
-including conditions and exceptions; it does not add another design round.
+Ordinary context campaigns apply the **anti-Karen rule**: deliver the requested
+behaviour and verify it with meaningful checks. Bootstrap checks goal coverage,
+coherent slices, observable acceptance criteria and the final gate; detailed
+implementation and test design belong to the implementing worker. It does not
+require per-criterion source citations, verbatim requirement tables or duplicated
+implementation recipes.
 
-Verification returns `RETRY` for correctable generated agenda or change-spec
-mistakes as well as code and test defects. Repair synchronizes the affected
-derived artifacts while preserving supplied contracts and maintainer-owned
-conformance expectations. `BLOCKED` is reserved for a genuine external decision
-or unavailable required input. These instructions guide model judgment; the
-runner's structural agenda checks cannot prove semantic conformance.
+Ordinary verification returns `RETRY` only for a material blocker: missing or
+incorrect requested behaviour, a failed or missing required check, or an
+unworkable plan. Wording, preferred designs and harmless explanatory mistakes
+are non-blocking observations; a correct result can be `VERIFIED` with those
+observations. Repair makes the smallest necessary correction. Real correctness
+defects still block, and the project brief and required tests remain binding.
+
+The explicit supplied-contract workflow below retains exact source tracing,
+component ownership, conditions, exceptions and protected acceptance checks.
+Its repairs synchronize affected derived artifacts with those contracts.
+`BLOCKED` is reserved for a genuine external decision or unavailable required
+input. These instructions guide model judgment; the runner's structural agenda
+checks cannot prove semantic conformance. Updating the binary changes subsequent
+stage prompts, not a model invocation that is already running.
 
 ### Implementing supplied contracts
 

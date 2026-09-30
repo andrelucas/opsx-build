@@ -23,11 +23,40 @@ Do not edit supplied contracts, expand component scope, or weaken
 maintainer-owned conformance tests to make generated work appear consistent.
 
 Respect stage ownership: exploration and verification diagnose; planning changes
-planning artifacts; Apply/Repair synchronize affected derived plans, specs,
-implementation, and tests. Bootstrap remains planning-only. During verification,
-return RETRY for concrete correctable agenda, change-spec, implementation, or
-test mistakes, citing the governing source and affected artifacts. Do not repair
-them during verification. Use BLOCKED only when authoritative inputs themselves
-require an external decision or necessary external input is unavailable; cite
-the exact conflict or gap and the smallest decision needed. A contradiction
-introduced by generated planning is the campaign's responsibility to correct.
+planning artifacts; Apply/Repair correct the affected work. Bootstrap remains
+planning-only. Do not repair work during verification. Use BLOCKED only when
+authoritative inputs require an external decision or necessary external input
+is unavailable; cite the gap and the smallest decision needed.
+
+### Ordinary context workflow: anti-Karen rule
+
+Unless this run explicitly uses the supplied-contract workflow (OpenSpec schema
+`opsx-supplied-contracts`), apply a materiality threshold to review. Report RETRY
+only for a concrete defect that prevents delivery or verification of the
+requested behaviour: a missing requirement, incorrect observable behaviour,
+failed required check, or an unworkable plan. State the consequence and the
+smallest necessary correction. Wording, citation bookkeeping, preferred designs,
+speculative edge cases beyond the brief, and explanatory inaccuracies with no
+effect on the required outcome are non-blocking observations. Return VERIFIED
+when required outcomes and checks pass despite such observations. Do not turn
+observations into mandatory repair tasks or expand the scope on successive
+reviews. Actual correctness defects and missing required tests still block.
+
+During ordinary bootstrap, verify coverage, usable slice boundaries, observable
+acceptance criteria and the final whole-project gate. Leave implementation
+mechanics and detailed test design to implementation and its tests. Do not
+require exhaustive requirement labels, verbatim quotations, or duplicated
+implementation recipes. A plausible plan need not prove every implementation
+detail before work starts. Correct a materially impossible prescription by
+leaving the choice to implementation while preserving the required outcome and
+test.
+
+### Supplied-contract workflow
+
+Only in the supplied-contract workflow, enforce exact source references,
+component ownership, conditions, exceptions and protected acceptance scenarios.
+Return RETRY for concrete correctable agenda, change-spec, implementation or
+test mistakes against those contracts, citing the governing source and affected
+artifacts. Apply/Repair synchronize affected derived plans, specs,
+implementation and tests. A contradiction introduced by generated planning is
+the campaign's responsibility to correct; do not defer it or weaken the contract.

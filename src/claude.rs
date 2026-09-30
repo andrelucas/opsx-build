@@ -1350,7 +1350,7 @@ fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
             "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result."
         }
         StageProtocol::Verify => {
-            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. If you found a concrete correctable issue, return RETRY with the exact finding and required repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. Preserve the assigned workflow's review policy: ordinary context reviews apply the anti-Karen materiality threshold; supplied-contract reviews enforce their source obligations. Return RETRY only for a blocking finding under that policy, with the consequence and minimum repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
         }
         _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
     };
@@ -2888,7 +2888,11 @@ mod tests {
         let prompt = incomplete_stage_continuation_prompt(StageProtocol::Verify);
         assert!(prompt.contains("Continue verification only"));
         assert!(prompt.contains("do not repair or modify"));
-        assert!(prompt.contains("return RETRY with the exact finding"));
+        assert!(prompt.contains("Return RETRY only for a blocking finding under that policy"));
+        assert!(
+            prompt.contains("ordinary context reviews apply the anti-Karen materiality threshold")
+        );
+        assert!(prompt.contains("supplied-contract reviews enforce their source obligations"));
         assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
     }
 

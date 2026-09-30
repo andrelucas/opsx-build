@@ -29,10 +29,6 @@ Each implementation slice must:
 - be implementable in one OpenSpec propose/apply/verify/archive cycle;
 - state its dependencies on earlier slices;
 - define observable acceptance criteria and the tests that prove them;
-- cite the governing source paths and requirement IDs or sections for its
-  objective and acceptance criteria, preserving their conditions and exceptions;
-- distinguish work this component owns from dependency behaviour it consumes;
-  plan only the owned work and the integration needed to use dependencies;
 - include enough durable context for a worker without the planner's
   conversation history;
 - leave the repository buildable and its tests passing;
@@ -71,9 +67,14 @@ every stated project requirement must be delivered and the agenda is DONE.
 
 The README must list the slices in execution order, explain how their sequence
 reaches the complete goal, and map every material goal requirement to one or
-more slices, including the final acceptance gate. Include the governing source
-references and component ownership in this existing coverage map. A reference
-to another generated artifact alone does not establish contract conformance.
+more slices, including the final acceptance gate. Use a concise coverage map;
+do not invent a requirement-label system or duplicate the brief as verbatim quotes.
+
+Keep this ordinary context bootstrap proportionate to the project. Describe
+observable outcomes, dependencies and meaningful checks. Leave implementation
+mechanics and detailed test design to the implementing worker. Provide focused
+guidance where it helps, without prescribing and duplicating a complete algorithm
+across the bootstrap design, README and slices.
 
 ## Stage ownership
 
@@ -94,13 +95,13 @@ structural omission: the README must exist; at least one delivery slice and the
 section must match this contract; and the final gate must contain
 `## Project Goal Coverage`.
 
-Also check semantic conformance against the required source documents: every
-slice must stay within component ownership, every acceptance criterion must
-preserve its governing contract, and the coverage map must deliver the complete
-in-scope goal. Correct generated planning mistakes in the bootstrap artifacts
-and agenda together. Do not carry a known contradiction forward for a worker or
-maintainer to resolve. The existing verification pass checks these same facts;
-no additional system-design round is needed.
+Check that the agenda covers the complete in-scope goal and contains no material
+contradiction of the brief. Verification applies the ordinary anti-Karen rule:
+missing outcomes, unworkable dependencies and unusable acceptance criteria block;
+wording, preferred designs and implementation details that the worker can resolve
+do not. If an optional implementation recipe is flawed, remove the prescription
+while preserving the required outcome and check. Do not spend bootstrap repair
+cycles refining it into a complete implementation.
 
 Mark this planning change with `skip_specs: true`. Build its normal OpenSpec
 proposal, design, and tasks artifacts, apply those tasks by writing the agenda,
