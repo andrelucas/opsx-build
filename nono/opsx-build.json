@@ -12,6 +12,7 @@
   },
   "filesystem": {
     "read": [
+      "$XDG_CONFIG_HOME/git",
       "$XDG_CONFIG_HOME/opsx-build",
       "$XDG_CONFIG_HOME/openspec",
       "$HOME/.local/share/claude"

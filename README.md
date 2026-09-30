@@ -1072,6 +1072,13 @@ are covered by the working-directory grant. Custom `GOPATH`, `GOMODCACHE`,
 Restart the nono invocation after changing its profile; existing sandboxed
 processes keep their original permissions.
 
+Git's XDG directory (`$XDG_CONFIG_HOME/git`, normally `~/.config/git`) has a
+read-only directory grant. On Linux this covers replacement files within that
+directory. A config-file symlink pointing outside it still relies on access to
+its target; replacing that target can invalidate an individual Landlock file
+grant. For a Dotbot-managed layout, linking the whole Git directory to a dedicated
+directory in dotfiles lets the directory grant cover its config files.
+
 The same setting is available as `harness_sandbox = false` in the TOML config,
 `OPSX_BUILD_HARNESS_SANDBOX=false` in the environment, or a recorded campaign
 setting through `opsx-build configure`. It applies to worker and frontier
