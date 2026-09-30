@@ -2031,6 +2031,41 @@ merely because its acknowledgement was malformed.
 
 ## Prerequisites and limitations
 
+### Install the OpenSpec workflows
+
+Configure OpenSpec once per host to install the full workflow selection,
+including Apply, Verify, and Archive. These commands change the host's global
+OpenSpec defaults:
+
+```sh
+openspec config set profile custom
+openspec config set delivery both
+openspec config set workflows '["propose","explore","new","continue","apply","update","ff","sync","archive","verify"]'
+```
+
+`opsx-build bootstrap` initializes OpenSpec automatically with
+`openspec init --tools claude --no-animation .`; sidecar setup also initializes
+its planning store. Set the global workflow selection above before bootstrap
+so that initialization installs the required workflows. Codex receives the
+installed Claude/OpenSpec workflows as explicit App Server inputs, so a separate
+Codex integration is not required by opsx-build.
+
+Only when preparing a campaign manually, initialize OpenSpec yourself:
+
+```sh
+openspec init --tools claude --profile custom
+```
+
+For an already initialized campaign, refresh its installed integrations:
+
+```sh
+openspec update --force
+```
+
+opsx-build installs its unattended Explore and Propose skills automatically.
+
+### Requirements
+
 - The configured worker backend executable, `openspec`, and `git` must be on
   `PATH`. Bootstrap and enabled frontier recovery additionally
   require the configured frontier backend executable.
