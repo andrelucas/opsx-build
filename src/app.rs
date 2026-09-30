@@ -414,7 +414,7 @@ impl<U: Ui> App<U> {
     }
 
     fn run_inner(&self) -> Result<()> {
-        if self.cli.request == "configure" {
+        if matches!(self.cli.request.as_str(), "configure" | "autoconfigure") {
             return crate::campaign_config::configure(&self.cli, &self.ui);
         }
         if let Some(campaign) = &self.cli.campaign_config {

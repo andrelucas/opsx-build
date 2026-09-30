@@ -435,3 +435,133 @@ fn reconfigure_preserves_existing_choices_last_used_and_cli_defaults() {
     assert!(saved.contains("Previous run record retained."));
     assert!(saved.contains("default_sources"));
 }
+
+fn automatic_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("global.toml"), "worker_connection = 'automatic'\n[connections.automatic]\nbackend = 'claude'\ncommand = 'claude'\nmodel = 'configured-model'\n").unwrap();
+    fs::write(fixture.root.join("bin/claude"), r#"#!/bin/sh
+printf '%s\n' "$@" > "$CONFIGURE_TEST_ROOT/launcher.txt"
+while [ "$#" -gt 0 ]; do
+ case "$1" in --add-dir) shift; scratch="$1";; esac
+ shift
+done
+cp "$scratch/reference.md" "$CONFIGURE_TEST_ROOT/reference.md"
+if [ "$CONFIGURE_TEST_MODE" = blocked ]; then
+ echo '{"type":"result","subtype":"success","result":"Missing authoritative contract","structured_output":{"opsx_status":"BLOCKED","summary":"Missing authoritative contract"}}'
+ exit 0
+fi
+if [ "$CONFIGURE_TEST_MODE" != missing ]; then
+ cp "$CONFIGURE_TEST_ROOT/proposal.json" "$scratch/proposal.json"
+fi
+echo '{"type":"result","subtype":"success","result":"Proposal ready","structured_output":{"opsx_status":"READY","summary":"Proposal ready"}}'
+"#).unwrap();
+    fs::write(
+        fixture.root.join("campaign/contract.md"),
+        "Exact supplied behaviour.",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("proposal.json"), serde_json::to_string(&serde_json::json!({
+        "accepted":true, "intent":"Implement supplied behaviour.", "notes":"Accepted supplied contract defaults.",
+        "arguments":["--supplied-contracts", "--contract=contract.md"]
+    })).unwrap()).unwrap();
+    fixture
+}
+
+#[test]
+fn autoconfigure_uses_effective_model_and_saves_contract_defaults_without_interaction() {
+    let fixture = automatic_fixture();
+    fixture.init_git();
+    let result = fixture.run(
+        "accept",
+        &["autoconfigure", "--worker-model=explicit-model"],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let launcher = fs::read_to_string(fixture.root.join("launcher.txt")).unwrap();
+    assert!(launcher.contains("--print\n"));
+    assert!(launcher.contains("--model\nexplicit-model\n"));
+    assert!(launcher.contains("without further confirmation"));
+    assert!(fixture.markdown().contains("--supplied-contracts"));
+    assert!(fixture.markdown().contains("--contract=contract.md"));
+    assert!(fixture.markdown().contains("--claude-model=explicit-model"));
+    assert_eq!(
+        fixture.git(&["log", "-1", "--format=%s"]).trim(),
+        "opsx: configure campaign"
+    );
+}
+
+#[test]
+fn autoconfigure_blocked_missing_or_invalid_proposals_do_not_save() {
+    for mode in ["blocked", "missing", "invalid", "model-change"] {
+        let fixture = automatic_fixture();
+        if mode == "invalid" {
+            fs::write(fixture.root.join("proposal.json"), "{}").unwrap();
+        } else if mode == "model-change" {
+            fs::write(fixture.root.join("proposal.json"), serde_json::to_string(&serde_json::json!({
+                "accepted":true,"intent":"Intent","notes":"Notes","arguments":["--worker-model=different"]
+            })).unwrap()).unwrap();
+        }
+        let result = fixture.run(mode, &["autoconfigure"]);
+        assert!(
+            !result.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!fixture.root.join("campaign/opsx-build.md").exists());
+    }
+}
+
+#[test]
+fn autoconfigure_dry_run_does_not_launch_an_agent() {
+    let fixture = automatic_fixture();
+    let result = fixture.run("accept", &["autoconfigure", "--dry-run"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!fixture.root.join("launcher.txt").exists());
+    assert!(!fixture.root.join("campaign/opsx-build.md").exists());
+}
+
+#[test]
+fn autoconfigure_defaults_and_existing_acceptance_gate_are_preserved() {
+    let fixture = automatic_fixture();
+    fs::write(fixture.root.join("campaign/check.sh"), "exit 0\n").unwrap();
+    let result = fixture.run(
+        "accept",
+        &[
+            "autoconfigure",
+            "--supplied-contracts",
+            "--contract=contract.md",
+            "--acceptance-command=true",
+            "--acceptance-file=check.sh",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let saved = fixture.markdown();
+    assert!(saved.contains("--claude-model=configured-model"));
+    assert!(saved.contains("--acceptance-command=true"));
+    fs::write(
+        fixture.root.join("proposal.json"),
+        serde_json::to_string(&serde_json::json!({
+            "accepted":true,"intent":"Intent","notes":"Notes","arguments":["--no-acceptance-checks"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let result = fixture.run("accept", &["autoconfigure"]);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("cannot change an existing acceptance gate")
+    );
+    assert_eq!(fixture.markdown(), saved);
+}

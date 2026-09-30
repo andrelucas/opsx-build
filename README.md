@@ -925,6 +925,33 @@ then records the accepted selection in `opsx-build.md`. It preserves an existing
 workflow choice unless you change it. Later runs use the recorded settings;
 they do not infer the workflow again from the context.
 
+For unattended preparation, use `autoconfigure`:
+
+```sh
+opsx-build --frontier-worker autoconfigure
+# Select a configured connection or override its model using the normal options.
+opsx-build --worker-connection=codex-worker autoconfigure
+```
+
+Unlike interactive `configure`, this uses the resolved worker connection,
+model, environment, token policy, and approval/sandbox settings. Command-line
+options override recorded campaign settings and global defaults as usual.
+Invoking `autoconfigure` authorizes accepting defaults supported by the campaign
+context and supplied contracts, without a conversation or `/exit` step. It
+identifies precise contracts and explicitly supplied acceptance commands, then
+submits a proposal through the same validation, save and path-only commit logic
+as `configure`. It does not start a build or run acceptance checks.
+
+Autoconfigure preserves resolved worker/frontier model settings, existing
+workflow choices, supplied contracts and acceptance gates. Explicit command-line
+overrides are resolved before this preservation check. Missing or ambiguous
+inputs requiring a maintainer decision stop with an explanation; blocked,
+missing or invalid proposals leave the previous configuration untouched.
+It must not invent acceptance commands or infer complete coverage from missing
+checks. `autoconfigure --dry-run` shows the effective settings without invoking
+an agent or writing files. Interactive `configure` retains its normal Claude
+conversation and agreement requirement.
+
 The result is **`opsx-build.md`**, a visible file in the campaign base directory
 (the Git root, or the requested directory when Git has not been initialized).
 It contains:

@@ -140,7 +140,10 @@ impl Cli {
     }
 
     fn load_args(raw: Vec<std::ffi::OsString>, args: CliArgs) -> Result<Self> {
-        let configuring = args.request.as_deref() == Some("configure");
+        let configuring = args
+            .request
+            .as_deref()
+            .is_some_and(|v| matches!(v, "configure" | "autoconfigure"));
         let base = crate::campaign_config::base_directory(&args.repo)?;
         let campaign = if (args.no_campaign_config && !configuring)
             || args.test_connection.is_some()
@@ -160,7 +163,7 @@ impl Cli {
                 .and_then(|args| canonical_settings(&args))
             {
                 Ok(saved) => saved,
-                Err(_) if configuring => Vec::new(),
+                Err(_) if args.request.as_deref() == Some("configure") => Vec::new(),
                 Err(error) => return Err(error),
             };
             let explicit = CliArgs::command().try_get_matches_from(&raw)?;
@@ -243,7 +246,7 @@ impl Cli {
             Ok(cli) => cli,
             // An obsolete connection or combination in the Markdown must not
             // prevent configure from opening to repair it.
-            Err(_) if configuring => Self::resolve(args.clone())?,
+            Err(_) if args.request.as_deref() == Some("configure") => Self::resolve(args.clone())?,
             Err(error) => return Err(error),
         };
         if configuring {
@@ -284,7 +287,7 @@ impl Cli {
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
-        if cli.request == "configure" {
+        if matches!(cli.request.as_str(), "configure" | "autoconfigure") {
             if cli.rewind_target.is_some()
                 || cli.yes
                 || cli.interactive
@@ -295,7 +298,7 @@ impl Cli {
                 || cli.direction.is_some()
             {
                 anyhow::bail!(
-                    "`opsx-build configure` cannot be combined with another workflow mode"
+                    "`opsx-build configure/autoconfigure` cannot be combined with another workflow mode"
                 );
             }
             return Ok(cli);
@@ -420,7 +423,7 @@ impl Cli {
     args_override_self = true
 )]
 pub(crate) struct CliArgs {
-    /// Change request, `configure`, `advance`, `bootstrap`, `execute`, or `rewind`.
+    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, or `rewind`.
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
