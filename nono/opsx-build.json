@@ -43,7 +43,21 @@
   "platform_overrides": {
     "linux": {
       "filesystem": {
-        "allow": ["$XDG_CACHE_HOME/go-build", "$XDG_CACHE_HOME/pip"]
+        "allow": [
+          "$XDG_CACHE_HOME/go-build",
+          "$XDG_CACHE_HOME/pip",
+          "/tmp",
+          "$HOME/.ccache",
+          "$XDG_RUNTIME_DIR/ccache-tmp"
+        ],
+        "read": [
+          "/usr/libexec/gcc",
+          "/usr/share/python-wheels",
+          "/etc/pki/ca-trust",
+          "/etc/pki/tls",
+          "/usr/include",
+          "/etc/mime.types"
+        ]
       }
     },
     "macos": {

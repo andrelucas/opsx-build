@@ -1024,7 +1024,10 @@ nono run --profile /path/to/opsx-build/nono/opsx-build.json --allow-cwd -- \
 
 The bundled profile allows network access and Go's default module downloads,
 checksum database (`~/go/pkg/sumdb`), installed tools (`~/go/bin`), and build
-cache on macOS and Linux. Go still writes checksum state under `GOPATH/pkg/sumdb`
+cache on macOS and Linux, plus the Buf cache (`~/.cache/buf`). On Linux, it
+also grants temporary-file access, ccache state, and read access to Fedora's
+compiler helpers, headers, Python wheels, MIME database, and certificate stores.
+Go still writes checksum state under `GOPATH/pkg/sumdb`
 when `GOMODCACHE` points elsewhere. Campaign-local caches and tool directories
 are covered by the working-directory grant. Custom `GOPATH`, `GOMODCACHE`,
 `GOCACHE` or `GOBIN` paths outside those locations need their own grants.
