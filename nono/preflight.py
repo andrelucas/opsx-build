@@ -41,6 +41,20 @@ def inside(args):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             failures.append(name)
             print(f'FAIL {name}: {error}', flush=True)
+    def executable_check(name, version_args):
+        executable = shutil.which(name)
+        if not executable:
+            raise ValueError(name + ' is missing or not executable on PATH')
+        print(f'Selected {name}: {executable} -> {Path(executable).resolve()}', flush=True)
+        run([executable, *version_args], campaign, args.timeout)
+    for name, version_args in [
+        ('go', ['version']),
+        ('protoc', ['--version']),
+        ('protoc-gen-go', ['--version']),
+        ('protoc-gen-go-grpc', ['--version']),
+    ]:
+        check('PATH executable: ' + name,
+              lambda name=name, version_args=version_args: executable_check(name, version_args))
     check('Git configuration and metadata', lambda: run(
         ['git', 'rev-parse', '--git-path', 'opsx-build'], campaign, args.timeout))
     with tempfile.TemporaryDirectory(prefix='opsx-preflight-') as temporary:
@@ -68,8 +82,6 @@ def inside(args):
                 executable = shutil.which('go')
                 if not executable:
                     raise ValueError('go is missing from PATH')
-                print('Selected Go: ' + str(Path(executable).resolve()), flush=True)
-                run([executable, 'version'], campaign, args.timeout)
                 for module in modules:
                     settings = json.loads(run([executable, 'env', '-json', 'GOVERSION',
                         'GOROOT', 'GOCACHE', 'GOMODCACHE'], module.parent, args.timeout))

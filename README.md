@@ -1101,7 +1101,11 @@ actual named worker and frontier connections; omitting it skips model checks
 and prints that omission. Connection checks make real model requests and test
 one harmless shell-tool round trip using the configured models and environments.
 
-The preflight checks Git configuration and metadata, a commit in a disposable
+The preflight reports the PATH-selected Go, `protoc`, `protoc-gen-go`, and
+`protoc-gen-go-grpc` paths (including resolved symlink targets), and executes
+each version command inside the sandbox. Missing or blocked tools fail the
+preflight, even before Go modules exist. It also checks Git configuration and
+metadata, a commit in a disposable
 repository (excluding hooks and signing), OpenSpec startup/discovery, configuration
 resolution, and each Go module's selected toolchain, writable caches and compiler.
 It does not initialize OpenSpec, advance a campaign, change project files, or
