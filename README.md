@@ -1084,6 +1084,33 @@ permission configuration and unattended `--auto` behaviour are unchanged.
 This setting leaves `permission_mode` unchanged and is independent of
 `--yolo`, which controls proposal milestone commits.
 
+#### Check a campaign before launching
+
+Run the preflight outside nono. It wraps the checks in `nono wrap` using the
+campaign directory and selected profile, so child processes inherit the same
+filesystem restrictions as a campaign launch:
+
+```sh
+python3 /path/to/opsx-build/nono/preflight.py \
+  --campaign ~/git/sirocco/campaigns/namespace-read \
+  --connection anthropic --connection anthropic-frontier
+```
+
+Use `--profile PATH` for a locally edited profile. Repeat `--connection` for the
+actual named worker and frontier connections; omitting it skips model checks
+and prints that omission. Connection checks make real model requests and test
+one harmless shell-tool round trip using the configured models and environments.
+
+The preflight checks Git configuration and metadata, a commit in a disposable
+repository (excluding hooks and signing), OpenSpec startup/discovery, configuration
+resolution, and each Go module's selected toolchain, writable caches and compiler.
+It does not initialize OpenSpec, advance a campaign, change project files, or
+commit in the campaign repository. Toolchain resolution may download into shared
+caches. An uninitialized OpenSpec directory is reported as expected before
+bootstrap. Any failed check produces a nonzero exit; `--timeout` sets the limit
+per command (default 120 seconds). This checks access at preflight time; external
+file replacements during a later campaign can still invalidate Linux file grants.
+
 #### Validate the nono profile
 
 Run the standalone provisioning and harness smoke tests from this checkout,

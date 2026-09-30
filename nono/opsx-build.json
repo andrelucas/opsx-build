@@ -51,6 +51,7 @@
           "$XDG_RUNTIME_DIR/ccache-tmp"
         ],
         "read": [
+          "$HOME/.local/go",
           "/proc",
           "/usr/libexec/gcc",
           "/usr/share/python-wheels",
