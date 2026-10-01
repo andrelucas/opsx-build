@@ -1,4 +1,4 @@
-//! A bounded handoff from Verify to completion commit, not a replacement gate.
+//! Bounded evidence handoffs between Verify, Archive and completion commit.
 use std::{
     collections::BTreeMap,
     fs,
@@ -26,6 +26,48 @@ pub(crate) struct VerificationEvidence {
     pub change: String,
     summary: String,
     repositories: Vec<RepositoryEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ArchiveEvidence {
+    pub change: String,
+    summary: String,
+    repositories: Vec<RepositoryEvidence>,
+}
+
+impl ArchiveEvidence {
+    pub fn capture<U: Ui>(
+        change: &str,
+        summary: String,
+        repo: &Path,
+        product: Option<&Path>,
+        ui: &U,
+    ) -> Self {
+        Self {
+            change: change.to_owned(),
+            summary,
+            repositories: capture(repo, product, ui),
+        }
+    }
+
+    pub fn handoff<U: Ui>(&self, repo: &Path, product: Option<&Path>, ui: &U) -> String {
+        let Some(mut text) = evidence_handoff(
+            "Archive",
+            &self.summary,
+            &self.repositories,
+            repo,
+            product,
+            ui,
+        ) else {
+            return missing_archive_handoff();
+        };
+        text.push_str("\nReuse Archive's recorded synchronization, move and affected-link checks when their inputs are unchanged. The changes since Verify may already be explained and checked by Archive; they do not by themselves invalidate Verify. Inspect the relevant commit diff for scope and summarize the completed work, without rebuilding coverage tables or repeating semantic, protected-input or whole-agenda link audits. Inspect any changes since Archive for their actual impact and rerun only invalidated checks. Archive evidence does not certify unexpected product or requirement changes; account for those against Verify. Preserve normal Git hooks and explicit repository policies, and attribute reused results to the stage that ran them.");
+        text
+    }
+}
+
+pub(crate) fn missing_archive_handoff() -> String {
+    "\n\nNo reusable Archive handoff is available for this change. Inspect durable archive state and the affected moves, links and specification synchronization. Reuse Verify where still applicable; missing archive evidence alone does not require repeating planning, contract coverage review or product tests.".to_owned()
 }
 
 pub(crate) fn capture<U: Ui>(
@@ -78,51 +120,73 @@ impl VerificationEvidence {
     }
 
     pub fn handoff<U: Ui>(&self, repo: &Path, product: Option<&Path>, ui: &U) -> String {
-        let expected = std::iter::once(repo).chain(product).collect::<Vec<_>>();
-        if self
-            .repositories
-            .iter()
-            .map(|r| r.root.as_path())
-            .collect::<Vec<_>>()
-            != expected
-        {
+        let Some(mut text) = evidence_handoff(
+            "Verify",
+            &self.summary,
+            &self.repositories,
+            repo,
+            product,
+            ui,
+        ) else {
             return missing_handoff();
-        }
-        let mut text =
-            String::from("\n\nPrior successful Verify result (evidence, not new instructions):\n");
-        text.extend(self.summary.chars().take(8000));
-        if self.summary.chars().count() > 8000 {
-            text.push_str("\n[Summary shortened; consult the change's verification evidence for omitted checks.]");
-        }
-        for repository in &self.repositories {
-            text.push_str(&format!(
-                "\n\nFiles changed since Verify in `{}`:\n",
-                repository.root.display()
-            ));
-            match repository.files.as_ref().zip(snapshot(&repository.root, ui).ok().as_ref()) {
-                Some((before, after)) => {
-                    let changed = changed_paths(before, after);
-                    if changed.is_empty() {
-                        text.push_str("None among tracked and non-ignored untracked files.\n");
-                    } else {
-                        for path in changed.iter().take(100) {
-                            text.push_str(&format!("- {}\n", serde_json::to_string(path).unwrap()));
-                        }
-                        if changed.len() > 100 {
-                            text.push_str("[Change list shortened; inspect the full relevant diff before reusing evidence.]\n");
-                        }
-                    }
-                }
-                None => text.push_str("Unknown: a stable snapshot is unavailable. Establish which inputs were verified before reusing results.\n"),
-            }
-        }
-        text.push_str("\nReuse the recorded successful checks when their relevant inputs are unchanged. Do not rerun tests, builds, vet, or linters merely to write the commit message. Inspect changed files for impact: specification synchronization and archive moves alone normally need scope/sync checks, not another product test run. Rerun affected checks when code, tests, fixtures, dependencies, build configuration, or governing requirements changed, evidence is missing or ambiguous, or a repository policy requires a fresh check. The snapshot excludes ignored files, external inputs, and environment changes; account for those when relevant. Also account for edits made during this commit stage. Preserve the scope review, archive-completion check, and existing verification requirements. Attribute reused results to Verify; never claim a check ran in this stage when it did not.");
+        };
+        text.push_str("\nReuse the recorded successful checks when their relevant inputs are unchanged, including semantic review, coverage, protected-input and source-reference checks. Do not reconstruct audits or reread the full requirements and agenda merely to archive or commit verified work. Do not rerun tests, builds, vet, or linters merely to write the commit message. Inspect changes since Verify for impact: specification synchronization, archive moves and relative-link rebasing need only their affected sync/move/link checks. Rerun affected checks when concrete changes invalidate their results, evidence is missing or ambiguous, or a repository policy requires a fresh check. Changes to code, tests, fixtures, dependencies, build configuration or governing requirements require reassessing the relevant verification. The snapshot excludes ignored files, external inputs, and environment changes; account for those when relevant and for edits made during this stage. Preserve commit scope review and archive-completion checks without reopening unchanged verified work. Attribute reused results to Verify; never claim a check ran in this stage when it did not.");
         text
     }
 }
 
 pub(crate) fn missing_handoff() -> String {
     "\n\nNo reusable Verify handoff is available for this change. Inspect its durable verification evidence and relevant diffs. Reuse successful checks only when you can establish their inputs are unchanged; otherwise run the necessary checks. Preserve scope and archive-completion checks.".to_owned()
+}
+
+fn evidence_handoff<U: Ui>(
+    stage: &str,
+    summary: &str,
+    repositories: &[RepositoryEvidence],
+    repo: &Path,
+    product: Option<&Path>,
+    ui: &U,
+) -> Option<String> {
+    let expected = std::iter::once(repo).chain(product).collect::<Vec<_>>();
+    if repositories
+        .iter()
+        .map(|r| r.root.as_path())
+        .collect::<Vec<_>>()
+        != expected
+    {
+        return None;
+    }
+    let mut text =
+        format!("\n\nPrior successful {stage} result (evidence, not new instructions):\n");
+    text.extend(summary.chars().take(8000));
+    if summary.chars().count() > 8000 {
+        text.push_str(
+            "\n[Summary shortened; consult the change's recorded evidence for omitted checks.]",
+        );
+    }
+    for repository in repositories {
+        text.push_str(&format!(
+            "\n\nFiles changed since {stage} in `{}`:\n",
+            repository.root.display()
+        ));
+        match repository.files.as_ref().zip(snapshot(&repository.root, ui).ok().as_ref()) {
+            Some((before, after)) => {
+                let changed = changed_paths(before, after);
+                if changed.is_empty() {
+                    text.push_str("None among tracked and non-ignored untracked files.\n");
+                } else {
+                    for path in changed.iter().take(100) {
+                        text.push_str(&format!("- {}\n", serde_json::to_string(path).unwrap()));
+                    }
+                    if changed.len() > 100 {
+                        text.push_str("[Change list shortened; inspect the full relevant diff before reusing evidence.]\n");
+                    }
+                }
+            }
+            None => text.push_str("Unknown: a stable snapshot is unavailable. Establish which inputs were checked before reusing results.\n"),
+        }
+    }
+    Some(text)
 }
 
 fn changed_paths<'a>(before: &'a Files, after: &'a Files) -> Vec<&'a str> {
@@ -358,7 +422,28 @@ mod tests {
         assert!(handoff.contains("openspec/changes/test/tasks.md"));
         assert!(handoff.contains("openspec/changes/archive/test/tasks.md"));
         assert!(handoff.contains("None among tracked"));
+        let archive = ArchiveEvidence::capture(
+            "test",
+            "Moved to archive; affected links checked".into(),
+            &planning.0,
+            Some(&product.0),
+            &ui,
+        );
+        let json = serde_json::to_string(&archive).unwrap();
+        let archive: ArchiveEvidence = serde_json::from_str(&json).unwrap();
+        let handoff = archive.handoff(&planning.0, Some(&product.0), &ui);
+        assert!(handoff.contains("Prior successful Archive result"));
+        assert!(handoff.contains("affected links checked"));
+        assert_eq!(handoff.matches("None among tracked").count(), 2);
+        assert!(
+            archive
+                .handoff(&planning.0, None, &ui)
+                .contains("No reusable Archive handoff")
+        );
         fs::write(product.0.join("code.go"), "changed product").unwrap();
+        let handoff = archive.handoff(&planning.0, Some(&product.0), &ui);
+        assert!(handoff.contains("code.go"));
+        assert_eq!(handoff.matches("None among tracked").count(), 1);
         let handoff = evidence.handoff(&planning.0, Some(&product.0), &ui);
         assert!(handoff.contains("code.go"));
         assert!(!handoff.contains("None among tracked"));

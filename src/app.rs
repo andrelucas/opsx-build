@@ -59,7 +59,7 @@ use crate::{
     skills::{SkillInstallAction, ensure_unattended_skills},
     state::Stage,
     ui::{CampaignIterationView, CampaignView, Ui},
-    verification::{self, VerificationEvidence},
+    verification::{self, ArchiveEvidence, VerificationEvidence},
 };
 
 const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Decide slice identities, observable outcomes, ordering and prerequisites. Put one compact requirement-to-slice coverage map in the proposal, including the terminal gate; supplied-contract runs retain direct source references. Use design for decomposition rationale and unresolved risks, and tasks for authoring and checking the agenda. Reference the map from dependent artifacts instead of reproducing it. Do not draft complete future slice documents or duplicate per-slice acceptance and test catalogues inside the bootstrap artifacts. Retain all schema-required artifacts and acceptance scenarios. In ordinary mode, develop the observable requirements, completion boundary and material assumptions from the brief; do not assume prewritten contracts or acceptance tests. Apply develops the detailed agenda from these decisions and original inputs. Later implementation slices retain their normal Propose and Apply responsibilities.";
@@ -195,6 +195,8 @@ struct RunState {
     pending_repair: Option<String>,
     #[serde(default)]
     verification: Option<VerificationEvidence>,
+    #[serde(default)]
+    archive: Option<ArchiveEvidence>,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
@@ -269,6 +271,7 @@ impl RunState {
             planning_backend: None,
             pending_repair: None,
             verification: None,
+            archive: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -315,6 +318,7 @@ impl RunState {
             planning_backend: None,
             pending_repair: None,
             verification: None,
+            archive: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -2612,6 +2616,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let change = require_change(state)?;
         state.verification = None;
+        state.archive = None;
         if !self.check_bootstrap_for_verify(repo, state)? {
             return Ok(());
         }
@@ -2626,7 +2631,7 @@ impl<U: Ui> App<U> {
         );
         let verify_subject = with_sidecar_context(state, &verify_subject);
         let verify_subject = format!(
-            "{verify_subject}\n\nIn the final summary, record the checks actually run, their working directories, outcomes and any limitations concisely, so completion commit can reuse the evidence. Preserve the check process's own exit status when piping or summarizing output; a successful tail/echo command is not proof that the check passed. Keep this evidence in the summary; do not edit files just to record it."
+            "{verify_subject}\n\nIn the final summary, record the checks actually run, their working directories, outcomes and any limitations concisely, so Archive and completion commit can reuse the evidence. Preserve the check process's own exit status when piping or summarizing output; a successful tail/echo command is not proof that the check passed. Keep this evidence in the summary; do not edit files just to record it."
         );
         let Some(result) = worker_result(
             invoke_fresh(
@@ -2922,9 +2927,22 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
     ) -> Result<()> {
         let change = require_change(state)?;
-        let subject = archive_subject(&change);
-        let subject = with_sidecar_context(state, &subject);
+        state.archive = None;
+        let mut subject = archive_subject(&change, state.contracts.is_some());
+        if let Some(product) = state.product_repo.as_deref() {
+            subject.push_str(&format!(
+                "\n\nSIDECAR WORKSPACE: Archive and synchronize specifications in the current planning repository. The product repository is `{}`. Preserve its implementation, tests and documentation; inspect it only to resolve a concrete impact question from changes since Verify.",
+                product.display()
+            ));
+        }
         for attempt in 0..=1 {
+            let handoff = state
+                .verification
+                .as_ref()
+                .filter(|evidence| evidence.change == change)
+                .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
+                .unwrap_or_else(verification::missing_handoff);
+            let subject = format!("{subject}{handoff}");
             let attempt_subject = if attempt == 0 {
                 subject.clone()
             } else {
@@ -2971,6 +2989,13 @@ impl<U: Ui> App<U> {
                 },
             };
             require_ready("archive", &result.text, result.signal)?;
+            state.archive = Some(ArchiveEvidence::capture(
+                &change,
+                result.text.clone(),
+                repo,
+                state.product_repo.as_deref(),
+                &self.ui,
+            ));
             state.stage = state.stage.after_ready()?;
             return persist_state(repo, state, &self.ui);
         }
@@ -2991,6 +3016,12 @@ impl<U: Ui> App<U> {
             .filter(|evidence| evidence.change == change)
             .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
             .unwrap_or_else(verification::missing_handoff);
+        let archive_handoff = state
+            .archive
+            .as_ref()
+            .filter(|evidence| evidence.change == change)
+            .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
+            .unwrap_or_else(verification::missing_archive_handoff);
         let planning_baseline = current_head(repo, &self.ui)?;
         let product_repo = state.product_repo.clone();
         let product_baseline = product_repo
@@ -3000,7 +3031,7 @@ impl<U: Ui> App<U> {
             .flatten();
         let task = if state.bootstrap {
             format!(
-                "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow. {commit_message} Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and relevant diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow. {commit_message} Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
         } else if let Some(product_repo) = product_repo.as_deref() {
             format!(
@@ -3009,15 +3040,22 @@ impl<U: Ui> App<U> {
             )
         } else {
             format!(
-                "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status, history, and diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
+                "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status and relevant diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
+        };
+        let task = if state.contracts.is_some() {
+            format!(
+                "{task}\n\nPreserve all supplied contracts and acceptance inputs unchanged. This workflow archives proposal, design and tasks without specification synchronization. Contract interpretation, coverage and source-reference authoring belong to Propose, Apply and Verify; do not repeat them during this commit."
+            )
+        } else {
+            task
         };
         let result = invoke_fresh(
             claude,
             &format!("{change}-completion-commit"),
             &stage_prompt(
                 "",
-                &with_contract_context(state, &format!("{task}{handoff}")),
+                &format!("{task}{handoff}{archive_handoff}"),
                 StageProtocol::Ready,
             ),
             "Worker agent is committing the completed change",
@@ -4011,9 +4049,14 @@ fn with_direction(base: &str, direction: Option<&str>) -> String {
     }
 }
 
-fn archive_subject(change: &str) -> String {
+fn archive_subject(change: &str, supplied_contracts: bool) -> String {
+    let workflow = if supplied_contracts {
+        "This supplied-contract workflow has proposal, design and tasks only. Archive them without synchronizing specifications or creating canonical specs. Preserve supplied contracts, acceptance inputs and the workflow schema unchanged."
+    } else {
+        "Include normal specification synchronization. The user has already authorized the normal archive choices: if delta specs need synchronization, choose `Sync now (recommended)`, verify the sync, and continue the archive; if they are already synchronized, choose `Archive now`. Do not stop to request routine confirmation for either choice, and do not treat that confirmation as a BLOCKED condition."
+    };
     format!(
-        "{change}\n\nArchive this successfully verified OpenSpec change, including normal specification synchronization. The user has already authorized the normal archive choices: if delta specs need synchronization, choose `Sync now (recommended)`, verify the sync, and continue the archive; if they are already synchronized, choose `Archive now`. Do not stop to request routine confirmation for either choice, and do not treat that confirmation as a BLOCKED condition. Report BLOCKED only if synchronization, verification, or archival cannot safely be completed without a genuine human decision or unavailable external input."
+        "{change}\n\nArchive this successfully verified OpenSpec change. {workflow} This stage owns synchronization when applicable, archive moves and necessary relative-link updates. Reuse Verify's successful checks for unchanged inputs. Inspect task completion and the affected artifacts only as needed to perform and check those operations. Do not repeat planning, semantic review, requirement coverage, protected-input or whole-agenda link audits. Check links affected by moving documents; do not audit unchanged links elsewhere. Consult original requirements only for a concrete issue introduced by subsequent changes. Preserve unrelated work and do not implement or redesign the change. Report BLOCKED only if synchronization or archival cannot safely be completed without a genuine human decision or unavailable external input.\n\nIn the final summary, record the archive location, synchronization performed or intentionally omitted, files changed, checks actually run and outcomes, and any changes that invalidate Verify's evidence. Completion commit will reuse this report. Keep it in the summary; do not edit files just to record it."
     )
 }
 
@@ -4026,7 +4069,7 @@ fn proposal_commit_message(change: &str) -> String {
 fn completion_commit_message(change: &str) -> String {
     format!(
         "Use commit subject exactly `openspec: complete {change}`. Add a conventional Git commit body derived from the completed OpenSpec artifacts and actual verification results. Use imperative mood. Write a short first paragraph explaining the delivered observable behavior and its purpose. Add at most one second paragraph summarizing the most important validation that actually ran or a material scope boundary. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, exhaustive implementation mechanics, generated boilerplate, or claims about checks that did not run. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
-    ) + " Keep inspection focused on the assigned change, the diff being committed, verification evidence, and archive completion. Consult governing sources when needed to resolve a concrete issue. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
+    ) + " This stage packages completed, verified and archived work. Inspect Git status and the relevant diff to establish commit scope, read enough to summarize the delivered outcome, and commit. Start with changed-file names and diff summaries; inspect only the hunks needed to establish ownership or describe the outcome, without rereading the whole agenda or contract set. Scope review decides which changed files belong in this commit; it does not re-verify their design or requirement coverage. Reuse the Verify and Archive handoffs. Do not repeat semantic review, coverage tables, protected-input or whole-agenda link audits, OpenSpec completeness checks or validation already completed on unchanged inputs. Check only subsequent edits that invalidate evidence or checks explicitly required by repository policy; preserve normal Git hooks. Do not rewrite planning or implementation while preparing the commit. Consult governing sources only to resolve a concrete commit-scope question. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
 }
 
 fn queue_direction(state: &mut RunState, direction: &str) {
@@ -4194,6 +4237,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
             .map(str::to_owned),
         pending_direction: None,
         verification: None,
+        archive: None,
         proposal_head: value
             .get("proposal_commit")
             .and_then(Value::as_str)
@@ -5028,9 +5072,11 @@ mod tests {
         ))
         .unwrap();
         value.as_object_mut().unwrap().remove("verification");
+        value.as_object_mut().unwrap().remove("archive");
         value["stage"] = serde_json::json!("final-commit");
         let state: RunState = serde_json::from_value(value).unwrap();
         assert!(state.verification.is_none());
+        assert!(state.archive.is_none());
         assert_eq!(state.stage, Stage::FinalCommit);
         assert!(verification::missing_handoff().contains("otherwise run the necessary checks"));
     }
@@ -5053,7 +5099,7 @@ mod tests {
 
     #[test]
     fn archive_prompt_pre_authorizes_normal_spec_sync() {
-        let subject = archive_subject("0009-https-tls-forwarding-valid");
+        let subject = archive_subject("0009-https-tls-forwarding-valid", false);
 
         assert!(subject.contains("choose `Sync now (recommended)`"));
         assert!(subject.contains("choose `Archive now`"));

@@ -304,6 +304,136 @@ fn ordinary_planning_still_delivers_specs_design_and_tasks_to_implementation_app
 }
 
 #[test]
+fn archive_and_completion_reuse_evidence_across_resume_in_both_workflows() {
+    for mode in ["ordinary", "repair"] {
+        let fixture = Fixture::new();
+        fixture.run(mode, false);
+        let mut state = fixture.state();
+        state["stage"] = "verify".into();
+        state["agenda"] = serde_json::Value::Null;
+        fixture.save_state(&state);
+        fs::remove_file(fixture.root.join("calls")).unwrap();
+        fs::write(
+            fixture.root.join("repo/implementation.txt"),
+            "verified implementation\n",
+        )
+        .unwrap();
+        fs::write(fixture.root.join("repo/unrelated.txt"), "preserve me\n").unwrap();
+        fs::write(fixture.root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"
+status=READY
+summary='Committed verified work'
+case "$count" in
+ 1) status=VERIFIED; summary='Implementation checks and requirement coverage passed in campaign root; no edits';;
+ 2)
+  if [ "$CONTRACT_TEST_MODE" = ordinary ]; then
+   mkdir -p openspec/specs/greeting
+   cp openspec/changes/0001-delivery/specs/greeting/spec.md openspec/specs/greeting/spec.md
+  fi
+  mkdir -p openspec/changes/archive
+  mv openspec/changes/0001-delivery openspec/changes/archive/2026-10-01-0001-delivery
+  summary='Archived at openspec/changes/archive/2026-10-01-0001-delivery; affected links checked; product unchanged';;
+ 3) status=BLOCKED; summary='Fixture pauses before completion commit';;
+ 4) git add openspec implementation.txt; git commit -qm 'openspec: complete 0001-delivery' || exit 90;;
+ *) exit 90;;
+esac
+printf '{"type":"result","subtype":"success","session_id":"fixture-session","result":"%s","structured_output":{"opsx_status":"%s","summary":"%s"}}\n' "$summary" "$status" "$summary"
+"#).unwrap();
+        let result = fixture.run(mode, true);
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("Fixture pauses before completion commit")
+        );
+        let state = fixture.state();
+        assert_eq!(state["stage"], "final-commit");
+        assert_eq!(state["archive"]["change"], "0001-delivery");
+        let archive = fs::read_to_string(fixture.root.join("args-2")).unwrap();
+        assert!(archive.contains("Prior successful Verify result"));
+        assert!(archive.contains("Implementation checks and requirement coverage passed"));
+        assert!(archive.contains("Do not repeat planning, semantic review"));
+        assert!(
+            !archive.contains("Read the relevant original inputs listed below before planning")
+        );
+        if mode == "ordinary" {
+            assert!(archive.contains("choose `Sync now (recommended)`"));
+            assert!(
+                fixture
+                    .root
+                    .join("repo/openspec/specs/greeting/spec.md")
+                    .is_file()
+            );
+        } else {
+            assert!(archive.contains("Archive them without synchronizing specifications"));
+            assert!(!archive.contains("choose `Sync now (recommended)`"));
+            assert!(
+                !fixture
+                    .root
+                    .join("repo/openspec/specs/greeting/spec.md")
+                    .exists()
+            );
+        }
+        let completion = fs::read_to_string(fixture.root.join("args-3")).unwrap();
+        assert!(completion.contains("Prior successful Verify result"));
+        assert!(completion.contains("Prior successful Archive result"));
+        assert!(completion.contains("affected links checked; product unchanged"));
+        assert!(completion.contains("Files changed since Archive"));
+        assert!(completion.contains("None among tracked and non-ignored untracked files"));
+        assert!(completion.contains("it does not re-verify their design or requirement coverage"));
+        assert!(
+            !completion.contains("Read the relevant original inputs listed below before planning")
+        );
+        assert!(!completion.contains("MAINTAINER ACCEPTANCE"));
+
+        // A resumed commit still receives the archive evidence, but cannot claim
+        // that a subsequently edited implementation is unchanged.
+        fs::write(
+            fixture.root.join("repo/implementation.txt"),
+            "edited after archive\n",
+        )
+        .unwrap();
+        let result = fixture.run(mode, true);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let completion = fs::read_to_string(fixture.root.join("args-4")).unwrap();
+        assert!(completion.contains("Prior successful Archive result"));
+        assert!(completion.contains("implementation.txt"));
+        assert!(!completion.contains("None among tracked and non-ignored untracked files"));
+        assert_eq!(fixture.state()["stage"], "complete");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("repo/unrelated.txt")).unwrap(),
+            "preserve me\n"
+        );
+        let status = Command::new("git")
+            .args([
+                "status",
+                "--porcelain",
+                "--",
+                "unrelated.txt",
+                "implementation.txt",
+                "openspec",
+            ])
+            .current_dir(fixture.root.join("repo"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(status.stdout).unwrap(),
+            "?? unrelated.txt\n"
+        );
+    }
+}
+
+#[test]
 fn unrepaired_proposal_never_reaches_commit() {
     let fixture = Fixture::new();
     let result = fixture.run("reject", false);

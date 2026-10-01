@@ -5,9 +5,11 @@ govern the work. Read the supplied context in `openspec/config.yaml` and every
 input it declares required, within its stated reading boundaries, before
 planning. Do not wait for an apparent ambiguity to read required inputs. During
 Apply, Repair and Verify, re-read the source requirements relevant to the
-assigned work. Milestone commits package completed work: inspect the relevant
-diff and consult sources only to resolve a concrete scope question, without
-repeating planning or semantic review.
+assigned work. Archive performs the required specification synchronization,
+archive moves and affected-link checks, reusing successful Verify evidence.
+Milestone commits package completed work: inspect the relevant diff and consult
+sources only to resolve a concrete scope question, without repeating planning,
+semantic review or audits already completed on unchanged inputs.
 
 Supplied requirements govern generated agendas; those agendas govern subordinate
 OpenSpec change artifacts and implementation only within those requirements.
@@ -26,8 +28,8 @@ Do not edit supplied contracts, expand component scope, or weaken
 maintainer-owned conformance tests to make generated work appear consistent.
 
 Respect stage ownership: exploration and verification diagnose; planning changes
-planning artifacts; Apply/Repair correct the affected work; milestone commits
-preserve and commit that work. Bootstrap remains
+planning artifacts; Apply/Repair correct the affected work; Archive synchronizes
+and archives; milestone commits preserve and commit that work. Bootstrap remains
 planning-only. Do not repair work during verification. Use BLOCKED only when
 authoritative inputs require an external decision or necessary external input
 is unavailable; cite the gap and the smallest decision needed.

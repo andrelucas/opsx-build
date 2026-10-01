@@ -11,7 +11,7 @@ explicit worker or frontier backends.
 
 During an ordinary run it deliberately does **not** infer file ownership or
 require a clean working tree. Read-only file fingerprints support the handoff
-from Verify to completion commit; they do not determine commit scope.
+between Verify, Archive and completion commit; they do not determine commit scope.
 By default, the selected worker agent creates
 proposal and completion milestone commits under explicit non-destructive instructions.
 Development runs can use `--yolo` to skip the proposal commit and retain only
@@ -887,22 +887,36 @@ affected checks to run again. Normal Git hooks remain in force. The runner keeps
 its existing proposal and protected-input checks at stage boundaries.
 
 Successful Verify summaries record the checks run, working directories,
-outcomes and limitations. The checkpoint carries this evidence into completion
-commit, along with a list of files changed since verification. Read-only Git
-content hashes cover tracked and non-ignored untracked files, including file
-additions, deletions and executable-mode changes. Sidecar runs cover both
+outcomes and limitations. The checkpoint carries this evidence into Archive and
+completion commit, along with a list of files changed since verification. Archive
+owns specification synchronization in ordinary mode, archive moves and checks of
+links affected by those moves; supplied-contract mode archives without spec
+synchronization. It reuses successful Verify results for unchanged inputs rather
+than repeating semantic review, requirement coverage or whole-agenda audits.
+
+Archive records its location, changes, checks and any impact on Verify's evidence
+in its final summary. The runner saves that report and a fresh file snapshot, so
+completion can reuse both stages' results and see any changes since Archive.
+Read-only Git content hashes cover tracked and non-ignored untracked files,
+including file additions, deletions and executable-mode changes. Sidecar runs cover both
 repositories. No index, working-tree content or Git history is changed by this
 measurement.
 
-The completion agent reuses successful checks when their relevant inputs are
-unchanged. It still inspects commit scope and archive completion. Changes to
+Completion packages the verified and archived work. Its scope review determines
+which changed files belong in the commit; it does not reopen design, requirement
+coverage or checks of unchanged documents. Archive's recorded move, sync and link
+checks are reused when still applicable, alongside Verify's results. Changes to
 code, tests, fixtures, dependencies, build configuration or governing
 requirements require reassessing and rerunning affected checks. Ignored files,
 external inputs and environment changes remain the agent's responsibility;
 repository policies requiring fresh checks still apply. Missing/old evidence,
 changes during Verify, unreadable inputs, symlinks or submodules fall back to
-normal evidence inspection rather than certifying unchanged inputs. This
-handoff does not weaken Verify or introduce another verification stage.
+targeted evidence inspection rather than certifying unchanged inputs. An older
+checkpoint or recovered Archive without a report requires inspecting durable
+archive state and affected operations, without automatically repeating all
+verification. Normal Git hooks, protected-input checks and maintainer acceptance
+gates remain in force. These handoffs do not weaken Verify or introduce another
+verification stage.
 
 `BLOCKED` has one meaning: Claude explicitly reported that progress requires a
 human decision or unavailable external input. Subprocess failures, malformed
