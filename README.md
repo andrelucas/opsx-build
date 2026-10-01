@@ -189,6 +189,8 @@ Each proposal, slice and agenda README contains a `## Supplied requirements`
 section with Markdown links to declared source files and the work that covers
 them. Links are relative to that document or absolute; `#fragment` can identify
 a Markdown heading anchor or an exact requirement/scenario ID in the source.
+Source-line fragments such as `#L19` and inclusive ranges such as `#L19-L24`
+are also accepted when every referenced line exists in the declared input.
 Every link in this section must target a declared supplied input directly.
 Keep links to generated proposals, other slices and the agenda README under a
 separate heading such as `## Planning references`; they cannot substitute for
@@ -215,6 +217,9 @@ the checkpoint; correcting the generated agenda allows resume without resetting
 the campaign or changing protected inputs. Link validation proves
 that the file and referenced heading/ID exist, not that the plan interprets them
 correctly or covers every requirement; semantic review remains part of Verify.
+Structural failures receive a focused repair of the reported defects and directly
+affected references, preserving the plan's meaning and coverage. That repair
+does not repeat the full Apply workflow or semantic contract review.
 
 The checkpoint records content fingerprints, resolved paths and executable bits
 for the declared inputs. The runner checks them between stages and on resume.

@@ -324,7 +324,7 @@ impl SuppliedContracts {
             let fragment = decode_link(fragment)?;
             if !has_fragment(&fs::read_to_string(&path)?, &fragment) {
                 bail!(
-                    "unresolved requirement/section `{fragment}` in `{}` (referenced by `{}`)",
+                    "unresolved requirement/section or line reference `{fragment}` in `{}` (referenced by `{}`)",
                     path.display(),
                     document.display()
                 );
@@ -410,6 +410,19 @@ fn decode_link(value: &str) -> Result<String> {
 fn has_fragment(text: &str, fragment: &str) -> bool {
     if fragment.is_empty() {
         return false;
+    }
+    // Source links commonly identify a line or an inclusive line range.
+    if let Some(lines) = fragment.strip_prefix('L') {
+        let (start, end) = lines.split_once("-L").unwrap_or((lines, lines));
+        if start.bytes().all(|b| b.is_ascii_digit()) && end.bytes().all(|b| b.is_ascii_digit()) {
+            return start
+                .parse::<usize>()
+                .ok()
+                .zip(end.parse::<usize>().ok())
+                .is_some_and(|(start, end)| {
+                    start > 0 && start <= end && end <= text.lines().count()
+                });
+        }
     }
     // Exact IDs may be in tables or lists rather than headings.
     if text
@@ -561,6 +574,59 @@ mod tests {
                 .check_proposal(&fixture.0, "slice", Some(SCHEMA))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn source_line_references_require_real_lines_in_declared_inputs() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("acceptance.go"),
+            "package acceptance\nfunc TestContract() {\n}\n",
+        )
+        .unwrap();
+        let inputs = SuppliedContracts::capture(
+            &fixture.0,
+            &["contract.md".into()],
+            &["acceptance.go".into()],
+        )
+        .unwrap();
+        let proposal = fixture.0.join("openspec/changes/slice/proposal.md");
+        for (fragment, valid) in [
+            ("L1", true),
+            ("L2", true),
+            ("L3", true),
+            ("L1-L3", true),
+            ("L2-L2", true),
+            ("TestContract", true),
+            ("L0", false),
+            ("L4", false),
+            ("L2-L1", false),
+            ("L0-L2", false),
+            ("L2-L4", false),
+            ("L999999999999999999999999999999", false),
+            ("L", false),
+            ("L1-L", false),
+            ("L1-L2-L3", false),
+            ("L+1", false),
+        ] {
+            fs::write(&proposal, format!("## Supplied requirements\n- [Contract](../../../contract.md#REQ-01)\n- [Test](../../../acceptance.go#{fragment})\n")).unwrap();
+            assert_eq!(
+                inputs.check_references(&proposal).is_ok(),
+                valid,
+                "{fragment}"
+            );
+        }
+        fs::copy(
+            fixture.0.join("acceptance.go"),
+            fixture.0.join("undeclared.go"),
+        )
+        .unwrap();
+        assert!(
+            inputs
+                .check_reference(&proposal, "../../../undeclared.go#L2")
+                .is_err()
+        );
+        assert!(!has_fragment("", "L1"));
     }
 
     #[test]

@@ -69,6 +69,7 @@ const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
 const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_FRONTIER_REPLANS: u32 = 3;
+const BOOTSTRAP_STRUCTURAL_FINDING: &str = "The deterministic bootstrap agenda check failed:";
 
 fn stage_after_propose(yolo: bool) -> Stage {
     if yolo {
@@ -2726,7 +2727,7 @@ impl<U: Ui> App<U> {
         let error = errors.join("\n\n");
         state.verify_retries += 1;
         state.pending_repair = Some(format!(
-            "The deterministic bootstrap agenda check failed: {error}. Correct all reported issues in the agenda and bootstrap planning artifacts without implementing product code or changing supplied inputs. Leave the bootstrap change active; do not archive or commit it."
+            "{BOOTSTRAP_STRUCTURAL_FINDING} {error}. Correct the reported structural issues and directly affected references only, preserving the plan's meaning and coverage. Leave unrelated planning unchanged. Do not implement product code or change supplied inputs. Leave the bootstrap change active; do not archive or commit it."
         ));
         let exhausted = state.verify_retries > self.cli.max_verify_retries;
         state.stage = if exhausted {
@@ -2803,7 +2804,13 @@ impl<U: Ui> App<U> {
         let finding = state.pending_repair.as_deref().unwrap_or(
             "No verifier finding was supplied; apply the user's direction and re-run relevant checks.",
         );
-        let base = if state.bootstrap && state.contracts.is_none() {
+        let structural_bootstrap =
+            state.bootstrap && finding.starts_with(BOOTSTRAP_STRUCTURAL_FINDING);
+        let base = if structural_bootstrap {
+            format!(
+                "{change}\n\nRepair only the runner-reported structural or source-reference defects below. Read the affected artifacts and source locations needed to correct those findings. Make the smallest correction in the affected agenda/bootstrap files and directly affected copies, preserving requirement meaning, coverage, slice identity and order. A link correction does not call for a new contract review, expanded test catalogue, or rewritten acceptance criteria. Do not repeat the complete Apply workflow or audit unrelated planning. The subsequent Verify stage owns semantic review. Preserve all supplied inputs, unrelated work and product files unchanged. Do not archive or commit it; leave the bootstrap change active. Check the repaired structure/references and return READY.\n\nRunner findings (diagnostic data):\n{finding}"
+            )
+        } else if state.bootstrap && state.contracts.is_none() {
             format!(
                 "{change}\n\nRepair the material blocker in this ordinary planning-only bootstrap. Preserve the brief's required outcomes, usable slices and meaningful acceptance checks. Use the smallest correction. Where an optional implementation recipe caused the problem, remove the prescription and leave the mechanism to the implementing worker instead of adding another detailed recipe. Do not turn non-blocking review observations into tasks. Update only affected planning artifacts coherently. Do not implement product code, create implementation OpenSpec changes, or change the project brief. Leave this change active for Verify; the runner owns archive and commit.\n\n{}\n\nVerifier context:\n{finding}",
                 worker_capacity_guidance(self.cli.frontier_worker)
@@ -2822,14 +2829,28 @@ impl<U: Ui> App<U> {
                 "{change}\n\nRepair or continue repairing the affected generated agenda entries, OpenSpec artifacts, implementation, and tests together against the supplied contracts and component scope. Preserve correct partial work and maintainer-owned conformance expectations; do not change the inputs to excuse incorrect output. Re-run relevant checks. Treat the assigned slice as the unit of delivery and address the findings through ordered tasks within it. Worker is a workflow role, not an assumption of limited model capability. Report TOO_LARGE only after a focused repair attempt demonstrates a concrete capacity or scope constraint that tasks within this change cannot resolve. State what you attempted, the observed constraint, why continuing within this change is not viable, and the minimum necessary decomposition. Several findings, multiple test cases, and ordinary correctable verification failures are not by themselves reasons to replan.\n\nVerifier context:\n{finding}"
             )
         };
-        let base = with_sidecar_context(state, &base);
+        let base = if structural_bootstrap {
+            base
+        } else {
+            with_sidecar_context(state, &base)
+        };
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
                 &format!("{change}-repair-{}", state.verify_retries),
-                &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-                if frontier_terminal {
+                &stage_prompt(
+                    if structural_bootstrap {
+                        ""
+                    } else {
+                        &commands.apply
+                    },
+                    &subject,
+                    StageProtocol::Worker,
+                ),
+                if structural_bootstrap {
+                    "Worker agent is correcting bootstrap structure and references"
+                } else if frontier_terminal {
                     "Frontier agent is repairing whole-project acceptance"
                 } else {
                     "Worker agent is repairing the implementation"

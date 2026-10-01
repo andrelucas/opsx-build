@@ -555,9 +555,37 @@ fn bootstrap_reference_preflight_repairs_before_model_verify_and_preserves_exhau
             let prompt =
                 fs::read_to_string(fixture.root.join(format!("args-{}", baseline_calls + 1)))
                     .unwrap();
-            assert!(prompt.contains("Repair the planning-only implementation agenda"));
+            assert!(prompt.contains(
+                "Repair only the runner-reported structural or source-reference defects"
+            ));
+            assert!(prompt.contains("The subsequent Verify stage owns semantic review"));
+            assert!(prompt.contains("Do not repeat the complete Apply workflow"));
+            assert!(!prompt.contains("noop bootstrap-implementation-slices"));
+            assert!(!prompt.contains("SUPPLIED-CONTRACT WORKFLOW"));
+            assert!(!prompt.contains("Update the coverage map and required tests coherently"));
             assert!(prompt.contains("Do not archive or commit it"));
             assert!(prompt.contains("3 issue(s)"));
+            // Actual semantic findings still use normal Repair in both workflows.
+            for supplied_contracts in [true, false] {
+                let mut semantic = state.clone();
+                semantic["pending_repair"] =
+                    "An acceptance criterion contradicts the required outcome.".into();
+                if !supplied_contracts {
+                    semantic["contracts"] = serde_json::Value::Null;
+                }
+                fixture.save_state(&semantic);
+                fixture.run("repair", true);
+                let prompt =
+                    fs::read_to_string(fixture.root.join(format!("args-{}", fixture.calls())))
+                        .unwrap();
+                assert!(prompt.contains("noop bootstrap-implementation-slices"));
+                assert!(!prompt.contains("Repair only the runner-reported structural"));
+                assert!(prompt.contains(if supplied_contracts {
+                    "Update the coverage map and required tests coherently"
+                } else {
+                    "Repair the material blocker in this ordinary planning-only bootstrap"
+                }));
+            }
         }
     }
 }
