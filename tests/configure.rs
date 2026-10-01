@@ -61,8 +61,9 @@ OPENROUTER_API_KEY = "secret-do-not-copy"
         Self { root }
     }
 
-    fn run(&self, mode: &str, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_opsx-build"))
+    fn command(&self, mode: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opsx-build"));
+        command
             .current_dir(self.root.join("campaign"))
             .env(
                 "PATH",
@@ -80,9 +81,12 @@ OPENROUTER_API_KEY = "secret-do-not-copy"
                 "--config={}",
                 self.root.join("global.toml").display()
             ))
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
+    }
+
+    fn run(&self, mode: &str, args: &[&str]) -> Output {
+        self.command(mode, args).output().unwrap()
     }
 
     fn markdown(&self) -> String {
@@ -560,6 +564,97 @@ fn autoconfigure_uses_effective_model_and_saves_contract_defaults_without_intera
         fixture.git(&["log", "-1", "--format=%s"]).trim(),
         "opsx: configure campaign"
     );
+}
+
+#[test]
+fn autoconfigure_summary_survives_the_terminal_dashboard() {
+    use std::{
+        io::Read,
+        os::{fd::FromRawFd, unix::process::CommandExt},
+        process::Stdio,
+    };
+
+    for commit in [false, true] {
+        let fixture = automatic_fixture();
+        if commit {
+            fixture.init_git();
+        }
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 30,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // openpty initializes both descriptors on success; each File owns one.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { fs::File::from_raw_fd(master) };
+        let slave = unsafe { fs::File::from_raw_fd(slave) };
+        let mut command = fixture.command("accept", &["autoconfigure", "--stream-agent=reasoning"]);
+        command
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // Give the child its own controlling terminal for dashboard raw mode.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            // Linux reports EIO after the last slave closes; macOS returns EOF.
+            if let Err(error) = master.read_to_end(&mut output) {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            }
+            String::from_utf8(output).unwrap()
+        });
+        let status = child.wait().unwrap();
+        let output = reader.join().unwrap();
+        assert!(status.success(), "{output}");
+        assert!(
+            output.contains("\x1b[?1049h"),
+            "dashboard did not open: {output}"
+        );
+        let (_, permanent) = output
+            .rsplit_once("\x1b[?1049l")
+            .expect("dashboard must close");
+        for expected in [
+            "Saved campaign configuration",
+            "Workflow: supplied contracts (contract files: 1)",
+            "Worker: `automatic` (claude, configured-model)",
+            "Frontier:",
+            "Planning assumes",
+            "Acceptance:",
+            if commit {
+                "Committing campaign configuration"
+            } else {
+                "was not committed"
+            },
+        ] {
+            assert!(
+                permanent.contains(expected),
+                "missing {expected} after dashboard exit: {output}"
+            );
+        }
+    }
 }
 
 #[test]

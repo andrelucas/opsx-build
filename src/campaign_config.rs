@@ -192,6 +192,8 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
         ui.info("When you're happy with the proposal, exit Claude (/exit); opsx-build validates it, writes opsx-build.md in this campaign directory, and commits that file when possible");
         ProcessRunner::new(ui).run_interactive(&spec)
     };
+    // Keep validation, saved settings and commit results in terminal scrollback.
+    ui.finish_dashboard();
     if let Err(error) = execution {
         return Err(error).with_context(|| {
             format!(
