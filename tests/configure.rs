@@ -143,6 +143,12 @@ fn configure_uses_plain_claude_and_saves_only_valid_accepted_settings() {
     assert!(saved.contains("This preset is managed externally"));
     assert!(saved.contains("Test transactions"));
     assert!(!saved.contains("secret-do-not-copy"));
+    let feedback = String::from_utf8_lossy(&result.stderr);
+    assert!(feedback.contains("Workflow: ordinary context"));
+    assert!(feedback.contains("Worker: `remote` (codex, @preset/motd)"));
+    assert!(feedback.contains("Planning assumes a frontier-capable worker"));
+    assert!(feedback.contains("no final commands configured"));
+    assert!(!feedback.contains("secret-do-not-copy"));
     let reference = fs::read_to_string(fixture.root.join("reference.md")).unwrap();
     assert!(reference.contains("--max-terminal-remediations=5"));
     assert!(!reference.contains("secret-do-not-copy"));
@@ -547,6 +553,9 @@ fn autoconfigure_uses_effective_model_and_saves_contract_defaults_without_intera
     assert!(fixture.markdown().contains("--supplied-contracts"));
     assert!(fixture.markdown().contains("--contract=contract.md"));
     assert!(fixture.markdown().contains("--claude-model=explicit-model"));
+    let feedback = String::from_utf8_lossy(&result.stderr);
+    assert!(feedback.contains("Workflow: supplied contracts (contract files: 1)"));
+    assert!(feedback.contains("Worker: `automatic` (claude, explicit-model)"));
     assert_eq!(
         fixture.git(&["log", "-1", "--format=%s"]).trim(),
         "opsx: configure campaign"
@@ -609,6 +618,9 @@ fn autoconfigure_defaults_and_existing_acceptance_gate_are_preserved() {
     let saved = fixture.markdown();
     assert!(saved.contains("--claude-model=configured-model"));
     assert!(saved.contains("--acceptance-command=true"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains(
+        "Acceptance: protected files: 1; final commands: 1; timeout: 600s each (not run)"
+    ));
     fs::write(
         fixture.root.join("proposal.json"),
         serde_json::to_string(&serde_json::json!({

@@ -950,6 +950,9 @@ context and supplied contracts, without a conversation or `/exit` step. It
 identifies precise contracts and explicitly supplied acceptance commands, then
 submits a proposal through the same validation, save and path-only commit logic
 as `configure`. It does not start a build or run acceptance checks.
+After saving, both configuration modes report the selected workflow, worker and
+frontier connections/models, planning capacity, and registered contracts and
+acceptance checks. The saved file contains the full intent and decision notes.
 
 Autoconfigure preserves resolved worker/frontier model settings, existing
 workflow choices, supplied contracts and acceptance gates. Explicit command-line

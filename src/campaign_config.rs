@@ -307,6 +307,7 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
             "Saved campaign configuration to `{}`",
             path.display()
         ));
+        report_configuration(&resolved, ui);
         if let Err(error) = commit_configuration(&base, ui) {
             ui.warn(&format!(
                 "Configuration was saved, but `{FILE_NAME}` was not committed: {error:#}"
@@ -324,6 +325,50 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
     }
     fs::remove_dir_all(directory)?;
     Ok(())
+}
+
+fn report_configuration<U: Ui>(cli: &Cli, ui: &U) {
+    ui.info(&if cli.supplied_contracts {
+        format!(
+            "Workflow: supplied contracts (contract files: {})",
+            cli.contract_files.len()
+        )
+    } else {
+        "Workflow: ordinary context".to_owned()
+    });
+    for (role, connection) in [
+        ("Worker", &cli.worker_connection),
+        ("Frontier", &cli.frontier_connection),
+    ] {
+        ui.info(&format!(
+            "{role}: `{}` ({}, {})",
+            connection.name.as_deref().unwrap_or("default"),
+            connection.backend,
+            connection
+                .model
+                .as_deref()
+                .unwrap_or("harness default model"),
+        ));
+    }
+    ui.info(if cli.frontier_worker {
+        "Planning assumes a frontier-capable worker"
+    } else {
+        "Planning assumes a smaller worker"
+    });
+    if cli.acceptance_commands.is_empty() {
+        ui.info(&format!(
+            "Acceptance: protected files: {}; no final commands configured",
+            cli.acceptance_files.len(),
+        ));
+    } else {
+        ui.info(&format!(
+            "Acceptance: protected files: {}; final commands: {}; timeout: {}s each (not run)",
+            cli.acceptance_files.len(),
+            cli.acceptance_commands.len(),
+            cli.acceptance_timeout_seconds
+                .unwrap_or(crate::acceptance::DEFAULT_TIMEOUT_SECONDS),
+        ));
+    }
 }
 
 fn autoconfigure_proposal<U: Ui>(
