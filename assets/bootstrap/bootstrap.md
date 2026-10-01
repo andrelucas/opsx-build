@@ -78,16 +78,37 @@ across the bootstrap design, README and slices.
 
 ## Stage ownership
 
+Ordinary mode starts from the project brief; it does not assume that a maintainer
+has supplied finished requirements, acceptance scenarios or a technical design.
+During Propose, derive the required observable outcomes and completion boundary,
+resolve reasonable engineering choices, and record material assumptions. Keep
+all normal OpenSpec artifacts and schema-required acceptance scenarios. Use
+BLOCKED only for a material product decision that cannot be inferred safely.
+
 During OpenSpec Propose, create or update only the normal OpenSpec artifacts for
 the `bootstrap-implementation-slices` change. Do not create or modify
 `automation/slices/README.md` or any implementation slice under
-`automation/slices/` during Propose. Describe the intended agenda structure,
-slice files, acceptance criteria, and required tests in the OpenSpec design and
-tasks so a fresh Apply session can carry them out without conversation history.
+`automation/slices/` during Propose. Decide the slice identities, observable
+outcomes, ordering and prerequisites. Put one compact goal-to-slice coverage map
+in the proposal, including the terminal gate. Use design for decomposition
+rationale and unresolved risks, and tasks for authoring and checking the agenda.
+Reference that map from dependent artifacts instead of reproducing it. Do not
+draft complete future slice documents or duplicate per-slice acceptance and test
+catalogues inside these artifacts. Retain the decisions and observable success
+conditions needed for Apply to develop the agenda without conversation history.
 
-During OpenSpec Apply, check the plan against its supplied inputs and materialize it as
-`automation/slices/README.md` and the ordered implementation slice files. Apply
-exclusively owns creation of those agenda deliverables.
+During OpenSpec Apply, use the chosen decomposition and original inputs to write
+`automation/slices/README.md` and the ordered implementation slice files. Develop
+their acceptance criteria and required tests here.
+Apply exclusively owns creation of those agenda deliverables. Preserve sound
+decomposition decisions;
+reopen them only when a concrete contradiction, coverage gap or unworkable
+dependency requires correction. Keep the proposal map and design at decision
+level rather than copying the finished agenda back into them.
+
+This boundary applies only to bootstrap. Each later implementation slice still
+uses normal OpenSpec Propose to develop its specifications, design and tasks,
+then normal Apply to implement and test them.
 
 Before reporting Apply complete, inspect the finished agenda and correct every
 structural omission: the README must exist; at least one delivery slice and the

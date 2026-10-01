@@ -62,8 +62,8 @@ use crate::{
     verification::{self, VerificationEvidence},
 };
 
-const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Record the intended agenda structure, slice files, acceptance criteria, and required tests in the OpenSpec design and tasks so a fresh Apply session can materialize them.";
-const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Create the ordered implementation agenda and README required by `automation/bootstrap.md`, conforming to the supplied context in `openspec/config.yaml` and its declared required inputs. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Check each slice's component ownership and trace its acceptance criteria to the governing source requirements, preserving conditions and exceptions. Correct contradictory bootstrap artifacts and agenda entries together. Do not archive the bootstrap change.";
+const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Decide slice identities, observable outcomes, ordering and prerequisites. Put one compact requirement-to-slice coverage map in the proposal, including the terminal gate; supplied-contract runs retain direct source references. Use design for decomposition rationale and unresolved risks, and tasks for authoring and checking the agenda. Reference the map from dependent artifacts instead of reproducing it. Do not draft complete future slice documents or duplicate per-slice acceptance and test catalogues inside the bootstrap artifacts. Retain all schema-required artifacts and acceptance scenarios. In ordinary mode, develop the observable requirements, completion boundary and material assumptions from the brief; do not assume prewritten contracts or acceptance tests. Apply develops the detailed agenda from these decisions and original inputs. Later implementation slices retain their normal Propose and Apply responsibilities.";
+const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Use the chosen decomposition and original inputs to write the ordered implementation agenda and README required by `automation/bootstrap.md`, conforming to the supplied context in `openspec/config.yaml` and its declared required inputs. Develop the slices' acceptance criteria and required tests here. Preserve sound decomposition decisions; reopen them only when a concrete contradiction, coverage gap or unworkable dependency requires correction. Keep the bootstrap proposal map and design at decision level rather than copying the finished agenda back into them. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Check each slice's component ownership and trace its acceptance criteria to the governing source requirements, preserving conditions and exceptions. Correct contradictory bootstrap artifacts and agenda entries together. Do not archive the bootstrap change.";
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
@@ -2527,7 +2527,13 @@ impl<U: Ui> App<U> {
             )
         };
         let baseline = current_head(repo, &self.ui)?;
-        let task = with_contract_context(state, &task);
+        let task = if state.contracts.is_some() {
+            format!(
+                "{task}\n\nPreserve all supplied contracts and acceptance inputs unchanged. Include `openspec/schemas/opsx-supplied-contracts/` when newly installed for this workflow. Contract interpretation and source-reference authoring belong to Propose, Apply and Verify; this commit stage does not repeat them."
+            )
+        } else {
+            task
+        };
         let result = invoke_fresh(
             claude,
             &format!("{change}-proposal-commit"),
@@ -3993,7 +3999,7 @@ fn archive_subject(change: &str) -> String {
 fn proposal_commit_message(change: &str) -> String {
     format!(
         "Use commit subject exactly `openspec: propose {change}`. Add a conventional Git commit body derived from the completed OpenSpec proposal, specs, design, and tasks. Use imperative mood. Write a short first paragraph explaining the intended observable change and why it is being made. Add at most one second paragraph for an important scope boundary or acceptance condition. Separate paragraphs with a blank line and hard-wrap every body line at 72 columns or fewer. Prefer roughly four to eight body lines in total. Do not write one dense summary paragraph, Markdown headings or lists, file or task inventories, command invocations, generated boilerplate, or behavior not approved by those artifacts. Check the subject and body formatting before creating each commit. Once all relevant work is committed, message formatting alone is not a BLOCKED condition: preserve the existing commits, mention any formatting imperfection briefly, and report READY without requesting permission to amend or creating a replacement commit."
-    ) + " Keep inspection focused on the assigned change's proposal artifacts and the diff being committed. Consult governing sources where needed to resolve scope or a contradiction; do not repeat the whole planning or implementation workflow. This is a planning-artifact commit: run required artifact validation, not product tests merely to create the commit. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
+    ) + " This stage packages completed planning. Inspect the relevant Git status and diff to establish commit scope, read enough of the completed artifacts to summarize them, and create the commit. Do not repeat planning, semantic review, OpenSpec status/completeness checks or artifact validation already completed by Propose and the runner. Do not run product tests for a proposal commit. Reuse prior validation for unchanged artifacts; rerun only an affected check when concrete subsequent edits invalidate its result or repository policy explicitly requires a fresh check. Preserve normal Git hooks. Consult governing sources only to resolve a concrete commit-scope question; do not reread the full contract set or rewrite planning artifacts during this stage. Prepare and validate the complete message once in the repository's Git metadata directory, then pass that file to `git commit -F`; do not combine `-F` with `-m`."
 }
 
 fn completion_commit_message(change: &str) -> String {
@@ -4406,8 +4412,16 @@ mod tests {
             BOOTSTRAP_PROPOSAL_CONTEXT.contains("Apply stage exclusively owns those deliverables")
         );
         assert!(
-            BOOTSTRAP_PROPOSAL_CONTEXT.contains("so a fresh Apply session can materialize them")
+            BOOTSTRAP_PROPOSAL_CONTEXT.contains("one compact requirement-to-slice coverage map")
         );
+        assert!(BOOTSTRAP_PROPOSAL_CONTEXT.contains("do not assume prewritten contracts"));
+        assert!(
+            BOOTSTRAP_PROPOSAL_CONTEXT
+                .contains("Retain all schema-required artifacts and acceptance scenarios")
+        );
+        assert!(BOOTSTRAP_PROPOSAL_CONTEXT.contains(
+            "Later implementation slices retain their normal Propose and Apply responsibilities"
+        ));
     }
 
     #[test]
@@ -4415,6 +4429,11 @@ mod tests {
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("Before reporting READY"));
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("every structural requirement"));
         assert!(BOOTSTRAP_APPLY_CONTEXT.contains("correct any omission within this Apply stage"));
+        assert!(
+            BOOTSTRAP_APPLY_CONTEXT
+                .contains("Develop the slices' acceptance criteria and required tests here")
+        );
+        assert!(BOOTSTRAP_APPLY_CONTEXT.contains("rather than copying the finished agenda back"));
     }
 
     #[test]
@@ -5029,6 +5048,11 @@ mod tests {
         assert!(proposal.contains("hard-wrap every body line at 72 columns or fewer"));
         assert!(proposal.contains("Do not write one dense summary paragraph"));
         assert!(proposal.contains("file or task inventories"));
+        assert!(proposal.contains("This stage packages completed planning"));
+        assert!(proposal.contains("Reuse prior validation for unchanged artifacts"));
+        assert!(proposal.contains("concrete subsequent edits invalidate its result"));
+        assert!(proposal.contains("Preserve normal Git hooks"));
+        assert!(!proposal.contains("run required artifact validation"));
 
         let completion = completion_commit_message("0009-https-tls-forwarding-valid");
         assert!(completion.contains("subject exactly `openspec: complete"));

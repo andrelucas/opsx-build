@@ -54,6 +54,7 @@ case "$1" in
   else echo '{"changes":[]}' ; fi;;
  status)
   schema=opsx-supplied-contracts
+  if [ "$CONTRACT_TEST_MODE" = ordinary ]; then schema=spec-driven; fi
   if [ -f openspec/changes/0001-delivery/wrong-schema ]; then schema=spec-driven; fi
   printf '{"isPlanningComplete":true,"schemaName":"%s","nextSteps":[]}\n' "$schema";;
  *) exit 80;;
@@ -77,6 +78,15 @@ mkdir -p "$change"
 status=READY
 summary='Fixture proposal'
 case "$CONTRACT_TEST_MODE:$count" in
+ ordinary:1)
+  mkdir -p "$change/specs/greeting"
+  printf '# Greeting\nReturn the requested greeting.\n' > "$change/proposal.md"
+  printf '# Design\nUse the existing entry point.\n' > "$change/design.md"
+  printf '%s\n' '- [ ] Implement and test the greeting.' > "$change/tasks.md"
+  printf '## ADDED Requirements\n### Requirement: Greeting\nReturn the requested greeting.\n' > "$change/specs/greeting/spec.md";;
+ ordinary:2)
+  git add "$change"; git commit -qm 'openspec: propose 0001-delivery' || exit 90;;
+ ordinary:3) status=BLOCKED; summary='Fixture reached implementation Apply';;
  edit:1) printf 'Changed expectation\n' > contract.md;;
  repair:1|reject:*|wrong-schema:1)
   printf '## Supplied requirements\n- [Invented](../../../contract.md#REQ-99)\n' > "$change/proposal.md"
@@ -130,6 +140,8 @@ printf '{"type":"result","subtype":"success","session_id":"fixture-session","res
             ]);
         if resume {
             command.arg("--resume");
+        } else if mode == "ordinary" {
+            command.arg("advance");
         } else {
             command.args(["--supplied-contracts", "--contract=contract.md", "advance"]);
         }
@@ -242,7 +254,53 @@ fn invalid_references_are_repaired_in_propose_before_the_commit_stage() {
         }));
         assert_eq!(fixture.state()["stage"], "proposal-commit");
         assert!(fixture.state()["contracts"].is_object());
+        let commit = fs::read_to_string(fixture.root.join("args-3")).unwrap();
+        assert!(commit.contains("This stage packages completed planning"));
+        assert!(commit.contains("Reuse prior validation for unchanged artifacts"));
+        assert!(commit.contains("Preserve all supplied contracts and acceptance inputs unchanged"));
+        assert!(commit.contains("openspec/schemas/opsx-supplied-contracts/"));
+        assert!(!commit.contains("Read the relevant original inputs listed below before planning"));
+        assert!(!commit.contains("run required artifact validation"));
     }
+}
+
+#[test]
+fn ordinary_planning_still_delivers_specs_design_and_tasks_to_implementation_apply() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("repo/automation/slices/0001-delivery.md"),
+        "# Greeting\n\n## Objective\nReturn the requested greeting and test it.\n",
+    )
+    .unwrap();
+    let result = fixture.run("ordinary", false);
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("Fixture reached implementation Apply")
+    );
+    assert_eq!(fixture.calls(), 3);
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert!(fixture.state()["contracts"].is_null());
+    for path in [
+        "proposal.md",
+        "design.md",
+        "tasks.md",
+        "specs/greeting/spec.md",
+    ] {
+        assert!(
+            fixture
+                .root
+                .join("repo/openspec/changes/0001-delivery")
+                .join(path)
+                .is_file()
+        );
+    }
+    let commit = fs::read_to_string(fixture.root.join("args-2")).unwrap();
+    assert!(commit.contains("This stage packages completed planning"));
+    assert!(!commit.contains("SUPPLIED-CONTRACT WORKFLOW"));
+    let apply = fs::read_to_string(fixture.root.join("args-3")).unwrap();
+    assert!(apply.contains("Implement or continue implementing this OpenSpec change completely"));
+    assert!(apply.contains("run appropriate project checks"));
+    assert!(!apply.contains("planning-only bootstrap"));
+    assert!(!apply.contains("Do not draft complete future slice documents"));
 }
 
 #[test]

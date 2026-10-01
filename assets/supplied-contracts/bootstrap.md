@@ -16,10 +16,23 @@ results. Keep conditions, exceptions and component ownership with the original
 source. Internal implementation decisions remain the campaign's responsibility.
 
 During Propose, create only this change's proposal, design and tasks using
-schema `opsx-supplied-contracts`. Map supplied requirements to the planning work
-with source links. Do not create spec deltas or the agenda files yet.
+schema `opsx-supplied-contracts`. Decide slice identities, observable outcomes,
+ordering and prerequisites. Put one compact source-to-slice coverage map in the
+proposal, including the terminal gate and direct links to original requirements
+and supplied scenarios. Use design for decomposition rationale and unresolved
+risks, and tasks for authoring and checking the agenda. Reference the map from
+dependent artifacts instead of reproducing it. Do not draft the complete slice
+documents, detailed acceptance criteria or test lists inside these artifacts;
+Apply owns that detail. Do not create spec deltas or the agenda files yet.
 
-During Apply, materialize the agenda under `automation/slices/`:
+During Apply, use the chosen decomposition and original sources to write the
+agenda under `automation/slices/`, developing acceptance criteria and required
+tests here. Preserve sound decomposition decisions; reopen them only when a
+concrete contradiction, coverage gap or unworkable dependency requires
+correction. Keep the proposal map and design at decision level rather than
+copying the finished agenda back into them.
+
+The completed agenda must satisfy:
 
 - A README lists slices in order and maps every material in-scope requirement
   to delivery slices and the terminal gate, using links to original inputs.

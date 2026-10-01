@@ -131,6 +131,14 @@ implementation and test design belong to the implementing worker. It does not
 require per-criterion source citations, verbatim requirement tables or duplicated
 implementation recipes.
 
+Bootstrap Propose decides slice boundaries, dependencies and a compact coverage
+map. In ordinary mode it develops the required outcomes and material assumptions
+from the brief, retaining all normal OpenSpec artifacts and required acceptance
+scenarios. Bootstrap Apply writes the detailed agenda and its acceptance criteria
+and tests from those decisions and original inputs. It does not copy the finished
+agenda back into the bootstrap design. Each later implementation slice still has
+its normal Propose/specification and Apply/implementation stages.
+
 Ordinary verification returns `RETRY` only for a material blocker: missing or
 incorrect requested behaviour, a failed or missing required check, or an
 unworkable plan. Wording, preferred designs and harmless explanatory mistakes
@@ -865,6 +873,13 @@ commit. Commit inspection stays focused on the assigned change and relevant
 diffs. The agent prepares one complete message file under Git's metadata
 directory and passes it to `git commit -F`, avoiding repeated formatting and
 temporary-file work.
+
+Proposal commit packages completed planning. It reuses prior artifact validation
+when the relevant inputs are unchanged, without repeating planning, semantic
+review, OpenSpec completeness checks or product tests. Concrete subsequent edits
+that invalidate a result, or an explicit repository policy, require only the
+affected checks to run again. Normal Git hooks remain in force. The runner keeps
+its existing proposal and protected-input checks at stage boundaries.
 
 Successful Verify summaries record the checks run, working directories,
 outcomes and limitations. The checkpoint carries this evidence into completion

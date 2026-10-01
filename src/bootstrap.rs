@@ -497,6 +497,23 @@ mod tests {
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("exclusively owns creation"));
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("Before reporting Apply complete"));
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("final gate must contain"));
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("Ordinary mode starts from the project brief"));
+        assert!(
+            BOOTSTRAP_INSTRUCTIONS
+                .contains("normal OpenSpec artifacts and schema-required acceptance scenarios")
+        );
+        assert!(BOOTSTRAP_INSTRUCTIONS.contains("normal Apply to implement and test them"));
+        for supplied_contracts in [false, true] {
+            let instructions = instructions_for(true, supplied_contracts);
+            assert!(
+                instructions.contains("Reference the map from")
+                    || instructions.contains("Reference that map from")
+            );
+            assert!(instructions.contains("copying the finished agenda back"));
+            assert!(instructions.contains("coverage map"));
+            assert!(instructions.contains("Required Tests"));
+            assert!(instructions.contains("9999-project-acceptance.md"));
+        }
     }
 
     #[test]
