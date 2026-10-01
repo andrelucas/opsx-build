@@ -468,6 +468,66 @@ echo '{"type":"result","subtype":"success","result":"Proposal ready","structured
 }
 
 #[test]
+fn configuration_accepts_paragraph_notes_without_changing_settings() {
+    for action in ["configure", "autoconfigure"] {
+        let fixture = if action == "autoconfigure" {
+            automatic_fixture()
+        } else {
+            Fixture::new()
+        };
+        fixture.init_git();
+        let path = fixture.root.join("proposal.json");
+        let mut proposal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        proposal["notes"] = serde_json::json!([
+            "Accepted the configured defaults.",
+            "## Coverage gaps\nNo complete coverage is claimed."
+        ]);
+        fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let result = fixture.run("accept", &[action]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(fixture.markdown().contains(
+            "Accepted the configured defaults.\n\n## Coverage gaps\nNo complete coverage is claimed."
+        ));
+        assert_eq!(
+            fixture.git(&["log", "-1", "--format=%s"]).trim(),
+            "opsx: configure campaign"
+        );
+        if action == "autoconfigure" {
+            assert!(fixture.markdown().contains("--contract=contract.md"));
+            assert!(
+                fixture
+                    .markdown()
+                    .contains("--claude-model=configured-model")
+            );
+        }
+    }
+}
+
+#[test]
+fn autoconfigure_rejects_nontext_notes_without_saving() {
+    for notes in [
+        serde_json::json!(["Valid paragraph", 42]),
+        serde_json::json!({"unexpected": "shape"}),
+    ] {
+        let fixture = automatic_fixture();
+        let path = fixture.root.join("proposal.json");
+        let mut proposal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        proposal["notes"] = notes;
+        fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let result = fixture.run("accept", &["autoconfigure"]);
+        assert!(!result.status.success());
+        assert!(!fixture.root.join("campaign/opsx-build.md").exists());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("proposal retained"));
+    }
+}
+
+#[test]
 fn autoconfigure_uses_effective_model_and_saves_contract_defaults_without_interaction() {
     let fixture = automatic_fixture();
     fixture.init_git();
