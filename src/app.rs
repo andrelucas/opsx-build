@@ -2698,6 +2698,7 @@ impl<U: Ui> App<U> {
             StageSignal::Ready
             | StageSignal::Done
             | StageSignal::TooLarge
+            | StageSignal::Incomplete
             | StageSignal::Replanned => {
                 bail!(
                     "verify returned an invalid terminal status instead of VERIFIED, RETRY, or BLOCKED"

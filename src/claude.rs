@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        AgentBackend, MissingTerminalResult, SessionId, SessionMode, StageProtocol, StageResult,
-        StageSignal, parse_status_value,
+        AgentBackend, MAX_INCOMPLETE_STAGE_RECOVERIES, MissingTerminalResult, SessionId,
+        SessionMode, StageProtocol, StageResult, StageSignal, parse_status_value,
     },
     cli::{AgentConnection, BackendKind, Cli, ConnectionEnvironmentValue},
     model_confusions::prompt_guidance as model_confusion_guidance,
@@ -36,7 +36,6 @@ const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(crate) const DISABLE_SANDBOX_SETTINGS: &str = r#"{"sandbox":{"enabled":false}}"#;
-const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
 const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 10;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -989,6 +988,24 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                     ))
                     .into());
                 }
+                Ok(ClaudeAttempt::Complete(result)) if result.signal == StageSignal::Incomplete => {
+                    if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
+                        bail!(
+                            "Claude phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
+                            result.text
+                        );
+                    }
+                    incomplete_stage_recoveries += 1;
+                    self.ui
+                        .warn("Claude reported unfinished work; continuing the same session once");
+                    current_session = SessionMode::Resume {
+                        id: session_id.clone(),
+                    };
+                    current_prompt = incomplete_stage_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                    );
+                }
                 Ok(ClaudeAttempt::Complete(result)) => return Ok(result),
             }
         }
@@ -1344,15 +1361,17 @@ fn supports_incomplete_stage_recovery(protocol: StageProtocol) -> bool {
     matches!(protocol, StageProtocol::Worker | StageProtocol::Verify)
 }
 
-fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
+pub(crate) fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> String {
     let instruction = match protocol {
         StageProtocol::Worker => {
-            "The preceding Claude turn ended without completing this worker phase or returning a terminal result. Its partial work remains in the repository and this session has been compacted. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Finish with the required terminal result."
+            "The preceding turn left this phase unfinished. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Do not stop at a progress update. Preserve correct partial work and use existing delegated results; do not restart completed tasks or launch duplicate audits. Wait for required pending work using the runtime's tools and collect its results before finishing."
         }
         StageProtocol::Verify => {
-            "The preceding verification turn ended without returning a terminal result. This session has been compacted. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. If you created temporary diagnostic artifacts, remove only those artifacts where safe. Preserve the assigned workflow's review policy: ordinary context reviews apply the anti-Karen materiality threshold; supplied-contract reviews enforce their source obligations. Return RETRY only for a blocking finding under that policy, with the consequence and minimum repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+            "The preceding verification turn left this phase unfinished. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. Preserve correct partial work. Reuse completed checks and delegated results; wait for required pending audits using the runtime's tools rather than launching duplicates. If you created temporary diagnostic artifacts, remove only those artifacts where safe. Preserve the assigned workflow's review policy: ordinary context reviews apply the anti-Karen materiality threshold; supplied-contract reviews enforce their source obligations. Return RETRY only for a blocking finding under that policy, with the consequence and minimum repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
         }
-        _ => unreachable!("incomplete-turn recovery is only used for worker and verify stages"),
+        _ => {
+            "The preceding turn left this phase unfinished. Continue the same assigned phase in this session, retaining its scope, permissions and acceptance conditions. Inspect durable state and existing delegated results, preserve completed work and finish only outstanding tasks. Wait for required pending work using the runtime's tools. Do not restart completed tasks, repeat completed audits or create duplicate changes or commits. This continuation does not authorize implementation during planning, repairs during review, or broader work during archive or milestone commits."
+        }
     };
     stage_prompt("", instruction, protocol)
 }
@@ -1815,7 +1834,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nTERMINAL PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests one same-session continuation under the original stage timeout; it is not success or a blocker.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -2546,11 +2565,11 @@ mod tests {
     #[test]
     fn worker_protocol_accepts_too_large_without_weakening_strict_stages() {
         let schema = StageProtocol::Worker.json_schema();
-        assert!(schema.contains(r#"["READY","TOO_LARGE","BLOCKED"]"#));
+        assert!(schema.contains(r#"["READY","TOO_LARGE","BLOCKED","INCOMPLETE"]"#));
         assert!(!StageProtocol::Ready.json_schema().contains("TOO_LARGE"));
         assert!(!StageProtocol::Verify.json_schema().contains("TOO_LARGE"));
         let prompt = stage_prompt("/explore-unattended", "inspect it", StageProtocol::Worker);
-        assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+        assert!(prompt.contains("READY, TOO_LARGE, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
@@ -2616,31 +2635,31 @@ mod tests {
     #[test]
     fn proposal_protocol_accepts_done_and_too_large_without_weakening_other_stages() {
         let schema = StageProtocol::Propose.json_schema();
-        assert!(schema.contains(r#"["READY","DONE","TOO_LARGE","BLOCKED"]"#));
+        assert!(schema.contains(r#"["READY","DONE","TOO_LARGE","BLOCKED","INCOMPLETE"]"#));
         assert!(!StageProtocol::Ready.json_schema().contains("DONE"));
         let prompt = stage_prompt("/propose-unattended", "finish it", StageProtocol::Propose);
-        assert!(prompt.contains("READY, DONE, TOO_LARGE, or BLOCKED"));
+        assert!(prompt.contains("READY, DONE, TOO_LARGE, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
-    fn frontier_protocol_accepts_only_replanned_or_blocked() {
+    fn frontier_protocol_excludes_ready() {
         let schema = StageProtocol::Frontier.json_schema();
-        assert!(schema.contains(r#"["REPLANNED","BLOCKED"]"#));
+        assert!(schema.contains(r#"["REPLANNED","BLOCKED","INCOMPLETE"]"#));
         assert!(!schema.contains("READY"));
         assert_eq!(
             parse_status_value("replanned"),
             Some(StageSignal::Replanned)
         );
         let prompt = stage_prompt("", "subdivide it", StageProtocol::Frontier);
-        assert!(prompt.contains("REPLANNED or BLOCKED"));
+        assert!(prompt.contains("REPLANNED, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
     fn terminal_review_protocol_accepts_ready_replanned_or_blocked() {
         let schema = StageProtocol::TerminalReview.json_schema();
-        assert!(schema.contains(r#"["READY","REPLANNED","BLOCKED"]"#));
+        assert!(schema.contains(r#"["READY","REPLANNED","BLOCKED","INCOMPLETE"]"#));
         let prompt = stage_prompt("", "review it", StageProtocol::TerminalReview);
-        assert!(prompt.contains("READY, REPLANNED, or BLOCKED"));
+        assert!(prompt.contains("READY, REPLANNED, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
@@ -2872,7 +2891,7 @@ mod tests {
     fn continuation_prompt_preserves_the_stage_protocol() {
         let prompt = output_limit_continuation_prompt(StageProtocol::Verify);
         assert!(prompt.contains("Continue the same phase"));
-        assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
+        assert!(prompt.contains("VERIFIED, RETRY, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
@@ -2880,7 +2899,7 @@ mod tests {
         let prompt = incomplete_stage_continuation_prompt(StageProtocol::Worker);
         assert!(prompt.contains("continue the same phase"));
         assert!(prompt.contains("actual tools"));
-        assert!(prompt.contains("READY, TOO_LARGE, or BLOCKED"));
+        assert!(prompt.contains("READY, TOO_LARGE, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
@@ -2893,11 +2912,11 @@ mod tests {
             prompt.contains("ordinary context reviews apply the anti-Karen materiality threshold")
         );
         assert!(prompt.contains("supplied-contract reviews enforce their source obligations"));
-        assert!(prompt.contains("VERIFIED, RETRY, or BLOCKED"));
+        assert!(prompt.contains("VERIFIED, RETRY, BLOCKED, or INCOMPLETE"));
     }
 
     #[test]
-    fn incomplete_recovery_is_limited_to_worker_and_verify_phases() {
+    fn missing_result_recovery_is_limited_to_worker_and_verify_phases() {
         assert!(supports_incomplete_stage_recovery(StageProtocol::Worker));
         assert!(supports_incomplete_stage_recovery(StageProtocol::Verify));
         assert!(!supports_incomplete_stage_recovery(StageProtocol::Ready));
@@ -2945,6 +2964,152 @@ printf '%s\n' "$((count + 1))" > "$state"
         assert_eq!(result.text, "continued successfully");
         assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "3");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_incomplete_continues_once_without_compaction_and_keeps_blockers_terminal() {
+        for (protocol, first, second, turns, expected) in [
+            (
+                StageProtocol::Worker,
+                "INCOMPLETE",
+                "READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (
+                StageProtocol::Verify,
+                "INCOMPLETE",
+                "VERIFIED",
+                2,
+                Some(StageSignal::Verified),
+            ),
+            (
+                StageProtocol::Ready,
+                "INCOMPLETE",
+                "READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (StageProtocol::Worker, "INCOMPLETE", "INCOMPLETE", 2, None),
+            (
+                StageProtocol::Worker,
+                "BLOCKED",
+                "READY",
+                1,
+                Some(StageSignal::Blocked),
+            ),
+        ] {
+            let directory = std::env::temp_dir().join(format!("opsx-status-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let script = directory.join("agent.sh");
+            fs::write(&script, format!(r#"
+printf '%s\n' "$@" >> arguments
+if [ ! -f partial-work ]; then
+    printf 'existing audit result\n' > partial-work
+    status={first}
+else
+    status={second}
+fi
+printf 'call\n' >> calls
+printf '{{"type":"result","subtype":"success","session_id":"00000000-0000-0000-0000-000000000000","structured_output":{{"opsx_status":"%s","summary":"Audits pending; no external input needed"}}}}\n' "$status"
+"#)).unwrap();
+            let launcher = shell_launcher(&script);
+            let ui = crate::usage::tests::RecordingUi::default();
+            let backend = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 0, &ui)
+                .with_provider_retries(0);
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new(Uuid::nil().to_string()),
+                    name: None,
+                },
+                &stage_prompt("", "Finish acceptance", protocol),
+                "acceptance",
+                protocol,
+            );
+            if let Some(signal) = expected {
+                assert_eq!(result.unwrap().signal, signal);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("remains INCOMPLETE after one continuation")
+                );
+                assert!(!error.is::<WorkerEscalationRequested>());
+            }
+            assert_eq!(
+                fs::read_to_string(directory.join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                turns
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join("partial-work")).unwrap(),
+                "existing audit result\n"
+            );
+            let args = fs::read_to_string(directory.join("arguments")).unwrap();
+            assert!(!args.contains("/compact"));
+            assert_eq!(args.matches("--session-id").count(), 1);
+            assert_eq!(
+                args.matches("--resume\n00000000-0000-0000-0000-000000000000")
+                    .count(),
+                turns - 1
+            );
+            assert!(args.contains("wait using the runtime's tools"));
+            if protocol == StageProtocol::Verify && turns == 2 {
+                assert!(args.contains("Continue verification only: do not repair or modify"));
+            }
+            let records = ui.records.lock().unwrap();
+            assert_eq!(records.len(), turns);
+            assert_eq!(records[0].outcome, first.to_ascii_lowercase());
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.invocation_id == records[0].invocation_id)
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_continuation_keeps_the_original_stage_deadline() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-incomplete-deadline-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("agent.sh");
+        fs::write(&script, r#"
+IFS= read -r prompt
+printf 'call\n' >> calls
+sleep 0.7
+if [ -f first-finished ]; then status=READY; else touch first-finished; status=INCOMPLETE; fi
+printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":"%s","summary":"pending audit"}}\n' "$status"
+"#).unwrap();
+        let launcher = shell_launcher(&script);
+        let backend = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 0, &QuietUi)
+            .with_stage_timeout(Duration::from_secs(1));
+        let error = backend
+            .invoke(
+                SessionMode::New {
+                    id: SessionId::new(Uuid::nil().to_string()),
+                    name: None,
+                },
+                "Finish acceptance",
+                "acceptance",
+                StageProtocol::Worker,
+            )
+            .unwrap_err();
+        assert!(error.is::<WorkerEscalationRequested>(), "{error:#}");
+        assert_eq!(
+            fs::read_to_string(directory.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

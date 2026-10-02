@@ -628,7 +628,22 @@ This one continuation is separate from the provider and output retry budgets.
 Worker phases require actual tool use rather than another description of
 intended work; Verify is instructed to report a concrete `RETRY` finding rather
 than repairing implementation. Explicit terminal outcomes, Propose, frontier
-planning, and narrow milestone stages do not use this incomplete-turn recovery.
+planning, and narrow milestone stages do not use recovery for an omitted result.
+
+Every backend also accepts an explicit `INCOMPLETE` result in any stage: work
+remains, but it can continue without an external decision or input. The runner
+continues the same session once, preserving partial work and the original stage
+timeout, without compacting just for this result. This shares the one-continuation
+allowance with omitted-result recovery and is recorded as `incomplete` in usage.
+A second incomplete result stops with an error and preserves the unfinished
+checkpoint for `--resume`; it neither advances the stage nor requests a frontier
+replan. `BLOCKED` always stops immediately and is never reclassified from its
+summary wording. Verification continuations remain review-only.
+
+Agents must wait for required delegated work using their runtime's tools and
+collect the results before ending the stage. If the harness requires a status
+while work is unfinished, `INCOMPLETE` supplies a truthful continuation request
+instead of misreporting a blocker. Continuations reuse completed work and audits.
 
 ## Campaign loop
 
@@ -2115,6 +2130,7 @@ OPSX_STATUS: VERIFIED
 OPSX_STATUS: RETRY
 OPSX_STATUS: BLOCKED
 OPSX_STATUS: REPLANNED
+OPSX_STATUS: INCOMPLETE
 ```
 
 Explore, Apply, and Repair use `READY`, `TOO_LARGE`, or `BLOCKED`. Propose also
@@ -2127,6 +2143,10 @@ planner uses `REPLANNED` only after committing a valid agenda subdivision or
 inserting validated remediation slices before the unchanged terminal acceptance
 gate. Terminal frontier review otherwise returns `READY` without changing
 repository state.
+
+All stages additionally accept the nonterminal `INCOMPLETE` result described
+above. Its summary identifies remaining work and pending delegated results;
+it does not claim completion or a need for human intervention.
 
 The corrected structured field and fallback marker are `opsx_status` and
 `OPSX_STATUS`. Results using the old `ospx_status` or `OSPX_STATUS` spellings

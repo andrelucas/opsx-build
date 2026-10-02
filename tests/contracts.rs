@@ -234,6 +234,57 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn incomplete_apply_preserves_checkpoint_and_partial_work_for_resume_in_both_workflows() {
+    for mode in ["ordinary", "repair"] {
+        let fixture = Fixture::new();
+        assert!(!fixture.run(mode, false).status.success());
+        let mut state = fixture.state();
+        state["stage"] = "apply".into();
+        fixture.save_state(&state);
+        let contract = fs::read(fixture.root.join("repo/contract.md")).unwrap();
+        fs::remove_file(fixture.root.join("calls")).unwrap();
+        fs::write(fixture.root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+case "$count" in
+ 1) printf 'audit result\n' > partial-work; status=INCOMPLETE;;
+ 2) status=INCOMPLETE;;
+ 3) test -f partial-work || exit 90; status=READY;;
+ *) status=BLOCKED;;
+esac
+printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":"%s","summary":"Fixture stage result"}}\n' "$status"
+"#).unwrap();
+        let first = fixture.run(mode, true);
+        assert!(!first.status.success());
+        assert!(
+            String::from_utf8_lossy(&first.stderr)
+                .contains("remains INCOMPLETE after one continuation")
+        );
+        assert_eq!(fixture.calls(), 2);
+        assert_eq!(fixture.state()["stage"], "apply");
+        assert_eq!(fixture.state()["change"], state["change"]);
+        let resumed = fixture.run(mode, true);
+        assert!(!resumed.status.success()); // A genuine Verify blocker stops immediately.
+        assert_eq!(fixture.calls(), 4);
+        assert_eq!(fixture.state()["stage"], "verify");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("repo/partial-work")).unwrap(),
+            "audit result\n"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("repo/contract.md")).unwrap(),
+            contract
+        );
+    }
+}
+
+#[test]
 fn invalid_references_are_repaired_in_propose_before_the_commit_stage() {
     for mode in ["repair", "wrong-schema"] {
         let fixture = Fixture::new();

@@ -12,10 +12,13 @@ use serde_json::Value;
 
 use crate::{
     backend::{
-        AgentBackend, MissingTerminalResult, SessionId, SessionMode, StageProtocol, StageResult,
-        parse_terminal_signal,
+        AgentBackend, MAX_INCOMPLETE_STAGE_RECOVERIES, MissingTerminalResult, SessionId,
+        SessionMode, StageProtocol, StageResult, StageSignal, parse_terminal_signal,
     },
-    claude::{CONNECTION_TEST_MARKER, ConnectionTestMode, stage_prompt},
+    claude::{
+        CONNECTION_TEST_MARKER, ConnectionTestMode, incomplete_stage_continuation_prompt,
+        stage_prompt,
+    },
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
     opencode_server::OpenCodeServer,
     process::{
@@ -522,6 +525,7 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
+        let mut incomplete_stage_recoveries = 0;
         let mut provider_retries = 0;
         let invocation = uuid::Uuid::new_v4().to_string();
         let mut attempt_number = 0;
@@ -664,6 +668,27 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                         self.max_output_retries
                     ))
                     .into());
+                }
+                Ok(OpenCodeAttempt::Complete(result))
+                    if result.signal == StageSignal::Incomplete =>
+                {
+                    if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
+                        bail!(
+                            "OpenCode phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
+                            result.text
+                        );
+                    }
+                    incomplete_stage_recoveries += 1;
+                    self.ui.warn(
+                        "OpenCode reported unfinished work; continuing the same session once",
+                    );
+                    if let Some(id) = result.session_id {
+                        current_session = SessionId::new(id);
+                    }
+                    current_prompt = incomplete_stage_continuation_prompt(protocol);
+                    current_activity = format!(
+                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                    );
                 }
                 Ok(OpenCodeAttempt::Complete(result)) => return Ok(result),
             }
@@ -1423,6 +1448,75 @@ mod tests {
             output_session_id(&output.stdout).unwrap().as_str(),
             "ses_limit"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_incomplete_reuses_the_session_and_has_a_separate_bounded_recovery() {
+        for (first, second, turns, expected) in [
+            ("INCOMPLETE", "READY", 2, Some(StageSignal::Ready)),
+            ("INCOMPLETE", "INCOMPLETE", 2, None),
+            ("BLOCKED", "READY", 1, Some(StageSignal::Blocked)),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-opencode-incomplete-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let script = directory.join("agent.sh");
+            fs::write(&script, format!(r#"
+if [ -f calls ]; then status={second}; else status={first}; fi
+printf 'call\n' >> calls
+printf '%s\n' "$@" >> arguments
+printf '{{"type":"text","sessionID":"ses_created","part":{{"type":"text","text":"OPSX_STATUS: %s"}}}}\n' "$status"
+"#)).unwrap();
+            let launcher = OpenCodeLauncher {
+                connection_name: None,
+                environment_name: None,
+                program: "sh".into(),
+                prefix_args: vec![script.display().to_string()],
+                model: None,
+                context_window: None,
+                environment: Vec::new(),
+                unset_environment: Vec::new(),
+            };
+            let ui = crate::usage::tests::RecordingUi::default();
+            let mut backend =
+                OpenCodeBackend::new(&directory, &launcher, true, None, &ui).with_retries(0, 0);
+            let (url, server) = fake_session_server();
+            backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, url));
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new("provisional"),
+                    name: None,
+                },
+                "finish work",
+                "test phase",
+                StageProtocol::Worker,
+            );
+            if let Some(signal) = expected {
+                assert_eq!(result.unwrap().signal, signal);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("remains INCOMPLETE after one continuation")
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(directory.join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                turns
+            );
+            let args = fs::read_to_string(directory.join("arguments")).unwrap();
+            assert_eq!(args.matches("--session\nses_created").count(), turns);
+            let records = ui.records.lock().unwrap();
+            assert_eq!(records.len(), turns);
+            assert_eq!(records[0].outcome, first.to_ascii_lowercase());
+            server.join().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[cfg(unix)]

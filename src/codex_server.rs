@@ -911,6 +911,8 @@ done
     fn incomplete_codex_phase_continues_once_without_provider_retries() {
         use crate::backend::{StageSignal, is_missing_terminal_result};
 
+        let incomplete =
+            r#"{"opsx_status":"INCOMPLETE","summary":"Audits pending; no external input needed"}"#;
         let unfinished = "Now I will validate the schemas and generate the bindings.";
         for (protocol, first, second, expected_turns, signal) in [
             (
@@ -927,6 +929,30 @@ done
                 2,
                 Some(StageSignal::Retry),
             ),
+            (
+                StageProtocol::Worker,
+                incomplete,
+                "OPSX_STATUS: READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (
+                StageProtocol::Verify,
+                incomplete,
+                "OPSX_STATUS: VERIFIED",
+                2,
+                Some(StageSignal::Verified),
+            ),
+            (
+                StageProtocol::TerminalReview,
+                incomplete,
+                "OPSX_STATUS: READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (StageProtocol::Worker, incomplete, incomplete, 2, None),
+            (StageProtocol::Worker, unfinished, incomplete, 2, None),
+            (StageProtocol::Worker, incomplete, unfinished, 2, None),
             (StageProtocol::Worker, unfinished, unfinished, 2, None),
             (StageProtocol::Verify, unfinished, unfinished, 2, None),
             (
@@ -971,6 +997,7 @@ done
                 .to_string()
                 .replace('\\', "\\\\")
             };
+            let exhausted_incomplete = second == incomplete;
             let first = completed(first);
             let second = completed(second);
             let script = directory.join("server.sh");
@@ -998,8 +1025,16 @@ done
                 assert_eq!(result.session_id.as_deref(), Some("actual-thread"));
             } else {
                 let error = result.unwrap_err();
-                assert!(is_missing_terminal_result(&error));
-                assert!(error.to_string().contains(unfinished));
+                if exhausted_incomplete {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("remains INCOMPLETE after one continuation")
+                    );
+                } else {
+                    assert!(is_missing_terminal_result(&error));
+                    assert!(error.to_string().contains(unfinished));
+                }
             }
             let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
                 .unwrap()
@@ -1023,7 +1058,10 @@ done
                 let prompt = requests.last().unwrap()["params"]["input"][0]["text"]
                     .as_str()
                     .unwrap();
-                assert!(prompt.contains("Preserve correct partial work"));
+                assert!(
+                    prompt.contains("preserve completed work")
+                        || prompt.contains("Preserve correct partial work")
+                );
                 assert!(prompt.contains(protocol.json_schema()));
                 if protocol == StageProtocol::Verify {
                     assert!(prompt.contains("Continue verification only"));
@@ -1039,7 +1077,7 @@ done
                         prompt
                             .contains("supplied-contract reviews enforce their source obligations")
                     );
-                } else {
+                } else if protocol == StageProtocol::Worker {
                     assert!(prompt.contains("actual tools"));
                     assert!(prompt.contains("Do not stop at a progress update"));
                 }
