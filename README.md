@@ -1013,6 +1013,12 @@ It contains:
   changing the configured defaults. It records launch settings, not successful
   completion of the run. Reconfiguration preserves the previous run record.
 
+The runner commits both configuration changes and launch records itself, before
+starting model work. Launch commits use `opsx: record campaign launch` and include
+only `opsx-build.md`, preserving unrelated staged and unstaged work. Unreconciled
+manual edits or a pre-existing staged version of this file are left uncommitted
+with a warning. A failed commit keeps the saved record and reports the failure.
+
 Ordinary runs automatically read this file without invoking a configuration
 agent. Explicit CLI arguments override its settings. Selecting another named
 connection on the CLI also replaces that role's saved connection parameters;

@@ -848,7 +848,7 @@ impl<U: Ui> App<U> {
         if !self.cli.dry_run
             && let Some(campaign) = &self.cli.campaign_config
         {
-            campaign.record_used(&self.cli)?;
+            campaign.record_used(&self.cli, &self.ui)?;
         }
         Ok(())
     }
@@ -1219,7 +1219,7 @@ impl<U: Ui> App<U> {
                     effective.acceptance_commands.clear();
                 }
             }
-            configuration.record_used(&effective)?;
+            configuration.record_used(&effective, &self.ui)?;
         }
 
         if state.request == "advance"

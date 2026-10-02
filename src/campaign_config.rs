@@ -81,11 +81,21 @@ impl CampaignConfig {
         }
     }
 
-    pub fn record_used(&self, cli: &Cli) -> Result<()> {
+    pub fn record_used<U: Ui>(&self, cli: &Cli, ui: &U) -> Result<()> {
         let current = fs::read_to_string(&self.path)?;
         if current != self.contents {
             bail!("opsx-build.md changed during startup; restart to use the updated configuration");
         }
+        let base = self
+            .path
+            .parent()
+            .context("campaign configuration has no directory")?;
+        // Do not replace a user's staged version of this file with bookkeeping.
+        let staged_edits = Command::new("git")
+            .args(["diff", "--cached", "--quiet", "--", FILE_NAME])
+            .current_dir(base)
+            .output()
+            .is_ok_and(|output| output.status.code() == Some(1));
         let record = section(
             "last-used",
             &format!(
@@ -104,7 +114,15 @@ impl CampaignConfig {
         } else {
             updated.push_str(&format!("\n\n{record}\n"));
         }
-        atomic_write(&self.path, &updated)
+        atomic_write(&self.path, &updated)?;
+        if self.changed() || staged_edits {
+            ui.warn("Launch settings were recorded, but opsx-build.md has unreconciled manual or staged edits and was left uncommitted. Run `opsx-build configure` to reconcile them.");
+        } else if let Err(error) = commit_configuration(base, "opsx: record campaign launch", ui) {
+            ui.warn(&format!(
+                "Launch settings were saved, but `{FILE_NAME}` was not committed: {error:#}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -310,7 +328,7 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
             path.display()
         ));
         report_configuration(&resolved, ui);
-        if let Err(error) = commit_configuration(&base, ui) {
+        if let Err(error) = commit_configuration(&base, "opsx: configure campaign", ui) {
             ui.warn(&format!(
                 "Configuration was saved, but `{FILE_NAME}` was not committed: {error:#}"
             ));
@@ -440,7 +458,7 @@ fn autoconfigure_proposal<U: Ui>(
     Ok(())
 }
 
-fn commit_configuration<U: Ui>(base: &Path, ui: &U) -> Result<()> {
+fn commit_configuration<U: Ui>(base: &Path, subject: &str, ui: &U) -> Result<()> {
     let git = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(base)
@@ -467,14 +485,7 @@ fn commit_configuration<U: Ui>(base: &Path, ui: &U) -> Result<()> {
     }
     // A path-only commit excludes unrelated staged work, including in a new repository.
     runner.checked(
-        &CommandSpec::new("git", base).args([
-            "commit",
-            "--only",
-            "-m",
-            "opsx: configure campaign",
-            "--",
-            FILE_NAME,
-        ]),
+        &CommandSpec::new("git", base).args(["commit", "--only", "-m", subject, "--", FILE_NAME]),
         "Committing campaign configuration",
     )?;
     Ok(())
@@ -669,7 +680,9 @@ mod tests {
         assert!(!campaign.changed());
         assert_eq!(campaign.arguments().unwrap(), args);
         let cli = resolve_configured_settings(&args, &["--no-config".to_owned()], &base).unwrap();
-        campaign.record_used(&cli).unwrap();
+        campaign
+            .record_used(&cli, &crate::usage::tests::RecordingUi::default())
+            .unwrap();
         let used = CampaignConfig::read(&base).unwrap().unwrap();
         assert!(!used.changed());
         assert_eq!(used.arguments().unwrap(), args);
@@ -682,6 +695,158 @@ mod tests {
         edited.contents = used.contents.replace("\n", "\r\n");
         assert!(!edited.changed());
         assert_eq!(edited.arguments().unwrap(), args);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn git(base: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(base)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn launch_fixture() -> (PathBuf, Cli) {
+        let base =
+            std::env::temp_dir().join(format!("opsx-launch-commit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", ".git/hooks"],
+        ] {
+            git(&base, &args);
+        }
+        fs::write(
+            base.join(FILE_NAME),
+            render("Configured intent", "Accepted", &[], &[], &json!({})).unwrap(),
+        )
+        .unwrap();
+        let cli = resolve_configured_settings(&[], &["--no-config".into()], &base).unwrap();
+        (base, cli)
+    }
+
+    #[test]
+    fn launch_and_resume_commit_only_the_record_preserving_unrelated_work() {
+        let ui = crate::usage::tests::RecordingUi::default();
+        for existing_head in [false, true] {
+            let (base, mut cli) = launch_fixture();
+            if existing_head {
+                commit_configuration(&base, "opsx: configure campaign", &ui).unwrap();
+            }
+            fs::write(base.join("other.txt"), "staged\n").unwrap();
+            git(&base, &["add", "other.txt"]);
+            fs::write(base.join("other.txt"), "unstaged\n").unwrap();
+            let staged = git(&base, &["diff", "--cached", "--binary"]);
+            let unstaged = git(&base, &["diff", "--binary"]);
+            for resume in [false, true] {
+                cli.resume = resume;
+                let campaign = CampaignConfig::read(&base).unwrap().unwrap();
+                campaign.record_used(&cli, &ui).unwrap();
+                let saved = fs::read_to_string(base.join(FILE_NAME)).unwrap();
+                assert_eq!(git(&base, &["show", "HEAD:opsx-build.md"]), saved);
+                assert_eq!(json_section(&saved, "last-used").unwrap()["resume"], resume);
+                assert_eq!(
+                    git(&base, &["log", "-1", "--format=%s"]),
+                    "opsx: record campaign launch\n"
+                );
+                assert_eq!(
+                    git(
+                        &base,
+                        &[
+                            "diff-tree",
+                            "--root",
+                            "--no-commit-id",
+                            "--name-only",
+                            "-r",
+                            "HEAD"
+                        ]
+                    ),
+                    "opsx-build.md\n"
+                );
+                assert_eq!(git(&base, &["diff", "--cached", "--binary"]), staged);
+                assert_eq!(git(&base, &["diff", "--binary"]), unstaged);
+            }
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn launch_does_not_commit_manual_configuration_or_replace_a_staged_version() {
+        let ui = crate::usage::tests::RecordingUi::default();
+        for staged_edit in [false, true] {
+            let (base, cli) = launch_fixture();
+            commit_configuration(&base, "opsx: configure campaign", &ui).unwrap();
+            let head = git(&base, &["rev-parse", "HEAD"]);
+            let original = fs::read_to_string(base.join(FILE_NAME)).unwrap();
+            fs::write(
+                base.join(FILE_NAME),
+                original.replace("Configured intent", "Manual intent"),
+            )
+            .unwrap();
+            if staged_edit {
+                git(&base, &["add", FILE_NAME]);
+                fs::write(base.join(FILE_NAME), &original).unwrap();
+            }
+            let staged = git(&base, &["diff", "--cached", "--binary"]);
+            CampaignConfig::read(&base)
+                .unwrap()
+                .unwrap()
+                .record_used(&cli, &ui)
+                .unwrap();
+            assert_eq!(git(&base, &["rev-parse", "HEAD"]), head);
+            assert_eq!(git(&base, &["diff", "--cached", "--binary"]), staged);
+            let saved = fs::read_to_string(base.join(FILE_NAME)).unwrap();
+            assert!(saved.contains(if staged_edit {
+                "Configured intent"
+            } else {
+                "Manual intent"
+            }));
+            assert!(json_section(&saved, "last-used").is_ok());
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_launch_commit_keeps_the_record_and_unrelated_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let ui = crate::usage::tests::RecordingUi::default();
+        let (base, cli) = launch_fixture();
+        commit_configuration(&base, "opsx: configure campaign", &ui).unwrap();
+        let head = git(&base, &["rev-parse", "HEAD"]);
+        fs::write(base.join("other.txt"), "staged work").unwrap();
+        git(&base, &["add", "other.txt"]);
+        let staged = git(&base, &["diff", "--cached", "--binary", "--", "other.txt"]);
+        let hook = base.join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        CampaignConfig::read(&base)
+            .unwrap()
+            .unwrap()
+            .record_used(&cli, &ui)
+            .unwrap();
+        assert_eq!(git(&base, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git(&base, &["diff", "--cached", "--binary", "--", "other.txt"]),
+            staged
+        );
+        assert!(
+            json_section(
+                &fs::read_to_string(base.join(FILE_NAME)).unwrap(),
+                "last-used"
+            )
+            .is_ok()
+        );
+        assert!(!base.join(".git/index.lock").exists());
         fs::remove_dir_all(base).unwrap();
     }
 
