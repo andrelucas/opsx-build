@@ -1927,9 +1927,13 @@ complete message.
 Campaign mode adds the iteration number to the header and retains a compact
 summary row for every completed change. Bootstrap appears in the same progress
 list, without consuming implementation iteration 1. Once its archive exists,
-subsequent agenda iterations retain its completed summary. The active iteration
-continues to use the existing phase disclosures; starting the next iteration
-clears the old phase chatter while preserving its summary.
+subsequent agenda iterations retain its completed summary.
+Bootstrap's row shows its running elapsed time, then retains its final duration
+and completion commit when available. New runs save these details in the
+checkpoint so they survive handoff and resume; paused time is excluded. Older
+checkpoints without these details continue to show the compact bootstrap row.
+The active iteration continues to use the existing phase disclosures; starting
+the next iteration clears the old phase chatter while preserving its summary.
 
 Upcoming agenda slices appear in grey below the active phase, in numeric order,
 including subdivision children and the final acceptance slice. Archived and

@@ -25,6 +25,9 @@ pub struct CampaignView {
     pub completed: Vec<CampaignIterationView>,
     pub bootstrap: bool,
     pub bootstrap_complete: bool,
+    pub bootstrap_elapsed: Option<Duration>,
+    pub bootstrap_started_at: Option<Instant>,
+    pub bootstrap_final_head: Option<String>,
     pub upcoming: Vec<String>,
 }
 
@@ -546,6 +549,9 @@ fn campaign_dashboard_view(campaign: &CampaignView) -> CampaignDashboardView {
             .collect(),
         bootstrap: campaign.bootstrap,
         bootstrap_complete: campaign.bootstrap_complete,
+        bootstrap_elapsed: campaign.bootstrap_elapsed,
+        bootstrap_started_at: campaign.bootstrap_started_at,
+        bootstrap_final_head: campaign.bootstrap_final_head.clone(),
         upcoming: campaign.upcoming.clone(),
     }
 }

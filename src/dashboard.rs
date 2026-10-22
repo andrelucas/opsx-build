@@ -43,6 +43,9 @@ pub(crate) struct CampaignDashboardView {
     pub completed: Vec<CampaignIterationDashboardView>,
     pub bootstrap: bool,
     pub bootstrap_complete: bool,
+    pub bootstrap_elapsed: Option<Duration>,
+    pub bootstrap_started_at: Option<Instant>,
+    pub bootstrap_final_head: Option<String>,
     pub upcoming: Vec<String>,
 }
 
@@ -874,13 +877,32 @@ impl StreamDashboard {
         let mut lines = Vec::new();
         if let Some(campaign) = &self.campaign {
             if campaign.bootstrap || campaign.bootstrap_complete {
+                let elapsed = campaign
+                    .bootstrap_elapsed
+                    .map(|elapsed| {
+                        elapsed
+                            + campaign
+                                .bootstrap_started_at
+                                .map_or(Duration::ZERO, |start| {
+                                    now.saturating_duration_since(start)
+                                })
+                    })
+                    .map(format_duration)
+                    .map_or_else(String::new, |elapsed| format!(" · {elapsed}"));
+                let head = campaign
+                    .bootstrap_final_head
+                    .as_deref()
+                    .map(short_hash)
+                    .map_or_else(String::new, |head| format!(" · {head}"));
                 lines.push(RenderLine {
-                    text: if campaign.bootstrap && !campaign.bootstrap_complete {
-                        "  ◆ Bootstrap · current"
-                    } else {
-                        "  ✓ Bootstrap"
-                    }
-                    .to_owned(),
+                    text: format!(
+                        "{}{elapsed}{head}",
+                        if campaign.bootstrap && !campaign.bootstrap_complete {
+                            "  ◆ Bootstrap · current"
+                        } else {
+                            "  ✓ Bootstrap"
+                        }
+                    ),
                     color: if campaign.bootstrap && !campaign.bootstrap_complete {
                         Color::Cyan
                     } else {
@@ -1593,6 +1615,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: false,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: Vec::new(),
         }));
         dashboard.set_change_name(Some("0001-reproducible-go-bindings".to_owned()));
@@ -1622,6 +1647,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: true,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: vec!["0001-core".into(), "9999-project-acceptance".into()],
         }));
         dashboard.set_stage(StageView {
@@ -1664,6 +1692,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: true,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: Vec::new(),
         }));
         dashboard.set_stage(StageView {
@@ -1678,6 +1709,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: false,
             bootstrap_complete: true,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: vec!["0002-next".into()],
         };
         dashboard.set_campaign(Some(campaign.clone()));
@@ -1701,6 +1735,55 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_timer_spans_phases_and_completed_duration_and_commit_stay_fixed() {
+        let mut dashboard = dashboard();
+        let now = Instant::now();
+        let mut campaign = CampaignDashboardView {
+            iteration: 0,
+            max_iterations: None,
+            completed: Vec::new(),
+            bootstrap: true,
+            bootstrap_complete: false,
+            bootstrap_elapsed: Some(Duration::from_secs(40)),
+            bootstrap_started_at: Some(now - Duration::from_secs(25)),
+            bootstrap_final_head: None,
+            upcoming: Vec::new(),
+        };
+        dashboard.set_campaign(Some(campaign.clone()));
+        dashboard.set_stage(StageView {
+            current: 3,
+            total: 7,
+            title: "Apply".into(),
+            started_at: now,
+        });
+        assert_eq!(
+            dashboard.render_lines_at(now)[0].text,
+            "  ◆ Bootstrap · current · 1m 05s"
+        );
+        dashboard.set_stage(StageView {
+            current: 4,
+            total: 7,
+            title: "Verify".into(),
+            started_at: now + Duration::from_secs(10),
+        });
+        assert_eq!(
+            dashboard.render_lines_at(now + Duration::from_secs(10))[0].text,
+            "  ◆ Bootstrap · current · 1m 15s"
+        );
+        campaign.bootstrap = false;
+        campaign.bootstrap_complete = true;
+        campaign.iteration = 1;
+        campaign.bootstrap_elapsed = Some(Duration::from_secs(75));
+        campaign.bootstrap_started_at = None;
+        campaign.bootstrap_final_head = Some("1234567890abcdef".into());
+        dashboard.set_campaign(Some(campaign));
+        assert_eq!(
+            dashboard.render_lines_at(now + Duration::from_secs(1000))[0].text,
+            "  ✓ Bootstrap · 1m 15s · 1234567890ab"
+        );
+    }
+
+    #[test]
     fn follow_tracks_live_output_while_pending_work_remains_scrollable() {
         let mut dashboard = dashboard();
         dashboard.set_campaign(Some(CampaignDashboardView {
@@ -1709,6 +1792,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: false,
             bootstrap_complete: true,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: (2..=30).map(|n| format!("{n:04}-planned")).collect(),
         }));
         dashboard.set_stage(StageView {
@@ -1759,6 +1845,9 @@ mod tests {
             }],
             bootstrap: false,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: Vec::new(),
         }));
 
@@ -1791,6 +1880,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: false,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: Vec::new(),
         });
         assert_eq!(
@@ -1860,6 +1952,9 @@ mod tests {
             completed: Vec::new(),
             bootstrap: false,
             bootstrap_complete: false,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
             upcoming: Vec::new(),
         }));
         dashboard.set_bootstrap_continues(false);

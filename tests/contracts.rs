@@ -583,6 +583,11 @@ fn completed_bootstrap_handoff_keeps_the_original_input_versions() {
     state["agenda"] = serde_json::Value::Null;
     state["campaign"] =
         serde_json::json!({"iteration": 1, "max_iterations": null, "completed": []});
+    state["bootstrap_progress"] = serde_json::json!({
+        "elapsed": {"secs": 125, "nanos": 500000000},
+        "final_head": "bootstrap-completion"
+    });
+    state["final_head"] = "bootstrap-completion".into();
     fs::write(
         fixture.root.join("repo/.git/opsx-build/last-run.json"),
         serde_json::to_vec(&state).unwrap(),
@@ -602,6 +607,12 @@ fn completed_bootstrap_handoff_keeps_the_original_input_versions() {
     assert_eq!(state["bootstrap"], false);
     assert_eq!(state["change"], "0001-delivery");
     assert_eq!(state["campaign"]["iteration"], 1);
+    assert_eq!(state["bootstrap_progress"]["elapsed"]["secs"], 125);
+    assert_eq!(state["bootstrap_progress"]["elapsed"]["nanos"], 500000000);
+    assert_eq!(
+        state["bootstrap_progress"]["final_head"],
+        "bootstrap-completion"
+    );
     assert!(
         !fixture
             .root

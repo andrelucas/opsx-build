@@ -222,6 +222,8 @@ struct RunState {
     #[serde(default)]
     bootstrap: bool,
     #[serde(default)]
+    bootstrap_progress: Option<BootstrapProgress>,
+    #[serde(default)]
     product_repo: Option<PathBuf>,
     #[serde(default)]
     sidecar_store: Option<String>,
@@ -253,6 +255,28 @@ struct CompletedIteration {
     proposal_head: Option<String>,
     final_head: Option<String>,
     elapsed_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BootstrapProgress {
+    elapsed: Duration,
+    final_head: Option<String>,
+    #[serde(skip)]
+    started_at: Option<Instant>,
+}
+
+impl BootstrapProgress {
+    fn elapsed_at(&self, now: Instant) -> Duration {
+        self.elapsed
+            + self
+                .started_at
+                .map_or(Duration::ZERO, |start| now.saturating_duration_since(start))
+    }
+
+    fn stop_at(&mut self, now: Instant) {
+        self.elapsed = self.elapsed_at(now);
+        self.started_at = None;
+    }
 }
 
 enum WorkflowOutcome {
@@ -287,6 +311,7 @@ impl RunState {
             terminal_review_complete: false,
             terminal_remediations: 0,
             bootstrap: false,
+            bootstrap_progress: None,
             product_repo: None,
             sidecar_store: None,
             planning_final_head: None,
@@ -334,6 +359,7 @@ impl RunState {
             terminal_review_complete: false,
             terminal_remediations: 0,
             bootstrap: false,
+            bootstrap_progress: None,
             product_repo: None,
             sidecar_store: None,
             planning_final_head: None,
@@ -353,6 +379,7 @@ impl RunState {
             content: bootstrap_instructions(frontier_worker),
         });
         state.bootstrap = true;
+        state.bootstrap_progress = Some(BootstrapProgress::default());
         state
     }
 
@@ -385,6 +412,9 @@ impl RunState {
                 completed: Vec::new(),
                 bootstrap: true,
                 bootstrap_complete: matches!(self.stage, Stage::Complete | Stage::Done),
+                bootstrap_elapsed: self.bootstrap_progress.as_ref().map(|p| p.elapsed),
+                bootstrap_started_at: self.bootstrap_progress.as_ref().and_then(|p| p.started_at),
+                bootstrap_final_head: self.final_head.clone(),
                 upcoming: Vec::new(),
             });
         }
@@ -403,7 +433,13 @@ impl RunState {
                 })
                 .collect(),
             bootstrap: false,
-            bootstrap_complete: false,
+            bootstrap_complete: self.bootstrap_progress.is_some(),
+            bootstrap_elapsed: self.bootstrap_progress.as_ref().map(|p| p.elapsed),
+            bootstrap_started_at: None,
+            bootstrap_final_head: self
+                .bootstrap_progress
+                .as_ref()
+                .and_then(|p| p.final_head.clone()),
             upcoming: Vec::new(),
         })
     }
@@ -1322,6 +1358,12 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
+        if state.bootstrap
+            && !matches!(state.stage, Stage::Complete | Stage::Done)
+            && let Some(progress) = &mut state.bootstrap_progress
+        {
+            progress.started_at = Some(Instant::now());
+        }
         loop {
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
@@ -1417,6 +1459,14 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 WorkflowOutcome::Complete(mut completed_state) => {
+                    if completed_state.bootstrap {
+                        if let Some(progress) = &mut completed_state.bootstrap_progress {
+                            progress.stop_at(Instant::now());
+                            progress.final_head = completed_state.final_head.clone();
+                        }
+                        persist_state(repo, &completed_state, &self.ui)?;
+                        self.present_campaign(repo, &completed_state);
+                    }
                     if completed_state.bootstrap && completed_state.campaign.is_some() {
                         if self.ui.stop_after_iteration_requested() {
                             self.ui.finish_dashboard();
@@ -1436,6 +1486,7 @@ impl<U: Ui> App<U> {
                         let before_changes = openspec_snapshot(repo, &self.ui)?;
                         state = RunState::new("advance".to_owned(), before_changes);
                         state.contracts = completed_state.contracts.take();
+                        state.bootstrap_progress = completed_state.bootstrap_progress.take();
                         state.campaign = Some(campaign);
                         self.assign_agenda(repo, &mut state)?;
                         arm_slice_baseline(repo, &mut state, &self.ui)?;
@@ -1517,6 +1568,7 @@ impl<U: Ui> App<U> {
                     let before_changes = openspec_snapshot(repo, &self.ui)?;
                     state = RunState::new(request, before_changes);
                     state.contracts = completed_state.contracts.take();
+                    state.bootstrap_progress = completed_state.bootstrap_progress.take();
                     state.campaign = Some(campaign);
                     state.pending_direction = pending_direction;
                     state.terminal_remediations = completed_state.terminal_remediations;
@@ -2275,9 +2327,9 @@ impl<U: Ui> App<U> {
             } else {
                 worker_agent.as_ref()
             };
-            match state.stage {
+            let stage_result = match state.stage {
                 Stage::Explore => {
-                    self.run_explore(repo, worker_agent.as_ref(), commands, &mut state)?
+                    self.run_explore(repo, worker_agent.as_ref(), commands, &mut state)
                 }
                 Stage::Propose => self.run_propose(
                     repo,
@@ -2285,35 +2337,44 @@ impl<U: Ui> App<U> {
                     commands,
                     &mut state,
                     use_terminal_frontier,
-                )?,
-                Stage::ProposalCommit => {
-                    self.run_proposal_commit(repo, agent.as_ref(), &mut state)?
-                }
+                ),
+                Stage::ProposalCommit => self.run_proposal_commit(repo, agent.as_ref(), &mut state),
                 Stage::Apply => self.run_apply(
                     repo,
                     applying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
-                )?,
+                ),
                 Stage::Verify => self.run_verify(
                     repo,
                     verifying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
-                )?,
-                Stage::Acceptance => self.run_acceptance(repo, &mut state)?,
+                ),
+                Stage::Acceptance => self.run_acceptance(repo, &mut state),
                 Stage::Repair => self.run_repair(
                     repo,
                     applying_agent,
                     commands,
                     &mut state,
                     use_terminal_frontier,
-                )?,
-                Stage::Archive => self.run_archive(repo, agent.as_ref(), commands, &mut state)?,
-                Stage::FinalCommit => self.run_final_commit(repo, agent.as_ref(), &mut state)?,
+                ),
+                Stage::Archive => self.run_archive(repo, agent.as_ref(), commands, &mut state),
+                Stage::FinalCommit => self.run_final_commit(repo, agent.as_ref(), &mut state),
                 Stage::Complete | Stage::Done => unreachable!(),
+            };
+            if let Err(error) = stage_result {
+                if state.bootstrap
+                    && let Some(progress) = &state.bootstrap_progress
+                    && let Err(save_error) = persist_bootstrap_progress(repo, progress, &self.ui)
+                {
+                    self.ui.debug(&format!(
+                        "Could not save bootstrap elapsed time: {save_error:#}"
+                    ));
+                }
+                return Err(error);
             }
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
@@ -3923,7 +3984,7 @@ fn campaign_progress(repo: &Path, state: &RunState) -> Result<Option<CampaignVie
     {
         let (bootstrap_complete, pending) = crate::agenda::progress(repo)?;
         if !state.bootstrap {
-            view.bootstrap_complete = bootstrap_complete;
+            view.bootstrap_complete |= bootstrap_complete;
         }
         let current = state
             .agenda
@@ -4400,6 +4461,18 @@ fn state_path<U: Ui>(repo: &Path, ui: &U) -> Result<PathBuf> {
 fn persist_state<U: Ui>(repo: &Path, state: &RunState, ui: &U) -> Result<()> {
     let path = state_path(repo, ui)?;
     let temporary = path.with_extension("json.tmp");
+    // Save accrued bootstrap time without serializing an Instant or counting
+    // time spent paused before the next resume.
+    let mut checkpoint;
+    let state = if state.bootstrap {
+        checkpoint = state.clone();
+        if let Some(progress) = &mut checkpoint.bootstrap_progress {
+            progress.stop_at(Instant::now());
+        }
+        &checkpoint
+    } else {
+        state
+    };
     fs::write(&temporary, serde_json::to_vec_pretty(state)?)
         .with_context(|| format!("could not write checkpoint `{}`", temporary.display()))?;
     fs::rename(&temporary, &path)
@@ -4416,6 +4489,17 @@ fn try_load_state<U: Ui>(repo: &Path, ui: &U) -> Result<Option<RunState>> {
         return load_state_file(&legacy_path).map(Some);
     }
     Ok(None)
+}
+
+fn persist_bootstrap_progress<U: Ui>(
+    repo: &Path,
+    progress: &BootstrapProgress,
+    ui: &U,
+) -> Result<()> {
+    // A failed stage may have unsaved workflow changes; update only its timer.
+    let mut checkpoint = load_state(repo, ui)?;
+    checkpoint.bootstrap_progress = Some(progress.clone());
+    persist_state(repo, &checkpoint, ui)
 }
 
 fn load_state<U: Ui>(repo: &Path, ui: &U) -> Result<RunState> {
@@ -4528,6 +4612,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         terminal_review_complete: false,
         terminal_remediations: 0,
         bootstrap: false,
+        bootstrap_progress: None,
         product_repo: None,
         sidecar_store: None,
         planning_final_head: None,
@@ -4706,6 +4791,10 @@ mod tests {
         // q exits with this completed bootstrap checkpoint; it has not consumed
         // implementation iteration 1, and remains eligible for --resume.
         bootstrap.stage = Stage::Complete;
+        bootstrap.final_head = Some("bootstrap-completion".into());
+        let progress = bootstrap.bootstrap_progress.as_mut().unwrap();
+        progress.elapsed = Duration::from_secs(65);
+        progress.final_head = bootstrap.final_head.clone();
         let resumed: RunState =
             serde_json::from_slice(&serde_json::to_vec(&bootstrap).unwrap()).unwrap();
         assert!(resumed.campaign_view().unwrap().bootstrap_complete);
@@ -4715,6 +4804,7 @@ mod tests {
 
         let mut implementation = RunState::new("advance".to_owned(), ChangeSnapshot::default());
         implementation.campaign = resumed.campaign;
+        implementation.bootstrap_progress = resumed.bootstrap_progress;
         assert_eq!(
             implementation.campaign_view(),
             Some(CampaignView {
@@ -4722,10 +4812,69 @@ mod tests {
                 max_iterations: Some(10),
                 completed: Vec::new(),
                 bootstrap: false,
-                bootstrap_complete: false,
+                bootstrap_complete: true,
+                bootstrap_elapsed: Some(Duration::from_secs(65)),
+                bootstrap_started_at: None,
+                bootstrap_final_head: Some("bootstrap-completion".into()),
                 upcoming: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn bootstrap_checkpoint_retains_accrued_time_without_a_running_clock() {
+        let repo = std::env::temp_dir().join(format!("opsx-bootstrap-time-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        let ui = crate::ui::TerminalUi::new(false, false, false);
+        ProcessRunner::new(&ui)
+            .checked(
+                &CommandSpec::new("git", &repo).args(["init", "-q"]),
+                "Preparing timing fixture",
+            )
+            .unwrap();
+        let mut state = RunState::bootstrap(ChangeSnapshot::default(), false);
+        let progress = state.bootstrap_progress.as_mut().unwrap();
+        progress.elapsed = Duration::from_secs(40);
+        progress.started_at = Some(Instant::now() - Duration::from_secs(25));
+        persist_state(&repo, &state, &ui).unwrap();
+        state.stage = Stage::Apply;
+        persist_bootstrap_progress(&repo, state.bootstrap_progress.as_ref().unwrap(), &ui).unwrap();
+
+        let mut resumed = load_state(&repo, &ui).unwrap();
+        assert_eq!(resumed.stage, Stage::Propose);
+        let progress = resumed.bootstrap_progress.as_mut().unwrap();
+        assert!(progress.elapsed >= Duration::from_secs(65));
+        assert!(progress.started_at.is_none());
+        let saved = progress.elapsed;
+        let later = Instant::now() + Duration::from_secs(86_400);
+        assert_eq!(progress.elapsed_at(later), saved);
+        progress.started_at = Some(later);
+        progress.stop_at(later + Duration::from_secs(10));
+        progress.final_head = Some("bootstrap-completion".into());
+        resumed.stage = Stage::Complete;
+        persist_state(&repo, &resumed, &ui).unwrap();
+        let completed = load_state(&repo, &ui).unwrap();
+        let progress = completed.bootstrap_progress.unwrap();
+        assert_eq!(progress.elapsed, saved + Duration::from_secs(10));
+        assert_eq!(progress.final_head.as_deref(), Some("bootstrap-completion"));
+        assert!(progress.started_at.is_none());
+        // Taking a checkpoint did not reset the live timer or double-count it.
+        let original = state.bootstrap_progress.unwrap();
+        assert_eq!(original.elapsed, Duration::from_secs(40));
+        assert!(original.started_at.is_some());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn older_checkpoints_do_not_invent_bootstrap_timing() {
+        let state = RunState::bootstrap(ChangeSnapshot::default(), false);
+        let mut value = serde_json::to_value(state).unwrap();
+        value.as_object_mut().unwrap().remove("bootstrap_progress");
+        let decoded: RunState = serde_json::from_value(value).unwrap();
+        let view = decoded.campaign_view().unwrap();
+        assert!(view.bootstrap_elapsed.is_none());
+        assert!(view.bootstrap_started_at.is_none());
+        assert!(view.bootstrap_final_head.is_none());
     }
 
     #[test]
