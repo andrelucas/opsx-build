@@ -6,6 +6,7 @@ mod authority;
 pub mod backend;
 pub mod bootstrap;
 pub mod campaign_config;
+pub mod checks;
 pub mod claude;
 pub mod cli;
 pub mod codex;

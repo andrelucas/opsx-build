@@ -953,6 +953,66 @@ model/connection provenance. A repair claim cannot close a finding; independent
 Verify must explicitly resolve it. Omitted blockers remain open, and new evidence
 can reopen previously closed findings.
 
+Check execution can also retain runner-observed receipts under private Git
+metadata at `opsx-build/checks/<run>/<attempt>/result.json`, with adjacent
+`stdout.log` and `stderr.log`. The checkpoint retains the run identity across
+resume. Apply, Repair, Verify, Archive and completion receive the latest named
+checks for the current change, their declared execution boundaries, limitations
+and evidence paths. A reused receipt points to the original execution; it never
+claims that the current stage reran the command. This works in both standard and
+supplied-contract modes and requires no new campaign input or obligation format.
+
+Agents receive a preserved matching-version helper command:
+`opsx-build check --repo PATH --scope UUID`. It reads one JSON object on stdin:
+
+```json
+{
+  "key": "unit-tests",
+  "command": "go test ./...",
+  "cwd": ".",
+  "tools": ["go"],
+  "additional_inputs": [],
+  "review_only": [],
+  "runtime": "unknown",
+  "runtime_reason": "Toolchain, module-cache and runtime premises need assessment",
+  "timeout_seconds": 600
+}
+```
+
+The helper records the actual `/bin/sh -c` exit status, elapsed time and logs.
+Keep secrets out of command strings and logs. Inherited environment values are
+fingerprinted without storing their contents. Preserve the check's own status;
+a pipeline or trailing successful command can mask the failure of an earlier
+process. If the helper cannot support a required check's interface or sandbox,
+run that check normally and report the actual outcome and limitations; absence of
+a reusable receipt does not itself block delivery or waive a required check.
+
+Reuse is conservative and starts disabled by the `unknown` runtime premise.
+`live` also forces execution. Declare `stable` only after establishing the complete
+tool/dependency boundary and stable runtime premises, with a reason. All tracked
+and non-ignored files in both repositories are inputs by default. Declare tools
+and ignored/external dependencies or fixtures (`additional_inputs`) explicitly;
+fingerprinting executable bytes cannot discover transitive toolchains, shared
+libraries, services or native/clock premises. An individual evidence-only file
+may be declared as `{"path":"delivery.md","reason":"why this command does not
+consume it"}` in `review_only`. Directory/glob and blanket documentation exclusions
+are not supported; protected contracts and acceptance inputs cannot be excluded.
+These declarations remain claims for independent review, not new specifications.
+
+Only the latest successful attempt for the same named check in the same change
+and run can be reused. Commands, working directories, timeouts, declared boundaries,
+environment, host/kernel, tools, relevant file fingerprints and retained logs must
+match. Shared code, tests, dependencies and configuration invalidate checks by
+default. Missing evidence, failed/interrupted checks and checks that changed their
+inputs cannot provide cached passes. Same-key calls are serialized and sequenced
+without relying on wall-clock ordering. Unknown impact, live premises or an
+explicit fresh-check requirement always require execution. A failed/interrupted
+independent acceptance attempt invalidates earlier helper receipts even when files
+are unchanged. Independent review
+still establishes source compliance, assertion adequacy and coverage. The final
+acceptance gate never consults these receipts: its commands, order, timeouts and
+protected-input checks remain unchanged.
+
 Repair uses a dedicated brief instead of repeating the Apply skill. It corrects
 the governing rule across relevant sibling paths and allowed alternatives,
 updates affected evidence, and runs required checks while preserving unrelated
@@ -970,8 +1030,9 @@ starting acceptance. Text-only backends can carry the report on an
 without structured coverage records that limitation and cannot silently erase
 previously retained blockers.
 
-Supplied-assignment runs preserve a version-checked copy of the runner under
-private Git metadata and use that path for agenda helpers. Its version and Git
+Workflow runs preserve a version-checked copy of the runner under private Git
+metadata and use that path for check helpers and supplied-assignment agenda
+helpers. Its version and Git
 content fingerprint are recorded in the checkpoint. Installing a replacement at
 the normal path leaves these helper commands available. Agenda validation output
 identifies the runner version actually used.

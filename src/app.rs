@@ -202,6 +202,8 @@ struct RunState {
     archive: Option<ArchiveEvidence>,
     #[serde(default)]
     review: crate::review::History,
+    #[serde(default)]
+    checks: crate::checks::History,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
@@ -302,6 +304,7 @@ impl RunState {
             verification: None,
             archive: None,
             review: crate::review::History::default(),
+            checks: crate::checks::History::default(),
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -351,6 +354,7 @@ impl RunState {
             verification: None,
             archive: None,
             review: crate::review::History::default(),
+            checks: crate::checks::History::default(),
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -1364,16 +1368,13 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
+        state.checks.ensure(repo, &self.ui)?;
         if let Some(contracts) = &mut state.contracts
             && contracts.obligation_inventory.is_some()
         {
-            crate::runner_executable::RunnerExecutable::ensure(
-                &mut contracts.runner,
-                repo,
-                &self.ui,
-            )?;
-            persist_state(repo, &state, &self.ui)?;
+            contracts.runner = state.checks.runner.clone();
         }
+        persist_state(repo, &state, &self.ui)?;
         if state.bootstrap
             && !matches!(state.stage, Stage::Complete | Stage::Done)
             && let Some(progress) = &mut state.bootstrap_progress
@@ -2748,6 +2749,7 @@ impl<U: Ui> App<U> {
         };
         let base = with_sidecar_context(state, &base);
         let subject = with_direction(&base, state.pending_direction.as_deref());
+        let subject = format!("{subject}{}", self.check_guidance(repo, state, "Apply")?);
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
@@ -2817,6 +2819,10 @@ impl<U: Ui> App<U> {
             "{verify_subject}{}{}",
             state.review.handoff(&verification_inputs, false)?,
             crate::review::INSTRUCTIONS
+        );
+        let verify_subject = format!(
+            "{verify_subject}{}",
+            self.check_guidance(repo, state, "Verify")?
         );
         let Some(result) = worker_result(
             invoke_fresh(
@@ -3102,6 +3108,7 @@ impl<U: Ui> App<U> {
         let subject = with_direction(&base, state.pending_direction.as_deref());
         let inputs = verification::capture(repo, state.product_repo.as_deref(), &self.ui);
         let subject = format!("{subject}{}", state.review.handoff(&inputs, true)?);
+        let subject = format!("{subject}{}", self.check_guidance(repo, state, "Repair")?);
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
@@ -3136,6 +3143,25 @@ impl<U: Ui> App<U> {
         persist_state(repo, state, &self.ui)
     }
 
+    fn check_guidance(&self, repo: &Path, state: &RunState, stage: &str) -> Result<String> {
+        let protected = state
+            .contracts
+            .as_ref()
+            .map(|contracts| {
+                let (contracts, acceptance) = contracts.paths();
+                contracts.into_iter().chain(acceptance).collect()
+            })
+            .unwrap_or_default();
+        state.checks.guidance(
+            repo,
+            state.product_repo.as_deref(),
+            &require_change(state)?,
+            stage,
+            protected,
+            &self.ui,
+        )
+    }
+
     fn stop_verification_repairs(&self, repo: &Path, state: &mut RunState) -> Result<()> {
         state.stage = Stage::Repair;
         persist_state(repo, state, &self.ui)?;
@@ -3156,6 +3182,9 @@ impl<U: Ui> App<U> {
         let result = gate.run(repo, state.change.as_deref(), &self.ui, || {
             state.contracts.as_ref().unwrap().check_inputs(repo)
         });
+        if !matches!(&result, Ok(None)) {
+            state.checks.independent_check_failed();
+        }
         let outcome = match result {
             Ok(None) => {
                 state.stage = gate.next_stage;
@@ -3204,6 +3233,7 @@ impl<U: Ui> App<U> {
                 product.display()
             ));
         }
+        subject.push_str(&self.check_guidance(repo, state, "Archive")?);
         for attempt in 0..=1 {
             let handoff = state
                 .verification
@@ -3328,7 +3358,10 @@ impl<U: Ui> App<U> {
             &format!("{change}-completion-commit"),
             &stage_prompt(
                 "",
-                &format!("{task}{handoff}{archive_handoff}"),
+                &format!(
+                    "{task}{handoff}{archive_handoff}{}",
+                    self.check_guidance(repo, state, "Completion commit")?
+                ),
                 StageProtocol::Ready,
             ),
             if state.bootstrap {
@@ -4638,6 +4671,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         verification: None,
         archive: None,
         review: crate::review::History::default(),
+        checks: crate::checks::History::default(),
         proposal_head: value
             .get("proposal_commit")
             .and_then(Value::as_str)

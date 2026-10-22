@@ -3,6 +3,9 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
+import subprocess
 import sys
 
 if "--version" in sys.argv:
@@ -52,6 +55,20 @@ elif count == 3:
 else:
     status = "BLOCKED"
     summary = "Fixture stops at Archive after independent final acceptance"
+
+if mode == "review-checks" and count <= 4:
+    helper = shlex.split(re.search(r"For checks you need to run, prefer (.+?) with one JSON object", prompt)[1])
+    final = count >= 3 and Path("final-check.sh").exists()
+    command = "sh final-check.sh" if final else "printf 'unit check\\n' >> " + shlex.quote(str(root / "unit-check-runs"))
+    check = {"key": "final-check" if final else "unit-check", "command": command,
+             "cwd": str(Path.cwd()), "tools": ["sh", "cat"] if final else ["sh"], "additional_inputs": [],
+             "review_only": [], "runtime": "stable",
+             "runtime_reason": "Deterministic fixture without external or clock dependencies",
+             "timeout_seconds": 2}
+    checked = subprocess.run(helper, input=json.dumps(check), text=True, capture_output=True)
+    if checked.returncode:
+        raise RuntimeError(checked.stdout + checked.stderr)
+    (root / f"check-{count}.json").write_text(checked.stdout)
 
 output = {"opsx_status": status, "summary": summary}
 if report is not None:

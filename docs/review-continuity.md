@@ -97,7 +97,7 @@ reuse. Existing Verify-to-Archive-to-completion evidence reuse is preserved.
    installation replaces the normal executable. Avoid platform-specific advice
    that requires a model to discover a workaround.
 
-### Following change: conservative execution-evidence reuse
+### Second change: conservative execution-evidence reuse
 
 Record command, working directory, relevant environment/tool/dependency identities,
 protected inputs, code/tests, runtime premises, actual exit and retained logs.
@@ -110,6 +110,32 @@ Do not introduce a blanket documentation exclusion: a check may itself validate
 documentation, a delivery record or its hashes. Nor may generated convenience
 rules expand the supplied acceptance indefinitely. Keep independent final
 execution unchanged before optimizing repeated pre-terminal checks.
+
+The implementation uses a runner helper to capture actual process results rather
+than treating a model summary as an execution receipt. Check records and logs live
+under private Git metadata at `opsx-build/checks/<run>/<attempt>/`. The checkpoint
+retains the run identity and preserved helper executable; each stage supplies its
+change, stage and repository context. Resumes retain the same run; new runs do not
+inherit cached passes.
+
+The default input boundary includes all tracked and non-ignored files in both
+planning and product repositories. A caller can identify individual review-only
+files, with a reason why the command does not consume each file; this is an
+explicit diagnostic claim, not an automatic documentation exclusion. Protected
+inputs cannot be excluded. Ignored or external dependencies must be listed as
+additional inputs, and executable tools must be declared. Reuse also requires the
+same command, working directory, timeout, environment fingerprint, tool identities,
+unchanged logs and an explicitly stable runtime premise. Unknown or live premises
+force execution. Dependency completeness and runtime stability remain claims for
+independent review; fingerprints do not establish them.
+
+Only the latest attempt for a named check in the current change can be reused.
+Failed, interrupted, incomplete or input-mutating checks cannot supply a cached
+pass. The helper preserves the actual process exit code and separately records
+invalidation reasons. A failed or interrupted independent acceptance attempt also
+invalidates helper receipts from before that attempt, even if files are unchanged.
+Independent review still establishes coverage and whether
+fresh execution is required. The final acceptance gate never reads this cache.
 
 ## Evaluation
 
@@ -131,7 +157,7 @@ campaign evidence, or launch/resume campaigns as part of implementing this work.
 ## Work log
 
 - Investigation and combined findings documented before implementation.
-- First implementation in the 0.29.0 working copy retains Apply/Repair handoffs,
+- First implementation in 0.29.0 retains Apply/Repair handoffs,
   structured independent review rounds, stable findings and actual coverage.
   Only the verifier can close or reclassify a known blocker with stated evidence;
   omission does not close it. New evidence can reopen it.
@@ -150,9 +176,48 @@ campaign evidence, or launch/resume campaigns as part of implementing this work.
 - Deterministic tests cover both workflows, retained/open/closed/reopened and
   partial findings, scope changes, protocol transport, bounded resume and exact
   final acceptance execution. No live campaign or model evaluation is part of
-  these tests. Execution-evidence reuse remains the separately described follow-up.
+  these tests. Execution-evidence reuse was the separately described follow-up.
 - Validation: 410 tests pass with `TMPDIR=/private/tmp cargo test --all-targets`;
   `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` and
   `git diff --check` pass. Fourteen new regression tests supplement the existing
   suite. These results verify orchestration and preservation boundaries, not
   measured improvements in model review quality or live campaign cost.
+- The 0.30.0 working copy adds actual execution receipts and conservative reuse.
+  `opsx-build check` receives JSON on stdin and writes private per-run receipts,
+  exact shell-command outcomes, stdout/stderr and invalidation reasons. Check
+  context, run identity and the preserved helper survive checkpoint/resume.
+- Reuse starts disabled (`runtime: unknown`). Explicit stable-premise declarations
+  remain independently reviewable. All Git-visible files in both roots,
+  protected inputs, declared additional dependencies, executable identities,
+  inherited environment fingerprint, host/kernel and logs are checked. Individual
+  justified review-only exclusions are supported; no blanket exclusion is added.
+- The latest named attempt wins, including failures and incomplete receipts.
+  Calls for the same key are locked and sequenced independently of wall time.
+  Missing/corrupt receipts force fresh execution without fabricating a check
+  failure. Timeouts/interruption retain partial logs and do not invent exit codes.
+  Failed/interrupted independent acceptance invalidates earlier helper receipts.
+- Fifteen new regressions cover evidence-only edits, shared/new/deleted code,
+  tests/configuration, tool and dependency changes, environment identities,
+  native/live premise limits, log integrity, process interruption/timeout,
+  input mutation, protected inputs, sidecars, run isolation and concurrent calls.
+  Both workflows retain receipts across resume. A command already passed and
+  reused through the helper still executes independently as the exact final gate
+  with its pinned timeout. The acceptance executor and selection are unchanged.
+- Validation: 425 tests pass with `TMPDIR=/private/tmp cargo test --all-targets`;
+  Clippy with `-D warnings`, formatting and diff checks pass. No campaign input,
+  live process or installed runner was changed. Live model cost/quality evaluation
+  remains outstanding; these deterministic results establish orchestration only.
+
+## Sirocco handoff for the check-receipt change
+
+No new campaign switch, contract format or receipt file is required from the
+maintainer. The runner supplies the scoped helper and diagnostic context in both
+modes. Keep original acceptance commands, protected inputs and source obligations
+as prepared. Agents declare the execution boundary when invoking a check; those
+declarations are not another project specification. If helper use is unsuitable,
+normal execution and accurate summaries remain available without a cached claim.
+Future public input improvements and promotion of counterexamples still belong
+to Sirocco. Evaluate one separately authorized fresh demanding unit with frozen
+inputs and recorded model settings before a broad restart; compare actual reruns,
+invalidation reasons, cost, false blockers and substantive defects caught. Existing
+campaign evidence remains untouched.

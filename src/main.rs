@@ -2,6 +2,9 @@ use anyhow::Result;
 use opsx_build::{app::App, cli::Cli, ui::TerminalUi};
 
 fn main() -> Result<()> {
+    if let Some(code) = opsx_build::checks::run_cli()? {
+        std::process::exit(code);
+    }
     let cli = Cli::load()?;
     let workflow_dashboard =
         !cli.interactive && cli.test_connection.is_none() && cli.request != "configure";

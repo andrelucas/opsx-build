@@ -425,6 +425,75 @@ fn repair_loop_retains_findings_and_handoffs_and_still_runs_the_exact_final_gate
 }
 
 #[test]
+fn check_receipts_survive_resume_in_both_modes_and_cannot_waive_the_same_final_command() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        f.review_workflow(ordinary);
+        let stopped = f.run_with("review-checks", true, &["--max-verify-retries=0"]);
+        assert!(
+            String::from_utf8_lossy(&stopped.stderr).contains("verification repair limit reached")
+        );
+        let scope = f.state()["checks"]["scope"].clone();
+        assert!(scope.is_string());
+        let resumed = f.run_with("review-checks", true, &["--max-verify-retries=1"]);
+        assert!(
+            String::from_utf8_lossy(&resumed.stderr).contains("Fixture stops at Archive"),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(f.state()["checks"]["scope"], scope);
+        let receipts = (1..=4)
+            .map(|count| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(f.root.join(format!("check-{count}.json"))).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt["executed"].as_bool().unwrap())
+                .collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
+        for count in 2..=5 {
+            let prompt = fs::read_to_string(f.root.join(format!("args-{count}"))).unwrap();
+            assert!(prompt.contains("RECORDED EXECUTION EVIDENCE"));
+            assert!(prompt.contains("Execution boundary (diagnostic claim)"));
+            assert!(prompt.contains("Receipt:"));
+            if ordinary && count == 2 {
+                assert!(prompt.contains("anti-Karen"));
+            }
+        }
+        if ordinary {
+            assert_eq!(
+                fs::read_to_string(f.root.join("unit-check-runs"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        } else {
+            // The exact command already passed via the helper and was reused by
+            // Verify. Independent final acceptance must execute it once more.
+            assert_eq!(
+                fs::read_to_string(f.root.join("repo/.git/gate-runs")).unwrap(),
+                "final gate\nfinal gate\n"
+            );
+            let reports = f.acceptance_reports();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(
+                reports[0]["commands"],
+                serde_json::json!(["sh final-check.sh"])
+            );
+            assert_eq!(reports[0]["timeout_seconds"], 2);
+            assert_eq!(reports[0]["outcome"], "passed");
+        }
+    }
+}
+
+#[test]
 fn incomplete_review_saves_partial_findings_without_starting_repair_or_acceptance() {
     let f = Fixture::new();
     f.review_workflow(false);
@@ -808,6 +877,7 @@ fn supplied_acceptance_failure_repairs_then_reruns_before_archive() {
     assert_eq!(fixture.state()["stage"], "complete");
     let reports = fixture.acceptance_reports();
     assert_eq!(reports.len(), 2); // Archive and commit alone do not rerun checks.
+    assert_eq!(fixture.state()["checks"]["generation"], 1);
     assert!(
         reports
             .iter()

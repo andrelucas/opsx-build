@@ -443,7 +443,7 @@ impl Cli {
     args_override_self = true
 )]
 pub(crate) struct CliArgs {
-    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, or `rewind`.
+    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, `rewind`, or `check` (see `check --help`).
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
