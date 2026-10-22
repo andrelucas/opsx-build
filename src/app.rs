@@ -377,9 +377,16 @@ impl RunState {
     }
 
     fn campaign_view(&self) -> Option<CampaignView> {
-        // Bootstrap carries the future campaign checkpoint, but is not iteration 1.
+        // Bootstrap is visible, but never consumes an implementation iteration.
         if self.bootstrap {
-            return None;
+            return Some(CampaignView {
+                iteration: 0,
+                max_iterations: self.campaign.as_ref().and_then(|c| c.max_iterations),
+                completed: Vec::new(),
+                bootstrap: true,
+                bootstrap_complete: matches!(self.stage, Stage::Complete | Stage::Done),
+                upcoming: Vec::new(),
+            });
         }
         let campaign = self.campaign.as_ref()?;
         Some(CampaignView {
@@ -395,6 +402,9 @@ impl RunState {
                     elapsed_seconds: entry.elapsed_seconds,
                 })
                 .collect(),
+            bootstrap: false,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
         })
     }
 }
@@ -1336,7 +1346,7 @@ impl<U: Ui> App<U> {
                     }
                 }
             }
-            self.present_campaign(&state);
+            self.present_campaign(repo, &state);
             let iteration_started = (matches!(state.stage, Stage::Explore | Stage::Propose)
                 && state.planning_session.is_none())
             .then(Instant::now);
@@ -1485,7 +1495,7 @@ impl<U: Ui> App<U> {
                             });
                         persist_state(repo, &completed_state, &self.ui)?;
                     }
-                    self.present_campaign(&completed_state);
+                    self.present_campaign(repo, &completed_state);
                     self.ui.success(&format!(
                         "Campaign iteration {iteration} complete: `{change}`"
                     ));
@@ -1815,7 +1825,7 @@ impl<U: Ui> App<U> {
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
         let session = SessionId::new(Uuid::new_v4().to_string());
-        self.present_campaign(&state);
+        self.present_campaign(repo, &state);
         self.ui.stage(
             1,
             TOTAL_STAGES,
@@ -1975,8 +1985,13 @@ impl<U: Ui> App<U> {
         unreachable!("terminal review retry loop always returns")
     }
 
-    fn present_campaign(&self, state: &RunState) {
-        self.ui.campaign(state.campaign_view());
+    fn present_campaign(&self, repo: &Path, state: &RunState) {
+        let view = campaign_progress(repo, state).unwrap_or_else(|error| {
+            self.ui
+                .debug(&format!("Could not read agenda progress: {error:#}"));
+            state.campaign_view()
+        });
+        self.ui.campaign(view);
         self.ui
             .bootstrap_continues(state.bootstrap && state.campaign.is_some());
     }
@@ -2178,6 +2193,7 @@ impl<U: Ui> App<U> {
                     contracts.check_proposal(repo, &change, status.schema_name.as_deref())?;
                 }
             }
+            self.present_campaign(repo, &state);
             if self.cli.yolo && state.stage == Stage::ProposalCommit {
                 self.ui
                     .warn("YOLO mode: skipping the proposal milestone commit");
@@ -3900,6 +3916,32 @@ fn is_terminal_gate(state: &RunState) -> bool {
     state.agenda.as_ref().is_some_and(is_terminal_assignment)
 }
 
+fn campaign_progress(repo: &Path, state: &RunState) -> Result<Option<CampaignView>> {
+    let mut view = state.campaign_view();
+    if let Some(view) = &mut view
+        && (state.bootstrap || state.agenda.is_some())
+    {
+        let (bootstrap_complete, pending) = crate::agenda::progress(repo)?;
+        if !state.bootstrap {
+            view.bootstrap_complete = bootstrap_complete;
+        }
+        let current = state
+            .agenda
+            .as_ref()
+            .and_then(|a| Path::new(&a.path).file_name()?.to_str())
+            .and_then(crate::agenda::parse_slice_name)
+            .map(|(_, _, change)| change);
+        view.upcoming = pending
+            .into_iter()
+            .filter(|change| {
+                current.as_ref() != Some(change)
+                    && !view.completed.iter().any(|c| c.change == *change)
+            })
+            .collect();
+    }
+    Ok(view)
+}
+
 fn needs_terminal_review(state: &RunState) -> bool {
     is_terminal_gate(state)
         && state.stage == Stage::Propose
@@ -4656,14 +4698,17 @@ mod tests {
             max_iterations: Some(10),
             completed: Vec::new(),
         });
-        assert_eq!(bootstrap.campaign_view(), None);
+        let view = bootstrap.campaign_view().unwrap();
+        assert!(view.bootstrap);
+        assert_eq!(view.iteration, 0);
+        assert!(!view.bootstrap_complete);
 
         // q exits with this completed bootstrap checkpoint; it has not consumed
         // implementation iteration 1, and remains eligible for --resume.
         bootstrap.stage = Stage::Complete;
         let resumed: RunState =
             serde_json::from_slice(&serde_json::to_vec(&bootstrap).unwrap()).unwrap();
-        assert_eq!(resumed.campaign_view(), None);
+        assert!(resumed.campaign_view().unwrap().bootstrap_complete);
         assert_eq!(resumed.stage, Stage::Complete);
         assert!(resumed.bootstrap);
         assert!(resumed.campaign.as_ref().unwrap().completed.is_empty());
@@ -4676,8 +4721,45 @@ mod tests {
                 iteration: 1,
                 max_iterations: Some(10),
                 completed: Vec::new(),
+                bootstrap: false,
+                bootstrap_complete: false,
+                upcoming: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn progress_shows_bootstrap_history_and_pending_work_without_current_duplicates() {
+        let repo = std::env::temp_dir().join(format!("opsx-progress-{}", Uuid::new_v4()));
+        fs::create_dir_all(repo.join("automation/slices")).unwrap();
+        fs::create_dir_all(
+            repo.join("openspec/changes/archive/2026-10-22-bootstrap-implementation-slices"),
+        )
+        .unwrap();
+        for name in [
+            "0002-build.md",
+            "0002.1-more.md",
+            "9999-project-acceptance.md",
+        ] {
+            fs::write(repo.join("automation/slices").join(name), "").unwrap();
+        }
+        let mut state = RunState::new_campaign("advance".into(), ChangeSnapshot::default(), None);
+        state.agenda = Some(AgendaAssignment {
+            path: "automation/slices/0002-build.md".into(),
+            change: "prefix-0002-build".into(),
+            title: "Build".into(),
+            content: String::new(),
+        });
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert!(view.bootstrap_complete);
+        assert_eq!(view.upcoming, ["0002-1-more", "9999-project-acceptance"]);
+        assert_eq!(state.campaign.as_ref().unwrap().iteration, 1);
+        // An unrelated free-form campaign does not borrow this agenda's history.
+        state.agenda = None;
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert!(!view.bootstrap_complete);
+        assert!(view.upcoming.is_empty());
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

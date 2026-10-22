@@ -23,6 +23,9 @@ pub struct CampaignView {
     pub iteration: u32,
     pub max_iterations: Option<u32>,
     pub completed: Vec<CampaignIterationView>,
+    pub bootstrap: bool,
+    pub bootstrap_complete: bool,
+    pub upcoming: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +216,10 @@ impl Ui for TerminalUi {
     fn campaign(&self, campaign: Option<CampaignView>) {
         let dashboard_campaign = campaign.as_ref().map(campaign_dashboard_view);
         let mut state = self.state.lock().unwrap();
-        let previous_iteration = state.campaign.as_ref().map(|campaign| campaign.iteration);
+        let previous_iteration = state
+            .campaign
+            .as_ref()
+            .map(|campaign| (campaign.bootstrap, campaign.iteration));
         state.campaign = campaign;
         if let Some(dashboard) = state.dashboard.as_mut() {
             dashboard.set_campaign(dashboard_campaign);
@@ -222,7 +228,8 @@ impl Ui for TerminalUi {
         let campaign = state.campaign.clone();
         drop(state);
         if let Some(campaign) = campaign
-            && previous_iteration != Some(campaign.iteration)
+            && !campaign.bootstrap
+            && previous_iteration != Some((false, campaign.iteration))
         {
             let position = campaign.max_iterations.map_or_else(
                 || campaign.iteration.to_string(),
@@ -537,5 +544,8 @@ fn campaign_dashboard_view(campaign: &CampaignView) -> CampaignDashboardView {
                 elapsed_seconds: entry.elapsed_seconds,
             })
             .collect(),
+        bootstrap: campaign.bootstrap,
+        bootstrap_complete: campaign.bootstrap_complete,
+        upcoming: campaign.upcoming.clone(),
     }
 }

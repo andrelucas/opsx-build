@@ -1913,8 +1913,10 @@ start.
 
 When content exceeds the terminal height, a scrollbar appears on the right.
 Its arrow buttons move one line, its track is clickable, and its thumb can be
-dragged. Mouse-wheel and keyboard scrolling continue to work; reaching the
-bottom resumes tail-following.
+dragged. Mouse-wheel and keyboard scrolling continue to work. Without upcoming
+agenda rows, reaching the bottom resumes tail-following. When planned work is
+listed below the current output, manual scrolling lets you inspect the full
+agenda; End resumes following the active output.
 
 An individual Claude or OpenCode message is limited to 200 displayed lines in
 the dashboard. Longer messages retain their first 120 and final 80 lines with
@@ -1923,9 +1925,20 @@ presentation only; subprocess capture and workflow result parsing retain the
 complete message.
 
 Campaign mode adds the iteration number to the header and retains a compact
-summary row for every completed change. The active iteration continues to use
-the existing phase disclosures; starting the next iteration clears the old
-phase chatter while preserving its summary.
+summary row for every completed change. Bootstrap appears in the same progress
+list, without consuming implementation iteration 1. Once its archive exists,
+subsequent agenda iterations retain its completed summary. The active iteration
+continues to use the existing phase disclosures; starting the next iteration
+clears the old phase chatter while preserving its summary.
+
+Upcoming agenda slices appear in grey below the active phase, in numeric order,
+including subdivision children and the final acceptance slice. Archived and
+currently assigned slices are excluded from that list. Progress is refreshed at
+stage boundaries, so newly created or replanned slices appear automatically.
+Automatic following keeps live output visible with a small preview of planned
+work. Collapse phases or scroll down to inspect more of the remaining agenda.
+These rows are a read-only view of the agenda; they do not change execution order
+or campaign limits.
 
 On iTerm2 3.6.6 or later, workflow runs also show the terminal's animated busy
 indicator. It remains active across stages and automatic retries, then clears

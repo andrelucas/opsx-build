@@ -41,6 +41,9 @@ pub(crate) struct CampaignDashboardView {
     pub iteration: u32,
     pub max_iterations: Option<u32>,
     pub completed: Vec<CampaignIterationDashboardView>,
+    pub bootstrap: bool,
+    pub bootstrap_complete: bool,
+    pub upcoming: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,8 +219,13 @@ impl StreamDashboard {
     }
 
     pub(crate) fn set_campaign(&mut self, campaign: Option<CampaignDashboardView>) {
-        let changed_iteration = self.campaign.as_ref().map(|campaign| campaign.iteration)
-            != campaign.as_ref().map(|campaign| campaign.iteration);
+        let changed_iteration = self
+            .campaign
+            .as_ref()
+            .map(|campaign| (campaign.bootstrap, campaign.iteration))
+            != campaign
+                .as_ref()
+                .map(|campaign| (campaign.bootstrap, campaign.iteration));
         self.campaign = campaign;
         if changed_iteration {
             self.panels.clear();
@@ -249,7 +257,7 @@ impl StreamDashboard {
     fn deferred_pause_hint(&self) -> &'static str {
         if self.bootstrap_continues {
             " · q pause after bootstrap"
-        } else if self.campaign.is_some() {
+        } else if self.campaign.as_ref().is_some_and(|c| !c.bootstrap) {
             " · q pause after slice"
         } else {
             ""
@@ -270,6 +278,9 @@ impl StreamDashboard {
 
     fn header_text(&self) -> String {
         let campaign = self.campaign.as_ref().map(|campaign| {
+            if campaign.bootstrap {
+                return "bootstrap".to_owned();
+            }
             campaign.max_iterations.map_or_else(
                 || format!("iteration {}", campaign.iteration),
                 |maximum| format!("iteration {}/{}", campaign.iteration, maximum),
@@ -526,7 +537,7 @@ impl StreamDashboard {
                 KeyCode::Char('q') if self.bootstrap_continues => {
                     self.request_confirmation(PendingConfirmation::StopAfterBootstrap);
                 }
-                KeyCode::Char('q') if self.campaign.is_some() => {
+                KeyCode::Char('q') if self.campaign.as_ref().is_some_and(|c| !c.bootstrap) => {
                     self.request_confirmation(PendingConfirmation::StopAfterIteration);
                 }
                 KeyCode::Char('p') => {
@@ -785,9 +796,10 @@ impl StreamDashboard {
             .viewport_start
             .saturating_add(amount)
             .min(self.scrollbar.map_or(usize::MAX, |bar| bar.max_position));
-        self.follow_latest = self
-            .scrollbar
-            .is_some_and(|bar| self.viewport_start == bar.max_position);
+        self.follow_latest = self.upcoming_count() == 0
+            && self
+                .scrollbar
+                .is_some_and(|bar| self.viewport_start == bar.max_position);
         self.dirty = true;
     }
 
@@ -796,7 +808,8 @@ impl StreamDashboard {
             return;
         };
         self.viewport_start = position.min(scrollbar.max_position);
-        self.follow_latest = self.viewport_start == scrollbar.max_position;
+        self.follow_latest =
+            self.upcoming_count() == 0 && self.viewport_start == scrollbar.max_position;
         self.dirty = true;
     }
 
@@ -860,6 +873,24 @@ impl StreamDashboard {
     fn render_lines_at(&self, now: Instant) -> Vec<RenderLine> {
         let mut lines = Vec::new();
         if let Some(campaign) = &self.campaign {
+            if campaign.bootstrap || campaign.bootstrap_complete {
+                lines.push(RenderLine {
+                    text: if campaign.bootstrap && !campaign.bootstrap_complete {
+                        "  ◆ Bootstrap · current"
+                    } else {
+                        "  ✓ Bootstrap"
+                    }
+                    .to_owned(),
+                    color: if campaign.bootstrap && !campaign.bootstrap_complete {
+                        Color::Cyan
+                    } else {
+                        Color::Green
+                    },
+                    bold: true,
+                    panel: None,
+                    source: None,
+                });
+            }
             lines.extend(campaign.completed.iter().map(|iteration| {
                 let elapsed = iteration
                     .elapsed_seconds
@@ -886,13 +917,20 @@ impl StreamDashboard {
                 .change_name
                 .as_deref()
                 .map_or_else(String::new, |change| format!(" · {change}"));
-            lines.push(RenderLine {
-                text: format!("  ◆ iteration {} · current{change}", campaign.iteration),
-                color: Color::Cyan,
-                bold: true,
-                panel: None,
-                source: None,
-            });
+            if !campaign.bootstrap
+                && !campaign
+                    .completed
+                    .iter()
+                    .any(|c| c.iteration == campaign.iteration)
+            {
+                lines.push(RenderLine {
+                    text: format!("  ◆ iteration {} · current{change}", campaign.iteration),
+                    color: Color::Cyan,
+                    bold: true,
+                    panel: None,
+                    source: None,
+                });
+            }
         }
         for (index, panel) in self.panels.iter().enumerate() {
             let selected = if index == self.selected_panel {
@@ -942,7 +980,20 @@ impl StreamDashboard {
                 }));
             }
         }
+        if let Some(campaign) = &self.campaign {
+            lines.extend(campaign.upcoming.iter().map(|change| RenderLine {
+                text: format!("  ○ planned · {change}"),
+                color: Color::DarkGrey,
+                bold: false,
+                panel: None,
+                source: None,
+            }));
+        }
         lines
+    }
+
+    fn upcoming_count(&self) -> usize {
+        self.campaign.as_ref().map_or(0, |c| c.upcoming.len())
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -1013,7 +1064,16 @@ impl StreamDashboard {
         let body_height = height.saturating_sub(4) as usize;
         let maximum_start = lines.len().saturating_sub(body_height);
         if self.follow_latest {
-            self.viewport_start = maximum_start;
+            // Follow the active output with a small preview of planned work,
+            // rather than following the bottom of a potentially long agenda.
+            let pending = self.upcoming_count();
+            let preview = pending.min(3).min(body_height / 3);
+            self.viewport_start = lines
+                .len()
+                .saturating_sub(pending)
+                .saturating_add(preview)
+                .saturating_sub(body_height)
+                .min(maximum_start);
         } else {
             self.viewport_start = self.viewport_start.min(maximum_start);
         }
@@ -1531,6 +1591,9 @@ mod tests {
             iteration: 1,
             max_iterations: None,
             completed: Vec::new(),
+            bootstrap: false,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
         }));
         dashboard.set_change_name(Some("0001-reproducible-go-bindings".to_owned()));
         dashboard.set_stage(StageView {
@@ -1551,6 +1614,138 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_and_planned_work_share_the_progress_list_without_worker_numbering() {
+        let mut dashboard = dashboard();
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 0,
+            max_iterations: Some(10),
+            completed: Vec::new(),
+            bootstrap: true,
+            bootstrap_complete: false,
+            upcoming: vec!["0001-core".into(), "9999-project-acceptance".into()],
+        }));
+        dashboard.set_stage(StageView {
+            current: 4,
+            total: 7,
+            title: "Verify".into(),
+            started_at: Instant::now(),
+        });
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert_eq!(lines[0].text, "  ◆ Bootstrap · current");
+        assert!(!dashboard.header_text().contains("iteration"));
+        assert!(!lines.iter().any(|l| l.text.contains("iteration")));
+        assert!(lines[1].text.contains("Verify"));
+        assert!(lines[2].text.contains("planned · 0001-core"));
+        assert_eq!(lines[2].color, Color::DarkGrey);
+        assert!(lines[2].panel.is_none());
+        // Standalone bootstrap has no misleading pause-after-slice action.
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(dashboard.pending_confirmation.is_none());
+        dashboard.set_bootstrap_continues(true);
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            dashboard.pending_confirmation,
+            Some(PendingConfirmation::StopAfterBootstrap)
+        );
+    }
+
+    #[test]
+    fn completed_bootstrap_survives_worker_handoff_and_plan_refresh_preserves_panels() {
+        let mut dashboard = dashboard();
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 0,
+            max_iterations: None,
+            completed: Vec::new(),
+            bootstrap: true,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
+        }));
+        dashboard.set_stage(StageView {
+            current: 6,
+            total: 7,
+            title: "Archive bootstrap".into(),
+            started_at: Instant::now(),
+        });
+        let campaign = CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: Vec::new(),
+            bootstrap: false,
+            bootstrap_complete: true,
+            upcoming: vec!["0002-next".into()],
+        };
+        dashboard.set_campaign(Some(campaign.clone()));
+        assert!(dashboard.panels.is_empty());
+        dashboard.set_stage(StageView {
+            current: 1,
+            total: 6,
+            title: "Propose".into(),
+            started_at: Instant::now(),
+        });
+        dashboard.push(&StreamItem::Assistant("Keep live output".into()));
+        let mut updated = campaign;
+        updated.upcoming.push("0002-1-subdivision".into());
+        dashboard.set_campaign(Some(updated));
+        assert_eq!(dashboard.panels.len(), 1);
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert_eq!(lines[0].text, "  ✓ Bootstrap");
+        assert!(lines[1].text.contains("iteration 1"));
+        assert!(lines.iter().any(|l| l.text.contains("Keep live output")));
+        assert!(!lines.iter().any(|l| l.text.contains("Archive bootstrap")));
+    }
+
+    #[test]
+    fn follow_tracks_live_output_while_pending_work_remains_scrollable() {
+        let mut dashboard = dashboard();
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: Vec::new(),
+            bootstrap: false,
+            bootstrap_complete: true,
+            upcoming: (2..=30).map(|n| format!("{n:04}-planned")).collect(),
+        }));
+        dashboard.set_stage(StageView {
+            current: 3,
+            total: 6,
+            title: "Apply".into(),
+            started_at: Instant::now(),
+        });
+        dashboard.draw_to(&mut Vec::new(), 120, 12).unwrap();
+        for n in 0..40 {
+            dashboard.push(&StreamItem::Assistant(format!("live line {n}")));
+        }
+        let mut frame = Vec::new();
+        dashboard.draw_to(&mut frame, 120, 12).unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains("live line 39"));
+        assert!(text.contains("planned · 0002-planned"));
+        assert!(!text.contains("planned · 0030-planned"));
+        dashboard.scroll_down(usize::MAX);
+        assert!(!dashboard.follow_latest);
+        let mut frame = Vec::new();
+        dashboard.draw_to(&mut frame, 120, 12).unwrap();
+        assert!(
+            String::from_utf8(frame)
+                .unwrap()
+                .contains("planned · 0030-planned")
+        );
+        dashboard.handle_event(Event::Key(event::KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )));
+        let mut frame = Vec::new();
+        dashboard.draw_to(&mut frame, 120, 12).unwrap();
+        assert!(String::from_utf8(frame).unwrap().contains("live line 39"));
+    }
+
+    #[test]
     fn campaign_header_and_summary_survive_iteration_reset() {
         let mut dashboard = dashboard();
         dashboard.set_campaign(Some(CampaignDashboardView {
@@ -1562,6 +1757,9 @@ mod tests {
                 final_head: Some("1234567890abcdef".to_owned()),
                 elapsed_seconds: Some(65),
             }],
+            bootstrap: false,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
         }));
 
         assert_eq!(dashboard.header_text(), "opsx-build  iteration 2/10  /repo");
@@ -1591,6 +1789,9 @@ mod tests {
             iteration: 1,
             max_iterations: None,
             completed: Vec::new(),
+            bootstrap: false,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
         });
         assert_eq!(
             dashboard.handle_event(Event::Key(event::KeyEvent::new(
@@ -1657,6 +1858,9 @@ mod tests {
             iteration: 1,
             max_iterations: None,
             completed: Vec::new(),
+            bootstrap: false,
+            bootstrap_complete: false,
+            upcoming: Vec::new(),
         }));
         dashboard.set_bootstrap_continues(false);
         assert!(!dashboard.stop_after_iteration_requested());

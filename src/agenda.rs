@@ -27,6 +27,39 @@ pub fn is_terminal_assignment(assignment: &AgendaAssignment) -> bool {
     assignment.path == TERMINAL_SLICE_PATH
 }
 
+/// Read-only presentation data. Numeric order and archive matching follow the
+/// scheduler, but a partially written bootstrap agenda need not be valid yet.
+pub fn progress(repo: &Path) -> Result<(bool, Vec<String>)> {
+    let archived = directory_names(&repo.join("openspec/changes/archive"))?;
+    let bootstrap_complete =
+        unique_match(&archived, crate::bootstrap::BOOTSTRAP_CHANGE, "archived")?.is_some();
+    let directory = repo.join(SLICES_DIR);
+    if !directory.is_dir() {
+        return Ok((bootstrap_complete, Vec::new()));
+    }
+    let mut pending = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((ordinal, _, change)) = parse_slice_name(&name) else {
+            continue;
+        };
+        if unique_match(&archived, &change, "archived")?.is_none() {
+            pending.push((ordinal, change));
+        }
+    }
+    pending.sort();
+    Ok((
+        bootstrap_complete,
+        pending.into_iter().map(|(_, change)| change).collect(),
+    ))
+}
+
 pub fn has_subdivision(repo: &Path, assignment: &AgendaAssignment) -> Result<bool> {
     let file_name = Path::new(&assignment.path)
         .file_name()
@@ -213,6 +246,40 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn progress_orders_pending_slices_and_detects_archived_bootstrap() {
+        let repo = fixture();
+        for name in [
+            "0010-last.md",
+            "0002.10-later.md",
+            "0002.2-earlier.md",
+            "0001-done.md",
+            "9999-project-acceptance.md",
+        ] {
+            write_slice(&repo, name, name);
+        }
+        fs::write(repo.join(SLICES_DIR).join("assignments.json"), "{}").unwrap();
+        fs::write(repo.join(SLICES_DIR).join("README.md"), "Index").unwrap();
+        fs::create_dir(
+            repo.join("openspec/changes/archive/2026-10-22-bootstrap-implementation-slices"),
+        )
+        .unwrap();
+        fs::create_dir(repo.join("openspec/changes/archive/2026-10-22-0001-done")).unwrap();
+        assert_eq!(
+            progress(&repo).unwrap(),
+            (
+                true,
+                vec![
+                    "0002-2-earlier".into(),
+                    "0002-10-later".into(),
+                    "0010-last".into(),
+                    "9999-project-acceptance".into()
+                ]
+            )
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
 
     fn fixture() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("opsx-build-agenda-{}", Uuid::new_v4()));
