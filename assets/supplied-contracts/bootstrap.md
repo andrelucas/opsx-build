@@ -1,75 +1,71 @@
-# Bootstrap implementation agenda from supplied contracts
+# Assign supplied obligations to implementation work
 
 Change name: `bootstrap-implementation-slices`
 
-This is planning-only work. Create an ordered implementation agenda for the
-complete in-scope goal. Do not implement product functionality.
+This change is planning-only. Do not implement product functionality or create
+OpenSpec changes for the future delivery slices.
+This workflow does not author replacement behavioural specifications or spec deltas.
 
 {{OPSX_BUILD_WORKER_CAPACITY}}
 
 {{OPSX_BUILD_PROJECT_AUTHORITY}}
 
-Read the supplied context and declared required contracts within their reading
-boundaries. The supplied-contract workflow assigns existing requirements to
-work; it does not author replacement behavioural specifications or expected
-results. Keep conditions, exceptions and component ownership with the original
-source. Internal implementation decisions remain the campaign's responsibility.
+Read the protected obligation inventory, original contracts and acceptance
+inputs within their supplied reading and ownership boundaries. Original sources
+and their declared precedence govern meaning. The inventory identifies selected
+obligations, dependency owners, context-only material, supplied tests and tests
+the builder must add. A genuine contradiction or ambiguity in authoritative
+inputs requires an external decision; generated planning errors are yours to fix.
 
-During Propose, create only this change's proposal, design and tasks using
-schema `opsx-supplied-contracts`. Decide slice identities, observable outcomes,
-ordering and prerequisites. Put one compact source-to-slice coverage map in the
-proposal, including the terminal gate and direct links to original requirements
-and supplied scenarios. Use design for decomposition rationale and unresolved
-risks, and tasks for authoring and checking the agenda. Reference the map from
-dependent artifacts instead of reproducing it. Do not draft the complete slice
-documents, detailed acceptance criteria or test lists inside these artifacts;
-Apply owns that detail. Do not create spec deltas or the agenda files yet.
+During Propose, create proposal, design and tasks with the bundled
+`opsx-supplied-contracts` schema, plus `assignments.json` in this bootstrap change.
+The runner supplies its JSON format. Assign every non-context obligation and
+every acceptance obligation, with one accountable slice and any contributions.
+Dependency assignments mean consuming the named owner's contract, not building
+that owner's implementation. Make cross-cutting contributions explicit.
+Prerequisites must be executable in numeric slice order.
+Every link in `## Supplied requirements` must target a declared supplied input
+directly; generated records, proposals and coverage views belong under Planning
+references. The renderer creates the agenda's source-reference sections.
 
-During Apply, use the chosen decomposition and original sources to write the
-agenda under `automation/slices/`, developing acceptance criteria and required
-tests here. Preserve sound decomposition decisions; reopen them only when a
-concrete contradiction, coverage gap or unworkable dependency requires
-correction. Keep the proposal map and design at decision level rather than
-copying the finished agenda back into them.
+Use proposal for purpose and direct original-source references, design for
+decomposition decisions and risks, and tasks for materializing and checking the
+agenda. Reference the assignment record under Planning references; do not copy
+its coverage map into those documents. Do not create agenda files during Propose.
 
-The completed agenda must satisfy:
+During Apply, move the assignment to `automation/slices/assignments.json` and
+write the slice briefs there, plus `9999-project-acceptance.md`. Each slice has
+a level-one title and Objective, Prerequisites, Supplied requirements,
+Acceptance Criteria and Required Tests level-two headings. Delivery filenames
+start with a four-digit ordinal and use a kebab-case slug. The terminal also has
+Project Goal Coverage. Choose a few coherent delivery slices, keeping internal
+steps as tasks. A small component may need one delivery slice and acceptance.
 
-- A README lists slices in order and maps every material in-scope requirement
-  to delivery slices and the terminal gate, using links to original inputs.
-- At least one delivery slice precedes `9999-project-acceptance.md`.
-- Each slice uses `<four-digit ordinal>-<kebab-case slug>.md` and starts with
-  a level-one title. Include `## Objective`, `## Prerequisites`,
-  `## Supplied requirements`, `## Acceptance Criteria`, and `## Required Tests`.
-- `## Supplied requirements` in each slice and the README contains Markdown
-  links to declared original contracts, with heading anchors or exact IDs where
-  available. Paths are relative to that document or absolute. Beside each link
-  identify the work/slices that cover it; do not restate the requirement.
-- Every link in that section must target a declared supplied input directly.
-  Do not cite the bootstrap proposal, another slice, or the generated README
-  as a requirement source. Put planning/navigation links under a separate
-  level-two heading such as `## Planning references`, while retaining direct
-  source links for every requirement being assigned.
-- Acceptance criteria reference supplied expectations and scenarios. Required
-  tests reference those scenarios and describe implementation-specific checks
-  without replacing their expected outcomes. Link supplied acceptance files.
-- Each slice delivers coherent, testable owned work, lists its prerequisites,
-  and leaves the repository buildable. Several implementation steps can be
-  tasks within one slice; do not subdivide indefinitely.
-- Prove uncertain dependencies with a small end-to-end use before building
-  later slices on them; record a fallback in the implementation design.
-- The terminal `9999` slice also contains `## Project Goal Coverage` and covers
-  all supplied in-scope requirements, including integration and required checks.
-  It cannot define different acceptance expectations.
+Describe objective, owned scope, completion boundary and acceptance route by
+reference. Assign complete source conditions and exceptions without translating
+them into another behavioural checklist. Split obligations explicitly where
+needed. A source link does not excuse lost scope or unassigned required tests.
+Leave detailed algorithms and test mechanisms to implementation, except for
+source-mandated mechanisms and decisions necessary to establish decomposition.
+Assign an early dependency proof if uncertainty affects later ordering.
 
-Apply and Repair leave the bootstrap change active. Do not archive it or create
-completion commits in either stage; the runner invokes Archive and completion
-commit only after successful verification.
+Run `opsx-build render-agenda` after authoring or repairing the assignment. It
+generates the README coverage view, slice source references and prerequisites,
+and terminal checks from the record and the runner's pinned commands. Do not
+hand-copy commands or repeat case counts. Keep author-written completion and
+test-route prose concise. Remove contradictory optional recipes rather than
+replacing them with more prescriptions. Product code and protected inputs stay
+unchanged. Leave the change active; the runner owns Archive and milestone commits.
 
-Use the existing Verify pass to check agenda structure, ownership, source
-references, conditions, exceptions and complete goal coverage. Return RETRY for
-correctable derived-plan mistakes. Repair bootstrap artifacts and agenda
-together; never change supplied contracts or acceptance expectations. Use
-BLOCKED only for authoritative-input gaps requiring an external decision.
+Verify must independently read the sources and review actual assignment
+consequences. Reject omitted obligations, incorrect scope splits, ownership
+transfers, invented or inverted conditions, unworkable dependencies and weakened
+acceptance. Each blocker identifies source, defective assignment or prescription,
+and consequence. Complete assignment by reference requires no repeated prose
+condition; missing repetition alone is not missing scope. Harmless descriptive
+counts are observations when complete scope and acceptance remain assigned.
+Structural and source-reference checks remain mandatory. Verify reads and checks;
+it never renders or repairs. Real delivery tests and independent final acceptance
+remain required; a correct agenda does not establish implementation correctness.
 
-During the runner's Archive stage, archive proposal, design and tasks without
-specification synchronization.
+Archive proposal, design and tasks without synchronizing specifications.

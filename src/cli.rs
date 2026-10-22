@@ -56,6 +56,7 @@ pub struct Cli {
     pub bootstrap_defines: BTreeMap<String, String>,
     pub supplied_contracts: bool,
     pub contract_files: Vec<PathBuf>,
+    pub obligation_inventory: Option<PathBuf>,
     pub acceptance_files: Vec<PathBuf>,
     pub acceptance_commands: Vec<String>,
     pub acceptance_timeout_seconds: Option<u64>,
@@ -149,7 +150,10 @@ impl Cli {
             || args.test_connection.is_some()
             || args.forget
             || args.update_skills
-            || args.request.as_deref() == Some("rewind")
+            || args
+                .request
+                .as_deref()
+                .is_some_and(|v| matches!(v, "rewind" | "render-agenda" | "check-agenda"))
         {
             None
         } else {
@@ -287,6 +291,22 @@ impl Cli {
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
+        if matches!(cli.request.as_str(), "render-agenda" | "check-agenda") {
+            if cli.resume
+                || cli.interactive
+                || cli.forget
+                || cli.continue_existing
+                || cli.change.is_some()
+                || cli.direction.is_some()
+                || cli.execute
+                || cli.loop_workflow
+            {
+                anyhow::bail!(
+                    "agenda authoring/checking cannot be combined with a campaign action"
+                );
+            }
+            return Ok(cli);
+        }
         if matches!(cli.request.as_str(), "configure" | "autoconfigure") {
             if cli.rewind_target.is_some()
                 || cli.yes
@@ -456,6 +476,10 @@ pub(crate) struct CliArgs {
     /// Maintainer-owned acceptance file to protect; does not run it (repeatable).
     #[arg(long, value_name = "PATH")]
     acceptance_file: Vec<PathBuf>,
+
+    /// Maintainer-owned obligation inventory for supplied-contract assignments (protected automatically).
+    #[arg(long, value_name = "PATH", overrides_with = "obligation_inventory")]
+    obligation_inventory: Option<PathBuf>,
 
     /// Maintainer acceptance command run via /bin/sh -c from the campaign root (repeatable).
     #[arg(long, value_name = "COMMAND", overrides_with = "no_acceptance_checks")]
@@ -1130,6 +1154,9 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         bootstrap_defines,
         supplied_contracts: args.supplied_contracts && !args.no_supplied_contracts,
         contract_files: args.contract,
+        obligation_inventory: args
+            .obligation_inventory
+            .filter(|_| !args.no_supplied_contracts),
         acceptance_files: args.acceptance_file,
         acceptance_commands: args.acceptance_command,
         acceptance_timeout_seconds: args.acceptance_timeout_seconds,
@@ -1511,6 +1538,9 @@ pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
     for (name, value) in &cli.bootstrap_defines {
         args.push(format!("--define={name}={value}"));
     }
+    if let Some(path) = &cli.obligation_inventory {
+        args.push(format!("--obligation-inventory={}", path.display()));
+    }
     for (name, files) in [
         ("contract", &cli.contract_files),
         ("acceptance-file", &cli.acceptance_files),
@@ -1616,6 +1646,9 @@ fn configure_inputs(
 }
 
 fn validate_acceptance_options(cli: &Cli) -> Result<()> {
+    if cli.obligation_inventory.is_some() && !cli.supplied_contracts && !cli.resume {
+        anyhow::bail!("--obligation-inventory requires --supplied-contracts");
+    }
     if !cli.acceptance_commands.is_empty() && !cli.supplied_contracts && !cli.resume {
         anyhow::bail!("--acceptance-command requires --supplied-contracts");
     }
@@ -1655,10 +1688,11 @@ pub(crate) fn resolve_configured_settings(
                 "supplied-contract campaigns currently require an in-repository OpenSpec project"
             );
         }
-        crate::contracts::SuppliedContracts::capture(
+        crate::contracts::SuppliedContracts::capture_with_inventory(
             repo,
             &cli.contract_files,
             &cli.acceptance_files,
+            cli.obligation_inventory.as_deref(),
         )?;
     }
     // Validate launcher syntax without requiring campaign credentials to be
@@ -2153,6 +2187,41 @@ mod tests {
         assert!(load(&[]).is_err());
         assert!(load(&["--forget"]).is_ok());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn obligation_inventory_round_trips_and_standard_mode_clears_it() {
+        let cli = Cli::resolve(args([
+            "opsx-build",
+            "--supplied-contracts",
+            "--contract=contract.md",
+            "--obligation-inventory=obligations.json",
+            "bootstrap",
+        ]))
+        .unwrap();
+        let snapshot = settings_snapshot(&cli);
+        assert!(snapshot.contains(&"--obligation-inventory=obligations.json".to_owned()));
+        let changed =
+            merge_settings(&snapshot, &["--obligation-inventory=other.json".to_owned()]).unwrap();
+        assert!(changed.contains(&"--obligation-inventory=other.json".to_owned()));
+        assert!(!changed.contains(&"--obligation-inventory=obligations.json".to_owned()));
+        let ordinary = merge_settings(&snapshot, &["--no-supplied-contracts".to_owned()]).unwrap();
+        let cli = Cli::resolve(args(
+            std::iter::once("opsx-build".to_owned())
+                .chain(ordinary)
+                .chain(["configure".to_owned()]),
+        ))
+        .unwrap();
+        assert!(!cli.supplied_contracts);
+        assert!(cli.obligation_inventory.is_none());
+        assert!(
+            Cli::resolve(args([
+                "opsx-build",
+                "--obligation-inventory=obligations.json",
+                "bootstrap"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

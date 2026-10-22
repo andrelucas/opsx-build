@@ -64,10 +64,13 @@ use crate::{
 
 const BOOTSTRAP_PROPOSAL_CONTEXT: &str = "This is the one-time planning-only bootstrap change. Its purpose is to decompose the complete project goal into bounded implementation slices; do not implement product code and do not report TOO_LARGE merely because the overall project spans many slices. Use the exact assigned change name and create only this one OpenSpec change. During this Propose stage, create or update only that change's normal OpenSpec artifacts. Do not create or modify `automation/slices/README.md` or any implementation slice under `automation/slices/`; the subsequent Apply stage exclusively owns those deliverables. Decide slice identities, observable outcomes, ordering and prerequisites. Put one compact requirement-to-slice coverage map in the proposal, including the terminal gate; supplied-contract runs retain direct source references. Use design for decomposition rationale and unresolved risks, and tasks for authoring and checking the agenda. Reference the map from dependent artifacts instead of reproducing it. Do not draft complete future slice documents or duplicate per-slice acceptance and test catalogues inside the bootstrap artifacts. Retain all schema-required artifacts and acceptance scenarios. In ordinary mode, develop the observable requirements, completion boundary and material assumptions from the brief; do not assume prewritten contracts or acceptance tests. Apply develops the detailed agenda from these decisions and original inputs. Later implementation slices retain their normal Propose and Apply responsibilities.";
 const BOOTSTRAP_APPLY_CONTEXT: &str = "Apply this planning-only bootstrap change completely. Use the chosen decomposition and original inputs to write the ordered implementation agenda and README required by `automation/bootstrap.md`, conforming to the supplied context in `openspec/config.yaml` and its declared required inputs. Develop the slices' acceptance criteria and required tests here. Preserve sound decomposition decisions; reopen them only when a concrete contradiction, coverage gap or unworkable dependency requires correction. Keep the bootstrap proposal map and design at decision level rather than copying the finished agenda back into them. Do not implement product functionality and do not create OpenSpec changes for the planned implementation slices. Before reporting READY, inspect the completed agenda against every structural requirement in `automation/bootstrap.md` and correct any omission within this Apply stage. Check each slice's component ownership and trace its acceptance criteria to the governing source requirements, preserving conditions and exceptions. Correct contradictory bootstrap artifacts and agenda entries together. Do not archive the bootstrap change.";
+const ASSIGNMENT_PROPOSAL_CONTEXT: &str = "This is planning-only bootstrap under the protected obligation inventory. Create only this bootstrap change's proposal, design, tasks and draft assignments.json. Do not create automation/slices/ files or implement product code. Decide coherent delivery boundaries, accountable work, contributions, dependencies and acceptance routes using original sources. Reference the single assignment record rather than copying coverage maps. Keep design at decomposition level. Source-mandated mechanisms and decisions necessary for decomposition remain required; leave other implementation and test mechanisms to delivery.";
+const ASSIGNMENT_APPLY_CONTEXT: &str = "Materialize the planning-only assignment completely. Move the draft assignments.json to automation/slices/assignments.json and author concise delivery briefs plus 9999-project-acceptance.md. Each has a title, Objective, Prerequisites, Supplied requirements, Acceptance Criteria and Required Tests; 9999 also has Project Goal Coverage. Keep objectives, completion boundaries and acceptance routes grounded in full original source obligations and their ownership boundaries. Run opsx-build render-agenda, then opsx-build check-agenda before READY. Repair every structural omission now. Do not duplicate the complete map, hand-copy commands, expand prose into replacement behavioural specifications, or implement product code. Preserve sound decomposition; correct contradictions and scope gaps. Leave bootstrap active and uncommitted for Verify; the runner owns Archive and completion commit.";
+const ASSIGNMENT_VERIFY_CONTEXT: &str = "Independently verify the complete supplied-contract assignment against the protected inventory and original sources, including conditions and exceptions. Inspect assignments.json and run opsx-build check-agenda read-only. Mechanical completeness does not prove source meaning. Check correct ownership, full scoped allocation across accountable and contributing slices, required tests to be added, faithful acceptance routes, workable dependencies and the whole-project terminal gate. Reject omissions, ownership transfers, inverted conditions and weaker substitute acceptance even when all IDs and references exist. Every blocker must name the governing source, defective assignment or prescription and its consequence for implementation or verification. A full reference inherits complete source conditions; missing repetition in generated prose alone is not missing scope. A source link or test name alone does not prove faithful allocation or real acceptance coverage. Harmless descriptive count discrepancies are observations when the full obligation remains assigned. Structural/source checks remain mandatory. Do not design algorithms or test harnesses beyond what decomposition requires; report all concrete mistakes together as RETRY. Reserve BLOCKED for authoritative-input gaps. Do not render, repair, implement product code or run final acceptance commands during bootstrap review. A correct agenda does not certify implementation correctness.";
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
-const STATE_SCHEMA_VERSION: u32 = 5;
+const STATE_SCHEMA_VERSION: u32 = 6;
 const MAX_FRONTIER_REPLANS: u32 = 3;
 const BOOTSTRAP_STRUCTURAL_FINDING: &str = "The deterministic bootstrap agenda check failed:";
 
@@ -458,6 +461,23 @@ impl<U: Ui> App<U> {
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let product_repo = repository_root(&requested_repo, &self.ui)?;
+        if matches!(self.cli.request.as_str(), "render-agenda" | "check-agenda") {
+            let state = load_state(&product_repo, &self.ui)?;
+            let contracts = state
+                .contracts
+                .as_ref()
+                .context("agenda commands require a supplied-contract checkpoint")?;
+            contracts.check_inputs(&product_repo)?;
+            contracts.check_schema(&product_repo)?;
+            contracts.assignment_views(
+                &product_repo,
+                self.cli.request == "render-agenda" && !self.cli.dry_run,
+            )?;
+            contracts.check_agenda(&product_repo)?;
+            self.ui
+                .success("Assignment and generated agenda views are consistent");
+            return Ok(());
+        }
         if self.cli.request == "rewind" {
             self.ui.banner(&product_repo.display().to_string());
             return self.rewind(&product_repo);
@@ -904,6 +924,11 @@ impl<U: Ui> App<U> {
         worker_launcher: &AgentLauncher,
         frontier_launcher: &AgentLauncher,
     ) -> Result<()> {
+        if self.cli.supplied_contracts && self.cli.obligation_inventory.is_none() {
+            bail!(
+                "new supplied-contract bootstrap requires --obligation-inventory PATH; have the maintainer supply ownership and acceptance obligations. Existing checkpoints retain their recorded workflow on --resume"
+            );
+        }
         let contracts = self.capture_contracts(repo)?;
         let mut scaffold = BootstrapScaffold::plan(
             repo,
@@ -971,7 +996,7 @@ impl<U: Ui> App<U> {
         if state.contracts.is_some()
             && let Some(agenda) = state.agenda.as_mut()
         {
-            agenda.content = crate::bootstrap::instructions_for(self.cli.frontier_worker, true);
+            agenda.content = crate::bootstrap::assignment_instructions(self.cli.frontier_worker);
         }
         if self.cli.execute {
             state.campaign = Some(CampaignState {
@@ -1136,6 +1161,7 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         let mut state = load_state(repo, &self.ui)?;
         if let Some(contracts) = &state.contracts {
+            contracts.check_inventory_selection(repo, self.cli.obligation_inventory.as_deref())?;
             contracts.check_selection(
                 repo,
                 &self.cli.contract_files,
@@ -1155,7 +1181,10 @@ impl<U: Ui> App<U> {
             }
             self.ui
                 .info("Resuming the supplied-contract workflow with its recorded input versions");
-        } else if self.cli.supplied_contracts || !self.cli.acceptance_commands.is_empty() {
+        } else if self.cli.supplied_contracts
+            || !self.cli.acceptance_commands.is_empty()
+            || self.cli.obligation_inventory.is_some()
+        {
             bail!(
                 "cannot change an existing run to the supplied-contract workflow; start a new run"
             );
@@ -1216,6 +1245,7 @@ impl<U: Ui> App<U> {
             effective.supplied_contracts = state.contracts.is_some();
             if let Some(contracts) = &state.contracts {
                 (effective.contract_files, effective.acceptance_files) = contracts.paths();
+                effective.obligation_inventory = contracts.obligation_inventory.clone();
                 if let Some(gate) = &contracts.acceptance {
                     effective.acceptance_commands = gate.commands.clone();
                     effective.acceptance_timeout_seconds = Some(gate.timeout_seconds);
@@ -1286,6 +1316,9 @@ impl<U: Ui> App<U> {
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
                 contracts.check_schema(repo)?;
+                if has_assignments(&state) && !state.bootstrap && state.stage == Stage::Propose {
+                    contracts.check_agenda(repo)?;
+                }
             }
             if needs_terminal_review(&state) {
                 if state.local_only {
@@ -1607,6 +1640,7 @@ impl<U: Ui> App<U> {
             &state,
             &frontier_replan_prompt(&assignment, &outcome, self.cli.frontier_worker),
         );
+        let previous_assignment = recorded_assignment(repo, &state)?;
         let mut failure = None;
         for attempt in 0..2 {
             let prompt = match &failure {
@@ -1665,6 +1699,14 @@ impl<U: Ui> App<U> {
                 if let Some(contracts) = &state.contracts {
                     contracts.check_inputs(repo)?;
                     contracts.check_agenda(repo)?;
+                }
+                if let Some(previous) = &previous_assignment {
+                    let current: crate::assignment::Assignment =
+                        crate::assignment::read(&repo.join(crate::assignment::RECORD))?;
+                    current.check_recovery(
+                        previous,
+                        Some(assignment.path.strip_prefix("automation/slices/").unwrap()),
+                    )?;
                 }
                 Ok(assignment)
             }) {
@@ -1789,6 +1831,7 @@ impl<U: Ui> App<U> {
             ),
         );
         let mut postcondition_failure = None;
+        let previous_assignment = recorded_assignment(repo, &state)?;
 
         for attempt in 0..2 {
             let prompt = match &postcondition_failure {
@@ -1866,6 +1909,11 @@ impl<U: Ui> App<U> {
                     contracts.check_inputs(repo)?;
                     contracts.check_agenda(repo)?;
                 }
+                if let Some(previous) = &previous_assignment {
+                    let current: crate::assignment::Assignment =
+                        crate::assignment::read(&repo.join(crate::assignment::RECORD))?;
+                    current.check_recovery(previous, None)?;
+                }
                 Ok(assignment)
             });
             match postcondition {
@@ -1941,10 +1989,11 @@ impl<U: Ui> App<U> {
             return Ok(None);
         }
         self.ui.info("Implementing supplied contracts: source references, design and tasks; protected inputs recorded for this run");
-        let mut contracts = crate::contracts::SuppliedContracts::capture(
+        let mut contracts = crate::contracts::SuppliedContracts::capture_with_inventory(
             repo,
             &self.cli.contract_files,
             &self.cli.acceptance_files,
+            self.cli.obligation_inventory.as_deref(),
         )?;
         contracts.acceptance = crate::acceptance::AcceptanceGate::new(
             self.cli.acceptance_commands.clone(),
@@ -2315,7 +2364,11 @@ impl<U: Ui> App<U> {
         let mut session = planning_session(state, claude)?;
         persist_state(repo, state, &self.ui)?;
         let planning_context = if state.bootstrap {
-            BOOTSTRAP_PROPOSAL_CONTEXT
+            if has_assignments(state) {
+                ASSIGNMENT_PROPOSAL_CONTEXT
+            } else {
+                BOOTSTRAP_PROPOSAL_CONTEXT
+            }
         } else if is_terminal_gate(state) && state.contracts.is_some() {
             "Plan whole-project acceptance by mapping the supplied requirements and acceptance scenarios to integration and verification work. Preserve supplied expectations and create only proposal, design and tasks. Do not redefine requirements or report DONE while the terminal gate remains."
         } else if is_terminal_gate(state) && frontier_terminal {
@@ -2577,8 +2630,17 @@ impl<U: Ui> App<U> {
         let change = require_change(state)?;
         let base = if state.bootstrap {
             format!(
-                "{change}\n\n{BOOTSTRAP_APPLY_CONTEXT}\n\n{}",
-                worker_capacity_guidance(self.cli.frontier_worker)
+                "{change}\n\n{}\n\n{}",
+                if has_assignments(state) {
+                    ASSIGNMENT_APPLY_CONTEXT
+                } else {
+                    BOOTSTRAP_APPLY_CONTEXT
+                },
+                if has_assignments(state) {
+                    crate::bootstrap::assignment_worker_capacity(self.cli.frontier_worker)
+                } else {
+                    worker_capacity_guidance(self.cli.frontier_worker)
+                }
             )
         } else if frontier_terminal {
             format!(
@@ -2634,15 +2696,22 @@ impl<U: Ui> App<U> {
         if !self.check_bootstrap_for_verify(repo, state)? {
             return Ok(());
         }
+        if !self.check_assignment_for_verify(repo, state)? {
+            return Ok(());
+        }
         let verification_inputs =
             verification::capture(repo, state.product_repo.as_deref(), &self.ui);
-        let verify_subject = verification_subject(
-            &change,
-            state.bootstrap,
-            frontier_terminal,
-            self.cli.frontier_worker,
-            state.contracts.is_some(),
-        );
+        let verify_subject = if state.bootstrap && has_assignments(state) {
+            format!("{change}\n\n{ASSIGNMENT_VERIFY_CONTEXT}")
+        } else {
+            verification_subject(
+                &change,
+                state.bootstrap,
+                frontier_terminal,
+                self.cli.frontier_worker,
+                state.contracts.is_some(),
+            )
+        };
         let verify_subject = with_sidecar_context(state, &verify_subject);
         let verify_subject = format!(
             "{verify_subject}\n\nIn the final summary, record the checks actually run, their working directories, outcomes and any limitations concisely, so Archive and completion commit can reuse the evidence. Preserve the check process's own exit status when piping or summarizing output; a successful tail/echo command is not proof that the check passed. Keep this evidence in the summary; do not edit files just to record it."
@@ -2671,6 +2740,9 @@ impl<U: Ui> App<U> {
         match result.signal {
             StageSignal::Verified => {
                 if !self.check_bootstrap_for_verify(repo, state)? {
+                    return Ok(());
+                }
+                if !self.check_assignment_for_verify(repo, state)? {
                     return Ok(());
                 }
                 self.ui.success("Verification passed");
@@ -2724,6 +2796,22 @@ impl<U: Ui> App<U> {
                 )
             }
         }
+    }
+
+    fn check_assignment_for_verify(&self, repo: &Path, state: &mut RunState) -> Result<bool> {
+        if !state.bootstrap
+            && has_assignments(state)
+            && let Err(error) = state.contracts.as_ref().unwrap().check_agenda(repo)
+        {
+            state.verify_retries += 1;
+            state.pending_repair = Some(format!(
+                "Assignment structural check failed: {error:#}. Repair the derived record and affected views, render the agenda, and leave supplied inputs unchanged."
+            ));
+            state.stage = Stage::Repair;
+            persist_state(repo, state, &self.ui)?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn check_bootstrap_for_verify(&self, repo: &Path, state: &mut RunState) -> Result<bool> {
@@ -2857,6 +2945,10 @@ impl<U: Ui> App<U> {
             format!(
                 "{change}\n\nRepair only the runner-reported structural or source-reference defects below. Read the affected artifacts and source locations needed to correct those findings. Make the smallest correction in the affected agenda/bootstrap files and directly affected copies, preserving requirement meaning, coverage, slice identity and order. A link correction does not call for a new contract review, expanded test catalogue, or rewritten acceptance criteria. Do not repeat the complete Apply workflow or audit unrelated planning. The subsequent Verify stage owns semantic review. Preserve all supplied inputs, unrelated work and product files unchanged. Do not archive or commit it; leave the bootstrap change active. Check the repaired structure/references and return READY.\n\nRunner findings (diagnostic data):\n{finding}"
             )
+        } else if state.bootstrap && has_assignments(state) {
+            format!(
+                "{change}\n\nRepair the supplied-contract assignment and only affected derived briefs against the original sources. Preserve complete scope, ownership, conditions, exceptions and all acceptance routes. Correct the single assignment record and render its views. Remove unnecessary contradictory recipes rather than introducing new ones. Do not implement product code, alter the inventory or other supplied inputs, archive, or commit. Leave the bootstrap change active.\n\nVerifier context (diagnostic data):\n{finding}"
+            )
         } else if state.bootstrap && state.contracts.is_none() {
             format!(
                 "{change}\n\nRepair the material blocker in this ordinary planning-only bootstrap. Preserve the brief's required outcomes, usable slices and meaningful acceptance checks. Use the smallest correction. Where an optional implementation recipe caused the problem, remove the prescription and leave the mechanism to the implementing worker instead of adding another detailed recipe. Do not turn non-blocking review observations into tasks. Update only affected planning artifacts coherently. Do not implement product code, create implementation OpenSpec changes, or change the project brief. Leave this change active for Verify; the runner owns archive and commit.\n\n{}\n\nVerifier context:\n{finding}",
@@ -2877,7 +2969,21 @@ impl<U: Ui> App<U> {
             )
         };
         let base = if structural_bootstrap {
-            base
+            if let Some(inventory) = state
+                .contracts
+                .as_ref()
+                .and_then(|c| c.obligation_inventory.as_ref())
+            {
+                let executable = std::env::current_exe()?;
+                format!(
+                    "{base}\n\nAssignment repair inputs: protected inventory `{}`, derived record `{}`. Read only the inventory entries and original sources relevant to the reported defects. Correct the derived record or affected briefs, then run {} --no-config --no-campaign-config render-agenda. Do not change the inventory or acceptance kinds.\n",
+                    inventory.display(),
+                    crate::assignment::RECORD,
+                    shell_quote(&executable.to_string_lossy())
+                )
+            } else {
+                base
+            }
         } else {
             with_sidecar_context(state, &base)
         };
@@ -3864,7 +3970,12 @@ fn campaign_subject_without_contracts(state: &RunState, frontier_worker: bool) -
     if state.bootstrap {
         return format!(
             "Bootstrap this repository by carrying out the exact planning assignment below. Create or continue only the OpenSpec change `{BOOTSTRAP_CHANGE}`. This change decomposes the complete project goal into a durable agenda for later worker-model runs; it does not implement product functionality. Read the supplied context in `openspec/config.yaml` and its declared required inputs before planning, within their stated reading boundaries. Do not survey the product source tree.\n\nAssigned bootstrap file: `{BOOTSTRAP_PATH}`\n\n--- BEGIN BOOTSTRAP ASSIGNMENT ---\n{}\n--- END BOOTSTRAP ASSIGNMENT ---",
-            crate::bootstrap::instructions_for(frontier_worker, state.contracts.is_some()).trim()
+            if has_assignments(state) {
+                crate::bootstrap::assignment_instructions(frontier_worker)
+            } else {
+                crate::bootstrap::instructions_for(frontier_worker, state.contracts.is_some())
+            }
+            .trim()
         );
     }
     if let Some(assignment) = &state.agenda {
@@ -3916,6 +4027,26 @@ fn with_contract_context(state: &RunState, subject: &str) -> String {
     match &state.contracts {
         Some(contracts) => format!("{subject}{}", contracts.guidance()),
         None => subject.to_owned(),
+    }
+}
+
+fn has_assignments(state: &RunState) -> bool {
+    state
+        .contracts
+        .as_ref()
+        .is_some_and(|c| c.obligation_inventory.is_some())
+}
+
+fn recorded_assignment(
+    repo: &Path,
+    state: &RunState,
+) -> Result<Option<crate::assignment::Assignment>> {
+    if has_assignments(state) {
+        Ok(Some(crate::assignment::read(
+            &repo.join(crate::assignment::RECORD),
+        )?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -4260,6 +4391,11 @@ fn load_state_file(path: &Path) -> Result<RunState> {
         .unwrap_or(0) as u32;
     match schema {
         STATE_SCHEMA_VERSION => serde_json::from_value(value).context("invalid current checkpoint"),
+        5 => {
+            let mut value = value;
+            value["schema_version"] = Value::from(STATE_SCHEMA_VERSION);
+            serde_json::from_value(value).context("invalid version 5 checkpoint")
+        }
         4 => migrate_v4(value),
         3 => migrate_v3(value),
         2 => migrate_v2(value),

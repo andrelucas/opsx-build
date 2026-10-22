@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA: &str = "opsx-supplied-contracts";
 const SOURCE_REFERENCE_GUIDANCE: &str = "Every Markdown link inside `## Supplied requirements` must point directly to a declared supplied input. Generated proposals (including archived proposals), agenda READMEs, coverage tables and other slices are planning artifacts, not supplied inputs. Keep navigation or planning-evidence links under a separate level-two heading such as `## Planning references`. Replace indirect requirement references with links to the original declared files; moving a link must not remove its requirements from coverage. Do not add generated artifacts to the protected-input list or edit supplied inputs to satisfy this check. Correct all reported references together.";
-pub(crate) const CONFIGURE_GUIDANCE: &str = "\n\nWorkflow choice: read the campaign context file (the selected --context, otherwise context.md if present) and its declared relevant inputs. When these supply precise existing behavioural contracts and component ownership, suggest --supplied-contracts and explain that it plans implementation through original source references, design and tasks without generating replacement specifications. For exploratory work that still develops requirements, suggest the ordinary workflow. Let the user accept the suggestion in the configuration conversation; never silently switch an existing choice. Record the agreed workflow, repeatable --contract PATH arguments naming the exact authoritative files, and optional --acceptance-file PATH arguments naming maintainer-owned checks/fixtures to preserve. Paths are relative to the campaign root; files must already exist, and directories/globs are not supported. Identify supplied acceptance expectations separately from tests the campaign should implement. Acceptance files are protected inputs; listing them does not execute checks. If input completeness or ownership is unclear, explain that uncertainty rather than assuming it. The actual runner uses only the recorded selection and never infers its workflow from context at launch. Disabling this option for a new run does not change the workflow recorded by an existing resumable run.";
+pub(crate) const CONFIGURE_GUIDANCE: &str = "\n\nWorkflow choice: read the campaign context file (the selected --context, otherwise context.md if present) and its declared relevant inputs. When these supply precise existing behavioural contracts and component ownership, suggest --supplied-contracts and explain that it plans implementation through original source references, design and tasks without generating replacement specifications. For exploratory work that still develops requirements, suggest the ordinary workflow. Let the user accept the suggestion in the configuration conversation; never silently switch an existing choice. Record the agreed workflow, repeatable --contract PATH arguments naming the exact authoritative files, and optional --acceptance-file PATH arguments naming maintainer-owned checks/fixtures to preserve. Paths are relative to the campaign root; files must already exist, and directories/globs are not supported. Identify supplied acceptance expectations separately from tests the campaign should implement. Acceptance files are protected inputs; listing them does not execute checks. If input completeness or ownership is unclear, explain that uncertainty rather than assuming it. The actual runner uses only the recorded selection and never infers its workflow from context at launch. For new supplied-contract bootstrap/execute runs, also record --obligation-inventory PATH: an existing maintainer-owned version-1 JSON inventory of owned obligations, dependency owners, context and acceptance obligations (including builder-required tests). The inventory is protected automatically; never generate or rewrite it during configure/autoconfigure. Missing or ambiguous authoritative ownership needs a maintainer decision. The inventory format is documented in docs/supplied-assignments.md in opsx-build. Standalone supplied-contract changes need no agenda inventory. Disabling this option for a new run does not change the workflow recorded by an existing resumable run.";
 const ASSETS: &[(&str, &str)] = &[
     (
         "schema.yaml",
@@ -44,6 +44,9 @@ struct Input {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SuppliedContracts {
     inputs: Vec<Input>,
+    /// Absent in legacy checkpoints. Never inferred or added while resuming.
+    #[serde(default)]
+    pub obligation_inventory: Option<PathBuf>,
     #[serde(default)]
     pub acceptance: Option<crate::acceptance::AcceptanceGate>,
 }
@@ -102,8 +105,87 @@ impl SuppliedContracts {
         }
         Ok(Self {
             inputs,
+            obligation_inventory: None,
             acceptance: None,
         })
+    }
+
+    pub fn capture_with_inventory(
+        repo: &Path,
+        contracts: &[PathBuf],
+        acceptance: &[PathBuf],
+        inventory: Option<&Path>,
+    ) -> Result<Self> {
+        let mut paths = contracts.to_vec();
+        if let Some(path) = inventory {
+            let resolved = repo.join(path).canonicalize()?;
+            if !paths
+                .iter()
+                .any(|p| repo.join(p).canonicalize().ok().as_ref() == Some(&resolved))
+            {
+                paths.push(path.to_path_buf());
+            }
+        }
+        let mut selected = Self::capture(repo, &paths, acceptance)?;
+        // Read the captured target, even when the inventory was also declared
+        // through another alias. An unregistered alias must not change authority.
+        selected.obligation_inventory =
+            inventory.map(|p| repo.join(p).canonicalize()).transpose()?;
+        selected.inventory(repo)?;
+        Ok(selected)
+    }
+
+    pub fn check_inventory_selection(&self, repo: &Path, inventory: Option<&Path>) -> Result<()> {
+        if let Some(path) = inventory
+            && self
+                .obligation_inventory
+                .as_ref()
+                .map(|p| p.canonicalize())
+                .transpose()?
+                != Some(repo.join(path).canonicalize()?)
+        {
+            bail!(
+                "obligation inventory differs from the checkpoint; start a new run instead of migrating on resume"
+            );
+        }
+        Ok(())
+    }
+
+    fn inventory(&self, repo: &Path) -> Result<Option<crate::assignment::Inventory>> {
+        let Some(path) = &self.obligation_inventory else {
+            return Ok(None);
+        };
+        let inventory: crate::assignment::Inventory = crate::assignment::read(path)?;
+        let own_path = path.canonicalize()?;
+        inventory.validate(|source| {
+            let file = source.split('#').next().unwrap();
+            if repo.join(decode_link(file)?).canonicalize()? == own_path {
+                bail!("inventory entries must reference original inputs, not the obligation inventory itself");
+            }
+            self.check_reference(&repo.join("inventory-reference"), source)
+        })?;
+        Ok(Some(inventory))
+    }
+
+    pub fn assignment_views(&self, repo: &Path, render: bool) -> Result<()> {
+        self.check_inputs(repo)?;
+        let inventory = self.inventory(repo)?.context("this checkpoint uses the legacy workflow and has no obligation inventory; no migration is performed")?;
+        let assignment: crate::assignment::Assignment =
+            crate::assignment::read(&repo.join(crate::assignment::RECORD))?;
+        let views = assignment.views(repo, &inventory, self.acceptance.as_ref())?;
+        // Do not let a generated output replace any declared supplied input.
+        for (relative, _) in &views {
+            if repo
+                .join(relative)
+                .canonicalize()
+                .ok()
+                .is_some_and(|p| self.inputs.iter().any(|i| i.resolved == p))
+            {
+                bail!("generated view `{relative}` is a protected supplied input");
+            }
+        }
+        crate::assignment::update_views(repo, &views, render)?;
+        self.check_inputs(repo)
     }
 
     pub fn check_selection(
@@ -115,7 +197,12 @@ impl SuppliedContracts {
         if contracts.is_empty() && acceptance.is_empty() {
             return Ok(()); // A plain --resume uses the recorded inputs.
         }
-        let selected = Self::capture(repo, contracts, acceptance)?;
+        let selected = Self::capture_with_inventory(
+            repo,
+            contracts,
+            acceptance,
+            self.obligation_inventory.as_deref(),
+        )?;
         let paths = |value: &Self| {
             value
                 .inputs
@@ -172,6 +259,13 @@ impl SuppliedContracts {
         if let Some(gate) = &self.acceptance {
             text.push_str(&gate.guidance());
         }
+        if let Some(inventory) = &self.obligation_inventory {
+            if let Ok(executable) = std::env::current_exe() {
+                let command = crate::process::shell_quote(&executable.to_string_lossy());
+                text.push_str(&format!("\nUse the running runner version for agenda commands: {command} --no-config --no-campaign-config render-agenda (or check-agenda). A different installed binary may not support this workflow.\n"));
+            }
+            text.push_str(&format!("\n\nASSIGNMENT WORKFLOW v1\nThe protected maintainer-owned obligation inventory is `{}`. Its entries define selected ownership and acceptance obligations, subject to the original contracts and their precedence. Never edit it, invent an authoritative inventory, change an evidence kind, or infer ownership from shared context. Every complete source reference inherits its conditions and exceptions within the supplied boundary.\n\nThe derived work assignment is `{}`. During bootstrap Propose draft it at `{}`; do not create the agenda yet. Apply moves it to its durable path, authors concise slice briefs, and runs `opsx-build render-agenda`. Keep proposal/design/tasks at decomposition level and reference the assignment from a Planning references section; do not duplicate the complete coverage map.\n\nThe JSON format is {{\"version\":1,\"slices\":[{{\"path\":\"0001-delivery.md\",\"requires\":[]}}],\"obligations\":[{{\"id\":\"<inventory obligation ID>\",\"accountable\":\"0001-delivery.md\",\"contributors\":[]}}],\"acceptance\":[{{\"id\":\"<inventory acceptance ID>\",\"slices\":[\"0001-delivery.md\"],\"route\":\"How real assertions or required review establish this obligation\"}}]}}. Include all owned and dependency entries; context entries are not delivery assignments. An obligation may have contributions across slices, with one accountable slice. Include every acceptance entry; builder tests must be delivered before 9999. Every slice has assigned work. Prerequisites must refer to earlier slices; several internal steps can be tasks within one coherent slice. The terminal `9999-project-acceptance.md` is implicit and must exist on disk; do not put it in the slices array. Acceptance routes may include it. Do not introduce invented IDs.\n\n`render-agenda` is a deterministic authoring command: it generates the README, Supplied requirements and Prerequisites sections, and the terminal Required Tests and Project Goal Coverage sections from this record and the pinned runner commands. Author slice titles, Objective, Acceptance Criteria and delivery Required Tests as concise completion boundaries and acceptance routes. Leave implementation/test mechanisms to delivery, except source-mandated mechanisms and decisions necessary for decomposition. Rendering is required after bootstrap Apply/Repair, any affected agenda repair, subdivision and terminal remediation, before committing. In terminal remediation, retain all previous participants and add the remediation as a contribution or acceptance route; rendering must leave 9999 unchanged. Do not render during Verify; run `opsx-build check-agenda` to check the existing views read-only. The runner rejects stale or incomplete assignments.\n\nIndependent semantic review must still reject omitted scope, changed conditions, transferred ownership, impossible dependencies and weakened acceptance. Cite the governing source, defective assignment/prescription and concrete consequence for every blocker. Complete assignment by reference does not require repeated prose conditions; a citation or a test name alone does not prove a correct scope split or real acceptance coverage. Strict structural/source checks still apply. Input ambiguities require BLOCKED; generated mistakes require RETRY.\n", inventory.display(), crate::assignment::RECORD, crate::assignment::DRAFT));
+        }
         text
     }
 
@@ -219,7 +313,21 @@ impl SuppliedContracts {
                 "change `{change}` contains a specs directory; remove replacement specifications and reference supplied contracts in proposal/design/tasks"
             );
         }
-        self.check_references(&root.join("proposal.md"))
+        self.check_references(&root.join("proposal.md"))?;
+        if change == crate::bootstrap::BOOTSTRAP_CHANGE
+            && let Some(inventory) = self.inventory(repo)?
+        {
+            // Apply has already moved the draft when later stages revisit this boundary.
+            let draft = root.join("assignments.json");
+            let path = if draft.exists() {
+                draft
+            } else {
+                repo.join(crate::assignment::RECORD)
+            };
+            let assignment: crate::assignment::Assignment = crate::assignment::read(&path)?;
+            assignment.validate(&inventory)?;
+        }
+        Ok(())
     }
 
     pub fn check_agenda(&self, repo: &Path) -> Result<()> {
@@ -243,7 +351,25 @@ impl SuppliedContracts {
                 Err(error) => errors.push(format!("{error:#}")),
             }
         }
-        check_reference_errors(errors)
+        let references = check_reference_errors(errors);
+        if self.obligation_inventory.is_some() {
+            let assignment = if repo.join(crate::assignment::DRAFT).exists() {
+                Err(anyhow::anyhow!(
+                    "bootstrap draft assignments.json still exists; move it to the durable assignment instead of maintaining two records"
+                ))
+            } else {
+                self.assignment_views(repo, false)
+            };
+            if let Err(error) = assignment {
+                return match references {
+                    Ok(()) => Err(error.context("assignment structural check failed")),
+                    Err(references) => Err(anyhow::anyhow!(
+                        "{references:#}\n\nAssignment structural check: {error:#}"
+                    )),
+                };
+            }
+        }
+        references
     }
 
     pub fn check_references(&self, document: &Path) -> Result<()> {
@@ -462,6 +588,48 @@ fn has_fragment(text: &str, fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_uses_the_protected_target_when_also_declared_through_an_alias() {
+        let f = Fixture::new();
+        fs::write(
+            f.0.join("contract.md"),
+            include_str!("../tests/fixtures/assignment-workflow/contract.md"),
+        )
+        .unwrap();
+        fs::write(
+            f.0.join("inventory.json"),
+            include_str!("../tests/fixtures/assignment-workflow/inventory.json"),
+        )
+        .unwrap();
+        fs::write(
+            f.0.join("acceptance.sh"),
+            include_str!("../tests/fixtures/assignment-workflow/acceptance.sh"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("inventory.json", f.0.join("inventory-alias.json")).unwrap();
+        let contracts = SuppliedContracts::capture_with_inventory(
+            &f.0,
+            &["contract.md".into(), "inventory.json".into()],
+            &["acceptance.sh".into()],
+            Some(Path::new("inventory-alias.json")),
+        )
+        .unwrap();
+        fs::write(f.0.join("other.json"), "{}\n").unwrap();
+        fs::remove_file(f.0.join("inventory-alias.json")).unwrap();
+        std::os::unix::fs::symlink("other.json", f.0.join("inventory-alias.json")).unwrap();
+        contracts.check_inputs(&f.0).unwrap();
+        assert_eq!(
+            contracts.inventory(&f.0).unwrap().unwrap().component,
+            "example"
+        );
+        assert!(
+            contracts
+                .check_inventory_selection(&f.0, Some(Path::new("inventory-alias.json")))
+                .is_err()
+        );
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

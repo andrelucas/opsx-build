@@ -164,15 +164,29 @@ pub fn instructions(frontier_worker: bool) -> String {
 }
 
 pub fn instructions_for(frontier_worker: bool, supplied_contracts: bool) -> String {
-    let instructions = if supplied_contracts {
-        include_str!("../assets/supplied-contracts/bootstrap.md")
-    } else {
-        BOOTSTRAP_INSTRUCTIONS
-    };
+    if supplied_contracts {
+        return assignment_instructions(frontier_worker);
+    }
+    let instructions = BOOTSTRAP_INSTRUCTIONS;
     crate::authority::render(instructions).replace(
         WORKER_CAPACITY_PLACEHOLDER,
         worker_capacity_guidance(frontier_worker),
     )
+}
+
+pub fn assignment_instructions(frontier_worker: bool) -> String {
+    crate::authority::render(include_str!("../assets/supplied-contracts/bootstrap.md")).replace(
+        WORKER_CAPACITY_PLACEHOLDER,
+        assignment_worker_capacity(frontier_worker),
+    )
+}
+
+pub fn assignment_worker_capacity(frontier_worker: bool) -> &'static str {
+    if frontier_worker {
+        "Implementation worker capacity: the worker is frontier-capable (--frontier-worker). Choose the fewest coherent, testable delivery slices that fit this capability. Give durable source references and acceptance routes; multiple internal steps do not justify separate slices."
+    } else {
+        "Implementation worker capacity: assume a smaller local coding model, substantially less capable than the frontier planner. Choose coherent, testable delivery slices it can complete in one OpenSpec cycle, with focused scope, durable source references and acceptance routes. Keep internal implementation steps as tasks where practical."
+    }
 }
 
 pub fn worker_capacity_guidance(frontier_worker: bool) -> &'static str {
@@ -411,9 +425,8 @@ mod tests {
 
             let contracts = instructions_for(frontier_worker, true);
             assert!(contracts.contains("## Supplied requirements"));
-            assert!(contracts.contains(
-                "Every link in that section must target a declared supplied input directly"
-            ));
+            assert!(contracts.contains("must target a declared supplied input"));
+            assert!(contracts.contains("assignments.json"));
             assert!(!contracts.contains("Keep this ordinary context bootstrap proportionate"));
         }
     }
@@ -505,11 +518,13 @@ mod tests {
         assert!(BOOTSTRAP_INSTRUCTIONS.contains("normal Apply to implement and test them"));
         for supplied_contracts in [false, true] {
             let instructions = instructions_for(true, supplied_contracts);
-            assert!(
-                instructions.contains("Reference the map from")
-                    || instructions.contains("Reference that map from")
-            );
-            assert!(instructions.contains("copying the finished agenda back"));
+            if supplied_contracts {
+                assert!(instructions.contains("Reference the assignment record"));
+                assert!(instructions.contains("do not copy\nits coverage map"));
+            } else {
+                assert!(instructions.contains("Reference that map from"));
+                assert!(instructions.contains("copying the finished agenda back"));
+            }
             assert!(instructions.contains("coverage map"));
             assert!(instructions.contains("Required Tests"));
             assert!(instructions.contains("9999-project-acceptance.md"));

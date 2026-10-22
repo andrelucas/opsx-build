@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slices": [{"path": "0001-delivery.md", "requires": []}],
+  "obligations": [
+    {"id": "OWN-01", "accountable": "0001-delivery.md", "contributors": []},
+    {"id": "OWN-02", "accountable": "0001-delivery.md", "contributors": []},
+    {"id": "DEP-01", "accountable": "0001-delivery.md", "contributors": []}
+  ],
+  "acceptance": [
+    {"id": "SUPPLIED-01", "slices": ["9999-project-acceptance.md"], "route": "Run the pinned protected executable check at whole-component acceptance."},
+    {"id": "BUILDER-01", "slices": ["0001-delivery.md"], "route": "Implement and run assertions for the complete builder observations using controlled public dependencies."}
+  ]
+}

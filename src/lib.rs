@@ -1,6 +1,7 @@
 mod acceptance;
 pub mod agenda;
 pub mod app;
+mod assignment;
 mod authority;
 pub mod backend;
 pub mod bootstrap;

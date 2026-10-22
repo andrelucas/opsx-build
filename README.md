@@ -163,6 +163,7 @@ the optional supplied-contract workflow:
 opsx-build execute --supplied-contracts \
   --contract context.md \
   --contract contracts/component.md \
+  --obligation-inventory obligations.json \
   --acceptance-file acceptance/scenarios.md \
   --acceptance-file acceptance/check.sh \
   --acceptance-command 'sh acceptance/check.sh'
@@ -184,6 +185,14 @@ decisions; tasks describe coherent, testable steps. Bootstrap assigns those same
 source requirements to slices and a coverage index. Acceptance criteria refer
 to supplied expectations instead of rewriting them. Apply and Verify read the
 governing original sources, and Archive has no spec synchronization to perform.
+
+New supplied-contract `bootstrap`/`execute` runs also require a protected
+maintainer-owned `--obligation-inventory PATH`. Bootstrap assigns those IDs to
+work in one durable `automation/slices/assignments.json` record. The runner
+generates coverage views, source-reference sections, prerequisites and exact
+terminal-command listings; incomplete assignments and stale views fail before
+semantic review. Standard mode remains unchanged. See the
+[assignment format and Sirocco preparation instructions](docs/supplied-assignments.md).
 
 Each proposal, slice and agenda README contains a `## Supplied requirements`
 section with Markdown links to declared source files and the work that covers

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "component": "example",
+  "obligations": [
+    {"id": "OWN-01", "source": "contract.md#OWN-01", "role": "owned"},
+    {"id": "OWN-02", "source": "contract.md#OWN-02", "role": "owned"},
+    {"id": "DEP-01", "source": "contract.md#DEP-01", "role": "dependency", "owner": "clock-provider", "scope": "Consume qualification; do not implement its policy."},
+    {"id": "CONTEXT-01", "source": "contract.md#CONTEXT-01", "role": "context"}
+  ],
+  "acceptance": [
+    {"id": "SUPPLIED-01", "source": "acceptance.sh", "kind": "supplied-test", "obligations": ["OWN-01", "OWN-02"]},
+    {"id": "BUILDER-01", "source": "contract.md#TEST-01", "kind": "builder-test", "obligations": ["OWN-01", "OWN-02", "DEP-01"]}
+  ]
+}
