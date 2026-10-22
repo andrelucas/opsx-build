@@ -308,6 +308,22 @@ The checkpoint remembers that this is a frontier bootstrap; resume will not
 silently move it onto the local worker. Use `--dry-run` to inspect the planned
 initialization and generated paths without writing or invoking Claude.
 
+Bootstrap Verify and Repair both use the frontier connection. If bootstrap
+exhausts `--max-verify-retries` (default 3), the runner preserves the plan,
+latest findings and repair count. Raise the total allowance to continue the
+pending Repair, followed by Verify:
+
+```sh
+opsx-build --resume --max-verify-retries 10
+```
+
+Resuming does not reset the count or repeat completed planning. Older bootstrap
+checkpoints incorrectly marked as a local-worker subdivision after exhausting
+this allowance are recovered automatically; genuine capacity escalations are
+retained. Structural checks also preserve their pending repair number across
+resume attempts, and manually corrected structural findings can proceed to
+verification without another model repair.
+
 This first version intentionally does not merge into an existing OpenSpec
 configuration or replace an existing agenda. It stops before initialization if
 either already exists. The selected OpenSpec profile must expose Propose,

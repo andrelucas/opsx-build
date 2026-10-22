@@ -226,6 +226,59 @@ printf '{"type":"result","subtype":"success","session_id":"fixture-session","res
             })
             .collect()
     }
+
+    fn bootstrap_review(&self) {
+        self.run("repair", false);
+        let mut state = self.state();
+        state["stage"] = "verify".into();
+        state["bootstrap"] = true.into();
+        state["change"] = "bootstrap-implementation-slices".into();
+        state["agenda"] = serde_json::Value::Null;
+        state["pending_repair"] = serde_json::Value::Null;
+        state["verify_retries"] = 0.into();
+        self.save_state(&state);
+        let active = self
+            .root
+            .join("repo/openspec/changes/bootstrap-implementation-slices");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("proposal.md"), "Bootstrap planning").unwrap();
+        let agenda = self.root.join("repo/automation/slices");
+        let source = "## Supplied requirements\n- [REQ-01](../../contract.md#REQ-01)\n";
+        let slice = format!(
+            "# Slice\n## Objective\nImplement.\n## Prerequisites\nNone.\n## Acceptance Criteria\nRequired behaviour.\n## Required Tests\nConformance checks.\n{source}"
+        );
+        fs::write(agenda.join("README.md"), source).unwrap();
+        fs::write(agenda.join("0001-delivery.md"), &slice).unwrap();
+        fs::write(
+            agenda.join("9999-project-acceptance.md"),
+            format!("{slice}\n## Project Goal Coverage\nAll requirements.\n"),
+        )
+        .unwrap();
+        fs::write(self.root.join("repo/unrelated.txt"), "Keep user work\n").unwrap();
+        fs::write(self.root.join("calls"), "").unwrap();
+        fs::write(self.root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"
+status=BLOCKED
+summary='Fixture pauses at bootstrap Archive'
+case "$* $prompt" in
+ *'Verifier context:'*)
+  status=READY; summary='Repaired saved bootstrap finding'
+  touch "$CONTRACT_TEST_ROOT/repaired";;
+ *'In the final summary, record the checks actually run'*)
+  status=RETRY; summary='REQ-01: correct the generated acceptance criterion'
+  if [ -f "$CONTRACT_TEST_ROOT/repaired" ]; then status=VERIFIED; summary='Agenda covers the supplied requirements'; fi;;
+esac
+printf '{"type":"result","subtype":"success","session_id":"fixture-session","result":"%s","structured_output":{"opsx_status":"%s","summary":"%s"}}\n' "$summary" "$status" "$summary"
+"#).unwrap();
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -769,4 +822,136 @@ fn bootstrap_reference_preflight_repairs_before_model_verify_and_preserves_exhau
             }
         }
     }
+}
+
+#[test]
+fn bootstrap_repair_limit_resumes_saved_findings_on_the_frontier() {
+    for legacy in [false, true] {
+        let fixture = Fixture::new();
+        fixture.bootstrap_review();
+        let budget = if legacy { 3 } else { 0 };
+        let limit_arg = format!("--max-verify-retries={budget}");
+        if legacy {
+            let mut state = fixture.state();
+            state["verify_retries"] = 4.into();
+            state["pending_repair"] = "REQ-01: correct the generated acceptance criterion".into();
+            state["too_large"] = serde_json::json!({"stage":"verify", "summary":"local worker exhausted 3 verification repair cycle(s); the failed attempt requires frontier subdivision"});
+            fixture.save_state(&state);
+        } else {
+            let result = fixture.run_with("bootstrap", true, &[&limit_arg]);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains("bootstrap") && stderr.contains("--max-verify-retries"),
+                "{stderr}"
+            );
+            assert_eq!(fixture.state()["stage"], "repair");
+            assert_eq!(fixture.state()["too_large"], serde_json::Value::Null);
+        }
+        let saved = fixture.state();
+        let calls = fixture.calls();
+        let raised_arg = format!("--max-verify-retries={}", budget + 1);
+        let dry = fixture.run_with("bootstrap", true, &["--dry-run", &raised_arg]);
+        assert!(dry.status.success());
+        assert!(String::from_utf8_lossy(&dry.stderr).contains("Next stage: Repair"));
+        assert_eq!(fixture.state(), saved);
+        assert_eq!(fixture.calls(), calls);
+
+        let stopped = fixture.run_with("bootstrap", true, &[&limit_arg]);
+        assert!(!stopped.status.success());
+        assert!(String::from_utf8_lossy(&stopped.stderr).contains("--max-verify-retries"));
+        assert_eq!(fixture.calls(), calls);
+        assert_eq!(fixture.state()["verify_retries"], budget + 1);
+        assert_eq!(fixture.state()["pending_repair"], saved["pending_repair"]);
+
+        let resumed = fixture.run_with(
+            "bootstrap",
+            true,
+            &[
+                &raised_arg,
+                "--worker-model=worker-fixture",
+                "--frontier-model=frontier-fixture",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&resumed.stderr);
+        assert!(
+            stderr.contains("Fixture pauses at bootstrap Archive"),
+            "{stderr}"
+        );
+        assert_eq!(fixture.calls(), calls + 3); // Repair, Verify, Archive.
+        assert_eq!(fixture.state()["stage"], "archive");
+        assert_eq!(fixture.state()["verify_retries"], budget + 1);
+        assert_eq!(fixture.state()["pending_repair"], serde_json::Value::Null);
+        assert_eq!(fixture.state()["too_large"], serde_json::Value::Null);
+        let repair = fs::read_to_string(fixture.root.join(format!("args-{}", calls + 1))).unwrap();
+        assert!(repair.contains(saved["pending_repair"].as_str().unwrap()));
+        for number in calls + 1..=calls + 3 {
+            let args = fs::read_to_string(fixture.root.join(format!("args-{number}"))).unwrap();
+            assert!(args.contains("frontier-fixture"));
+            assert!(!args.contains("worker-fixture"));
+        }
+        let usage =
+            fs::read_to_string(fixture.root.join("repo/.git/opsx-build/usage.jsonl")).unwrap();
+        for row in usage.lines().rev().take(3) {
+            let record: serde_json::Value = serde_json::from_str(row).unwrap();
+            assert!(
+                record["activity"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Frontier agent"),
+                "{row}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("repo/unrelated.txt")).unwrap(),
+            "Keep user work\n"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_resume_does_not_clear_a_real_capacity_escalation() {
+    let fixture = Fixture::new();
+    fixture.bootstrap_review();
+    let mut state = fixture.state();
+    state["stage"] = "repair".into();
+    state["verify_retries"] = 4.into();
+    state["pending_repair"] = "Saved findings".into();
+    state["too_large"] = serde_json::json!({"stage":"repair", "summary":"Agent reported a concrete capacity constraint"});
+    fixture.save_state(&state);
+    let result = fixture.run_with("bootstrap", true, &["--max-verify-retries=10"]);
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("Agent reported a concrete capacity constraint")
+    );
+    assert_eq!(fixture.state(), state);
+    assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn bootstrap_structural_limit_resumes_repair_without_recounting_the_finding() {
+    let fixture = Fixture::new();
+    fixture.bootstrap_review();
+    fs::write(
+        fixture.root.join("repo/automation/slices/README.md"),
+        "## Supplied requirements\n- [Missing](../../contract.md#REQ-99)\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let result = fixture.run_with("bootstrap", true, &["--max-verify-retries=0"]);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("--max-verify-retries 1"));
+        assert_eq!(fixture.calls(), 0);
+        assert_eq!(fixture.state()["stage"], "verify");
+        assert_eq!(fixture.state()["verify_retries"], 1);
+    }
+    let saved = fixture.state();
+    let result = fixture.run_with("bootstrap", true, &["--max-verify-retries=1"]);
+    assert!(!result.status.success()); // The fixture stops the structural Repair turn.
+    assert_eq!(fixture.calls(), 1);
+    assert_eq!(fixture.state()["stage"], "repair");
+    assert_eq!(fixture.state()["verify_retries"], 1);
+    assert_eq!(fixture.state()["pending_repair"], saved["pending_repair"]);
+    let prompt = fs::read_to_string(fixture.root.join("args-1")).unwrap();
+    assert!(prompt.contains("Repair only the runner-reported structural"));
+    assert!(prompt.contains("REQ-99"));
 }

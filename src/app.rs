@@ -1179,6 +1179,10 @@ impl<U: Ui> App<U> {
             bail!("the saved run is already done; start a new run or use `--forget`");
         }
 
+        if resume_bootstrap_repair(&mut state, self.cli.max_verify_retries) {
+            self.ui
+                .info("Resuming saved bootstrap findings at frontier Repair");
+        }
         if let Some(outcome) = state.too_large.as_ref() {
             self.ui.warn(&format!(
                 "Resuming frontier recovery after {} escalation: {}",
@@ -2342,7 +2346,11 @@ impl<U: Ui> App<U> {
                 claude.invoke(
                     session.clone(),
                     &stage_prompt(&commands.propose, &subject, StageProtocol::Propose),
-                    if retrying_postcondition && frontier_terminal {
+                    if retrying_postcondition && state.bootstrap {
+                        "Frontier agent is correcting the bootstrap proposal"
+                    } else if state.bootstrap {
+                        "Frontier agent is creating bootstrap planning artifacts"
+                    } else if retrying_postcondition && frontier_terminal {
                         "Frontier agent is correcting the terminal acceptance proposal"
                     } else if retrying_postcondition {
                         "Worker agent is correcting the incomplete proposal"
@@ -2543,7 +2551,11 @@ impl<U: Ui> App<U> {
             claude,
             &format!("{change}-proposal-commit"),
             &stage_prompt("", &task, StageProtocol::Ready),
-            "Worker agent is committing the proposal",
+            if state.bootstrap {
+                "Frontier agent is committing the bootstrap proposal"
+            } else {
+                "Worker agent is committing the proposal"
+            },
             StageProtocol::Ready,
         );
         verify_milestone_ancestry(repo, baseline.as_deref(), "proposal", &self.ui)?;
@@ -2584,7 +2596,9 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-apply"),
                 &stage_prompt(&commands.apply, &subject, StageProtocol::Worker),
-                if frontier_terminal {
+                if state.bootstrap {
+                    "Frontier agent is writing the implementation agenda"
+                } else if frontier_terminal {
                     "Frontier agent is applying whole-project acceptance"
                 } else {
                     "Worker agent is applying the OpenSpec change"
@@ -2638,7 +2652,9 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-verify-{}", state.verify_retries + 1),
                 &stage_prompt(&commands.verify, &verify_subject, StageProtocol::Verify),
-                if frontier_terminal {
+                if state.bootstrap {
+                    "Frontier agent is verifying the bootstrap agenda"
+                } else if frontier_terminal {
                     "Frontier agent is verifying the complete project goal"
                 } else {
                     "Worker agent is verifying specification compliance"
@@ -2672,6 +2688,9 @@ impl<U: Ui> App<U> {
                 state.verify_retries += 1;
                 state.pending_repair = Some(result.text.clone());
                 if state.verify_retries > self.cli.max_verify_retries {
+                    if state.bootstrap {
+                        return self.stop_bootstrap_repair(repo, state);
+                    }
                     let summary = if frontier_terminal {
                         format!(
                             "frontier acceptance review still found material project-goal gaps after {} frontier repair cycle(s); insert bounded remediation slices before the terminal gate. Latest findings:\n{}",
@@ -2731,7 +2750,15 @@ impl<U: Ui> App<U> {
             return Ok(true);
         }
         let error = errors.join("\n\n");
-        state.verify_retries += 1;
+        // A resume of the same unresolved structural finding is not a new
+        // verification attempt. Keep its repair number until it is addressed.
+        if !state
+            .pending_repair
+            .as_deref()
+            .is_some_and(|finding| finding.starts_with(BOOTSTRAP_STRUCTURAL_FINDING))
+        {
+            state.verify_retries += 1;
+        }
         state.pending_repair = Some(format!(
             "{BOOTSTRAP_STRUCTURAL_FINDING} {error}. Correct the reported structural issues and directly affected references only, preserving the plan's meaning and coverage. Leave unrelated planning unchanged. Do not implement product code or change supplied inputs. Leave the bootstrap change active; do not archive or commit it."
         ));
@@ -2744,8 +2771,9 @@ impl<U: Ui> App<U> {
         persist_state(repo, state, &self.ui)?;
         if exhausted {
             bail!(
-                "bootstrap agenda still failed its structural check after {} repair cycle(s): {error}. Latest findings are saved in the checkpoint",
-                self.cli.max_verify_retries
+                "bootstrap agenda still failed its structural check after {} frontier repair cycle(s): {error}. Latest findings are saved in the checkpoint. Resume with --max-verify-retries {} (or higher) to repair them, or correct the structural findings before resuming",
+                self.cli.max_verify_retries,
+                state.verify_retries
             );
         }
         self.ui.warn(&format!(
@@ -2753,6 +2781,16 @@ impl<U: Ui> App<U> {
             state.verify_retries, self.cli.max_verify_retries
         ));
         Ok(false)
+    }
+
+    fn stop_bootstrap_repair(&self, repo: &Path, state: &mut RunState) -> Result<()> {
+        state.stage = Stage::Repair;
+        persist_state(repo, state, &self.ui)?;
+        bail!(
+            "bootstrap agenda exhausted its allowance of {} frontier verification repair cycle(s). Latest findings and planning work are preserved. Resume with --max-verify-retries {} (or higher) to continue frontier Repair",
+            self.cli.max_verify_retries,
+            state.verify_retries
+        );
     }
 
     fn run_repair(
@@ -2793,6 +2831,9 @@ impl<U: Ui> App<U> {
             return persist_state(repo, state, &self.ui);
         }
         if state.verify_retries > self.cli.max_verify_retries && state.pending_direction.is_none() {
+            if state.bootstrap {
+                return self.stop_bootstrap_repair(repo, state);
+            }
             let summary = if frontier_terminal {
                 format!(
                     "frontier terminal acceptance exhausted {} verification repair cycle(s); the remaining findings require bounded remediation slices before the terminal gate",
@@ -2855,7 +2896,9 @@ impl<U: Ui> App<U> {
                     StageProtocol::Worker,
                 ),
                 if structural_bootstrap {
-                    "Worker agent is correcting bootstrap structure and references"
+                    "Frontier agent is correcting bootstrap structure and references"
+                } else if state.bootstrap {
+                    "Frontier agent is repairing the bootstrap agenda"
                 } else if frontier_terminal {
                     "Frontier agent is repairing whole-project acceptance"
                 } else {
@@ -2955,7 +2998,11 @@ impl<U: Ui> App<U> {
                 claude,
                 &format!("{change}-archive"),
                 &stage_prompt(&commands.archive, &attempt_subject, StageProtocol::Ready),
-                if attempt == 0 {
+                if state.bootstrap && attempt == 0 {
+                    "Frontier agent is archiving the bootstrap change"
+                } else if state.bootstrap {
+                    "Frontier agent is retrying the bootstrap archive"
+                } else if attempt == 0 {
                     "Worker agent is archiving the OpenSpec change"
                 } else {
                     "Worker agent is retrying the OpenSpec archive"
@@ -2970,7 +3017,7 @@ impl<U: Ui> App<U> {
                 Err(error) => match openspec_snapshot(repo, &self.ui) {
                     Ok(changes) if archive_is_absent(&changes, &change) => {
                         self.ui.warn(
-                            "Archive completed but the worker agent omitted its terminal result; accepting OpenSpec state",
+                            "Archive completed but the agent omitted its terminal result; accepting OpenSpec state",
                         );
                         state.stage = state.stage.after_ready()?;
                         return persist_state(repo, state, &self.ui);
@@ -3059,7 +3106,11 @@ impl<U: Ui> App<U> {
                 &format!("{task}{handoff}{archive_handoff}"),
                 StageProtocol::Ready,
             ),
-            "Worker agent is committing the completed change",
+            if state.bootstrap {
+                "Frontier agent is committing the completed bootstrap"
+            } else {
+                "Worker agent is committing the completed change"
+            },
             StageProtocol::Ready,
         );
         verify_milestone_ancestry(
@@ -3223,8 +3274,15 @@ impl<U: Ui> App<U> {
                 .info(&format!("Pending one-shot direction: {direction}"));
         }
         if matches!(next_stage, Stage::Apply | Stage::Repair | Stage::Verify) {
-            self.ui
-                .info(&format!("Implementation workflow: {}", commands.apply));
+            self.ui.info(&format!(
+                "{} workflow: {}",
+                if state.bootstrap {
+                    "Agenda authoring/repair"
+                } else {
+                    "Implementation"
+                },
+                commands.apply
+            ));
             self.ui
                 .info(&format!("Verification workflow: {}", commands.verify));
         }
@@ -3614,6 +3672,42 @@ fn handle_worker_result<U: Ui>(
         StageSignal::Blocked => blocked(stage, response),
         other => bail!("{stage} returned unexpected terminal status {other:?}"),
     }
+}
+
+/// Recover the old bootstrap retry-limit escalation without waiving genuine
+/// capacity failures. Structural stops may also resume directly at Repair.
+fn resume_bootstrap_repair(state: &mut RunState, max_verify_retries: u32) -> bool {
+    if !state.bootstrap
+        || !matches!(state.stage, Stage::Verify | Stage::Repair)
+        || state.pending_repair.is_none()
+    {
+        return false;
+    }
+    if let Some(outcome) = &state.too_large {
+        let old_limit = outcome.summary
+            .strip_prefix("local worker exhausted ")
+            .and_then(|text| text.strip_suffix(" verification repair cycle(s); the failed attempt requires frontier subdivision"))
+            .and_then(|number| number.parse::<u32>().ok());
+        if !matches!(outcome.stage, Stage::Verify | Stage::Repair)
+            || !old_limit.is_some_and(|limit| state.verify_retries > limit)
+        {
+            return false;
+        }
+        state.too_large = None;
+        state.stage = Stage::Repair;
+        return true;
+    }
+    if state.stage == Stage::Verify
+        && state.verify_retries <= max_verify_retries
+        && state
+            .pending_repair
+            .as_deref()
+            .is_some_and(|finding| finding.starts_with(BOOTSTRAP_STRUCTURAL_FINDING))
+    {
+        state.stage = Stage::Repair;
+        return true;
+    }
+    false
 }
 
 fn record_too_large<U: Ui>(
