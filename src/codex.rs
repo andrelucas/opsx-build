@@ -776,6 +776,9 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
             match attempt {
                 Ok(TurnOutcome::Complete(result)) if result.signal == StageSignal::Incomplete => {
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
+                        if protocol == StageProtocol::Verify && result.review.is_some() {
+                            return Ok(result);
+                        }
                         bail!(
                             "Codex phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
                             result.text
@@ -1578,6 +1581,18 @@ mod tests {
         .unwrap();
         assert_eq!(result.text, "done");
         assert_eq!(result.session_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn structured_codex_result_retains_the_independent_review_report() {
+        let report: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/review-report.json")).unwrap();
+        let output = json!({"opsx_status":"VERIFIED", "summary":"reviewed", "review":report});
+        let result =
+            stage_result_from_text(&output.to_string(), Some("review-thread".into()), "Codex")
+                .unwrap();
+        assert_eq!(result.signal, StageSignal::Verified);
+        assert_eq!(result.review.unwrap().areas[0].id, "required-outcome");
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub(crate) struct SuppliedContracts {
     pub obligation_inventory: Option<PathBuf>,
     #[serde(default)]
     pub acceptance: Option<crate::acceptance::AcceptanceGate>,
+    #[serde(default)]
+    pub runner: Option<crate::runner_executable::RunnerExecutable>,
 }
 
 impl SuppliedContracts {
@@ -107,6 +109,7 @@ impl SuppliedContracts {
             inputs,
             obligation_inventory: None,
             acceptance: None,
+            runner: None,
         })
     }
 
@@ -260,8 +263,8 @@ impl SuppliedContracts {
             text.push_str(&gate.guidance());
         }
         if let Some(inventory) = &self.obligation_inventory {
-            if let Ok(executable) = std::env::current_exe() {
-                let command = crate::process::shell_quote(&executable.to_string_lossy());
+            if let Some(executable) = &self.runner {
+                let command = crate::process::shell_quote(&executable.path.to_string_lossy());
                 text.push_str(&format!("\nUse the running runner version for agenda commands: {command} --no-config --no-campaign-config render-agenda (or check-agenda). A different installed binary may not support this workflow.\n"));
             }
             text.push_str(&format!("\n\nASSIGNMENT WORKFLOW v1\nThe protected maintainer-owned obligation inventory is `{}`. Its entries define selected ownership and acceptance obligations, subject to the original contracts and their precedence. Never edit it, invent an authoritative inventory, change an evidence kind, or infer ownership from shared context. Every complete source reference inherits its conditions and exceptions within the supplied boundary.\n\nThe derived work assignment is `{}`. During bootstrap Propose draft it at `{}`; do not create the agenda yet. Apply moves it to its durable path, authors concise slice briefs, and runs `opsx-build render-agenda`. Keep proposal/design/tasks at decomposition level and reference the assignment from a Planning references section; do not duplicate the complete coverage map.\n\nThe JSON format is {{\"version\":1,\"slices\":[{{\"path\":\"0001-delivery.md\",\"requires\":[]}}],\"obligations\":[{{\"id\":\"<inventory obligation ID>\",\"accountable\":\"0001-delivery.md\",\"contributors\":[]}}],\"acceptance\":[{{\"id\":\"<inventory acceptance ID>\",\"slices\":[\"0001-delivery.md\"],\"route\":\"How real assertions or required review establish this obligation\"}}]}}. Include all owned and dependency entries; context entries are not delivery assignments. An obligation may have contributions across slices, with one accountable slice. Include every acceptance entry; builder tests must be delivered before 9999. Every slice has assigned work. Prerequisites must refer to earlier slices; several internal steps can be tasks within one coherent slice. The terminal `9999-project-acceptance.md` is implicit and must exist on disk; do not put it in the slices array. Acceptance routes may include it. Do not introduce invented IDs.\n\n`render-agenda` is a deterministic authoring command: it generates the README, Supplied requirements and Prerequisites sections, and the terminal Required Tests and Project Goal Coverage sections from this record and the pinned runner commands. Author slice titles, Objective, Acceptance Criteria and delivery Required Tests as concise completion boundaries and acceptance routes. Leave implementation/test mechanisms to delivery, except source-mandated mechanisms and decisions necessary for decomposition. Rendering is required after bootstrap Apply/Repair, any affected agenda repair, subdivision and terminal remediation, before committing. In terminal remediation, retain all previous participants and add the remediation as a contribution or acceptance route; rendering must leave 9999 unchanged. Do not render during Verify; run `opsx-build check-agenda` to check the existing views read-only. The runner rejects stale or incomplete assignments.\n\nIndependent semantic review must still reject omitted scope, changed conditions, transferred ownership, impossible dependencies and weakened acceptance. Cite the governing source, defective assignment/prescription and concrete consequence for every blocker. Complete assignment by reference does not require repeated prose conditions; a citation or a test name alone does not prove a correct scope split or real acceptance coverage. Strict structural/source checks still apply. Input ambiguities require BLOCKED; generated mistakes require RETRY.\n", inventory.display(), crate::assignment::RECORD, crate::assignment::DRAFT));

@@ -84,9 +84,7 @@ impl StageProtocol {
             Self::Propose => {
                 r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","DONE","TOO_LARGE","BLOCKED","INCOMPLETE"]},"summary":{"type":"string","description":"For INCOMPLETE, describe unfinished work and pending delegated results that can continue without external input. Concise proposal result. DONE means the requested objective is already satisfied. For TOO_LARGE, cite repository evidence of a concrete capacity or scope constraint, why ordered tasks within the assigned change cannot resolve it, and the minimum necessary decomposition. Multiple implementation steps or tests alone are insufficient. Neither outcome may create or modify OpenSpec artifacts. Include the exact external blocker for BLOCKED."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
-            Self::Verify => {
-                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["VERIFIED","RETRY","BLOCKED","INCOMPLETE"]},"summary":{"type":"string","description":"For INCOMPLETE, describe unfinished work and pending delegated results that can continue without external input. Concise stage result using the assigned workflow's review policy. For RETRY, state the blocking defect, its consequence for a required outcome, and the minimum repair. In supplied-contract mode include governing references and required synchronized corrections. Keep non-blocking observations separate. For BLOCKED, identify the necessary external decision or unavailable input."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
-            }
+            Self::Verify => include_str!("../assets/verify-result.schema.json"),
             Self::Frontier => {
                 r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["REPLANNED","BLOCKED","INCOMPLETE"]},"summary":{"type":"string","description":"For INCOMPLETE, describe unfinished work and pending delegated results that can continue without external input. Concise frontier-planning result. REPLANNED means the oversized agenda slice was replaced by a smaller first slice plus one or more ordered hierarchical descendants and committed. BLOCKED means safe subdivision requires a genuine external decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
@@ -102,6 +100,22 @@ pub struct StageResult {
     pub text: String,
     pub session_id: Option<String>,
     pub signal: StageSignal,
+    pub review: Option<crate::review::Report>,
+}
+
+impl StageResult {
+    pub(crate) fn normalize_review(mut self) -> Self {
+        if let Some(report) = &self.review
+            && matches!(self.signal, StageSignal::Verified | StageSignal::Retry)
+            && (report.incomplete()
+                || (self.signal == StageSignal::Verified && report.has_blockers())
+                || (self.signal == StageSignal::Retry && !report.has_blockers()))
+        {
+            self.signal = StageSignal::Incomplete;
+            self.text.push_str("\nFinish the outstanding review and reconcile the report's findings and terminal status before concluding this phase.");
+        }
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -195,11 +209,19 @@ pub(crate) fn stage_result_from_text(
         .and_then(serde_json::Value::as_str)
         .unwrap_or(text)
         .to_owned();
+    let review = match crate::review::Report::from_value(
+        structured.as_ref().and_then(|value| value.get("review")),
+    )? {
+        Some(report) => Some(report),
+        None => crate::review::Report::from_text(text)?,
+    };
     Ok(StageResult {
         text: result_text,
         session_id,
         signal,
-    })
+        review,
+    }
+    .normalize_review())
 }
 
 pub trait AgentBackend {

@@ -673,6 +673,9 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                     if result.signal == StageSignal::Incomplete =>
                 {
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
+                        if protocol == StageProtocol::Verify && result.review.is_some() {
+                            return Ok(result);
+                        }
                         bail!(
                             "OpenCode phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
                             result.text
@@ -787,10 +790,12 @@ fn parse_opencode_output(stdout: &str) -> Result<StageResult> {
         )
     })?;
     Ok(StageResult {
+        review: crate::review::Report::from_text(&text)?,
         text,
         session_id,
         signal,
-    })
+    }
+    .normalize_review())
 }
 
 fn opencode_stage_failure(output: &ProcessOutput) -> anyhow::Error {
@@ -1377,6 +1382,16 @@ mod tests {
                 .any(|pair| pair == ["--command", "opsx:apply"])
         );
         assert_eq!(command.args.last().map(String::as_str), Some("change-name"));
+    }
+
+    #[test]
+    fn opencode_marker_output_preserves_review_evidence() {
+        let report: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/review-report.json")).unwrap();
+        let event = serde_json::json!({"type":"text", "sessionID":"review-session", "part":{"text":format!("OPSX_REVIEW: {report}\nOPSX_STATUS: VERIFIED")}});
+        let result = parse_opencode_output(&event.to_string()).unwrap();
+        assert_eq!(result.signal, StageSignal::Verified);
+        assert_eq!(result.review.unwrap().areas[0].id, "required-outcome");
     }
 
     #[test]

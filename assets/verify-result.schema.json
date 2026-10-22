@@ -1,0 +1,158 @@
+{
+  "type": "object",
+  "properties": {
+    "opsx_status": {
+      "type": "string",
+      "enum": [
+        "VERIFIED",
+        "RETRY",
+        "BLOCKED",
+        "INCOMPLETE"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "Checks actually run and limitations. RETRY identifies blockers with a governing source, concrete consequence and minimum complete repair. Keep observations separate. BLOCKED identifies the necessary external decision or input. INCOMPLETE finishes pending review in the same session."
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Keep an existing runner-assigned finding ID; use an empty string for a new finding."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "implementation",
+                  "assertion",
+                  "source_ambiguity",
+                  "bookkeeping",
+                  "environment"
+                ]
+              },
+              "origin": {
+                "type": "string",
+                "enum": [
+                  "new",
+                  "previously_missed",
+                  "regression",
+                  "reopened",
+                  "uncertain"
+                ]
+              },
+              "evidence_kind": {
+                "type": "string",
+                "enum": [
+                  "reproduced",
+                  "code_review",
+                  "interpretation"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "closed",
+                  "observation"
+                ]
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "scope": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "consequence": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "repair": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "kind",
+              "origin",
+              "evidence_kind",
+              "status",
+              "sources",
+              "scope",
+              "consequence",
+              "evidence",
+              "repair"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "areas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "reviewed",
+                  "partial",
+                  "not_reviewed"
+                ]
+              },
+              "limitations": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "sources",
+              "paths",
+              "status",
+              "limitations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "findings",
+        "areas"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "opsx_status",
+    "summary",
+    "review"
+  ],
+  "additionalProperties": false
+}

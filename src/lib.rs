@@ -19,6 +19,8 @@ pub mod opencode;
 mod opencode_server;
 pub mod openspec;
 pub mod process;
+pub mod review;
+mod runner_executable;
 pub mod sidecar;
 pub mod skills;
 pub mod state;

@@ -153,6 +153,37 @@ printf '{"type":"result","subtype":"success","session_id":"fixture-session","res
             .lines()
             .count()
     }
+
+    fn review_workflow(&self, ordinary: bool) {
+        if ordinary {
+            self.run("ordinary", false);
+        } else {
+            fs::write(
+                self.root.join("repo/final-check.sh"),
+                "test \"$(cat candidate.txt)\" = fixed\nprintf 'final gate\\n' >> .git/gate-runs\n",
+            )
+            .unwrap();
+            self.run_with(
+                "repair",
+                false,
+                &[
+                    "--acceptance-file=final-check.sh",
+                    "--acceptance-command=sh final-check.sh",
+                    "--acceptance-timeout-seconds=2",
+                ],
+            );
+        }
+        let mut state = self.state();
+        state["stage"] = "apply".into();
+        state["agenda"] = serde_json::Value::Null;
+        self.save_state(&state);
+        fs::remove_file(self.root.join("calls")).unwrap();
+        fs::write(
+            self.root.join("bin/claude"),
+            include_str!("fixtures/review-agent.py"),
+        )
+        .unwrap();
+    }
     fn state(&self) -> serde_json::Value {
         serde_json::from_str(
             &fs::read_to_string(self.root.join("repo/.git/opsx-build/last-run.json")).unwrap(),
@@ -335,6 +366,148 @@ printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":
             contract
         );
     }
+}
+
+#[test]
+fn repair_loop_retains_findings_and_handoffs_and_still_runs_the_exact_final_gate() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        f.review_workflow(ordinary);
+        let result = f.run("review-complete", true);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("Fixture stops at Archive"), "{stderr}");
+        assert_eq!(f.calls(), 5);
+        let repair = fs::read_to_string(f.root.join("args-3")).unwrap();
+        assert!(repair.contains("smallest complete correction"));
+        assert!(repair.contains("relevant sibling paths"));
+        assert!(repair.contains("F0001"));
+        assert!(!repair.contains("noop")); // Dedicated repair; no full Apply skill.
+        let verify = fs::read_to_string(f.root.join("args-4")).unwrap();
+        assert!(verify.contains("Repair claims"));
+        assert!(verify.contains("candidate.txt"));
+        assert!(verify.contains("F0001"));
+        assert!(verify.contains("prior attestations"));
+        if ordinary {
+            assert!(verify.contains("anti-Karen"));
+        }
+        let state = f.state();
+        assert_eq!(state["stage"], "archive");
+        assert_eq!(state["review"]["rounds"].as_array().unwrap().len(), 2);
+        assert_eq!(state["review"]["findings"]["F0001"]["status"], "closed");
+        assert!(
+            state["review"]["work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|work| work["stage"] == "Apply")
+        );
+        assert_eq!(
+            fs::read_dir(f.root.join("repo/.git/opsx-build/reviews"))
+                .unwrap()
+                .count(),
+            2
+        );
+        if !ordinary {
+            assert_eq!(
+                fs::read_to_string(f.root.join("repo/.git/gate-runs")).unwrap(),
+                "final gate\n"
+            );
+            let reports = f.acceptance_reports();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(
+                reports[0]["commands"],
+                serde_json::json!(["sh final-check.sh"])
+            );
+            assert_eq!(reports[0]["timeout_seconds"], 2);
+            assert_eq!(reports[0]["outcome"], "passed");
+        }
+    }
+}
+
+#[test]
+fn incomplete_review_saves_partial_findings_without_starting_repair_or_acceptance() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let result = f.run("review-partial", true);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("partial review evidence and findings are saved"),
+        "{stderr}"
+    );
+    assert_eq!(f.calls(), 3); // Apply, Verify, one same-session continuation.
+    let state = f.state();
+    assert_eq!(state["stage"], "verify");
+    assert_eq!(state["verify_retries"], 0);
+    assert_eq!(state["review"]["rounds"][0]["verdict"], "Incomplete");
+    assert_eq!(
+        state["review"]["rounds"][0]["report"]["areas"][0]["status"],
+        "partial"
+    );
+    assert_eq!(state["review"]["findings"]["F0001"]["status"], "open");
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
+        "implemented\n"
+    );
+    assert!(!f.root.join("repo/.git/gate-runs").exists());
+}
+
+#[test]
+fn verified_cannot_silently_drop_a_retained_open_finding_after_repair() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let result = f.run("review-omit", true);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("without independently closing"));
+    assert_eq!(f.calls(), 4);
+    assert_eq!(f.state()["stage"], "verify");
+    assert_eq!(f.state()["review"]["findings"]["F0001"]["status"], "open");
+    assert!(!f.root.join("repo/.git/gate-runs").exists());
+}
+
+#[test]
+fn repair_exhaustion_preserves_candidate_and_resumes_only_with_a_higher_bound() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let before = f.state();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(f.root.join("repo"))
+        .output()
+        .unwrap()
+        .stdout;
+    let stopped = f.run_with("review-complete", true, &["--max-verify-retries=0"]);
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        stderr.contains("verification repair limit reached"),
+        "{stderr}"
+    );
+    assert_eq!(f.calls(), 2);
+    let saved = f.state();
+    assert_eq!(saved["stage"], "repair");
+    assert_eq!(saved["too_large"], serde_json::Value::Null);
+    assert_eq!(saved["slice_baseline"], before["slice_baseline"]);
+    assert_eq!(saved["contracts"], before["contracts"]);
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
+        "implemented\n"
+    );
+    assert_eq!(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(f.root.join("repo"))
+            .output()
+            .unwrap()
+            .stdout,
+        head
+    );
+    let unchanged = f.run_with("review-complete", true, &["--max-verify-retries=0"]);
+    assert!(
+        String::from_utf8_lossy(&unchanged.stderr).contains("verification repair limit reached")
+    );
+    assert_eq!(f.calls(), 2);
+    let resumed = f.run_with("review-complete", true, &["--max-verify-retries=1"]);
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("Fixture stops at Archive"));
+    assert_eq!(f.calls(), 5);
+    assert_eq!(f.state()["review"]["findings"]["F0001"]["status"], "closed");
 }
 
 #[test]
@@ -823,7 +996,7 @@ fn bootstrap_reference_preflight_repairs_before_model_verify_and_preserves_exhau
                 let prompt =
                     fs::read_to_string(fixture.root.join(format!("args-{}", fixture.calls())))
                         .unwrap();
-                assert!(prompt.contains("noop bootstrap-implementation-slices"));
+                assert!(!prompt.contains("noop bootstrap-implementation-slices"));
                 assert!(!prompt.contains("Repair only the runner-reported structural"));
                 assert!(prompt.contains(if supplied_contracts {
                     "Update the coverage map and required tests coherently"

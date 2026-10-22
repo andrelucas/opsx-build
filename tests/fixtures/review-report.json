@@ -1,0 +1,12 @@
+{
+  "findings": [],
+  "areas": [
+    {
+      "id": "required-outcome",
+      "sources": ["contract.md#REQ-01"],
+      "paths": ["candidate.txt"],
+      "status": "reviewed",
+      "limitations": "Native qualification is separate"
+    }
+  ]
+}

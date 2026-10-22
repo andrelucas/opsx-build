@@ -17,8 +17,8 @@ pub(crate) type Files = BTreeMap<String, (String, bool)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RepositoryEvidence {
-    root: PathBuf,
-    files: Option<Files>,
+    pub(crate) root: PathBuf,
+    pub(crate) files: Option<Files>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +189,7 @@ fn evidence_handoff<U: Ui>(
     Some(text)
 }
 
-fn changed_paths<'a>(before: &'a Files, after: &'a Files) -> Vec<&'a str> {
+pub(crate) fn changed_paths<'a>(before: &'a Files, after: &'a Files) -> Vec<&'a str> {
     before
         .keys()
         .chain(after.keys())

@@ -990,6 +990,9 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 }
                 Ok(ClaudeAttempt::Complete(result)) if result.signal == StageSignal::Incomplete => {
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
+                        if protocol == StageProtocol::Verify && result.review.is_some() {
+                            return Ok(result); // App retains partial review evidence without advancing.
+                        }
                         bail!(
                             "Claude phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
                             result.text
@@ -1367,7 +1370,7 @@ pub(crate) fn incomplete_stage_continuation_prompt(protocol: StageProtocol) -> S
             "The preceding turn left this phase unfinished. Inspect the durable OpenSpec and working-tree state, then continue the same phase from the first incomplete task. Perform outstanding work with actual tools; do not merely describe what you intend to do. Do not stop at a progress update. Preserve correct partial work and use existing delegated results; do not restart completed tasks or launch duplicate audits. Wait for required pending work using the runtime's tools and collect its results before finishing."
         }
         StageProtocol::Verify => {
-            "The preceding verification turn left this phase unfinished. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. Preserve correct partial work. Reuse completed checks and delegated results; wait for required pending audits using the runtime's tools rather than launching duplicates. If you created temporary diagnostic artifacts, remove only those artifacts where safe. Preserve the assigned workflow's review policy: ordinary context reviews apply the anti-Karen materiality threshold; supplied-contract reviews enforce their source obligations. Return RETRY only for a blocking finding under that policy, with the consequence and minimum repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
+            "The preceding verification turn left this phase unfinished. Continue verification only: do not repair or modify agendas, OpenSpec artifacts, implementation, or tests. Preserve correct partial work. Retain the findings and completed areas from this phase in the final review report and finish its outstanding areas. Reuse completed checks and delegated results; wait for required pending audits using the runtime's tools rather than launching duplicates. If you created temporary diagnostic artifacts, remove only those artifacts where safe. Preserve the assigned workflow's review policy: ordinary context reviews apply the anti-Karen materiality threshold; supplied-contract reviews enforce their source obligations. Return RETRY only for a blocking finding under that policy, with the consequence and minimum repair; otherwise finish verification and return VERIFIED or BLOCKED as appropriate."
         }
         _ => {
             "The preceding turn left this phase unfinished. Continue the same assigned phase in this session, retaining its scope, permissions and acceptance conditions. Inspect durable state and existing delegated results, preserve completed work and finish only outstanding tasks. Wait for required pending work using the runtime's tools. Do not restart completed tasks, repeat completed audits or create duplicate changes or commits. This continuation does not authorize implementation during planning, repairs during review, or broader work during archive or milestone commits."
@@ -1605,13 +1608,7 @@ fn parse_claude_output(stdout: &str) -> Result<StageResult> {
         .transpose()?
         .flatten();
     let signal = match structured {
-        Some((signal, summary)) => {
-            return Ok(StageResult {
-                text: summary,
-                session_id,
-                signal,
-            });
-        }
+        Some(result) => return Ok(result),
         None => match parse_signal(&text) {
             Some(signal) => signal,
             None => {
@@ -1628,10 +1625,12 @@ fn parse_claude_output(stdout: &str) -> Result<StageResult> {
     };
 
     Ok(StageResult {
+        review: crate::review::Report::from_text(&text)?,
         text,
         session_id,
         signal,
-    })
+    }
+    .normalize_review())
 }
 
 fn parse_claude_stream_output(stdout: &str) -> Result<StageResult> {
@@ -1654,19 +1653,17 @@ fn parse_claude_stream_output(stdout: &str) -> Result<StageResult> {
             .get("session_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        if let Some((signal, summary)) = parse_structured_output(result)? {
-            return Ok(StageResult {
-                text: summary,
-                session_id,
-                signal,
-            });
+        if let Some(result) = parse_structured_output(result)? {
+            return Ok(result);
         }
         if let Some(signal) = parse_signal(&text) {
             return Ok(StageResult {
+                review: crate::review::Report::from_text(&text)?,
                 text,
                 session_id,
                 signal,
-            });
+            }
+            .normalize_review());
         }
     }
 
@@ -1709,7 +1706,7 @@ fn parse_claude_stream_output(stdout: &str) -> Result<StageResult> {
     .into())
 }
 
-fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String)>> {
+fn parse_structured_output(result: &Value) -> Result<Option<StageResult>> {
     let Some(output) = result.get("structured_output") else {
         return Ok(None);
     };
@@ -1736,7 +1733,19 @@ fn parse_structured_output(result: &Value) -> Result<Option<(StageSignal, String
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    Ok(Some((signal, summary)))
+    let review = crate::review::Report::from_value(output.get("review"))?;
+    Ok(Some(
+        StageResult {
+            text: summary,
+            session_id: result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            signal,
+            review,
+        }
+        .normalize_review(),
+    ))
 }
 
 fn unsupported_json_option(output: &ProcessOutput) -> bool {
@@ -2688,6 +2697,24 @@ mod tests {
             Some(StageSignal::Ready),
             "legacy status spelling remains readable"
         );
+    }
+
+    #[test]
+    fn structured_and_streaming_claude_outputs_retain_review_reports() {
+        let report: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/review-report.json")).unwrap();
+        for encoded in [false, true] {
+            let structured = serde_json::json!({"opsx_status":"VERIFIED", "summary":"reviewed", "review":report});
+            let output = serde_json::json!({"type":"result", "session_id":"review-session", "structured_output":if encoded { Value::String(structured.to_string()) } else { structured }}).to_string();
+            for result in [
+                parse_claude_output(&output),
+                parse_claude_stream_output(&output),
+            ] {
+                let result = result.unwrap();
+                assert_eq!(result.signal, StageSignal::Verified);
+                assert_eq!(result.review.unwrap().areas[0].id, "required-outcome");
+            }
+        }
     }
 
     #[test]

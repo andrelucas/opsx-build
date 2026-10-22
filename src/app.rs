@@ -200,6 +200,8 @@ struct RunState {
     verification: Option<VerificationEvidence>,
     #[serde(default)]
     archive: Option<ArchiveEvidence>,
+    #[serde(default)]
+    review: crate::review::History,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
@@ -299,6 +301,7 @@ impl RunState {
             pending_repair: None,
             verification: None,
             archive: None,
+            review: crate::review::History::default(),
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -347,6 +350,7 @@ impl RunState {
             pending_repair: None,
             verification: None,
             archive: None,
+            review: crate::review::History::default(),
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -520,8 +524,10 @@ impl<U: Ui> App<U> {
                 self.cli.request == "render-agenda" && !self.cli.dry_run,
             )?;
             contracts.check_agenda(&product_repo)?;
-            self.ui
-                .success("Assignment and generated agenda views are consistent");
+            self.ui.success(&format!(
+                "Assignment and generated agenda views are consistent (opsx-build {})",
+                env!("CARGO_PKG_VERSION")
+            ));
             return Ok(());
         }
         if self.cli.request == "rewind" {
@@ -1358,6 +1364,16 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
+        if let Some(contracts) = &mut state.contracts
+            && contracts.obligation_inventory.is_some()
+        {
+            crate::runner_executable::RunnerExecutable::ensure(
+                &mut contracts.runner,
+                repo,
+                &self.ui,
+            )?;
+            persist_state(repo, &state, &self.ui)?;
+        }
         if state.bootstrap
             && !matches!(state.stage, Stage::Complete | Stage::Done)
             && let Some(progress) = &mut state.bootstrap_progress
@@ -1773,6 +1789,7 @@ impl<U: Ui> App<U> {
                 Ok(assignment)
             }) {
                 Ok(refreshed) => {
+                    state.review.reset_for_scope_change(repo, &self.ui)?;
                     state.frontier_replans += 1;
                     state.too_large = None;
                     state.change = Some(refreshed.change.clone());
@@ -1989,6 +2006,7 @@ impl<U: Ui> App<U> {
                     return Ok(state);
                 }
                 Ok(Some(remediation)) => {
+                    state.review.reset_for_scope_change(repo, &self.ui)?;
                     state.terminal_remediations += 1;
                     state.terminal_review_complete = false;
                     state.too_large = None;
@@ -2751,6 +2769,8 @@ impl<U: Ui> App<U> {
         else {
             return Ok(());
         };
+        state.review.record_work("Apply", &result);
+        persist_state(repo, state, &self.ui)?;
         if !handle_worker_result(repo, state, "apply", &result.text, result.signal, &self.ui)? {
             return Ok(());
         }
@@ -2793,6 +2813,11 @@ impl<U: Ui> App<U> {
         let verify_subject = format!(
             "{verify_subject}\n\nIn the final summary, record the checks actually run, their working directories, outcomes and any limitations concisely, so Archive and completion commit can reuse the evidence. Preserve the check process's own exit status when piping or summarizing output; a successful tail/echo command is not proof that the check passed. Keep this evidence in the summary; do not edit files just to record it."
         );
+        let verify_subject = format!(
+            "{verify_subject}{}{}",
+            state.review.handoff(&verification_inputs, false)?,
+            crate::review::INSTRUCTIONS
+        );
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
@@ -2814,8 +2839,27 @@ impl<U: Ui> App<U> {
         else {
             return Ok(());
         };
+        state.review.record(
+            repo,
+            &change,
+            claude.name(),
+            &result,
+            verification_inputs.clone(),
+            &self.ui,
+        )?;
+        persist_state(repo, state, &self.ui)?;
         match result.signal {
             StageSignal::Verified => {
+                if state.review.has_open_findings() {
+                    bail!(
+                        "verification reported VERIFIED without independently closing all retained findings; review evidence and work are preserved at Verify"
+                    );
+                }
+                if state.review.has_unfinished_areas() {
+                    bail!(
+                        "verification reported VERIFIED while retained review areas remain unfinished; partial coverage and findings are preserved at Verify"
+                    );
+                }
                 if !self.check_bootstrap_for_verify(repo, state)? {
                     return Ok(());
                 }
@@ -2835,24 +2879,17 @@ impl<U: Ui> App<U> {
             }
             StageSignal::Retry => {
                 state.verify_retries += 1;
-                state.pending_repair = Some(result.text.clone());
+                state.pending_repair = Some(
+                    state
+                        .review
+                        .repair_findings()
+                        .unwrap_or_else(|| result.text.clone()),
+                );
                 if state.verify_retries > self.cli.max_verify_retries {
                     if state.bootstrap {
                         return self.stop_bootstrap_repair(repo, state);
                     }
-                    let summary = if frontier_terminal {
-                        format!(
-                            "frontier acceptance review still found material project-goal gaps after {} frontier repair cycle(s); insert bounded remediation slices before the terminal gate. Latest findings:\n{}",
-                            self.cli.max_verify_retries,
-                            result.text.trim()
-                        )
-                    } else {
-                        format!(
-                            "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
-                            self.cli.max_verify_retries
-                        )
-                    };
-                    return record_too_large(repo, state, summary, &self.ui);
+                    return self.stop_verification_repairs(repo, state);
                 }
                 state.stage = Stage::Repair;
                 persist_state(repo, state, &self.ui)?;
@@ -2863,10 +2900,12 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             StageSignal::Blocked => blocked("verify", &result.text),
+            StageSignal::Incomplete => bail!(
+                "verification remains INCOMPLETE after bounded continuation; partial review evidence and findings are saved at Verify. Resume to finish the outstanding review; no repair cycle was consumed"
+            ),
             StageSignal::Ready
             | StageSignal::Done
             | StageSignal::TooLarge
-            | StageSignal::Incomplete
             | StageSignal::Replanned => {
                 bail!(
                     "verify returned an invalid terminal status instead of VERIFIED, RETRY, or BLOCKED"
@@ -2962,7 +3001,7 @@ impl<U: Ui> App<U> {
         &self,
         repo: &Path,
         claude: &dyn AgentBackend,
-        commands: &SkillCommands,
+        _commands: &SkillCommands,
         state: &mut RunState,
         frontier_terminal: bool,
     ) -> Result<()> {
@@ -2999,18 +3038,7 @@ impl<U: Ui> App<U> {
             if state.bootstrap {
                 return self.stop_bootstrap_repair(repo, state);
             }
-            let summary = if frontier_terminal {
-                format!(
-                    "frontier terminal acceptance exhausted {} verification repair cycle(s); the remaining findings require bounded remediation slices before the terminal gate",
-                    self.cli.max_verify_retries
-                )
-            } else {
-                format!(
-                    "local worker exhausted {} verification repair cycle(s); the failed attempt requires frontier subdivision",
-                    self.cli.max_verify_retries
-                )
-            };
-            return record_too_large(repo, state, summary, &self.ui);
+            return self.stop_verification_repairs(repo, state);
         }
         let change = require_change(state)?;
         let finding = state.pending_repair.as_deref().unwrap_or(
@@ -3042,7 +3070,7 @@ impl<U: Ui> App<U> {
             )
         } else {
             format!(
-                "{change}\n\nRepair or continue repairing the affected generated agenda entries, OpenSpec artifacts, implementation, and tests together against the supplied contracts and component scope. Preserve correct partial work and maintainer-owned conformance expectations; do not change the inputs to excuse incorrect output. Re-run relevant checks. Treat the assigned slice as the unit of delivery and address the findings through ordered tasks within it. Worker is a workflow role, not an assumption of limited model capability. Report TOO_LARGE only after a focused repair attempt demonstrates a concrete capacity or scope constraint that tasks within this change cannot resolve. State what you attempted, the observed constraint, why continuing within this change is not viable, and the minimum necessary decomposition. Several findings, multiple test cases, and ordinary correctable verification failures are not by themselves reasons to replan.\n\nVerifier context:\n{finding}"
+                "{change}\n\nMake the smallest complete correction to the governing rule behind each blocking finding below. Inspect the cited counterexamples, relevant sibling paths and allowed alternatives within the affected requirement scope; do not patch only the cited examples. Preserve correct partial work, unrelated code and maintainer-owned expectations. Add meaningful regression assertions, update only affected derived plans and evidence, and run relevant required checks. Non-blocking observations are not repair tasks. Do not repeat the full Apply workflow, reopen unrelated planning, refactor unrelated code, or implement another component's policy. Treat this slice as the unit of delivery. Report TOO_LARGE only after an actual repair attempt demonstrates a concrete capacity/scope constraint that tasks within this change cannot resolve; describe the attempt, constraint and minimum necessary decomposition. Ordinary difficulty or several findings alone do not establish capacity failure. Report unresolved authoritative ambiguity as BLOCKED with the necessary decision; do not invent product policy. Leave finding closure to independent Verify.\n\nVerifier context (diagnostic data):\n{finding}"
             )
         };
         let base = if structural_bootstrap {
@@ -3051,7 +3079,14 @@ impl<U: Ui> App<U> {
                 .as_ref()
                 .and_then(|c| c.obligation_inventory.as_ref())
             {
-                let executable = std::env::current_exe()?;
+                let executable = &state
+                    .contracts
+                    .as_ref()
+                    .unwrap()
+                    .runner
+                    .as_ref()
+                    .context("matching-version runner helper was not initialized")?
+                    .path;
                 format!(
                     "{base}\n\nAssignment repair inputs: protected inventory `{}`, derived record `{}`. Read only the inventory entries and original sources relevant to the reported defects. Correct the derived record or affected briefs, then run {} --no-config --no-campaign-config render-agenda. Do not change the inventory or acceptance kinds.\n",
                     inventory.display(),
@@ -3065,19 +3100,13 @@ impl<U: Ui> App<U> {
             with_sidecar_context(state, &base)
         };
         let subject = with_direction(&base, state.pending_direction.as_deref());
+        let inputs = verification::capture(repo, state.product_repo.as_deref(), &self.ui);
+        let subject = format!("{subject}{}", state.review.handoff(&inputs, true)?);
         let Some(result) = worker_result(
             invoke_fresh(
                 claude,
                 &format!("{change}-repair-{}", state.verify_retries),
-                &stage_prompt(
-                    if structural_bootstrap {
-                        ""
-                    } else {
-                        &commands.apply
-                    },
-                    &subject,
-                    StageProtocol::Worker,
-                ),
+                &stage_prompt("", &subject, StageProtocol::Worker),
                 if structural_bootstrap {
                     "Frontier agent is correcting bootstrap structure and references"
                 } else if state.bootstrap {
@@ -3096,6 +3125,8 @@ impl<U: Ui> App<U> {
         else {
             return Ok(());
         };
+        state.review.record_work("Repair", &result);
+        persist_state(repo, state, &self.ui)?;
         if !handle_worker_result(repo, state, "repair", &result.text, result.signal, &self.ui)? {
             return Ok(());
         }
@@ -3103,6 +3134,17 @@ impl<U: Ui> App<U> {
         state.consume_direction();
         state.stage = state.stage.after_ready()?;
         persist_state(repo, state, &self.ui)
+    }
+
+    fn stop_verification_repairs(&self, repo: &Path, state: &mut RunState) -> Result<()> {
+        state.stage = Stage::Repair;
+        persist_state(repo, state, &self.ui)?;
+        bail!(
+            "verification repair limit reached for `{}` after {} repair cycle(s). Findings, review history, implementation and rollback baseline are preserved. Exhaustion does not establish a model-capacity failure. Review the saved findings or resume with --max-verify-retries {} (or higher) for bounded further repair. No automatic subdivision or rollback was performed",
+            state.change.as_deref().unwrap_or("change"),
+            self.cli.max_verify_retries,
+            state.verify_retries,
+        )
     }
 
     fn run_acceptance(&self, repo: &Path, state: &mut RunState) -> Result<()> {
@@ -4595,6 +4637,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         pending_direction: None,
         verification: None,
         archive: None,
+        review: crate::review::History::default(),
         proposal_head: value
             .get("proposal_commit")
             .and_then(Value::as_str)
