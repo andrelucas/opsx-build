@@ -139,6 +139,34 @@ fresh execution is required. The final acceptance gate never reads this cache.
 
 ## Evaluation
 
+The 23 October blob-service run exposed an avoidable manual continuation. Its
+0007 verifier had four blocking findings and completed delegated audits, but
+left clean check receipts partial after temporary diagnostics. The runner
+correctly retained `INCOMPLETE` coverage and refused to start Repair, then asked
+the operator to resume despite needing no external decision. Retained review
+round `24a42aaa-5f46-411e-ae4f-6e1f8f9c89f1` records that partial coverage and
+the four findings. The correction is
+automatic bounded continuation, with explicit unfinished work in the handoff and
+stop diagnostics. The existing status distinction is sufficient: `INCOMPLETE`
+means autonomous work remains; `BLOCKED` names a genuine external dependency.
+No model-controlled retry recommendation or relaxed review gate is introduced.
+
+Verify now saves partial review evidence after its same-session continuation and
+starts a fresh reviewer under the same cumulative operating-policy request
+allowance. Findings and completed/unfinished areas survive the handoff. Other
+explicitly incomplete stages continue in the same session under their original
+deadline. Exhaustion reports the obstacle and preserved evidence; an identical
+manual resume does not purchase a fresh allowance. These are runner regression
+guarantees, not measured improvements in live review quality. Existing campaigns
+and installed runners are outside implementation and testing.
+
+Validation: all 450 deterministic tests pass with
+`TMPDIR=/private/tmp cargo test --all-targets`; Clippy with `-D warnings`,
+formatting and diff checks pass. New cases exercise productive automatic
+continuation in both workflows, cumulative exhaustion and identical resume,
+missing review coverage, partial independent closures, recurring findings and
+immediate external blockers. Existing final acceptance checks remain required.
+
 The third runner change, [operating policy](operating-policy.md), uses retained
 evidence to stop fruitless repetition and explain bounded recovery. It does not
 reopen the completed continuity/reuse backlog. It applies in both modes with

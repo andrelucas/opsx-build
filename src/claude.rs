@@ -989,24 +989,33 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                     .into());
                 }
                 Ok(ClaudeAttempt::Complete(result)) if result.signal == StageSignal::Incomplete => {
+                    if let Some(guard) = self.ui.operating_policy() {
+                        guard.incomplete_stage(&result)?;
+                    }
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
-                        if protocol == StageProtocol::Verify && result.review.is_some() {
-                            return Ok(result); // App retains partial review evidence without advancing.
+                        if protocol == StageProtocol::Verify {
+                            return Ok(result); // App retains evidence and continues within the durable allowance.
                         }
-                        bail!(
-                            "Claude phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
-                            result.text
-                        );
+                        if self.ui.operating_policy().is_none() {
+                            bail!(
+                                "Claude phase remains INCOMPLETE after one continuation without durable operating-policy accounting. Remaining work: {}",
+                                result.text
+                            );
+                        }
                     }
                     incomplete_stage_recoveries += 1;
                     self.ui
-                        .warn("Claude reported unfinished work; continuing the same session once");
+                        .warn("Claude reported unfinished work; continuing the same session within the remaining stage allowance");
                     current_session = SessionMode::Resume {
                         id: session_id.clone(),
                     };
-                    current_prompt = incomplete_stage_continuation_prompt(protocol);
+                    current_prompt = format!(
+                        "{}{}",
+                        incomplete_stage_continuation_prompt(protocol),
+                        result.continuation_context()
+                    );
                     current_activity = format!(
-                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                        "{activity} (unfinished-phase continuation {incomplete_stage_recoveries})"
                     );
                 }
                 Ok(ClaudeAttempt::Complete(result)) => return Ok(result),
@@ -1853,7 +1862,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests one same-session continuation under the original stage timeout; it is not success or a blocker.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under the original stage timeout; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -3020,6 +3029,13 @@ printf '%s\n' "$((count + 1))" > "$state"
                 "VERIFIED",
                 2,
                 Some(StageSignal::Verified),
+            ),
+            (
+                StageProtocol::Verify,
+                "INCOMPLETE",
+                "INCOMPLETE",
+                2,
+                Some(StageSignal::Incomplete),
             ),
             (
                 StageProtocol::Ready,

@@ -10,7 +10,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{git::metadata_dir, review::Progress, ui::Ui, usage::UsageRecord};
+use crate::{
+    backend::StageResult, git::metadata_dir, review::Progress, ui::Ui, usage::UsageRecord,
+};
 
 #[cfg(test)]
 mod tests;
@@ -90,6 +92,10 @@ struct Ledger {
     next_stage: String,
     last_verified: Option<String>,
     reviews: Vec<Progress>,
+    #[serde(default)]
+    incomplete_review: Option<Progress>,
+    #[serde(default)]
+    unfinished_stage: Option<String>,
     no_progress: u32,
     unassessable: u32,
     recurrences: BTreeMap<String, u32>,
@@ -143,6 +149,8 @@ impl Run {
                 next_stage: String::new(),
                 last_verified: None,
                 reviews: Vec::new(),
+                incomplete_review: None,
+                unfinished_stage: None,
                 no_progress: 0,
                 unassessable: 0,
                 recurrences: BTreeMap::new(),
@@ -224,6 +232,15 @@ impl Guard {
     pub(crate) fn boundary(&self, change: Option<&str>, next_stage: &str) -> Result<()> {
         {
             let mut ledger = self.ledger.lock().unwrap();
+            if ledger.change.as_deref() != change
+                || !ledger
+                    .next_stage
+                    .replace('-', " ")
+                    .eq_ignore_ascii_case(next_stage)
+            {
+                ledger.unfinished_stage = None;
+                ledger.incomplete_review = None;
+            }
             ledger.change = change.map(str::to_owned);
             ledger.next_stage = next_stage.to_owned();
         }
@@ -288,10 +305,51 @@ impl Guard {
         }
     }
 
-    pub(crate) fn review(&self, progress: Progress) -> Result<()> {
+    pub(crate) fn incomplete_stage(&self, result: &StageResult) -> Result<()> {
+        let mut remaining = result.text.clone();
+        if let Some(report) = &result.review {
+            remaining.push('\n');
+            remaining.push_str(&report.unfinished_work());
+        }
+        self.ledger.lock().unwrap().unfinished_stage = Some(remaining);
+        self.save()
+    }
+
+    pub(crate) fn incomplete_review(&self, mut progress: Progress) -> Result<()> {
+        let mut ledger = self.ledger.lock().unwrap();
+        if let Some(previous) = &ledger.incomplete_review
+            && previous.change == progress.change
+        {
+            if previous.id == progress.id {
+                return Ok(());
+            }
+            for id in &previous.closed {
+                if !progress.closed.contains(id) {
+                    progress.closed.push(id.clone());
+                }
+            }
+        }
+        for id in &progress.reopened {
+            *ledger.recurrences.entry(id.clone()).or_default() += 1;
+        }
+        ledger.incomplete_review = Some(progress);
+        drop(ledger);
+        self.save()
+    }
+
+    pub(crate) fn review(&self, mut progress: Progress) -> Result<()> {
         let mut ledger = self.ledger.lock().unwrap();
         if ledger.reviews.iter().any(|old| old.id == progress.id) {
             return Ok(());
+        }
+        if let Some(pending) = ledger.incomplete_review.take()
+            && pending.change == progress.change
+        {
+            for id in pending.closed {
+                if !progress.closed.contains(&id) {
+                    progress.closed.push(id);
+                }
+            }
         }
         let same_change = ledger
             .reviews
@@ -482,9 +540,8 @@ impl Guard {
             .values()
             .filter(|request| request.reported_cost_usd.is_none())
             .count();
-        let open = ledger
-            .reviews
-            .last()
+        let latest_review = ledger.incomplete_review.as_ref().or(ledger.reviews.last());
+        let open = latest_review
             .map(|review| review.open.clone())
             .unwrap_or_default();
         let action = match kind {
@@ -511,7 +568,9 @@ impl Guard {
             "outcome": "operating-policy-stop", "trigger": kind, "reason": reason,
             "next_stage": ledger.next_stage, "change": ledger.change, "last_verified_milestone": ledger.last_verified,
             "remaining_findings": open, "reviews": ledger.reviews, "policy": ledger.policy,
-            "remaining_work": ledger.reviews.last().map(|review| &review.blocking_details),
+            "remaining_work": latest_review.map(|review| &review.blocking_details),
+            "incomplete_review": ledger.incomplete_review,
+            "unfinished_stage": ledger.unfinished_stage,
             "active_elapsed_known_ms": self.elapsed_ms(), "active_time_has_gap": ledger.active_time_has_gap,
             "reported_known_cost_subtotal_usd": known_cost,
             "cost_unknown_attempts": unknown_cost, "requests": ledger.requests,
@@ -524,9 +583,7 @@ impl Guard {
             "uncertainty": "review classifications and closure are independent reviewer evidence; matching snapshots do not prove a defect pre-existed or that repeated checking was waste",
         });
         write(&self.directory.join("stop.json"), &report)?;
-        let details = ledger
-            .reviews
-            .last()
+        let details = latest_review
             .map(|review| {
                 review
                     .blocking_details
@@ -545,6 +602,33 @@ impl Guard {
                     .join("\n")
             })
             .unwrap_or_default();
+        let pending = ledger
+            .incomplete_review
+            .as_ref()
+            .map(|review| {
+                let areas = review
+                    .unfinished_areas
+                    .iter()
+                    .map(|area| {
+                        format!(
+                            "{} ({:?}): {} Sources: {}. Paths: {}.",
+                            area.id,
+                            area.status,
+                            area.limitations,
+                            area.sources.join(", "),
+                            area.paths.join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "Unfinished independent review: {}\n{areas}\nFull retained evidence: {}",
+                    review.summary,
+                    review.evidence_path.display()
+                )
+            })
+            .unwrap_or_default();
+        let unfinished = ledger.unfinished_stage.as_deref().unwrap_or_default();
         let trend = format!(
             "No-progress rounds: {}/{}; unassessable review transitions: {}/{}; stage requests: {}/{}; replans without independent progress: {}/{}.",
             ledger.no_progress,
@@ -557,7 +641,7 @@ impl Guard {
             ledger.policy.max_replans_without_verified_progress
         );
         let text = format!(
-            "OPERATING POLICY STOP: {reason}\nChange {:?}; next stage {}. Last verified milestone: {}.\nRemaining findings: {}. Known active elapsed: {:.1}s; missing interval: {}. Known reported cost subtotal: ${known_cost:.4}; {unknown_cost} attempt(s) have unknown cost.\n{trend}\n{details}\n{action}\nWork and evidence are preserved. Report: {}\nThis is incomplete delivery, not accepted completion or a capacity escalation.",
+            "OPERATING POLICY STOP: {reason}\nChange {:?}; next stage {}. Last verified milestone: {}.\nRemaining findings: {}. Known active elapsed: {:.1}s; missing interval: {}. Known reported cost subtotal: ${known_cost:.4}; {unknown_cost} attempt(s) have unknown cost.\n{trend}\n{details}\n{pending}\nUnfinished stage work: {unfinished}\n{action}\nWork and evidence are preserved. Report: {}\nThis is incomplete delivery, not accepted completion or a capacity escalation.",
             ledger.change,
             ledger.next_stage,
             ledger.last_verified.as_deref().unwrap_or("none recorded"),

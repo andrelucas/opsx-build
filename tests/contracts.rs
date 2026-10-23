@@ -318,7 +318,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn incomplete_apply_preserves_checkpoint_and_partial_work_for_resume_in_both_workflows() {
+fn incomplete_apply_continues_automatically_without_repeating_partial_work_in_both_workflows() {
     for mode in ["ordinary", "repair"] {
         let fixture = Fixture::new();
         assert!(!fixture.run(mode, false).status.success());
@@ -345,16 +345,9 @@ esac
 printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":"%s","summary":"Fixture stage result"}}\n' "$status"
 "#).unwrap();
         let first = fixture.run(mode, true);
-        assert!(!first.status.success());
-        assert!(
-            String::from_utf8_lossy(&first.stderr)
-                .contains("remains INCOMPLETE after one continuation")
-        );
-        assert_eq!(fixture.calls(), 2);
-        assert_eq!(fixture.state()["stage"], "apply");
+        assert!(!first.status.success()); // A genuine Verify blocker stops immediately.
+        assert!(String::from_utf8_lossy(&first.stderr).contains("BLOCKED"));
         assert_eq!(fixture.state()["change"], state["change"]);
-        let resumed = fixture.run(mode, true);
-        assert!(!resumed.status.success()); // A genuine Verify blocker stops immediately.
         assert_eq!(fixture.calls(), 4);
         assert_eq!(fixture.state()["stage"], "verify");
         assert_eq!(
@@ -522,6 +515,12 @@ fn request_guard_bounds_internal_continuations_and_policy_files_are_pinned_until
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
     assert_eq!(report["trigger"], "request_limit");
+    assert!(
+        report["unfinished_stage"]
+            .as_str()
+            .unwrap()
+            .contains("Unfinished owned review work")
+    );
     fs::write(&policy, r#"{"max_requests_per_stage":2}"#).unwrap();
     f.run("review-incomplete-loop", true); // Editing the source file cannot silently raise a limit.
     assert_eq!(f.calls(), 1);
@@ -804,16 +803,69 @@ fn check_receipts_survive_resume_in_both_modes_and_cannot_waive_the_same_final_c
 }
 
 #[test]
-fn incomplete_review_saves_partial_findings_without_starting_repair_or_acceptance() {
+fn incomplete_review_continues_automatically_with_retained_findings_and_coverage() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        f.review_workflow(ordinary);
+        let contract = fs::read(f.root.join("repo/contract.md")).unwrap();
+        let result = f.run("review-continue", true);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("Fixture stops at Archive"), "{stderr}");
+        assert_eq!(f.calls(), 7); // Apply, two Verify turns, fresh Verify, Repair, Verify, Archive.
+        let state = f.state();
+        assert_eq!(state["stage"], "archive");
+        assert_eq!(state["verify_retries"], 1);
+        assert_eq!(state["review"]["rounds"][0]["verdict"], "Incomplete");
+        assert_eq!(state["review"]["rounds"][1]["verdict"], "Retry");
+        assert_eq!(state["review"]["rounds"][2]["verdict"], "Verified");
+        assert_eq!(state["review"]["findings"]["F0001"]["status"], "closed");
+        assert_eq!(
+            state["review"]["areas"]["completed-audit"]["status"],
+            "reviewed"
+        );
+        let same_session = fs::read_to_string(f.root.join("args-3")).unwrap();
+        assert!(same_session.contains("required-outcome"));
+        assert!(same_session.contains("Rerun clean unit and vet checks"));
+        let fresh = fs::read_to_string(f.root.join("args-4")).unwrap();
+        assert!(fresh.contains("--session-id"));
+        assert!(!fresh.contains("--resume\n"));
+        for retained in [
+            "F0001",
+            "completed-audit",
+            "required-outcome",
+            "Rerun clean unit and vet checks",
+        ] {
+            assert!(
+                fresh.contains(retained),
+                "Missing {retained} in fresh review"
+            );
+        }
+        assert_eq!(fs::read(f.root.join("repo/contract.md")).unwrap(), contract);
+        if !ordinary {
+            assert_eq!(
+                fs::read_to_string(f.root.join("repo/.git/gate-runs")).unwrap(),
+                "final gate\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn incomplete_review_exhaustion_is_actionable_and_plain_resume_cannot_reset_it() {
     let f = Fixture::new();
     f.review_workflow(false);
-    let result = f.run("review-partial", true);
+    let policy = f.root.join("operating.json");
+    fs::write(&policy, r#"{"max_requests_per_stage":4}"#).unwrap();
+    let option = format!("--operating-policy={}", policy.display());
+    let result = f.run_with("review-partial", true, &[&option]);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+    assert!(stderr.contains("required-outcome"), "{stderr}");
     assert!(
-        stderr.contains("partial review evidence and findings are saved"),
+        stderr.contains("Rerun clean unit and vet checks"),
         "{stderr}"
     );
-    assert_eq!(f.calls(), 3); // Apply, Verify, one same-session continuation.
+    assert_eq!(f.calls(), 5); // Apply, two same-session turns in each of two fresh reviews.
     let state = f.state();
     assert_eq!(state["stage"], "verify");
     assert_eq!(state["verify_retries"], 0);
@@ -823,11 +875,81 @@ fn incomplete_review_saves_partial_findings_without_starting_repair_or_acceptanc
         "partial"
     );
     assert_eq!(state["review"]["findings"]["F0001"]["status"], "open");
+    assert_eq!(state["review"]["rounds"].as_array().unwrap().len(), 2);
+    let directory = PathBuf::from(state["operating"]["directory"].as_str().unwrap());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
+    assert_eq!(report["trigger"], "request_limit");
+    assert_eq!(report["remaining_findings"], serde_json::json!(["F0001"]));
+    assert_eq!(
+        report["incomplete_review"]["unfinished_areas"][0]["id"],
+        "required-outcome"
+    );
+    assert!(
+        PathBuf::from(
+            report["incomplete_review"]["evidence_path"]
+                .as_str()
+                .unwrap()
+        )
+        .is_file()
+    );
     assert_eq!(
         fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
         "implemented\n"
     );
     assert!(!f.root.join("repo/.git/gate-runs").exists());
+    let resumed = f.run("review-partial", true);
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"));
+    assert!(stderr.contains("required-outcome"), "{stderr}");
+    assert!(
+        stderr.contains("Rerun clean unit and vet checks"),
+        "{stderr}"
+    );
+    assert_eq!(f.calls(), 5);
+}
+
+#[test]
+fn a_blocked_review_requires_external_input_even_when_its_areas_are_partial() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let result = f.run("review-blocked", true);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("BLOCKED"), "{stderr}");
+    assert_eq!(f.calls(), 2);
+    assert_eq!(f.state()["stage"], "verify");
+    assert_eq!(f.state()["verify_retries"], 0);
+    assert!(!f.root.join("repo/.git/gate-runs").exists());
+}
+
+#[test]
+fn incomplete_review_without_structured_coverage_is_bounded_and_never_invents_acceptance() {
+    let f = Fixture::new();
+    f.review_workflow(true);
+    let policy = f.root.join("operating.json");
+    fs::write(&policy, r#"{"max_requests_per_stage":4}"#).unwrap();
+    let option = format!("--operating-policy={}", policy.display());
+    let result = f.run_with("review-no-report", true, &[&option]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+    assert!(
+        stderr.contains("Collect the pending delegated audit"),
+        "{stderr}"
+    );
+    assert_eq!(f.calls(), 5);
+    let state = f.state();
+    assert_eq!(state["stage"], "verify");
+    assert_eq!(state["verify_retries"], 0);
+    assert!(state["review"]["findings"].as_object().unwrap().is_empty());
+    assert!(state["review"]["areas"].as_object().unwrap().is_empty());
+    assert!(
+        fs::read_to_string(f.root.join("args-4"))
+            .unwrap()
+            .contains("No structured review coverage was recorded")
+    );
+    let resumed = f.run("review-no-report", true);
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("OPERATING POLICY STOP"));
+    assert_eq!(f.calls(), 5);
 }
 
 #[test]

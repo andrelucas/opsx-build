@@ -33,6 +33,26 @@ Repeated unassessable outcomes reach the same allowance with a distinct
 product repair. Missing evidence is not proof of waste or a product defect.
 Request and existing recovery bounds still apply.
 
+An explicit `INCOMPLETE` result means authorized work remains without an external
+decision or input. The runner continues automatically under the existing stage
+request allowance instead of asking the operator to run an identical resume.
+Other stages keep their session and original timeout. Verify uses one same-session
+continuation, then retains its partial review and starts a fresh verifier with
+the exact outstanding areas and prior evidence. Neither partial coverage nor
+known blockers alone authorize Repair before review is complete.
+
+Incomplete review handoffs do not consume repair cycles or count as unsuccessful
+repair/review transitions. Independent closures recorded during partial review
+still count when the completed review arrives; genuine reopening remains subject
+to the recurrence guard. Missing structured coverage stays unknown. All backend
+dispatches consume the same cumulative request allowance across fresh sessions
+and manual resumes. An exhausted allowance stops before another model request;
+the report includes the latest unfinished stage work and partial review's
+findings, area limitations and evidence path. Diagnose that obstacle or explicitly
+authorize a justified cumulative allowance change before resuming. `BLOCKED`
+continues to require external intervention, and substantive process errors and
+missing-status protocol recovery are not converted to autonomous continuation.
+
 Repeated commands or unchanged file hashes alone never establish waste, nor that
 a defect pre-existed. Dependency/caller changes can affect unchanged code. Review
 snapshots and original review records remain available for diagnosis, with that

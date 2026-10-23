@@ -668,13 +668,19 @@ planning, and narrow milestone stages do not use recovery for an omitted result.
 
 Every backend also accepts an explicit `INCOMPLETE` result in any stage: work
 remains, but it can continue without an external decision or input. The runner
-continues the same session once, preserving partial work and the original stage
-timeout, without compacting just for this result. This shares the one-continuation
-allowance with omitted-result recovery and is recorded as `incomplete` in usage.
-A second incomplete result stops with an error and preserves the unfinished
-checkpoint for `--resume`; it neither advances the stage nor requests a frontier
-replan. `BLOCKED` always stops immediately and is never reclassified from its
-summary wording. Verification continuations remain review-only.
+continues automatically within the durable operating-policy request allowance,
+without compacting just for this result. Ordinary stages retain the same session
+and original stage timeout. Verify first continues the same session once (sharing
+that turn with omitted-result recovery), then saves the partial review and opens
+a fresh verifier with retained findings, completed coverage, outstanding areas
+and check guidance. No repair cycle is consumed until a complete `RETRY`.
+Each dispatch is recorded as `incomplete` in usage and consumes the existing
+cumulative stage allowance (default 12 requests). Exhaustion stops with the
+remaining work, evidence paths and required intervention; plain `--resume` cannot
+reset that allowance. `BLOCKED` always stops immediately and is never reclassified
+from its summary wording. Verification continuations remain review-only;
+unfinished coverage cannot authorize Repair or acceptance. Missing terminal
+results retain their separate one-continuation protocol-recovery rule.
 
 Agents must wait for required delegated work using their runtime's tools and
 collect the results before ending the stage. If the harness requires a status

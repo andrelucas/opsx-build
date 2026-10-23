@@ -12,7 +12,7 @@
     },
     "summary": {
       "type": "string",
-      "description": "Checks actually run and limitations. RETRY identifies blockers with a governing source, concrete consequence and minimum complete repair. Keep observations separate. BLOCKED identifies the necessary external decision or input. INCOMPLETE finishes pending review in the same session."
+      "description": "Checks actually run and limitations. RETRY identifies blockers with a governing source, concrete consequence and minimum complete repair after finishing required review areas. Keep observations separate. BLOCKED identifies the necessary external decision or unavailable input. INCOMPLETE means the unfinished review can continue without external input; identify the exact pending checks, areas or delegated results in the summary and area limitations. The runner controls bounded continuation; do not ask the user to resume routine unfinished work."
     },
     "review": {
       "type": "object",

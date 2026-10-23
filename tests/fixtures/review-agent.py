@@ -28,14 +28,14 @@ summary = "Apply checked the required outcome; remaining claims need independent
 report = None
 if count == 1:
     Path("candidate.txt").write_text("implemented\n")
-elif count in (2, 4) or (mode == "review-partial" and count >= 2) or (convergence and count % 2 == 0):
-    partial = mode == "review-partial"
+elif count in (2, 4) or (mode in ("review-partial", "review-no-report") and count >= 2) or (mode == "review-continue" and count in (3, 6)) or (convergence and count % 2 == 0):
+    partial = mode == "review-partial" or (mode == "review-continue" and count <= 3)
     finding = {
-        "id": "" if count == 2 or partial else "F0001",
+        "id": "" if count == 2 or (partial and count == 3) else "F0001",
         "kind": "assertion",
         "origin": "previously_missed",
         "evidence_kind": "reproduced",
-        "status": "open" if count == 2 or partial or mode == "review-stall" else "closed",
+        "status": "open" if count == 2 or partial or mode == "review-stall" or (mode == "review-continue" and count == 4) else "closed",
         "sources": ["contract.md#REQ-01"],
         "scope": ["required outcome and sibling refusal paths"],
         "consequence": "The required refusal could be omitted without failing a test",
@@ -46,9 +46,17 @@ elif count in (2, 4) or (mode == "review-partial" and count >= 2) or (convergenc
         "findings": [] if count == 4 and mode == "review-omit" else [finding],
         "areas": [{"id": "required-outcome", "sources": ["contract.md#REQ-01"],
                    "paths": ["candidate.txt"], "status": "partial" if partial else "reviewed",
-                   "limitations": "No native runtime qualification claimed"}],
+                   "limitations": "Rerun clean unit and vet checks after removing the temporary diagnostic" if partial else "No native runtime qualification claimed"}],
     }
+    if mode == "review-continue":
+        report["areas"].append({"id": "completed-audit", "sources": ["contract.md#REQ-01"],
+                                "paths": ["candidate.txt"], "status": "reviewed", "limitations": ""})
     status = "RETRY" if count == 2 and not partial else "VERIFIED"
+    if mode == "review-continue" and count <= 4:
+        status = "RETRY"
+    if mode == "review-blocked":
+        status = "BLOCKED"
+        report["areas"][0]["status"] = "partial"
     if mode == "review-stall":
         status = "RETRY"
     if mode == "review-productive" and count >= 4:
@@ -57,7 +65,7 @@ elif count in (2, 4) or (mode == "review-partial" and count >= 2) or (convergenc
             report["findings"].append(dict(finding, id="", status="open", consequence="A different genuine required assertion remains missing"))
             status = "RETRY"
     summary = "Required assertion missing" if count == 2 else "Independently checked the repaired rule and alternatives"
-elif count == 3 or (convergence and count >= 3 and count % 2 == 1 and (mode == "review-stall" or count < 6)):
+elif count == 3 or (mode == "review-continue" and count == 5) or (convergence and count >= 3 and count % 2 == 1 and (mode == "review-stall" or count < 6)):
     Path("candidate.txt").write_text("fixed\n")
     summary = "Repair claims the rule and relevant sibling paths are corrected"
 else:
@@ -81,6 +89,9 @@ if mode == "review-checks" and count <= 4:
 output = {"opsx_status": status, "summary": summary}
 if mode == "review-incomplete-loop":
     output = {"opsx_status": "INCOMPLETE", "summary": "Unfinished owned review work; continuing without a durable result"}
+if mode == "review-no-report" and count >= 2:
+    output = {"opsx_status": "INCOMPLETE", "summary": "Collect the pending delegated audit before finalizing coverage"}
+    report = None
 if mode == "review-timeout":
     child = subprocess.Popen(["sleep", "30"])
     (root / "owned-child.pid").write_text(str(child.pid))

@@ -810,21 +810,30 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
             usage.finish(&outcome);
             match attempt {
                 Ok(TurnOutcome::Complete(result)) if result.signal == StageSignal::Incomplete => {
+                    if let Some(guard) = self.ui.operating_policy() {
+                        guard.incomplete_stage(&result)?;
+                    }
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
-                        if protocol == StageProtocol::Verify && result.review.is_some() {
+                        if protocol == StageProtocol::Verify {
                             return Ok(result);
                         }
-                        bail!(
-                            "Codex phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
-                            result.text
-                        );
+                        if self.ui.operating_policy().is_none() {
+                            bail!(
+                                "Codex phase remains INCOMPLETE after one continuation without durable operating-policy accounting. Remaining work: {}",
+                                result.text
+                            );
+                        }
                     }
                     incomplete_stage_recoveries += 1;
                     self.ui
-                        .warn("Codex reported unfinished work; continuing the same session once");
-                    current_prompt = incomplete_stage_continuation_prompt(protocol);
+                        .warn("Codex reported unfinished work; continuing the same session within the remaining stage allowance");
+                    current_prompt = format!(
+                        "{}{}",
+                        incomplete_stage_continuation_prompt(protocol),
+                        result.continuation_context()
+                    );
                     current_activity = format!(
-                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                        "{activity} (unfinished-phase continuation {incomplete_stage_recoveries})"
                     );
                 }
                 Ok(TurnOutcome::Complete(result)) => return Ok(result),

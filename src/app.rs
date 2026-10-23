@@ -2979,9 +2979,17 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             StageSignal::Blocked => blocked("verify", &result.text),
-            StageSignal::Incomplete => bail!(
-                "verification remains INCOMPLETE after bounded continuation; partial review evidence and findings are saved at Verify. Resume to finish the outstanding review; no repair cycle was consumed"
-            ),
+            StageSignal::Incomplete => {
+                let guard = self.ui.operating_policy()
+                    .context("automatic verification continuation requires durable operating-policy accounting")?;
+                if let Some(progress) = state.review.progress() {
+                    guard.incomplete_review(progress)?;
+                }
+                self.ui.warn(
+                    "Verification is unfinished; continuing in a fresh session with retained findings and coverage under the remaining stage request allowance",
+                );
+                Ok(())
+            }
             StageSignal::Ready
             | StageSignal::Done
             | StageSignal::TooLarge

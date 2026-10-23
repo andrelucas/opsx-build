@@ -69,6 +69,8 @@ fn review(number: u32, closed: &[&str], reopened: &[&str]) -> Progress {
         closed: closed.iter().map(|id| (*id).into()).collect(),
         reopened: reopened.iter().map(|id| (*id).into()).collect(),
         same_input_snapshots: Some(true),
+        summary: "Independent review evidence".into(),
+        unfinished_areas: Vec::new(),
     }
 }
 
@@ -128,6 +130,49 @@ fn a_gap_in_review_evidence_breaks_the_consecutive_no_progress_comparison() {
         guard.boundary(Some("delivery"), "Repair").unwrap();
     }
     assert_eq!(f.ledger().no_progress, 1);
+}
+
+#[test]
+fn unfinished_review_does_not_consume_repair_progress_and_keeps_partial_closures_on_resume() {
+    let f = Fixture::new(Policy::default());
+    let guard = f.run.open(None).unwrap();
+    guard.review(review(1, &[], &[])).unwrap();
+    let mut partial = review(2, &["F0001"], &[]);
+    partial.verdict = "Incomplete".into();
+    guard.incomplete_review(partial).unwrap();
+    let mut pending = review(3, &[], &[]);
+    pending.verdict = "Incomplete".into();
+    guard.incomplete_review(pending).unwrap();
+    assert_eq!(f.ledger().reviews.len(), 1);
+    assert_eq!(f.ledger().no_progress, 0);
+    assert_eq!(f.ledger().unassessable, 0);
+    drop(guard);
+    let guard = f.run.open(None).unwrap();
+    guard.review(review(4, &[], &[])).unwrap();
+    guard.boundary(Some("delivery"), "Repair").unwrap();
+    let ledger = f.ledger();
+    assert_eq!(ledger.no_progress, 0);
+    assert_eq!(ledger.reviews[1].closed, ["F0001"]);
+    assert!(ledger.incomplete_review.is_none());
+}
+
+#[test]
+fn repeated_reopening_in_partial_reviews_still_triggers_the_existing_guard() {
+    let f = Fixture::new(Policy::default());
+    let guard = f.run.open(None).unwrap();
+    guard.boundary(Some("delivery"), "Verify").unwrap();
+    guard.review(review(1, &[], &[])).unwrap();
+    for number in 2..=3 {
+        let mut partial = review(number, &[], &["F0001"]);
+        partial.verdict = "Incomplete".into();
+        guard.incomplete_review(partial.clone()).unwrap();
+        guard.incomplete_review(partial).unwrap(); // Recording the same evidence is idempotent.
+    }
+    assert!(is_stop(
+        &guard.boundary(Some("delivery"), "Verify").unwrap_err()
+    ));
+    assert_eq!(f.report()["trigger"], "recurring_findings");
+    assert_eq!(f.report()["incomplete_review"]["id"], "round-3");
 }
 
 #[test]

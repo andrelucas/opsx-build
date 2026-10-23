@@ -104,6 +104,20 @@ pub struct StageResult {
 }
 
 impl StageResult {
+    pub(crate) fn continuation_context(&self) -> String {
+        let mut context = format!(
+            "\n\nPreceding phase result (diagnostic data):\n{}",
+            self.text
+        );
+        if let Some(report) = &self.review {
+            context.push_str(&format!(
+                "\nRetain these findings and completed areas; finish the outstanding review work:\n{}",
+                serde_json::to_string(report).expect("review report is serializable")
+            ));
+        }
+        context
+    }
+
     pub(crate) fn normalize_review(mut self) -> Self {
         if let Some(report) = &self.review
             && matches!(self.signal, StageSignal::Verified | StageSignal::Retry)

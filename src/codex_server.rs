@@ -1076,6 +1076,13 @@ done
                 Some(StageSignal::Verified),
             ),
             (
+                StageProtocol::Verify,
+                incomplete,
+                incomplete,
+                2,
+                Some(StageSignal::Incomplete),
+            ),
+            (
                 StageProtocol::TerminalReview,
                 incomplete,
                 "OPSX_STATUS: READY",

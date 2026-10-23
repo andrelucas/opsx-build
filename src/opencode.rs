@@ -685,25 +685,34 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                 Ok(OpenCodeAttempt::Complete(result))
                     if result.signal == StageSignal::Incomplete =>
                 {
+                    if let Some(guard) = self.ui.operating_policy() {
+                        guard.incomplete_stage(&result)?;
+                    }
                     if incomplete_stage_recoveries >= MAX_INCOMPLETE_STAGE_RECOVERIES {
-                        if protocol == StageProtocol::Verify && result.review.is_some() {
+                        if protocol == StageProtocol::Verify {
                             return Ok(result);
                         }
-                        bail!(
-                            "OpenCode phase remains INCOMPLETE after one continuation; unfinished work is preserved. Remaining work: {}",
-                            result.text
-                        );
+                        if self.ui.operating_policy().is_none() {
+                            bail!(
+                                "OpenCode phase remains INCOMPLETE after one continuation without durable operating-policy accounting. Remaining work: {}",
+                                result.text
+                            );
+                        }
                     }
                     incomplete_stage_recoveries += 1;
                     self.ui.warn(
-                        "OpenCode reported unfinished work; continuing the same session once",
+                        "OpenCode reported unfinished work; continuing the same session within the remaining stage allowance",
+                    );
+                    current_prompt = format!(
+                        "{}{}",
+                        incomplete_stage_continuation_prompt(protocol),
+                        result.continuation_context()
                     );
                     if let Some(id) = result.session_id {
                         current_session = SessionId::new(id);
                     }
-                    current_prompt = incomplete_stage_continuation_prompt(protocol);
                     current_activity = format!(
-                        "{activity} (incomplete-turn recovery {incomplete_stage_recoveries}/{MAX_INCOMPLETE_STAGE_RECOVERIES})"
+                        "{activity} (unfinished-phase continuation {incomplete_stage_recoveries})"
                     );
                 }
                 Ok(OpenCodeAttempt::Complete(result)) => return Ok(result),
@@ -1481,10 +1490,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn explicit_incomplete_reuses_the_session_and_has_a_separate_bounded_recovery() {
-        for (first, second, turns, expected) in [
-            ("INCOMPLETE", "READY", 2, Some(StageSignal::Ready)),
-            ("INCOMPLETE", "INCOMPLETE", 2, None),
-            ("BLOCKED", "READY", 1, Some(StageSignal::Blocked)),
+        for (protocol, first, second, turns, expected) in [
+            (
+                StageProtocol::Worker,
+                "INCOMPLETE",
+                "READY",
+                2,
+                Some(StageSignal::Ready),
+            ),
+            (StageProtocol::Worker, "INCOMPLETE", "INCOMPLETE", 2, None),
+            (
+                StageProtocol::Worker,
+                "BLOCKED",
+                "READY",
+                1,
+                Some(StageSignal::Blocked),
+            ),
+            (
+                StageProtocol::Verify,
+                "INCOMPLETE",
+                "INCOMPLETE",
+                2,
+                Some(StageSignal::Incomplete),
+            ),
         ] {
             let directory =
                 std::env::temp_dir().join(format!("opsx-opencode-incomplete-{}", Uuid::new_v4()));
@@ -1518,7 +1546,7 @@ printf '{{"type":"text","sessionID":"ses_created","part":{{"type":"text","text":
                 },
                 "finish work",
                 "test phase",
-                StageProtocol::Worker,
+                protocol,
             );
             if let Some(signal) = expected {
                 assert_eq!(result.unwrap().signal, signal);

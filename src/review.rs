@@ -91,6 +91,31 @@ pub enum AreaStatus {
 }
 
 impl Report {
+    pub(crate) fn unfinished_work(&self) -> String {
+        if self.areas.is_empty() {
+            return "No review areas were recorded; establish actual review coverage.".into();
+        }
+        self.areas
+            .iter()
+            .filter(|area| {
+                area.status != AreaStatus::Reviewed
+                    || area.id.trim().is_empty()
+                    || area.sources.is_empty()
+            })
+            .map(|area| {
+                format!(
+                    "{} ({:?}): {} Sources: {}. Paths: {}.",
+                    area.id,
+                    area.status,
+                    area.limitations,
+                    area.sources.join(", "),
+                    area.paths.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub(crate) fn from_value(value: Option<&serde_json::Value>) -> Result<Option<Self>> {
         value
             .filter(|value| !value.is_null())
@@ -163,6 +188,10 @@ pub(crate) struct Progress {
     pub closed: Vec<String>,
     pub reopened: Vec<String>,
     pub same_input_snapshots: Option<bool>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub unfinished_areas: Vec<Area>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +371,13 @@ impl History {
                 .collect(),
             reopened: round.reopened.clone(),
             same_input_snapshots,
+            summary: round.summary.clone(),
+            unfinished_areas: self
+                .areas
+                .values()
+                .filter(|area| area.status != AreaStatus::Reviewed)
+                .cloned()
+                .collect(),
         })
     }
 
@@ -405,6 +441,9 @@ impl History {
                 "Full retained evidence: `{}`\n",
                 round.evidence_path.display()
             ));
+            if round.verdict == "Incomplete" && !repair {
+                text.push_str("Continue this unfinished Verify from the first outstanding area. Retain existing findings and completed audits; do not repair the candidate. Finish the recorded limitations and return a complete verdict. Expand prior coverage only when changed inputs or concrete new evidence require it.\n");
+            }
             if !repair || round.report.is_none() {
                 text.push_str(&format!("{}\n", excerpt(&round.summary, 4000)));
             }
