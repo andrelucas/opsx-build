@@ -204,6 +204,8 @@ struct RunState {
     review: crate::review::History,
     #[serde(default)]
     checks: crate::checks::History,
+    #[serde(default)]
+    operating: Option<crate::operating_policy::Run>,
     pending_direction: Option<String>,
     proposal_head: Option<String>,
     final_head: Option<String>,
@@ -305,6 +307,7 @@ impl RunState {
             archive: None,
             review: crate::review::History::default(),
             checks: crate::checks::History::default(),
+            operating: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -355,6 +358,7 @@ impl RunState {
             archive: None,
             review: crate::review::History::default(),
             checks: crate::checks::History::default(),
+            operating: None,
             pending_direction: None,
             proposal_head: None,
             final_head: None,
@@ -460,6 +464,14 @@ impl<U: Ui> App<U> {
 
     pub fn run(self) -> Result<()> {
         match self.run_inner() {
+            Err(error) if crate::operating_policy::is_stop(&error) => {
+                self.ui.finish_dashboard();
+                if let Some(guard) = self.ui.operating_policy() {
+                    guard.finish_stop()
+                } else {
+                    Err(error)
+                }
+            }
             Err(error) if error.downcast_ref::<PauseRequested>().is_some() => {
                 let pause = error
                     .downcast_ref::<PauseRequested>()
@@ -1368,6 +1380,23 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
+        let selected_policy = self
+            .cli
+            .operating_policy
+            .as_ref()
+            .filter(|_| state.operating.is_none() || self.cli.operating_policy_explicit)
+            .map(|path| crate::operating_policy::Policy::read(&self.cli.repo.join(path)))
+            .transpose()?;
+        if state.operating.is_none() {
+            state.operating = Some(crate::operating_policy::Run::new(
+                repo,
+                selected_policy.clone().unwrap_or_default(),
+                &self.ui,
+            )?);
+            persist_state(repo, &state, &self.ui)?;
+        }
+        let guard = Arc::new(state.operating.as_ref().unwrap().open(selected_policy)?);
+        self.ui.set_operating_policy(guard.clone())?;
         state.checks.ensure(repo, &self.ui)?;
         if let Some(contracts) = &mut state.contracts
             && contracts.obligation_inventory.is_some()
@@ -1382,6 +1411,7 @@ impl<U: Ui> App<U> {
             progress.started_at = Some(Instant::now());
         }
         loop {
+            guard.boundary(state.change.as_deref(), state.stage.title())?;
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
                 contracts.check_schema(repo)?;
@@ -1502,6 +1532,8 @@ impl<U: Ui> App<U> {
                             .expect("bootstrap campaign was checked above");
                         let before_changes = openspec_snapshot(repo, &self.ui)?;
                         state = RunState::new("advance".to_owned(), before_changes);
+                        state.operating = completed_state.operating.take();
+                        state.checks = completed_state.checks.clone();
                         state.contracts = completed_state.contracts.take();
                         state.bootstrap_progress = completed_state.bootstrap_progress.take();
                         state.campaign = Some(campaign);
@@ -1584,6 +1616,8 @@ impl<U: Ui> App<U> {
                     campaign.iteration += 1;
                     let before_changes = openspec_snapshot(repo, &self.ui)?;
                     state = RunState::new(request, before_changes);
+                    state.operating = completed_state.operating.take();
+                    state.checks = completed_state.checks.clone();
                     state.contracts = completed_state.contracts.take();
                     state.bootstrap_progress = completed_state.bootstrap_progress.take();
                     state.campaign = Some(campaign);
@@ -1663,6 +1697,9 @@ impl<U: Ui> App<U> {
         frontier_launcher: &AgentLauncher,
         mut state: RunState,
     ) -> Result<RunState> {
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.before_replan()?;
+        }
         let outcome = state
             .too_large
             .clone()
@@ -1749,6 +1786,9 @@ impl<U: Ui> App<U> {
             ) {
                 Ok(result) => result,
                 Err(error) => {
+                    if crate::operating_policy::is_stop(&error) {
+                        return Err(error);
+                    }
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier replan invocation failed; the pre-Propose baseline was restored",
@@ -1825,6 +1865,9 @@ impl<U: Ui> App<U> {
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                 }
                 Err(error) => {
+                    if crate::operating_policy::is_stop(&error) {
+                        return Err(error);
+                    }
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier replan failed its repository postcondition twice; the pre-Propose baseline was restored",
@@ -1842,6 +1885,12 @@ impl<U: Ui> App<U> {
         mut state: RunState,
         escalation: Option<TooLargeOutcome>,
     ) -> Result<RunState> {
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.boundary(state.change.as_deref(), "Frontier acceptance review")?;
+            if escalation.is_some() {
+                guard.before_replan()?;
+            }
+        }
         let assignment = state
             .agenda
             .clone()
@@ -1941,6 +1990,9 @@ impl<U: Ui> App<U> {
             ) {
                 Ok(result) => result,
                 Err(error) => {
+                    if crate::operating_policy::is_stop(&error) {
+                        return Err(error);
+                    }
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
                     return Err(error.context(
                         "frontier acceptance review failed; the pre-9999 baseline was restored",
@@ -2395,6 +2447,9 @@ impl<U: Ui> App<U> {
                 }
                 return Err(error);
             }
+            if let Some(guard) = self.ui.operating_policy() {
+                guard.boundary(state.change.as_deref(), state.stage.title())?;
+            }
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
                 contracts.check_schema(repo)?;
@@ -2655,6 +2710,13 @@ impl<U: Ui> App<U> {
             self.ui
                 .info(&format!("Selected OpenSpec change `{change}`"));
             if let Err(error) = claude.rename_session(session.id(), &change) {
+                if crate::operating_policy::is_stop(&error) {
+                    state.planning_session = None;
+                    state.planning_backend = None;
+                    state.stage = stage_after_propose(self.cli.yolo);
+                    persist_state(repo, state, &self.ui)?;
+                    return Err(error);
+                }
                 self.ui
                     .warn(&format!("Could not rename planning session: {error}"));
             }
@@ -2873,6 +2935,12 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 self.ui.success("Verification passed");
+                if let Some(guard) = self.ui.operating_policy() {
+                    if let Some(progress) = state.review.progress() {
+                        guard.review(progress)?;
+                    }
+                    guard.verified(format!("Independent Verify passed for {change}; final acceptance remains separately required"))?;
+                }
                 state.verification = Some(VerificationEvidence::finish(
                     &change,
                     result.text.clone(),
@@ -2884,6 +2952,11 @@ impl<U: Ui> App<U> {
                 persist_state(repo, state, &self.ui)
             }
             StageSignal::Retry => {
+                if let Some(guard) = self.ui.operating_policy()
+                    && let Some(progress) = state.review.progress()
+                {
+                    guard.review(progress)?;
+                }
                 state.verify_retries += 1;
                 state.pending_repair = Some(
                     state
@@ -3187,6 +3260,12 @@ impl<U: Ui> App<U> {
         }
         let outcome = match result {
             Ok(None) => {
+                if let Some(guard) = self.ui.operating_policy() {
+                    guard.verified(format!(
+                        "Independent acceptance passed for {:?}",
+                        state.change
+                    ))?;
+                }
                 state.stage = gate.next_stage;
                 state.pending_repair = None;
                 Ok(())
@@ -4672,6 +4751,7 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         archive: None,
         review: crate::review::History::default(),
         checks: crate::checks::History::default(),
+        operating: None,
         proposal_head: value
             .get("proposal_commit")
             .and_then(Value::as_str)

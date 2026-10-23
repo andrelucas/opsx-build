@@ -139,6 +139,12 @@ fresh execution is required. The final acceptance gate never reads this cache.
 
 ## Evaluation
 
+The third runner change, [operating policy](operating-policy.md), uses retained
+evidence to stop fruitless repetition and explain bounded recovery. It does not
+reopen the completed continuity/reuse backlog. It applies in both modes with
+normal operating defaults; cost remains diagnostic context. Independent acceptance
+continues to define completion.
+
 Deterministic synthetic contracts and fake stage backends establish orchestration,
 state, provenance and gate invariants; they do not prove a model's review quality.
 Include rejection of real missing observations, wrong conditions/ownership and
@@ -207,6 +213,25 @@ campaign evidence, or launch/resume campaigns as part of implementing this work.
   Clippy with `-D warnings`, formatting and diff checks pass. No campaign input,
   live process or installed runner was changed. Live model cost/quality evaluation
   remains outstanding; these deterministic results establish orchestration only.
+- The 0.31.0 working copy adds a default operating-policy guard in both modes.
+  Independent closure evidence establishes progress; recurring findings,
+  fruitless repair/review transitions, repeated reporting gaps, stage dispatches,
+  recovery without progress and selected runtime bounds can stop further work.
+  No extra diagnostic call, automatic model change or policy-driven rollback is
+  introduced. Incomplete acceptance stays incomplete.
+- Policy state and actionable reports live in private Git metadata. A normal
+  resume retains consumed allowances, review history and unresolved operations;
+  explicit policy revisions authorize only the remaining cumulative allowance.
+  Owned process groups are cleaned up on cancellation, with unconfirmed work
+  reported for reconciliation. Bootstrap and iteration handoffs carry the same
+  policy ledger and check-helper scope.
+- Twenty new regression tests cover productive versus fruitless repair, genuine
+  new and recurring defects, review uncertainty, pinned policies and cumulative
+  resume, internal continuations/compaction, concurrency, pre-rollback stops,
+  owned-child cleanup and interrupted acceptance. All 445 tests pass with
+  `TMPDIR=/private/tmp cargo test --all-targets`; Clippy with `-D warnings`,
+  formatting and diff checks pass. Existing campaigns and installed runners are
+  untouched. Live evaluation of default thresholds remains outstanding.
 
 ## Sirocco handoff for the check-receipt change
 

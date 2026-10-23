@@ -14,7 +14,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::{codex::CodexLauncher, ui::Ui};
+use crate::{
+    codex::CodexLauncher,
+    process::{configure_stream_process, kill_stream_process},
+    ui::Ui,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -101,7 +105,7 @@ impl Drop for CodexClientInner {
             stdin.take();
         }
         if let Ok(child) = self.child.get_mut() {
-            let _ = child.kill();
+            let _ = kill_stream_process(child);
             let _ = child.wait();
         }
     }
@@ -140,6 +144,7 @@ impl CodexServerClient {
             command.env(name, value);
         }
         ui.debug(&format!("Codex App Server: {}", spec.display()));
+        configure_stream_process(&mut command);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch Codex App Server `{}`", launcher.program))?;
@@ -390,6 +395,7 @@ impl CodexServerClient {
         output_schema: Option<Value>,
         sandbox_policy: Option<Value>,
         reasoning_summary: Option<&str>,
+        limit: Option<Duration>,
     ) -> Result<String> {
         let mut params = json!({
             "threadId": thread_id,
@@ -404,7 +410,11 @@ impl CodexServerClient {
         if let Some(summary) = reasoning_summary {
             params["summary"] = json!(summary);
         }
-        let response = self.request("turn/start", params, REQUEST_TIMEOUT)?;
+        let response = self.request(
+            "turn/start",
+            params,
+            limit.unwrap_or(REQUEST_TIMEOUT).min(REQUEST_TIMEOUT),
+        )?;
         response
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -438,13 +448,15 @@ impl CodexServerClient {
         &self,
         thread_id: &str,
         mut observe: impl FnMut(&Value),
+        limit: Option<Duration>,
     ) -> Result<()> {
+        let timeout = limit.unwrap_or(COMPACTION_TIMEOUT).min(COMPACTION_TIMEOUT);
+        let deadline = Instant::now() + timeout;
         self.request(
             "thread/compact/start",
             json!({"threadId": thread_id}),
-            COMPACTION_TIMEOUT,
+            timeout,
         )?;
-        let deadline = Instant::now() + COMPACTION_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -659,6 +671,126 @@ done
             unset_environment: Vec::new(),
             isolated_home: None,
         }
+    }
+
+    #[test]
+    fn operating_policy_refuses_an_extra_turn_or_compaction_before_dispatch() {
+        use crate::{
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        let directory = std::env::temp_dir().join(format!("opsx-codex-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ui = RecordingUi::default();
+        let run = Run::new(
+            &directory,
+            Policy {
+                max_requests_per_stage: 1,
+                ..Policy::default()
+            },
+            &ui,
+        )
+        .unwrap();
+        ui.set_operating_policy(Arc::new(run.open(None).unwrap()))
+            .unwrap();
+        let launcher = planning_test_launcher(&directory, r#""result":{}"#);
+        let backend = CodexBackend::new(&directory, &launcher, "auto", None, &ui);
+        let error = backend
+            .invoke(
+                SessionMode::New {
+                    id: SessionId::new("first"),
+                    name: None,
+                },
+                "work",
+                "Verify",
+                StageProtocol::Verify,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("simulated turn failure"));
+        let stopped = backend
+            .invoke(
+                SessionMode::New {
+                    id: SessionId::new("next"),
+                    name: None,
+                },
+                "retry",
+                "Verify",
+                StageProtocol::Verify,
+            )
+            .unwrap_err();
+        assert!(crate::operating_policy::is_stop(&stopped));
+        let stopped = backend
+            .compact_session(&SessionId::new("actual-thread"), "Verify")
+            .unwrap_err();
+        assert!(crate::operating_policy::is_stop(&stopped));
+        let requests = std::fs::read_to_string(directory.join("requests.jsonl")).unwrap();
+        assert_eq!(
+            requests
+                .lines()
+                .filter(|line| line.contains("\"method\":\"turn/start\""))
+                .count(),
+            1
+        );
+        assert!(!requests.contains("thread/compact/start"));
+        drop(backend);
+        drop(ui);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn owned_server_cleanup_includes_its_child_process_group() {
+        let directory =
+            std::env::temp_dir().join(format!("opsx-codex-owned-group-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let launcher = planning_test_launcher(&directory, r#""result":{}"#);
+        let script = directory.join("server.sh");
+        let contents = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(
+            &script,
+            format!("sleep 30 &\nprintf '%s\\n' \"$!\" > owned-child.pid\n{contents}"),
+        )
+        .unwrap();
+        let client = CodexServerClient::start(&launcher, &directory, &QuietUi).unwrap();
+        let server_pid = client.inner.child.lock().unwrap().id() as libc::pid_t;
+        let child_pid: libc::pid_t = std::fs::read_to_string(directory.join("owned-child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: these identities belong to the fake server and child created here.
+        assert_eq!(unsafe { libc::getpgid(server_pid) }, server_pid);
+        assert_eq!(unsafe { libc::getpgid(child_pid) }, server_pid);
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = Command::new("ps")
+                .args(["-p", &child_pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            assert!(
+                state.stderr.is_empty(),
+                "could not inspect owned child: {}",
+                String::from_utf8_lossy(&state.stderr)
+            );
+            let state = String::from_utf8_lossy(&state.stdout);
+            if state.trim().is_empty() || state.contains('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned child still running: {state}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1414,7 +1546,7 @@ read remaining
         assert_eq!(client.reported_model(&thread).as_deref(), Some("test"));
         let mut observed = Vec::new();
         client
-            .compact_thread(&thread, |event| observed.push(event.clone()))
+            .compact_thread(&thread, |event| observed.push(event.clone()), None)
             .unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0]["method"], "thread/compacted");

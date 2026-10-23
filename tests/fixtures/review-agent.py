@@ -22,19 +22,20 @@ with (root / "calls").open("a") as out:
 count = len((root / "calls").read_text().splitlines())
 (root / f"args-{count}").write_text("\n".join(sys.argv) + "\n" + prompt)
 mode = os.environ["CONTRACT_TEST_MODE"]
+convergence = mode in ("review-stall", "review-productive")
 status = "READY"
 summary = "Apply checked the required outcome; remaining claims need independent review"
 report = None
 if count == 1:
     Path("candidate.txt").write_text("implemented\n")
-elif count in (2, 4) or (mode == "review-partial" and count >= 2):
+elif count in (2, 4) or (mode == "review-partial" and count >= 2) or (convergence and count % 2 == 0):
     partial = mode == "review-partial"
     finding = {
         "id": "" if count == 2 or partial else "F0001",
         "kind": "assertion",
         "origin": "previously_missed",
         "evidence_kind": "reproduced",
-        "status": "open" if count == 2 or partial else "closed",
+        "status": "open" if count == 2 or partial or mode == "review-stall" else "closed",
         "sources": ["contract.md#REQ-01"],
         "scope": ["required outcome and sibling refusal paths"],
         "consequence": "The required refusal could be omitted without failing a test",
@@ -48,8 +49,15 @@ elif count in (2, 4) or (mode == "review-partial" and count >= 2):
                    "limitations": "No native runtime qualification claimed"}],
     }
     status = "RETRY" if count == 2 and not partial else "VERIFIED"
+    if mode == "review-stall":
+        status = "RETRY"
+    if mode == "review-productive" and count >= 4:
+        finding["id"] = f"F{count // 2 - 1:04d}"
+        if count < 6:
+            report["findings"].append(dict(finding, id="", status="open", consequence="A different genuine required assertion remains missing"))
+            status = "RETRY"
     summary = "Required assertion missing" if count == 2 else "Independently checked the repaired rule and alternatives"
-elif count == 3:
+elif count == 3 or (convergence and count >= 3 and count % 2 == 1 and (mode == "review-stall" or count < 6)):
     Path("candidate.txt").write_text("fixed\n")
     summary = "Repair claims the rule and relevant sibling paths are corrected"
 else:
@@ -71,6 +79,15 @@ if mode == "review-checks" and count <= 4:
     (root / f"check-{count}.json").write_text(checked.stdout)
 
 output = {"opsx_status": status, "summary": summary}
+if mode == "review-incomplete-loop":
+    output = {"opsx_status": "INCOMPLETE", "summary": "Unfinished owned review work; continuing without a durable result"}
+if mode == "review-timeout":
+    child = subprocess.Popen(["sleep", "30"])
+    (root / "owned-child.pid").write_text(str(child.pid))
+    try:
+        child.wait()
+    finally:
+        child.wait()
 if report is not None:
     output["review"] = report
 print(json.dumps({"type": "result", "subtype": "success", "session_id": "review-fixture",

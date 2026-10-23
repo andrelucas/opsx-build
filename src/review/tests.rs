@@ -95,6 +95,7 @@ fn repair_claims_do_not_close_findings_and_later_evidence_can_reopen_them() {
         )
         .unwrap();
     assert!(!history.has_open_findings());
+    assert_eq!(history.progress().unwrap().closed, ["F0001"]);
     let mut history: History =
         serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
     history
@@ -111,6 +112,7 @@ fn repair_claims_do_not_close_findings_and_later_evidence_can_reopen_them() {
         )
         .unwrap();
     assert_eq!(history.findings["F0001"].origin, FindingOrigin::Reopened);
+    assert_eq!(history.progress().unwrap().reopened, ["F0001"]);
     assert_eq!(
         history.rounds[0].report.as_ref().unwrap().findings[0].status,
         FindingStatus::Open

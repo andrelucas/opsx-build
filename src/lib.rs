@@ -19,6 +19,7 @@ pub mod model_confusions;
 pub mod opencode;
 mod opencode_server;
 pub mod openspec;
+pub mod operating_policy;
 pub mod process;
 pub mod review;
 mod runner_executable;

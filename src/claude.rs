@@ -1055,10 +1055,12 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 spec
             };
             let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
+                usage.before_request()?;
                 self.run_stage_command(&spec, activity, timeout, usage)?
             } else {
+                usage.before_request()?;
                 self.runner.run(
-                    &spec,
+                    &spec.policy_request(),
                     if first_attempt {
                         activity
                     } else {
@@ -1123,8 +1125,11 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         timeout: Option<Duration>,
         usage: &mut Attempt<'_, U>,
     ) -> Result<ProcessOutput> {
-        self.runner
-            .run_streaming_with_timeout(spec, activity, timeout, |line| {
+        self.runner.run_streaming_with_timeout(
+            &spec.clone().policy_request(),
+            activity,
+            timeout,
+            |line| {
                 usage.line(line);
                 if let Some(filter) = self.stream_filter {
                     for item in filter_line(line, filter) {
@@ -1135,7 +1140,8 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                         self.ui.stream_item(&item);
                     }
                 }
-            })
+            },
+        )
     }
 
     pub fn rename_session(&self, session_id: &SessionId, name: &str) -> Result<()> {
@@ -1179,7 +1185,10 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
             },
             "Naming Claude session",
         );
-        let output = self.runner.run(&spec, "Naming Claude session")?;
+        usage.before_request()?;
+        let output = self
+            .runner
+            .run(&spec.policy_request(), "Naming Claude session")?;
         usage.output(&output.stdout);
         usage.finish(if output.success { "completed" } else { "error" });
         if !output.success {
@@ -1228,10 +1237,11 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
             },
             &activity,
         );
+        usage.before_request()?;
         let result = if self.stream_transport {
             self.run_stage_command(&spec, &activity, None, &mut usage)
         } else {
-            self.runner.run(&spec, &activity)
+            self.runner.run(&spec.policy_request(), &activity)
         };
         if let Ok(output) = &result {
             usage.output(&output.stdout);

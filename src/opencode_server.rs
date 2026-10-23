@@ -236,8 +236,16 @@ impl OpenCodeServerClient {
         Ok(())
     }
 
-    pub(crate) fn compact_session(&self, session_id: &str) -> Result<()> {
+    pub(crate) fn compact_session(&self, session_id: &str, limit: Option<Duration>) -> Result<()> {
+        let deadline = Instant::now()
+            + limit
+                .unwrap_or(COMPACTION_REQUEST_TIMEOUT)
+                .min(COMPACTION_REQUEST_TIMEOUT);
         let (provider_id, model_id) = self.session_model(session_id)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("OpenCode compaction exhausted its request allowance before dispatch");
+        }
         let value = self.request_json(
             "POST",
             &format!("/session/{session_id}/summarize"),
@@ -247,7 +255,7 @@ impl OpenCodeServerClient {
                 "auto": false
             })),
             true,
-            COMPACTION_REQUEST_TIMEOUT,
+            remaining,
         )?;
         if value.as_bool() != Some(true) {
             bail!("OpenCode did not confirm compaction of session `{session_id}`")
@@ -561,7 +569,7 @@ mod tests {
             None,
         );
 
-        client.compact_session("ses_123").unwrap();
+        client.compact_session("ses_123", None).unwrap();
 
         let request = requests.recv().unwrap();
         assert!(request.starts_with("POST /session/ses_123/summarize?directory=%2Frepo"));

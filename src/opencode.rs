@@ -408,11 +408,22 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
             },
             "Compacting OpenCode session",
         );
+        usage.before_request()?;
         // The existing summarize response exposes no usage; do not query the model again.
-        let result = self
-            .server
-            .client(self.ui)?
-            .compact_session(session.as_str());
+        let guard = self.ui.operating_policy();
+        let result = self.server.client(self.ui)?.compact_session(
+            session.as_str(),
+            guard.as_ref().map(|guard| guard.remaining_request_time()),
+        );
+        if let Some(guard) = &guard
+            && let Err(error) = guard.poll()
+        {
+            if let Err(cleanup) = self.server.client(self.ui)?.abort_session(session.as_str()) {
+                guard.cancellation_unconfirmed(cleanup.to_string());
+            }
+            usage.finish("policy_stop_incomplete");
+            return Err(error);
+        }
         usage.finish(if result.is_ok() { "completed" } else { "error" });
         result
     }
@@ -441,6 +452,8 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         } else {
             spec
         };
+        usage.before_request()?;
+        let spec = spec.policy_request();
         let output = if self.stream_transport {
             self.runner.run_streaming_with_timeout_and_controls(
                 &spec,

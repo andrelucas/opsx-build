@@ -57,6 +57,8 @@ pub struct Cli {
     pub supplied_contracts: bool,
     pub contract_files: Vec<PathBuf>,
     pub obligation_inventory: Option<PathBuf>,
+    pub operating_policy: Option<PathBuf>,
+    pub operating_policy_explicit: bool,
     pub acceptance_files: Vec<PathBuf>,
     pub acceptance_commands: Vec<String>,
     pub acceptance_timeout_seconds: Option<u64>,
@@ -282,6 +284,10 @@ impl Cli {
             }
         }
         cli.campaign_config = campaign;
+        cli.operating_policy_explicit = CliArgs::command()
+            .try_get_matches_from(&raw)?
+            .value_source("operating_policy")
+            == Some(clap::parser::ValueSource::CommandLine);
         Ok(cli)
     }
 
@@ -480,6 +486,10 @@ pub(crate) struct CliArgs {
     /// Maintainer-owned obligation inventory for supplied-contract assignments (protected automatically).
     #[arg(long, value_name = "PATH", overrides_with = "obligation_inventory")]
     obligation_inventory: Option<PathBuf>,
+
+    /// Override default operating limits; selected JSON values are pinned across resume.
+    #[arg(long, value_name = "PATH")]
+    operating_policy: Option<PathBuf>,
 
     /// Maintainer acceptance command run via /bin/sh -c from the campaign root (repeatable).
     #[arg(long, value_name = "COMMAND", overrides_with = "no_acceptance_checks")]
@@ -1146,6 +1156,8 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         args.rewind_target.clone()
     };
     Ok(Cli {
+        operating_policy_explicit: args.operating_policy.is_some(),
+        operating_policy: args.operating_policy,
         request,
         execute,
         rewind_target,
@@ -1419,6 +1431,9 @@ fn role_setting(name: &str, role: &str) -> bool {
 /// A complete, non-secret snapshot. `default` explicitly prevents profile inheritance.
 pub(crate) fn settings_snapshot(cli: &Cli) -> Vec<String> {
     let mut args = Vec::new();
+    if let Some(path) = &cli.operating_policy {
+        args.push(format!("--operating-policy={}", path.display()));
+    }
     for (name, value) in [
         ("sidecar", cli.sidecar),
         ("supplied-contracts", cli.supplied_contracts),

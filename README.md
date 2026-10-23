@@ -574,7 +574,8 @@ selection.
 
 Agenda runs also escalate when a bounded worker stage reports `TOO_LARGE`, exceeds
 `local_worker_timeout_minutes`, exhausts output-limit recovery, or receives the
-dashboard's `f` command.
+dashboard's `f` command. An operating-policy limit that expires first produces a
+preserved-work policy stop instead of capacity escalation.
 
 Exhausting `--max-verify-retries` stops at Repair with the implementation,
 findings, review history and rollback baseline preserved. It does not by itself
@@ -2168,6 +2169,31 @@ flags and are not read from the config file.
 [codex-providers]: https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers
 [openrouter-codex]: https://openrouter.ai/blog/tutorials/codex-cli-openrouter/
 
+## Operating policy
+
+Normal unattended workflows in both modes detect fruitless repair/review loops
+and stop with an actionable report. Independent closure of retained findings is
+progress; worker claims, commit/task counts and assigned coverage percentages
+are not. By default, two repair/review rounds without independent closure stop
+before another repair, after the initial review established the baseline. The
+guard also bounds repeated reopened findings, requests within one stage, recovery
+without independent progress, and model-request runtime. Productive repairs
+continue within the existing allowances. New real defects stay blocking.
+
+Reports, selected limits, request outcomes and cumulative history live under
+`.git/opsx-build/policy/<run>/`. A policy stop preserves the next stage, candidate
+work, findings, protected inputs and recovery baselines. It does not initiate
+rollback, subdivision, a model upgrade or another diagnostic model call. The
+final acceptance commands, ordering and per-command timeouts stay pinned;
+interrupted acceptance remains incomplete.
+
+Optional `--operating-policy PATH` selects JSON overrides. Resumes keep the stored
+policy unless that option is supplied explicitly; editing a configured file
+alone cannot increase limits. An explicit change retains cumulative history and
+authorizes only the remaining allowance. Use `--direction` to state the corrected
+strategy for the next code-changing stage. See [defaults, stop reports and bounded
+recovery](docs/operating-policy.md), including handling unfinished backend work.
+
 ## Local usage records
 
 Workflow stages automatically show a short usage summary and append records to
@@ -2176,11 +2202,12 @@ For an ordinary checkout this is `.git/opsx-build/usage.jsonl`; linked worktrees
 use their own Git metadata directory. No flag or configuration change is needed.
 Only newly started opsx-build processes collect these records.
 
-This is passive observation of the backend responses already used by the
-runner. It makes no additional model calls and does not change prompts, tools,
-commit checks, retries, model selection, or workflow decisions. A logging error
-warns once and the workflow continues. Records stay on this machine and are
-not committed with the project.
+Usage collection observes backend responses already used by the runner and makes
+no additional model calls. The operating-policy guard separately consumes request
+starts, outcomes and independent review progress to decide whether to continue.
+A usage-journal logging error warns once; inability to preserve the policy ledger
+stops further requests. Records stay on this machine and are not committed with
+the project.
 
 Each JSON line describes one stage invocation attempt, including failed or
 interrupted attempts, with:

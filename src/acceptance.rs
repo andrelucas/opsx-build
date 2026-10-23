@@ -243,6 +243,12 @@ fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U)
     };
     let execution = (|| {
         loop {
+            if let Some(guard) = ui.operating_policy()
+                && let Err(error) = guard.poll()
+            {
+                result.outcome = "operating-policy stop; incomplete".into();
+                return Err(error);
+            }
             if let Some(status) = child.try_wait().context("waiting for acceptance check")? {
                 result.exit_code = status.code();
                 result.outcome = if status.success() { "passed" } else { "failed" }.to_owned();

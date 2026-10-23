@@ -474,7 +474,20 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
             "Compacting Codex session",
         );
         usage.model(client.reported_model(session.as_str()).as_deref());
-        let result = client.compact_thread(session.as_str(), |event| usage.event(event));
+        usage.before_request()?;
+        let guard = self.ui.operating_policy();
+        let result = client.compact_thread(
+            session.as_str(),
+            |event| usage.event(event),
+            guard.as_ref().map(|guard| guard.remaining_request_time()),
+        );
+        if let Some(guard) = &guard
+            && let Err(error) = guard.poll()
+        {
+            guard.cancellation_unconfirmed(format!("Codex compaction of {session} did not finish within policy; confirm owned-server cleanup"));
+            usage.finish("policy_stop_incomplete");
+            return Err(error);
+        }
         usage.finish(if result.is_ok() { "completed" } else { "error" });
         result
     }
@@ -506,7 +519,9 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         });
         let prompt = text_protocol.as_deref().unwrap_or(prompt);
         self.ui.debug_prompt(activity, prompt);
-        let turn_id = client.start_turn(
+        usage.before_request()?;
+        let guard = self.ui.operating_policy();
+        let dispatched = client.start_turn(
             session_id.as_str(),
             codex_turn_input(self.repo, prompt),
             schema,
@@ -518,7 +533,15 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
             self.stream_filter
                 .is_some_and(StreamFilter::includes_reasoning)
                 .then_some("auto"),
-        )?;
+            guard.as_ref().map(|guard| guard.remaining_request_time()),
+        );
+        if let Some(guard) = &guard
+            && let Err(error) = guard.poll()
+        {
+            guard.cancellation_unconfirmed(format!("Codex did not confirm a turn identity within policy for {session_id}; confirm owned-server cleanup"));
+            return Err(error);
+        }
+        let turn_id = dispatched?;
         usage.codex_turn(&turn_id);
         let started = Instant::now();
         let mut response = String::new();
@@ -527,6 +550,18 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         let mut stream = CodexStream::default();
         self.ui.start_stream(activity);
         loop {
+            if let Some(guard) = self.ui.operating_policy()
+                && let Err(error) = guard.poll()
+            {
+                if let Err(cleanup) = client.interrupt_turn(session_id.as_str(), &turn_id) {
+                    guard.cancellation_unconfirmed(cleanup.to_string());
+                    self.ui.warn(&format!(
+                        "Operating-policy stop could not confirm Codex cancellation: {cleanup}"
+                    ));
+                }
+                self.ui.finish_stream(false, activity);
+                return Err(error);
+            }
             if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                 let _ = client.interrupt_turn(session_id.as_str(), &turn_id);
                 self.ui.finish_stream(false, activity);

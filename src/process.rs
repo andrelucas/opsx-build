@@ -114,6 +114,7 @@ pub struct CommandSpec {
     pub initial_stdin: Option<String>,
     pub accepts_stream_messages: bool,
     resume_repo: Option<PathBuf>,
+    policy_request: bool,
 }
 
 impl CommandSpec {
@@ -128,6 +129,7 @@ impl CommandSpec {
             initial_stdin: None,
             accepts_stream_messages: false,
             resume_repo: None,
+            policy_request: false,
         }
     }
 
@@ -182,6 +184,11 @@ impl CommandSpec {
 
     pub fn resume_from(mut self, repo: &Path) -> Self {
         self.resume_repo = Some(repo.to_path_buf());
+        self
+    }
+
+    pub(crate) fn policy_request(mut self) -> Self {
+        self.policy_request = true;
         self
     }
 
@@ -274,6 +281,9 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
     }
 
     pub fn run(&self, spec: &CommandSpec, activity: &str) -> Result<ProcessOutput> {
+        if spec.policy_request && self.ui.operating_policy().is_some() {
+            return self.run_streaming(spec, activity, |_| {});
+        }
         self.ui.command(&spec.display());
         let spinner = self.ui.start_activity(activity);
         let output = command_for(spec)
@@ -386,6 +396,7 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         let mut captured_stderr = String::new();
         let mut read_error: Option<std::io::Error> = None;
         let mut cancelled = false;
+        let mut policy_stop = None;
         let mut pause_requested = false;
         let mut escalation_reason = None;
         let mut backend_control = None;
@@ -550,6 +561,21 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             if !cancelled && backend_control.is_none() {
+                if spec.policy_request
+                    && let Some(guard) = self.ui.operating_policy()
+                    && let Err(error) = guard.poll()
+                {
+                    if let Err(cleanup) = on_control(&StreamControl::Interrupt) {
+                        guard.cancellation_unconfirmed(cleanup.to_string());
+                        self.ui.warn(&format!("Operating-policy stop could not confirm backend cancellation: {cleanup}"));
+                    }
+                    policy_stop = Some(error);
+                    child_stdin.take();
+                    cancelled = true;
+                    cancel_started = Some(std::time::Instant::now());
+                    let _ = interrupt_stream_process(&mut child);
+                    continue;
+                }
                 if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
                     let limit = timeout.expect("timeout was checked above");
                     let reason = format!(
@@ -685,6 +711,16 @@ impl<'a, U: Ui> ProcessRunner<'a, U> {
         }
 
         let status = child.wait();
+        if let Some(error) = policy_stop {
+            if let Some(cleanup) = &read_error
+                && let Some(guard) = self.ui.operating_policy()
+            {
+                guard.cancellation_unconfirmed(cleanup.to_string());
+            }
+            self.ui.finish_stream(false, activity);
+            status.context("reaping stopped policy request")?;
+            return Err(error);
+        }
         let succeeded = backend_control.is_some()
             || (status.as_ref().is_ok_and(|status| status.success())
                 && read_error.is_none()

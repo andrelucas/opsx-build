@@ -1,6 +1,6 @@
 use std::{
     io::IsTerminal,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -40,6 +40,15 @@ pub struct CampaignIterationView {
 }
 
 pub trait Ui {
+    fn operating_policy(&self) -> Option<Arc<crate::operating_policy::Guard>> {
+        None
+    }
+    fn set_operating_policy(
+        &self,
+        _guard: Arc<crate::operating_policy::Guard>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this UI does not support the operating-policy guard")
+    }
     fn usage_context(&self) -> UsageContext {
         UsageContext::default()
     }
@@ -94,6 +103,7 @@ pub struct TerminalUi {
     state: Mutex<TerminalState>,
     usage: Mutex<UsageLog>,
     usage_warning: std::sync::atomic::AtomicBool,
+    policy: Mutex<Option<Arc<crate::operating_policy::Guard>>>,
     // Drop after the dashboard has restored the terminal screen.
     _terminal_progress: TerminalProgress<std::io::Stderr>,
 }
@@ -121,6 +131,7 @@ impl TerminalUi {
                 std::env::var_os("STY").is_some(),
             );
         Self {
+            policy: Mutex::new(None),
             verbose,
             debug,
             interactive: stderr_terminal,
@@ -149,6 +160,16 @@ impl TerminalUi {
 }
 
 impl Ui for TerminalUi {
+    fn operating_policy(&self) -> Option<Arc<crate::operating_policy::Guard>> {
+        self.policy.lock().unwrap().clone()
+    }
+    fn set_operating_policy(
+        &self,
+        guard: Arc<crate::operating_policy::Guard>,
+    ) -> anyhow::Result<()> {
+        *self.policy.lock().unwrap() = Some(guard);
+        Ok(())
+    }
     fn usage_context(&self) -> UsageContext {
         let Ok(state) = self.state.lock() else {
             return UsageContext::default();

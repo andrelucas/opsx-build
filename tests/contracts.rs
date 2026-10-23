@@ -425,6 +425,316 @@ fn repair_loop_retains_findings_and_handoffs_and_still_runs_the_exact_final_gate
 }
 
 #[test]
+fn campaign_iterations_keep_the_same_policy_ledger_and_check_helper_scope() {
+    let f = Fixture::new();
+    f.review_workflow(true);
+    let initial = f.state();
+    fs::write(
+        f.root.join("repo/automation/slices/0002-followup.md"),
+        "# Followup\n\n## Objective\nFinish the next bounded change.\n",
+    )
+    .unwrap();
+    fs::write(f.root.join("bin/openspec"), r#"#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+if '--version' in sys.argv: print('1.13.2')
+elif 'list' in sys.argv:
+    print(json.dumps({'changes': [{'name': path.name, 'lastModified': 'fixture'} for path in Path('openspec/changes').iterdir() if (path / 'proposal.md').exists()]}))
+else: print(json.dumps({'isPlanningComplete': True, 'schemaName': 'spec-driven', 'nextSteps': []}))
+"#).unwrap();
+    fs::write(f.root.join("bin/claude"), r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+if '--version' in sys.argv: print('Claude fixture'); raise SystemExit
+if any(arg.startswith('/rename ') for arg in sys.argv): print(json.dumps({'type':'result', 'subtype':'success', 'result':'Renamed'})); raise SystemExit
+root = Path(os.environ['CONTRACT_TEST_ROOT'])
+prompt = sys.stdin.readline() if 'stream-json' in sys.argv else '\n'.join(sys.argv)
+with (root / 'calls').open('a') as out: out.write('call\n')
+count = len((root / 'calls').read_text().splitlines())
+(root / f'args-{count}').write_text(prompt)
+change = '0001-delivery' if count <= 4 else '0002-followup'
+active = Path('openspec/changes') / change
+status = 'READY'
+if count in (1,7): Path('candidate.txt').write_text(f'candidate at {count}\n')
+elif count in (2,8): status = 'VERIFIED'
+elif count in (3,9):
+    Path('openspec/changes/archive').mkdir(exist_ok=True)
+    active.rename(Path('openspec/changes/archive') / ('2026-10-22-' + change))
+elif count in (4,6,10):
+    subprocess.run(['git','add','openspec','candidate.txt'], check=True, stdout=subprocess.DEVNULL)
+    verb = 'propose' if count == 6 else 'complete'
+    subprocess.run(['git','commit','-qm',f'openspec: {verb} {change}'], check=True, stdout=subprocess.DEVNULL)
+elif count == 5:
+    active.mkdir()
+    for name in ('proposal.md','design.md','tasks.md'): (active / name).write_text('Followup planning\n')
+else: raise RuntimeError(f'unexpected model call {count}')
+result = {'opsx_status':status,'summary':'Actual fixture stage finished; no external premises claimed'}
+print(json.dumps({'type':'result','subtype':'success','session_id':'fixture-session','structured_output':result}))
+"#).unwrap();
+    let result = f.run_with("ordinary", true, &["--loop"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(f.calls(), 10);
+    let saved = f.state();
+    assert_eq!(saved["operating"], initial["operating"]);
+    assert_eq!(saved["checks"]["scope"], initial["checks"]["scope"]);
+    let directory = PathBuf::from(saved["operating"]["directory"].as_str().unwrap());
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("ledger.json")).unwrap()).unwrap();
+    assert!(
+        ledger["requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|request| request["context"]["change"] == "0001-delivery")
+    );
+    assert!(
+        ledger["requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|request| request["context"]["change"] == "0002-followup")
+    );
+    assert!(
+        fs::read_to_string(f.root.join("args-7"))
+            .unwrap()
+            .contains(initial["checks"]["scope"].as_str().unwrap())
+    );
+}
+
+#[test]
+fn request_guard_bounds_internal_continuations_and_policy_files_are_pinned_until_explicit_resume() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let policy = f.root.join("operating.json");
+    fs::write(&policy, r#"{"max_requests_per_stage":1}"#).unwrap();
+    let option = format!("--operating-policy={}", policy.display());
+    let result = f.run_with("review-incomplete-loop", true, &[&option]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+    assert_eq!(f.calls(), 1); // No second backend continuation was purchased.
+    assert_eq!(f.state()["stage"], "apply");
+    let directory = PathBuf::from(f.state()["operating"]["directory"].as_str().unwrap());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
+    assert_eq!(report["trigger"], "request_limit");
+    fs::write(&policy, r#"{"max_requests_per_stage":2}"#).unwrap();
+    f.run("review-incomplete-loop", true); // Editing the source file cannot silently raise a limit.
+    assert_eq!(f.calls(), 1);
+    f.run_with("review-incomplete-loop", true, &[&option]);
+    assert_eq!(f.calls(), 2);
+    assert_eq!(f.state()["too_large"], serde_json::Value::Null);
+    assert!(!f.root.join("repo/.git/gate-runs").exists());
+}
+
+#[test]
+fn a_policy_timeout_stops_owned_children_preserves_work_and_never_becomes_capacity_escalation() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let baseline = f.state()["slice_baseline"].clone();
+    let policy = f.root.join("timeout.json");
+    fs::write(&policy, r#"{"max_request_seconds":1}"#).unwrap();
+    let option = format!("--operating-policy={}", policy.display());
+    let result = f.run_with("review-timeout", true, &[&option]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+    assert!(stderr.contains("active model request exceeded"), "{stderr}");
+    assert_eq!(f.calls(), 1);
+    assert_eq!(f.state()["stage"], "apply");
+    assert_eq!(f.state()["slice_baseline"], baseline);
+    assert_eq!(f.state()["too_large"], serde_json::Value::Null);
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
+        "implemented\n"
+    );
+    let pid: libc::pid_t = fs::read_to_string(f.root.join("owned-child.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only checks the identity of the child created by this fixture.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let directory = PathBuf::from(f.state()["operating"]["directory"].as_str().unwrap());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
+    assert_eq!(report["next_stage"], "apply");
+    assert!(
+        report["requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|request| request["outcome"] == "policy_stop_incomplete")
+    );
+}
+
+#[test]
+fn repeated_recovery_is_stopped_before_restoring_the_candidate_baseline() {
+    let f = Fixture::new();
+    f.review_workflow(false);
+    let mut state = f.state();
+    state["too_large"] = serde_json::json!({"stage":"apply", "summary":"Fixture demonstrates a concrete capacity constraint"});
+    // Retain the real ordered assignment so the normal recovery route is eligible.
+    state["agenda"] = serde_json::json!({"path":"automation/slices/0001-delivery.md", "change":"0001-delivery", "title":"Delivery", "content":fs::read_to_string(f.root.join("repo/automation/slices/0001-delivery.md")).unwrap()});
+    f.save_state(&state);
+    fs::write(
+        f.root.join("repo/candidate.txt"),
+        "valuable partial candidate\n",
+    )
+    .unwrap();
+    fs::write(f.root.join("calls"), "").unwrap();
+    let directory = PathBuf::from(state["operating"]["directory"].as_str().unwrap());
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("ledger.json")).unwrap()).unwrap();
+    ledger["replans_without_progress"] = 2.into();
+    fs::write(
+        directory.join("ledger.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(f.root.join("repo"))
+        .output()
+        .unwrap()
+        .stdout;
+    let result = f.run("review-complete", true);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+    assert!(stderr.contains("before another rollback"), "{stderr}");
+    assert_eq!(f.calls(), 0);
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
+        "valuable partial candidate\n"
+    );
+    assert_eq!(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(f.root.join("repo"))
+            .output()
+            .unwrap()
+            .stdout,
+        head
+    );
+}
+
+#[test]
+fn a_cumulative_time_stop_during_acceptance_retains_an_incomplete_gate_and_its_pinned_timeout() {
+    let f = Fixture::new();
+    f.acceptance("printf 'started\\n'\nsleep 30\n");
+    let policy = f.root.join("active-time.json");
+    fs::write(&policy, r#"{"max_active_seconds":1}"#).unwrap();
+    let option = format!("--operating-policy={}", policy.display());
+    let result = f.run_with("pass", true, &[&option]);
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("OPERATING POLICY STOP"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(f.state()["stage"], "acceptance");
+    let reports = f.acceptance_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0]["commands"],
+        serde_json::json!(["sh contract_test.sh"])
+    );
+    assert_eq!(reports[0]["timeout_seconds"], 2);
+    assert_eq!(
+        reports[0]["results"][0]["outcome"],
+        "operating-policy stop; incomplete"
+    );
+    assert_ne!(reports[0]["outcome"], "passed");
+    assert!(!f.root.join("calls").exists());
+}
+
+#[test]
+fn default_policy_stops_fruitless_repairs_and_resume_cannot_reset_the_trend() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        f.review_workflow(ordinary);
+        let original = f.state();
+        let result = f.run_with("review-stall", true, &["--max-verify-retries=20"]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+        assert!(stderr.contains("governing-rule correction"), "{stderr}");
+        assert_eq!(f.calls(), 6); // Two unsuccessful repairs, three independent reviews.
+        let saved = f.state();
+        assert_eq!(saved["stage"], "repair");
+        assert_eq!(saved["too_large"], serde_json::Value::Null);
+        assert_eq!(saved["slice_baseline"], original["slice_baseline"]);
+        assert_eq!(
+            fs::read_to_string(f.root.join("repo/candidate.txt")).unwrap(),
+            "fixed\n"
+        );
+        assert!(!f.root.join("repo/.git/gate-runs").exists());
+        let directory = PathBuf::from(saved["operating"]["directory"].as_str().unwrap());
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
+        assert_eq!(report["trigger"], "no_verified_progress");
+        assert_eq!(report["next_stage"], "repair");
+        assert_eq!(report["trend"]["no_progress_reviews"], 2);
+        assert_eq!(report["remaining_findings"], serde_json::json!(["F0001"]));
+        assert!(report["cost_unknown_attempts"].as_u64().unwrap() > 0);
+        let again = f.run_with("review-stall", true, &["--max-verify-retries=20"]);
+        assert!(String::from_utf8_lossy(&again.stderr).contains("OPERATING POLICY STOP"));
+        assert_eq!(f.calls(), 6);
+        let policy = f.root.join("resume-policy.json");
+        fs::write(&policy, r#"{"max_no_progress_reviews":3}"#).unwrap();
+        let option = format!("--operating-policy={}", policy.display());
+        let resumed = f.run_with(
+            "review-stall",
+            true,
+            &[
+                "--max-verify-retries=20",
+                &option,
+                "--direction=Correct the governing rule and demonstrate its regression",
+            ],
+        );
+        assert!(String::from_utf8_lossy(&resumed.stderr).contains("OPERATING POLICY STOP"));
+        assert_eq!(f.calls(), 8); // Exactly one newly permitted repair/review round.
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["no_progress"], 3);
+        assert_eq!(ledger["revisions"].as_array().unwrap().len(), 1);
+        assert_eq!(f.state()["operating"], saved["operating"]);
+        assert_eq!(
+            fs::read(f.root.join("repo/contract.md")).unwrap(),
+            b"# Contract\nREQ-01: Original required behaviour.\n"
+        );
+    }
+}
+
+#[test]
+fn independently_closed_findings_allow_productive_repairs_and_still_require_the_final_gate() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        f.review_workflow(ordinary);
+        let result = f.run_with("review-productive", true, &["--max-verify-retries=20"]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("Fixture stops at Archive"), "{stderr}");
+        assert!(!stderr.contains("OPERATING POLICY STOP"), "{stderr}");
+        assert_eq!(f.calls(), 7);
+        let saved = f.state();
+        assert_eq!(saved["stage"], "archive");
+        assert_eq!(saved["review"]["findings"]["F0001"]["status"], "closed");
+        assert_eq!(saved["review"]["findings"]["F0002"]["status"], "closed");
+        let directory = PathBuf::from(saved["operating"]["directory"].as_str().unwrap());
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["no_progress"], 0);
+        if !ordinary {
+            assert_eq!(f.acceptance_reports().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn check_receipts_survive_resume_in_both_modes_and_cannot_waive_the_same_final_command() {
     for ordinary in [false, true] {
         let f = Fixture::new();

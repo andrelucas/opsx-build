@@ -145,6 +145,24 @@ struct Round {
     report: Option<Report>,
     inputs: Vec<RepositoryEvidence>,
     work: Option<Work>,
+    #[serde(default)]
+    closed: Vec<String>,
+    #[serde(default)]
+    reopened: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Progress {
+    pub structured: bool,
+    pub id: String,
+    pub evidence_path: std::path::PathBuf,
+    pub change: String,
+    pub verdict: String,
+    pub open: Vec<String>,
+    pub blocking_details: Vec<Finding>,
+    pub closed: Vec<String>,
+    pub reopened: Vec<String>,
+    pub same_input_snapshots: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +195,8 @@ impl History {
         let mut report = result.review.clone();
         let mut findings = self.findings.clone();
         let mut areas = self.areas.clone();
+        let mut closed = Vec::new();
+        let mut reopened = Vec::new();
         if let Some(report) = &mut report {
             let mut area_ids = std::collections::BTreeSet::new();
             for area in &report.areas {
@@ -219,12 +239,16 @@ impl History {
                         .is_some_and(|old| old.status == FindingStatus::Closed)
                     {
                         finding.origin = FindingOrigin::Reopened;
+                        reopened.push(finding.id.clone());
                     }
                 }
                 let disposes_blocker = finding.status != FindingStatus::Open
                     && findings
                         .get(&finding.id)
                         .is_some_and(|old| old.status == FindingStatus::Open);
+                if disposes_blocker && finding.status == FindingStatus::Closed {
+                    closed.push(finding.id.clone());
+                }
                 if (finding.status == FindingStatus::Closed || disposes_blocker)
                     && (finding.evidence.trim().is_empty() || finding.sources.is_empty())
                 {
@@ -256,6 +280,8 @@ impl History {
             report,
             inputs,
             work: self.work.last().cloned(),
+            closed,
+            reopened,
         };
         fs::write(&evidence_path, serde_json::to_vec_pretty(&round)?)?;
         ui.info(&format!(
@@ -273,6 +299,50 @@ impl History {
         self.findings
             .values()
             .any(|finding| finding.status == FindingStatus::Open)
+    }
+
+    pub(crate) fn progress(&self) -> Option<Progress> {
+        let round = self.rounds.last()?;
+        let previous = self.rounds.iter().rev().nth(1);
+        let same_input_snapshots = previous.and_then(|previous| {
+            if previous.inputs.len() != round.inputs.len() {
+                return None;
+            }
+            let pairs = previous
+                .inputs
+                .iter()
+                .zip(&round.inputs)
+                .map(|(before, after)| {
+                    Some(
+                        before.root == after.root
+                            && before.files.as_ref()? == after.files.as_ref()?,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(pairs.into_iter().all(|same| same))
+        });
+        Some(Progress {
+            structured: round.report.is_some(),
+            id: round.id.clone(),
+            evidence_path: round.evidence_path.clone(),
+            change: round.change.clone(),
+            verdict: round.verdict.clone(),
+            open: self
+                .findings
+                .values()
+                .filter(|finding| finding.status == FindingStatus::Open)
+                .map(|finding| finding.id.clone())
+                .collect(),
+            closed: round.closed.clone(),
+            blocking_details: self
+                .findings
+                .values()
+                .filter(|finding| finding.status == FindingStatus::Open)
+                .cloned()
+                .collect(),
+            reopened: round.reopened.clone(),
+            same_input_snapshots,
+        })
     }
 
     pub(crate) fn has_unfinished_areas(&self) -> bool {

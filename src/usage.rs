@@ -1,4 +1,4 @@
-//! Passive accounting. Never changes a request, invokes a model, or gates a stage.
+//! Backend usage observations and operating-policy request/receipt hooks.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
@@ -249,6 +249,12 @@ pub(crate) struct Identity<'a> {
 }
 
 impl<'a, U: Ui> Attempt<'a, U> {
+    pub(crate) fn before_request(&self) -> anyhow::Result<()> {
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.before_request(&self.record)?;
+        }
+        Ok(())
+    }
     pub fn new(ui: &'a U, repo: &Path, identity: Identity<'_>, activity: &str) -> Self {
         let baseline = if identity.fresh {
             Some(Snapshot::zero())
@@ -765,6 +771,9 @@ impl<'a, U: Ui> Attempt<'a, U> {
             self.note("Assistant input observed without an attributable final total; output and full-tree usage remain unknown.");
         }
         self.record.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.record_usage(&self.record);
+        }
         self.ui.record_usage(&self.record);
     }
 }
@@ -979,7 +988,9 @@ pub(crate) fn summary(record: &UsageRecord) -> String {
 }
 
 pub(crate) fn error_outcome(error: &anyhow::Error) -> &'static str {
-    if error
+    if crate::operating_policy::is_stop(error) {
+        "policy_stop_incomplete"
+    } else if error
         .downcast_ref::<crate::process::PauseRequested>()
         .is_some()
     {
@@ -1012,9 +1023,20 @@ pub(crate) mod tests {
     pub(crate) struct RecordingUi {
         pub records: Mutex<Vec<UsageRecord>>,
         snapshots: Mutex<HashMap<String, Snapshot>>,
+        policy: Mutex<Option<std::sync::Arc<crate::operating_policy::Guard>>>,
     }
 
     impl Ui for RecordingUi {
+        fn operating_policy(&self) -> Option<std::sync::Arc<crate::operating_policy::Guard>> {
+            self.policy.lock().unwrap().clone()
+        }
+        fn set_operating_policy(
+            &self,
+            guard: std::sync::Arc<crate::operating_policy::Guard>,
+        ) -> anyhow::Result<()> {
+            *self.policy.lock().unwrap() = Some(guard);
+            Ok(())
+        }
         fn usage_context(&self) -> UsageContext {
             UsageContext {
                 stage: Some("Apply".into()),
