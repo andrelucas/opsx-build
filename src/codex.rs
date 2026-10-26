@@ -28,6 +28,7 @@ use crate::{
 
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const DIAGNOSTIC_LOG_FILTER: &str = "warn,codex_api=debug,codex_http_client=debug";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LauncherEnvironment {
@@ -150,6 +151,9 @@ impl CodexLauncher {
             ]);
         }
         spec = spec.args(["app-server", "--listen", "stdio://"]);
+        if let Some(filter) = self.diagnostic_log_filter() {
+            spec = spec.env("RUST_LOG", filter);
+        }
         for name in &self.unset_environment {
             spec = spec.remove_env(name);
         }
@@ -166,6 +170,23 @@ impl CodexLauncher {
                 .remove_env("CODEX_SQLITE_HOME");
         }
         spec
+    }
+
+    pub(crate) fn diagnostic_log_filter(&self) -> Option<String> {
+        self.environment
+            .iter()
+            .find(|v| v.name == "RUST_LOG")
+            .map(|v| v.value.clone())
+            .or_else(|| {
+                if self.unset_environment.iter().any(|v| v == "RUST_LOG") {
+                    None
+                } else {
+                    Some(
+                        std::env::var("RUST_LOG")
+                            .unwrap_or_else(|_| DIAGNOSTIC_LOG_FILTER.to_owned()),
+                    )
+                }
+            })
     }
 
     pub(crate) fn thread_params(
@@ -1540,6 +1561,32 @@ mod tests {
                 .any(|arg| arg.starts_with("sqlite_home="))
         );
         assert!(server.args.iter().any(|arg| arg.starts_with("log_dir=")));
+        assert!(server.env.contains(&(
+            "RUST_LOG".to_owned(),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| DIAGNOSTIC_LOG_FILTER.to_owned())
+        )));
+        let mut logging = launcher.clone();
+        logging.environment.push(LauncherEnvironment {
+            name: "RUST_LOG".to_owned(),
+            value: "error".to_owned(),
+            redacted: false,
+        });
+        assert!(
+            logging
+                .server_command(Path::new("/repo"))
+                .env
+                .contains(&("RUST_LOG".to_owned(), "error".to_owned()))
+        );
+        logging.environment.retain(|v| v.name != "RUST_LOG");
+        logging.unset_environment.push("RUST_LOG".to_owned());
+        assert!(logging.diagnostic_log_filter().is_none());
+        assert!(
+            !logging
+                .server_command(Path::new("/repo"))
+                .env
+                .iter()
+                .any(|(k, _)| k == "RUST_LOG")
+        );
         let interactive = build_interactive_codex_command(
             Path::new("/repo"),
             &launcher,

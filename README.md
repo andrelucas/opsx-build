@@ -2338,7 +2338,8 @@ Reports contain the runner version, connection, stage, invocation/attempt,
 thread/turn IDs, timings, requested and reported models, safe launch overrides,
 and settings/version information returned by App Server. Inputs record their
 types, byte counts and fingerprints; skill paths and file fingerprints identify
-the actual procedure. Prompt and skill bodies are not copied. The runner-owned
+the selected procedure without copying prompt or skill bodies into request
+descriptors. The runner-owned
 output schema is retained with its fingerprint. Fingerprints are grouping
 identifiers, not cryptographic hashes.
 
@@ -2358,10 +2359,12 @@ failures warn without replacing the original stage outcome. Missing upstream
 details remain unknown; saving a report cannot recover a response body that the
 Codex harness never supplied.
 
-For a deliberately instrumented run, Codex supports targeted Rust logging through
-`RUST_LOG`, for example `codex_api=debug,codex_http_client=debug,codex_core=info`.
-Set it in the connection environment or the launching shell; the report records
-the selected filter. The runner does not enable extra tracing automatically.
+Unattended Codex servers default to targeted transport diagnostics through
+`RUST_LOG=warn,codex_api=debug,codex_http_client=debug`. An existing filter in the
+connection environment or launching shell, or an explicit environment unset,
+is preserved. The report records the selected filter. The default selects only
+the transport modules; error/transport excerpts may contain additional service
+data, and Codex's own local diagnostic stores may also retain these records.
 `--max-provider-retries=0` disables automatic provider retries when investigating
 a reproducible failure. See [Codex diagnostic logging](https://learn.chatgpt.com/docs/config-file/environment-variables#diagnostics).
 

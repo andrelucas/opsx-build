@@ -37,16 +37,7 @@ impl Capture {
             .collect();
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
-        let rust_log = launcher
-            .environment
-            .iter()
-            .find(|v| v.name == "RUST_LOG")
-            .map(|v| v.value.clone())
-            .or_else(|| {
-                (!launcher.unset_environment.iter().any(|v| v == "RUST_LOG"))
-                    .then(|| std::env::var("RUST_LOG").ok())
-                    .flatten()
-            });
+        let rust_log = launcher.diagnostic_log_filter();
         let overrides: serde_json::Map<_, _> = launcher
             .prefix_args
             .iter()
@@ -168,7 +159,7 @@ impl Capture {
             "connection":record.connection, "requested_model":record.requested_model,
             "reported_models":record.reported_models, "session_id":record.session_id,
             "limitations":[
-                "Input and schema fingerprints are grouping identifiers, not cryptographic hashes. Prompt and skill contents are not copied.",
+                "Input and schema fingerprints are grouping identifiers, not cryptographic hashes. Request descriptors omit prompt/skill contents; error and transport excerpts are bounded and credential-redacted.",
                 "Server stderr is a process-wide tail; it may include earlier requests and delayed or partial output.",
                 "Missing upstream response bodies, request IDs or retry hints remain unknown; HTTP 429 alone does not identify a limit.",
             ],
