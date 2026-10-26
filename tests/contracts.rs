@@ -318,6 +318,89 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn qualification_boundaries_preserve_current_blockers_and_the_exact_final_gate() {
+    for required_now in [false, true] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        let source = if required_now {
+            "# Contract\nREQ-01: Deliver the owned harness and assertions.\nQUAL-01: Execute fresh-peer qualification before component delivery.\n"
+        } else {
+            "# Contract\nREQ-01: Deliver the owned harness and assertions.\nQUAL-01: Fresh-peer qualification is required after assembly; record it pending at component delivery.\n"
+        };
+        fs::write(repo.join("contract.md"), source).unwrap();
+        let gate = "test -f candidate.txt || exit 1\nprintf 'original component gate\\n' >> .git/gate-runs\n";
+        fs::write(repo.join("final-check.sh"), gate).unwrap();
+        f.run_with(
+            "repair",
+            false,
+            &[
+                "--acceptance-file=final-check.sh",
+                "--acceptance-command=sh final-check.sh",
+                "--acceptance-timeout-seconds=2",
+            ],
+        );
+        let mut state = f.state();
+        state["stage"] = "apply".into();
+        state["agenda"] = serde_json::Value::Null;
+        f.save_state(&state);
+        let tasks = repo.join("openspec/changes/0001-delivery/tasks.md");
+        fs::write(
+            &tasks,
+            "- [ ] Execute fresh-peer qualification before completing this slice.\n",
+        )
+        .unwrap();
+        fs::remove_file(f.root.join("calls")).unwrap();
+        fs::write(
+            f.root.join("bin/claude"),
+            include_str!("fixtures/qualification-agent.py"),
+        )
+        .unwrap();
+
+        let output = f.run("qualification", true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(repo.join("contract.md")).unwrap(),
+            source
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("final-check.sh")).unwrap(),
+            gate
+        );
+        assert!(!repo.join("fresh-peer").exists());
+        if required_now {
+            assert!(stderr.contains("BLOCKED during apply"), "{stderr}");
+            assert!(stderr.contains("contract.md#QUAL-01"), "{stderr}");
+            assert_eq!(f.calls(), 1); // BLOCKED never causes an automatic retry.
+            assert_eq!(f.state()["stage"], "apply");
+            assert!(repo.join("candidate.txt").exists()); // Preserve finished owned work.
+            assert!(!repo.join(".git/gate-runs").exists());
+        } else {
+            assert!(stderr.contains("Fixture stops at Archive"), "{stderr}");
+            assert_eq!(f.calls(), 3);
+            assert_eq!(f.state()["stage"], "archive");
+            assert!(
+                fs::read_to_string(tasks)
+                    .unwrap()
+                    .contains("pending after assembly")
+            );
+            assert_eq!(
+                fs::read_to_string(repo.join(".git/gate-runs")).unwrap(),
+                "original component gate\n"
+            );
+            let reports = f.acceptance_reports();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(
+                reports[0]["commands"],
+                serde_json::json!(["sh final-check.sh"])
+            );
+            assert_eq!(reports[0]["timeout_seconds"], 2);
+            assert_eq!(reports[0]["outcome"], "passed");
+        }
+    }
+}
+
+#[test]
 fn incomplete_apply_continues_automatically_without_repeating_partial_work_in_both_workflows() {
     for mode in ["ordinary", "repair"] {
         let fixture = Fixture::new();
@@ -1113,6 +1196,10 @@ fn ordinary_planning_still_delivers_specs_design_and_tasks_to_implementation_app
     assert_eq!(fixture.calls(), 3);
     assert_eq!(fixture.state()["stage"], "apply");
     assert!(fixture.state()["contracts"].is_null());
+    for call in 1..=fixture.calls() {
+        let prompt = fs::read_to_string(fixture.root.join(format!("args-{call}"))).unwrap();
+        assert!(!prompt.contains("STAGE COMPLETION AND EXTERNAL INPUTS"));
+    }
     for path in [
         "proposal.md",
         "design.md",

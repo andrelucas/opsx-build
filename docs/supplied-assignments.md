@@ -13,6 +13,26 @@ remain authoritative. Conflicting authoritative inputs require a maintainer
 decision. Mistakes introduced in the generated assignment are runner work to
 repair.
 
+## Current delivery and later qualification
+
+Planning and delivery prompts distinguish owned implementation and checks needed
+now from qualification that the original inputs explicitly assign after assembly
+or outside the component's delivery. Derived tasks must preserve that boundary.
+When later qualification is allowed, finish and check the owned harness and its
+assertions, correct mistaken derived tasks, and proceed through independent
+Verify and the unchanged component gate. Record each unexecuted observation,
+missing input, responsible owner and remaining acceptance route as pending.
+Missing peers never excuse unfinished owned work or failing required checks.
+
+A `BLOCKED` summary must cite the original source making the input necessary for
+the current stage, identify the affected work/check and missing input or decision,
+give evidence of its absence, and state the action needed to continue. A generated
+task alone cannot justify that dependency. A narrower passing gate does not waive
+execution required by the original inputs. Genuine missing current prerequisites
+and authoritative ambiguities still stop the run; `BLOCKED` is not automatically
+retried. These instructions apply to both backends in supplied-contract mode;
+they guide model judgment rather than mechanically prove a correct scope split.
+
 ## Changes needed in Sirocco campaign preparation
 
 For each fresh component workspace, the Sirocco maintainer should:
