@@ -61,11 +61,37 @@ if [ "$streamed" = true ]; then IFS= read -r prompt; fi
 printf 'call\n' >> "$TERMINAL_TEST_ROOT/calls"
 count=$(wc -l < "$TERMINAL_TEST_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" "$prompt" > "$TERMINAL_TEST_ROOT/prompt-$count"
+case "$TERMINAL_TEST_MODE:$count" in
+ retry-terminal:2|retry-replan:3)
+  previous=
+  resumed=
+  for arg in "$@"; do
+   if [ "$previous" = --resume ]; then resumed=$arg; fi
+   previous=$arg
+  done
+  if [ "$resumed" != fixture-session ]; then
+   printf 'no rollout found for requested thread %s\n' "$resumed" >&2
+   exit 92
+  fi;;
+esac
 status=BLOCKED
 summary='Fixture stopped at Propose'
 case "$TERMINAL_TEST_MODE:$count" in
  ready:1) status=READY; summary='Project ready';;
  blocked:1) summary='REQ-01 remains unsatisfied; further remediation needs a maintainer decision';;
+ retry-terminal:1)
+  printf 'Unapproved edit\n' > unrelated.txt
+  status=READY; summary='Incorrectly claimed readiness after editing the repository';;
+ retry-terminal:2) status=READY; summary='Project ready without edits';;
+ retry-replan:1) status=TOO_LARGE; summary='The delivery boundary needs a separately verified followup';;
+ retry-replan:2) status=REPLANNED; summary='Incorrectly claimed subdivision without a commit';;
+ retry-replan:3)
+  printf '# Delivery\n\n## Objective\nImplement the first coherent subset.\n' > automation/slices/0001-delivery.md
+  printf '# Followup\n\n## Objective\nComplete the remaining subset.\n' > automation/slices/0001.1-followup.md
+  printf '# Agenda\n0001: Delivery\n0001.1: Followup\n9999: Project acceptance\n' > automation/slices/README.md
+  git add automation/slices
+  git commit -qm 'opsx: subdivide 0001-delivery' || exit 90
+  status=REPLANNED; summary='Committed the narrowed delivery and its followup';;
  replanned:1)
   printf '# Remediation\n## Objective\nComplete the remaining behaviour.\n## Prerequisites\nEarlier slices.\n## Acceptance Criteria\nRequired behaviour works.\n## Required Tests\nRun conformance checks.\n' > automation/slices/0009-unapproved.md
   printf '# Agenda\n0009: Remediation\n9999: Project acceptance\n' > automation/slices/README.md
@@ -165,6 +191,112 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn terminal_postcondition_retry_resumes_the_returned_session_and_preserves_the_gate() {
+    let fixture = Fixture::new();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let gate = fs::read(
+        fixture
+            .root
+            .join("repo/automation/slices/9999-project-acceptance.md"),
+    )
+    .unwrap();
+    let output = fixture.run("retry-terminal", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Frontier review confirmed readiness"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Fixture stopped at Propose"), "{stderr}");
+    assert_eq!(fixture.calls(), 3);
+    assert!(
+        fs::read_to_string(fixture.root.join("prompt-2"))
+            .unwrap()
+            .contains("--resume\nfixture-session\n")
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("prompt-2"))
+            .unwrap()
+            .contains("POSTCONDITION REPAIR")
+    );
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert!(!fixture.root.join("repo/unrelated.txt").exists());
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join("repo/automation/slices/9999-project-acceptance.md")
+        )
+        .unwrap(),
+        gate
+    );
+    assert_eq!(fixture.state()["terminal_remediations"], 3);
+}
+
+#[test]
+fn subdivision_postcondition_retry_resumes_the_returned_session_without_repeating_worker_work() {
+    let fixture = Fixture::new();
+    let forgotten = fixture
+        .command("initial", false)
+        .arg("--forget")
+        .output()
+        .unwrap();
+    assert!(forgotten.status.success(), "{forgotten:?}");
+    fs::write(
+        fixture.root.join("repo/automation/slices/0001-delivery.md"),
+        "# Delivery\n\n## Objective\nImplement the complete delivery boundary.\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "automation/slices/0001-delivery.md"]);
+    fixture.git(&["commit", "-qm", "Assign delivery"]);
+    let gate = fs::read(
+        fixture
+            .root
+            .join("repo/automation/slices/9999-project-acceptance.md"),
+    )
+    .unwrap();
+    let output = fixture.run("retry-replan", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Frontier replanned `0001-delivery`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Fixture stopped at Propose"), "{stderr}");
+    assert_eq!(fixture.calls(), 4);
+    assert!(
+        fs::read_to_string(fixture.root.join("prompt-3"))
+            .unwrap()
+            .contains("--resume\nfixture-session\n")
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("prompt-3"))
+            .unwrap()
+            .contains("POSTCONDITION REPAIR")
+    );
+    assert_eq!(fixture.state()["frontier_replans"], 1);
+    assert_eq!(fixture.state()["too_large"], serde_json::Value::Null);
+    assert_eq!(fixture.state()["change"], "0001-delivery");
+    assert!(
+        fixture
+            .root
+            .join("repo/automation/slices/0001.1-followup.md")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join("repo/automation/slices/9999-project-acceptance.md")
+        )
+        .unwrap(),
+        gate
+    );
+    assert_eq!(
+        fixture.git(&["show", "-s", "--format=%s"]),
+        "opsx: subdivide 0001-delivery\n"
+    );
 }
 
 #[test]

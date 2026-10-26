@@ -175,7 +175,12 @@ not evidence that a split preserves scope or a test has real assertions.
 Apply/Repair must render changed assignments before returning. Subdivision must
 update the record and views before its agenda-only commit. Recovery can
 redistribute work in the failed slice, while preserving other accountability,
-participants and prerequisites. Terminal remediation adds contributions/routes
+participants and existing prerequisites. Later, unstarted slices may additionally
+depend on newly introduced hierarchical children of the failed slice. Recovery
+cannot add unrelated or pre-existing prerequisites to those later slices, remove
+their existing prerequisites, or change earlier slices' prerequisites. Dependency
+ordering and cycle checks still apply to the complete assignment. Terminal
+remediation adds contributions/routes
 to new slices while retaining completed accountability and existing acceptance
 routes. The terminal document stays byte-for-byte unchanged: its generated whole
 coverage and prerequisites do not depend on mutable delivery slice lists.

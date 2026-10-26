@@ -588,6 +588,12 @@ On escalation, opsx-build retains a diagnostic and any failed commits under
 private Git metadata, then restores the exact pre-Propose Git-visible state. A
 fresh frontier-agent session narrows the original agenda file, adds one or
 more hierarchical child slices, and commits only `automation/slices/`.
+
+If a frontier result fails its repository postcondition, the corrective turn
+resumes the actual session ID returned by the backend. This applies to both
+subdivision and terminal readiness/remediation review, including backends that
+assign a different thread ID from the runner's requested UUID.
+
 Deterministic postconditions require the original first slice to remain next,
 at least one child to exist, OpenSpec state to be unchanged, all frontier
 commits to be agenda-only, and the pre-existing dirty state to be identical.

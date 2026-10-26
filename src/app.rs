@@ -1745,7 +1745,7 @@ impl<U: Ui> App<U> {
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
-        let session = SessionId::new(Uuid::new_v4().to_string());
+        let mut session = SessionId::new(Uuid::new_v4().to_string());
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
         self.ui.stage(
             stage_number,
@@ -1795,6 +1795,9 @@ impl<U: Ui> App<U> {
                     ));
                 }
             };
+            if let Some(id) = &result.session_id {
+                session = SessionId::new(id);
+            }
             match result.signal {
                 StageSignal::Blocked => {
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
@@ -1943,7 +1946,7 @@ impl<U: Ui> App<U> {
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
         let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
-        let session = SessionId::new(Uuid::new_v4().to_string());
+        let mut session = SessionId::new(Uuid::new_v4().to_string());
         self.present_campaign(repo, &state);
         self.ui.stage(
             1,
@@ -2000,6 +2003,9 @@ impl<U: Ui> App<U> {
                 }
             };
 
+            if let Some(id) = &result.session_id {
+                session = SessionId::new(id);
+            }
             let postcondition = match result.signal {
                 StageSignal::Blocked => {
                     restore_slice_baseline(repo, &baseline, &state.before_changes, &self.ui)?;
@@ -4322,7 +4328,7 @@ fn frontier_replan_prompt(
 ) -> String {
     let worker_capacity = worker_capacity_guidance(frontier_worker);
     format!(
-        "{worker_capacity}\n\nThe worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria that conform to the supplied inputs so the sequence still delivers the in-scope objective. Read the governing contracts and component scope first; correct derived contradictions rather than distributing them among children. Retain source references for the corrected criteria.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
+        "{worker_capacity}\n\nThe worker could not complete the ordered agenda slice below. The orchestrator has discarded that failed attempt and restored the exact pre-Propose repository state. Replan the agenda using independent planning judgement; do not implement the slice and do not create or modify any OpenSpec change.\n\nOriginal agenda file: `{path}`\nOriginal OpenSpec change name: `{change}`\nWorker failure stage: {stage}\nWorker failure report:\n{failure}\n\nRewrite the original agenda file so it describes only the first independently implementable and verifiable subset. Keep its current filename and therefore its current OpenSpec change name. Add the remaining work as immediately following child slices whose numeric ordinal appends `.1`, `.2`, and so on to the original ordinal. For example, `0009-feature.md` may be followed by `0009.1-next-part.md` and `0009.2-final-part.md`; those filenames map to OpenSpec change names `0009-1-next-part` and `0009-2-final-part`. Choose the fewest additional slices needed to address the reported constraint, each with a coherent testable outcome. Keep implementation steps, test cases, and internal component boundaries as tasks within those slices; do not turn every testable substep into a separate OpenSpec cycle. Preserve dependencies and acceptance criteria that conform to the supplied inputs so the sequence still delivers the in-scope objective. Later, unstarted slices may add prerequisites on newly introduced children of this failed slice, while retaining every existing prerequisite. Leave earlier slices' prerequisites unchanged. Read the governing contracts and component scope first; correct derived contradictions rather than distributing them among children. Retain source references for the corrected criteria.\n\nModify only files under `automation/slices/`. Update an agenda index there if one exists and needs updating. Do not modify source code, tests, OpenSpec artifacts, CLAUDE.md, or other project files. Inspect repository evidence only as needed to choose sound boundaries; do not perform an exhaustive repository survey.\n\nCommit the agenda-only replan with commit message exactly `opsx: subdivide {change}`. Preserve every pre-existing working-tree change exactly. Do not reset, stash, restore, discard, amend, or rewrite existing history. Return REPLANNED only after the subdivision is committed, the original slice is materially narrower, at least one child slice exists, and no uncommitted changes from your work remain. Return BLOCKED only if the agenda cannot be subdivided safely from available evidence.\n\n--- BEGIN ORIGINAL AGENDA SLICE ---\n{content}\n--- END ORIGINAL AGENDA SLICE ---",
         path = assignment.path,
         change = assignment.change,
         stage = outcome.stage.title(),

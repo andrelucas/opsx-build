@@ -225,8 +225,24 @@ impl Inventory {
 
 impl Assignment {
     /// Recovery may redistribute the failed slice, but cannot quietly reassign
-    /// completed work. Terminal remediation only adds contributions/routes.
+    /// completed work. Later slices may add prerequisites on new subdivision
+    /// children. Terminal remediation only adds contributions/routes.
     pub fn check_recovery(&self, previous: &Self, failed_slice: Option<&str>) -> Result<()> {
+        let subdivision = failed_slice
+            .and_then(parse_slice_name)
+            .map(|(parent, _, _)| {
+                let children = self
+                    .slices
+                    .iter()
+                    .filter(|slice| !previous.slices.iter().any(|old| old.path == slice.path))
+                    .filter_map(|slice| {
+                        let (ordinal, _, _) = parse_slice_name(&slice.path)?;
+                        (ordinal.len() > parent.len() && ordinal.starts_with(&parent))
+                            .then_some(slice.path.as_str())
+                    })
+                    .collect::<BTreeSet<_>>();
+                (parent, children)
+            });
         for old in &previous.slices {
             let current = self
                 .slices
@@ -234,10 +250,21 @@ impl Assignment {
                 .find(|s| s.path == old.path)
                 .with_context(|| format!("recovery removed existing slice `{}`", old.path))?;
             if Some(old.path.as_str()) != failed_slice && old.requires != current.requires {
-                bail!(
-                    "recovery changed prerequisites of unaffected slice `{}`",
-                    old.path
-                );
+                let adds_child_prerequisites =
+                    subdivision.as_ref().is_some_and(|(parent, children)| {
+                        parse_slice_name(&old.path).is_some_and(|(ordinal, _, _)| ordinal > *parent)
+                            && current
+                                .requires
+                                .iter()
+                                .filter(|path| !children.contains(path.as_str()))
+                                .eq(old.requires.iter())
+                    });
+                if !adds_child_prerequisites {
+                    bail!(
+                        "recovery changed prerequisites of unaffected slice `{}`; only later slices may add newly introduced subdivision children while retaining existing prerequisites",
+                        old.path
+                    );
+                }
             }
         }
         for old in &previous.obligations {
@@ -943,6 +970,84 @@ mod tests {
         let mut lost = new;
         lost.acceptance[0].slices.clear();
         assert!(lost.check_recovery(&old, None).is_err());
+    }
+
+    #[test]
+    fn subdivision_allows_only_new_child_prerequisites_on_later_slices() {
+        for (failed, child, later) in [
+            (
+                "0002-recovery.md",
+                "0002.1-accounting.md",
+                "0003-bindings.md",
+            ),
+            (
+                "0002.1-recovery.md",
+                "0002.1.1-accounting.md",
+                "0002.2-bindings.md",
+            ),
+        ] {
+            let mut old = assignment();
+            old.slices.push(Slice {
+                path: failed.into(),
+                requires: vec!["0001-delivery.md".into()],
+            });
+            old.slices.push(Slice {
+                path: later.into(),
+                requires: vec!["0001-delivery.md".into(), failed.into()],
+            });
+            old.obligations[0]
+                .contributors
+                .extend([failed.into(), later.into()]);
+            old.validate(&inventory()).unwrap();
+            let mut new = old.clone();
+            new.slices.push(Slice {
+                path: child.into(),
+                requires: vec![failed.into()],
+            });
+            new.obligations[0].contributors.push(child.into());
+            new.slices[2].requires.push(child.into());
+            new.validate(&inventory()).unwrap();
+            new.check_recovery(&old, Some(failed)).unwrap();
+            assert!(new.check_recovery(&old, None).is_err()); // No subdivision allowance for terminal remediation.
+
+            let mut invalid = new.clone();
+            invalid.slices[2].requires.retain(|path| path != failed);
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.slices[2].requires.push("0001-delivery.md".into());
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.slices[0].requires.push(child.into());
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.slices.push(Slice {
+                path: "0001.1-unrelated.md".into(),
+                requires: vec![],
+            });
+            invalid.slices[2]
+                .requires
+                .push("0001.1-unrelated.md".into());
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.slices[2].requires.push("0002.8-missing.md".into());
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut existing = new.clone();
+            existing.slices[2].requires = old.slices[2].requires.clone();
+            existing.validate(&inventory()).unwrap();
+            // An existing child is not a newly introduced prerequisite.
+            assert!(new.check_recovery(&existing, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.obligations[0].accountable = child.into();
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new.clone();
+            invalid.obligations[0]
+                .contributors
+                .retain(|path| path != later);
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+            let mut invalid = new;
+            invalid.acceptance[0].slices.clear();
+            assert!(invalid.check_recovery(&old, Some(failed)).is_err());
+        }
     }
 
     #[test]
