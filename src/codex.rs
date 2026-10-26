@@ -337,6 +337,7 @@ pub fn build_interactive_codex_command(
 #[derive(Debug)]
 struct CodexTurnError {
     message: String,
+    details: Value,
     transient: bool,
     output_limit: bool,
     requires_user_turn: bool,
@@ -349,6 +350,18 @@ impl fmt::Display for CodexTurnError {
 }
 
 impl Error for CodexTurnError {}
+
+impl CodexTurnError {
+    fn classification_label(&self) -> &'static str {
+        if self.requires_user_turn {
+            "Codex request compatibility failure"
+        } else if self.message.contains("429") {
+            "Codex HTTP 429 rejection (specific limit unknown)"
+        } else {
+            "Retryable Codex request failure"
+        }
+    }
+}
 
 enum TurnOutcome {
     Complete(StageResult),
@@ -499,8 +512,9 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         activity: &str,
         protocol: StageProtocol,
         timeout: Option<Duration>,
-        usage: &mut Attempt<'_, U>,
+        observations: (&mut Attempt<'_, U>, &mut crate::codex_diagnostics::Capture),
     ) -> Result<TurnOutcome> {
+        let (usage, diagnostic) = observations;
         let client = self.server.client(self.ui)?;
         usage.model(client.reported_model(session_id.as_str()).as_deref());
         usage.observe_codex_transcript(client.transcript_path(session_id.as_str()).as_deref());
@@ -520,10 +534,12 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         let prompt = text_protocol.as_deref().unwrap_or(prompt);
         self.ui.debug_prompt(activity, prompt);
         usage.before_request()?;
+        let input = codex_turn_input(self.repo, prompt);
+        diagnostic.request(&input, schema.as_ref());
         let guard = self.ui.operating_policy();
         let dispatched = client.start_turn(
             session_id.as_str(),
-            codex_turn_input(self.repo, prompt),
+            input,
             schema,
             self.launcher.turn_sandbox_policy(
                 self.repo,
@@ -542,6 +558,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
             return Err(error);
         }
         let turn_id = dispatched?;
+        diagnostic.turn(&turn_id);
         usage.codex_turn(&turn_id);
         let started = Instant::now();
         let mut response = String::new();
@@ -589,6 +606,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                         .and_then(Value::as_str)
                         .is_none_or(|id| id == turn_id)
                 {
+                    diagnostic.event(&event);
                     usage.event(&event);
                     if event.get("method").and_then(Value::as_str) == Some("error")
                         && event.pointer("/params/turnId").and_then(Value::as_str)
@@ -598,13 +616,9 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                             .and_then(Value::as_bool)
                             .unwrap_or(false)
                     {
-                        let message = event
-                            .pointer("/params/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex turn failed")
-                            .to_owned();
+                        let details = event["params"]["error"].clone();
                         self.ui.finish_stream(false, activity);
-                        return Err(classify_turn_error(message).into());
+                        return Err(classify_turn_error(details).into());
                     }
                     if let Some(report) = context_usage_report(&event) {
                         context_report = Some(report);
@@ -630,12 +644,10 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
                             .and_then(Value::as_str)
                             .unwrap_or("failed");
                         if status != "completed" {
-                            let message = event
-                                .pointer("/params/turn/error/message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Codex turn did not complete")
-                                .to_owned();
-                            return Err(classify_turn_error(message).into());
+                            return Err(classify_turn_error(
+                                event["params"]["turn"]["error"].clone(),
+                            )
+                            .into());
                         }
                         if response.is_empty() {
                             response = event
@@ -780,13 +792,15 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                 },
                 &current_activity,
             );
+            let mut diagnostic =
+                crate::codex_diagnostics::Capture::new(self.launcher, protocol.terminal_values());
             let attempt = self.invoke_once(
                 &current_session,
                 &current_prompt,
                 &current_activity,
                 protocol,
                 remaining,
-                &mut usage,
+                (&mut usage, &mut diagnostic),
             );
             let outcome = match &attempt {
                 Ok(TurnOutcome::Complete(result)) => format!("{:?}", result.signal).to_lowercase(),
@@ -801,13 +815,51 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                 Err(error)
                     if error
                         .downcast_ref::<CodexTurnError>()
-                        .is_some_and(|e| e.transient || e.requires_user_turn) =>
+                        .is_some_and(|e| e.requires_user_turn) =>
+                {
+                    "compatibility_error".to_owned()
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<CodexTurnError>()
+                        .is_some_and(|e| e.transient) =>
                 {
                     "provider_error".to_owned()
                 }
                 Err(error) => crate::usage::error_outcome(error).to_owned(),
             };
+            let failure = attempt.as_ref().err().map(|error| {
+                if let Some(turn) = error.downcast_ref::<CodexTurnError>() {
+                    json!({"source":"codex-turn", "error":turn.details,
+                        "retryable_by_runner":turn.transient,"compatibility_recovery":turn.requires_user_turn})
+                } else if let Some(rpc) = error.downcast_ref::<CodexRequestError>() { rpc.diagnostic() }
+                else { json!({"source":"runtime","message":error.to_string()}) }
+            });
+            diagnostic.finish(
+                &outcome,
+                failure,
+                self.server.diagnostic(current_session.as_str()),
+            );
+            let report = match diagnostic.save(self.repo, &usage.record, self.ui) {
+                Ok(path) => {
+                    usage.note(&format!("Codex diagnostic report: {}", path.display()));
+                    Some(path)
+                }
+                Err(error) => {
+                    self.ui
+                        .warn(&format!("Could not save Codex diagnostics: {error}"));
+                    None
+                }
+            };
             usage.finish(&outcome);
+            let attempt = attempt.map_err(|error| {
+                if let Some(path) = &report {
+                    let message = format!("{error}; diagnostic report: {}", path.display());
+                    error.context(message)
+                } else {
+                    error
+                }
+            });
             match attempt {
                 Ok(TurnOutcome::Complete(result)) if result.signal == StageSignal::Incomplete => {
                     if let Some(guard) = self.ui.operating_policy() {
@@ -925,11 +977,15 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                         provider_retry_delay(self.provider_retry_base_delay, provider_retries);
                     if remaining.is_some_and(|remaining| delay >= remaining) {
                         return Err(error.context(
-                            "transient provider failure could not be retried before the stage timeout",
+                            "retryable Codex request failure could not be retried before the stage timeout",
                         ));
                     }
                     self.ui.warn(&format!(
-                        "Transient Codex provider failure; retrying the same thread in {} second(s) ({provider_retries}/{})",
+                        "{}; retrying the same thread in {} second(s) ({provider_retries}/{})",
+                        error
+                            .downcast_ref::<CodexTurnError>()
+                            .unwrap()
+                            .classification_label(),
                         delay.as_secs(),
                         self.max_provider_retries
                     ));
@@ -1285,7 +1341,12 @@ fn continuation_prompt(protocol: StageProtocol, reason: &str) -> String {
     )
 }
 
-fn classify_turn_error(message: String) -> CodexTurnError {
+fn classify_turn_error(details: Value) -> CodexTurnError {
+    let message = details
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Codex turn did not complete")
+        .to_owned();
     let lowercase = message.to_ascii_lowercase();
     let requires_user_turn =
         lowercase.contains("requests ending with a model turn are not supported");
@@ -1316,6 +1377,7 @@ fn classify_turn_error(message: String) -> CodexTurnError {
     .any(|marker| lowercase.contains(marker));
     CodexTurnError {
         message: format!("Codex turn failed: {message}"),
+        details,
         transient,
         output_limit,
         requires_user_turn,

@@ -30,6 +30,10 @@ pub(crate) struct CodexRequestError {
 }
 
 impl CodexRequestError {
+    pub(crate) fn diagnostic(&self) -> Value {
+        json!({"source":"app-server-rpc", "method":self.method,"error":self.error})
+    }
+
     pub(crate) fn is_missing_thread(&self, thread_id: &str) -> bool {
         self.method == "thread/resume"
             && self.error.get("code").and_then(Value::as_i64) == Some(-32600)
@@ -58,6 +62,15 @@ pub(crate) struct CodexServer {
 }
 
 impl CodexServer {
+    pub(crate) fn diagnostic(&self, thread: &str) -> Value {
+        self.client
+            .lock()
+            .ok()
+            .and_then(|c| c.clone())
+            .map(|client| client.diagnostic(thread))
+            .unwrap_or_else(|| json!({"available":false}))
+    }
+
     pub(crate) fn new(repo: &std::path::Path, launcher: &CodexLauncher) -> Self {
         Self {
             repo: repo.to_path_buf(),
@@ -97,6 +110,8 @@ struct CodexClientInner {
     thread_models: Mutex<HashMap<String, String>>,
     thread_paths: Mutex<HashMap<String, std::path::PathBuf>>,
     stderr: Arc<Mutex<String>>,
+    server_info: Mutex<Value>,
+    thread_settings: Mutex<HashMap<String, Value>>,
 }
 
 impl Drop for CodexClientInner {
@@ -189,11 +204,15 @@ impl CodexServerClient {
         thread::spawn(move || {
             for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
                 if let Ok(mut output) = captured_stderr.lock() {
-                    if output.len() > 32 * 1024 {
-                        output.drain(..16 * 1024);
-                    }
                     output.push_str(&line);
                     output.push('\n');
+                    if output.len() > 32 * 1024 {
+                        let mut boundary = output.len() - 16 * 1024;
+                        while !output.is_char_boundary(boundary) {
+                            boundary += 1;
+                        }
+                        output.drain(..boundary);
+                    }
                 }
             }
         });
@@ -208,9 +227,11 @@ impl CodexServerClient {
                 thread_models: Mutex::new(HashMap::new()),
                 thread_paths: Mutex::new(HashMap::new()),
                 stderr,
+                server_info: Mutex::new(Value::Null),
+                thread_settings: Mutex::new(HashMap::new()),
             }),
         };
-        client.request(
+        let initialized = client.request(
             "initialize",
             json!({
                 "clientInfo": {
@@ -222,6 +243,9 @@ impl CodexServerClient {
             }),
             REQUEST_TIMEOUT,
         )?;
+        if let Ok(mut info) = client.inner.server_info.lock() {
+            *info = json!({"userAgent":initialized["userAgent"],"serverInfo":initialized["serverInfo"]});
+        }
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -329,6 +353,20 @@ impl CodexServerClient {
     }
 
     fn remember_model(&self, thread_id: &str, response: &Value) {
+        if let Ok(mut settings) = self.inner.thread_settings.lock() {
+            let value: serde_json::Map<_, _> = [
+                "model",
+                "modelProvider",
+                "reasoningEffort",
+                "serviceTier",
+                "approvalPolicy",
+                "sandbox",
+            ]
+            .into_iter()
+            .filter_map(|key| response.get(key).map(|v| (key.to_owned(), v.clone())))
+            .collect();
+            settings.insert(thread_id.to_owned(), Value::Object(value));
+        }
         if let Some(path) = response.pointer("/thread/path").and_then(Value::as_str)
             && std::path::Path::new(path).is_absolute()
             && let Ok(mut paths) = self.inner.thread_paths.lock()
@@ -496,6 +534,13 @@ impl CodexServerClient {
             .lock()
             .map(|value| value.trim().to_owned())
             .unwrap_or_default()
+    }
+
+    fn diagnostic(&self, thread: &str) -> Value {
+        json!({"launcher_process_id":self.inner.child.lock().ok().map(|c| c.id()),
+            "initialization":self.inner.server_info.lock().ok().map(|v| v.clone()),
+            "thread_settings":self.inner.thread_settings.lock().ok().and_then(|s|s.get(thread).cloned()),
+            "stderr_tail":self.stderr_excerpt()})
     }
 
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -926,6 +971,137 @@ done
                 assert!(prompt.contains(StageProtocol::Ready.json_schema()));
                 assert!(prompt.contains("OPSX_STATUS: <value>"));
             }
+            drop(backend);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_attempt_diagnostics_retain_failure_details_and_comparable_success_metadata() {
+        use crate::codex::LauncherEnvironment;
+        for mode in ["error", "completed", "rpc", "success", "unwritable"] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-evidence-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&directory)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            launcher.environment.push(LauncherEnvironment {
+                name: "DIAGNOSTIC_TEST_SECRET".to_owned(),
+                value: "configured-secret-value".to_owned(),
+                redacted: true,
+            });
+            launcher.environment.push(LauncherEnvironment {
+                name: "RUST_LOG".to_owned(),
+                value: "codex_api=debug".to_owned(),
+                redacted: false,
+            });
+            let error = json!({"message":"exceeded retry limit, last status: 429 Too Many Requests",
+                "codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},
+                "additionalDetails":{"request_id":"req-provider","retry_after":17,"access_token":"private-provider-token","echo":"configured-secret-value"}});
+            let event = if mode == "error" {
+                json!({"method":"error","params":{"threadId":"actual-thread","turnId":"turn-1","willRetry":false,"error":error}})
+            } else if mode == "completed" {
+                json!({"method":"turn/completed","params":{"threadId":"actual-thread","turn":{"id":"turn-1","status":"failed","error":error}}})
+            } else {
+                json!({"method":"turn/completed","params":{"threadId":"actual-thread","turn":{"id":"turn-1","status":"completed","items":[{"type":"agentMessage","text":"{\"opsx_status\":\"READY\",\"summary\":\"done\"}"}]}}})
+            };
+            let script = directory.join("server.sh");
+            let contents = std::fs::read_to_string(&script).unwrap();
+            let old = r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#;
+            let replacement = if mode == "rpc" {
+                old.to_owned()
+            } else {
+                format!(
+                    r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"; printf '%s\n' {}"#,
+                    crate::process::shell_quote(&event.to_string())
+                )
+            };
+            assert!(contents.contains(old));
+            std::fs::write(&script, contents.replace(old, &replacement)).unwrap();
+            let skill = directory.join(".agents/skills/diagnostic-fixture/SKILL.md");
+            std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+            std::fs::write(&skill, "PRIVATE_SKILL_CONTENT").unwrap();
+            if mode == "unwritable" {
+                std::fs::create_dir_all(directory.join(".git/opsx-build")).unwrap();
+                std::fs::write(
+                    directory.join(".git/opsx-build/diagnostics"),
+                    "preserve this file",
+                )
+                .unwrap();
+            }
+            let ui = crate::usage::tests::RecordingUi::default();
+            let backend =
+                CodexBackend::new(&directory, &launcher, "auto", None, &ui).with_retries(0, 0);
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new("placeholder"),
+                    name: None,
+                },
+                "/diagnostic-fixture PRIVATE_PROMPT_CONTENT",
+                "Apply",
+                StageProtocol::Ready,
+            );
+            let succeeds = matches!(mode, "success" | "unwritable");
+            assert_eq!(result.is_ok(), succeeds, "{mode}: {result:?}");
+            let records = ui.records.lock().unwrap();
+            assert_eq!(records.len(), 1); // Diagnostics do not dispatch another model request.
+            if mode == "unwritable" {
+                assert_eq!(
+                    std::fs::read_to_string(directory.join(".git/opsx-build/diagnostics")).unwrap(),
+                    "preserve this file"
+                );
+            } else {
+                let path = records[0]
+                    .notes
+                    .iter()
+                    .find_map(|n| n.strip_prefix("Codex diagnostic report: "))
+                    .unwrap();
+                let text = std::fs::read_to_string(path).unwrap();
+                let saved: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(saved["session_id"], "actual-thread");
+                assert_eq!(saved["runner_request_id"], records[0].id);
+                assert_eq!(saved["request"]["rust_log_filter"], "codex_api=debug");
+                assert_eq!(saved["request"]["input"][0]["type"], "skill");
+                assert_eq!(
+                    saved["request"]["input"][1]["text"]["bytes"],
+                    "PRIVATE_PROMPT_CONTENT".len()
+                );
+                assert_eq!(saved["request"]["output_schema"]["value"]["type"], "object");
+                assert_eq!(
+                    saved["result"]["server"]["thread_settings"]["model"],
+                    "test-default"
+                );
+                for secret in [
+                    "PRIVATE_SKILL_CONTENT",
+                    "PRIVATE_PROMPT_CONTENT",
+                    "private-provider-token",
+                    "configured-secret-value",
+                ] {
+                    assert!(!text.contains(secret), "{secret}");
+                }
+                if matches!(mode, "error" | "completed") {
+                    let failure = &saved["result"]["failure"]["error"];
+                    assert_eq!(
+                        failure["codexErrorInfo"]["responseTooManyFailedAttempts"]["httpStatusCode"],
+                        429
+                    );
+                    assert_eq!(failure["additionalDetails"]["request_id"], "req-provider");
+                    assert_eq!(failure["additionalDetails"]["retry_after"], 17);
+                    assert!(result.unwrap_err().to_string().contains(path));
+                } else if mode == "rpc" {
+                    assert_eq!(saved["result"]["failure"]["source"], "app-server-rpc");
+                } else {
+                    assert!(saved["result"]["failure"].is_null());
+                }
+            }
+            drop(records);
             drop(backend);
             std::fs::remove_dir_all(directory).unwrap();
         }

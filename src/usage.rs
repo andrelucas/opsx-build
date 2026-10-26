@@ -305,7 +305,7 @@ impl<'a, U: Ui> Attempt<'a, U> {
         }
     }
 
-    fn note(&mut self, text: &str) {
+    pub(crate) fn note(&mut self, text: &str) {
         if !self.record.notes.iter().any(|n| n == text) {
             self.record.notes.push(text.to_owned());
         }

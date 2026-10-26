@@ -10,6 +10,7 @@ pub mod checks;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+mod codex_diagnostics;
 mod codex_home;
 mod codex_server;
 mod contracts;

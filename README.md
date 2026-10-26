@@ -2324,6 +2324,47 @@ backend-hidden work can leave gaps. Inspect coverage and unsuccessful attempts
 alongside completed stages when comparing campaigns; do not add the raw
 `cumulative` snapshots to the per-attempt `tokens` or cost fields.
 
+### Codex request diagnostics
+
+Each Codex attempt also saves a private JSON report under
+`.git/opsx-build/diagnostics/codex/<request-id>.json`, using the actual Git metadata
+directory for worktrees and sidecars. The usage record's `notes` link the report;
+failed attempts also include its path in the terminal error. Successful attempts
+are retained so a failing request can be compared with a working one.
+The filename and `runner_request_id` identify the opsx-build attempt; upstream
+provider request IDs, when exposed, remain in the error or transport details.
+
+Reports contain the runner version, connection, stage, invocation/attempt,
+thread/turn IDs, timings, requested and reported models, safe launch overrides,
+and settings/version information returned by App Server. Inputs record their
+types, byte counts and fingerprints; skill paths and file fingerprints identify
+the actual procedure. Prompt and skill bodies are not copied. The runner-owned
+output schema is retained with its fingerprint. Fingerprints are grouping
+identifiers, not cryptographic hashes.
+
+Bounded error, completion, routing and token-usage events preserve structured
+`codexErrorInfo`, `additionalDetails`, request IDs, status codes and retry hints
+when Codex exposes them. A bounded process-wide stderr tail supplies additional
+diagnostics; it may include earlier requests or delayed output and is not proof
+of which request caused a message. Credential fields, credential-bearing lines
+and known configured/inherited secrets are redacted, and files use private Unix
+permissions. Reports are private diagnostics; review them before sharing.
+
+HTTP 429 is reported as a rejection, without asserting which limit was hit or
+that the cause is temporary. Compatibility recovery is recorded separately as
+`compatibility_error`. Diagnostics do not change retry limits, reset request
+counters, switch models, start fresh threads or alter acceptance. Report-write
+failures warn without replacing the original stage outcome. Missing upstream
+details remain unknown; saving a report cannot recover a response body that the
+Codex harness never supplied.
+
+For a deliberately instrumented run, Codex supports targeted Rust logging through
+`RUST_LOG`, for example `codex_api=debug,codex_http_client=debug,codex_core=info`.
+Set it in the connection environment or the launching shell; the report records
+the selected filter. The runner does not enable extra tracing automatically.
+`--max-provider-retries=0` disables automatic provider retries when investigating
+a reproducible failure. See [Codex diagnostic logging](https://learn.chatgpt.com/docs/config-file/environment-variables#diagnostics).
+
 ## Interactive launcher testing
 
 Open an ordinary interactive session using the configured worker backend, model,
