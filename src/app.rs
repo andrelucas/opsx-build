@@ -438,7 +438,7 @@ impl RunState {
                 .completed
                 .iter()
                 .map(|entry| CampaignIterationView {
-                    iteration: entry.iteration,
+                    iteration: Some(entry.iteration),
                     change: entry.change.clone(),
                     final_head: entry.final_head.clone(),
                     elapsed_seconds: entry.elapsed_seconds,
@@ -4266,9 +4266,9 @@ fn campaign_progress(repo: &Path, state: &RunState) -> Result<Option<CampaignVie
     if let Some(view) = &mut view
         && (state.bootstrap || state.agenda.is_some())
     {
-        let (bootstrap_complete, pending) = crate::agenda::progress(repo)?;
+        let progress = crate::agenda::progress(repo)?;
         if !state.bootstrap {
-            view.bootstrap_complete |= bootstrap_complete;
+            view.bootstrap_complete |= progress.bootstrap_complete;
         }
         let current = state
             .agenda
@@ -4276,7 +4276,26 @@ fn campaign_progress(repo: &Path, state: &RunState) -> Result<Option<CampaignVie
             .and_then(|a| Path::new(&a.path).file_name()?.to_str())
             .and_then(crate::agenda::parse_slice_name)
             .map(|(_, _, change)| change);
-        view.upcoming = pending
+        let mut recorded = std::mem::take(&mut view.completed);
+        for change in progress.archived {
+            let suffix = format!("-{change}");
+            if let Some(index) = recorded
+                .iter()
+                .position(|c| c.change == change || c.change.ends_with(&suffix))
+            {
+                view.completed.push(recorded.remove(index));
+            } else if current.as_ref() != Some(&change) {
+                view.completed.push(CampaignIterationView {
+                    iteration: None,
+                    change,
+                    final_head: None,
+                    elapsed_seconds: None,
+                });
+            }
+        }
+        view.completed.extend(recorded);
+        view.upcoming = progress
+            .pending
             .into_iter()
             .filter(|change| {
                 current.as_ref() != Some(change)
@@ -5195,6 +5214,99 @@ mod tests {
         let view = campaign_progress(&repo, &state).unwrap().unwrap();
         assert!(!view.bootstrap_complete);
         assert!(view.upcoming.is_empty());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn progress_recovers_archived_slices_after_forget_and_advance() {
+        let repo = std::env::temp_dir().join(format!("opsx-progress-{}", Uuid::new_v4()));
+        fs::create_dir_all(repo.join("automation/slices")).unwrap();
+        for change in [
+            "bootstrap-implementation-slices",
+            "0001-core",
+            "0002-transactions",
+            "0002-1-observations",
+            "unrelated-change",
+        ] {
+            fs::create_dir_all(
+                repo.join("openspec/changes/archive")
+                    .join(format!("2026-10-26-{change}")),
+            )
+            .unwrap();
+        }
+        for name in [
+            "0001-core.md",
+            "0002-transactions.md",
+            "0002.1-observations.md",
+            "0006-delivery-qualification.md",
+            "9999-project-acceptance.md",
+        ] {
+            fs::write(repo.join("automation/slices").join(name), "").unwrap();
+        }
+        // Forget/advance creates a fresh campaign with no completed iterations.
+        let mut state = RunState::new_campaign("advance".into(), ChangeSnapshot::default(), None);
+        let AgendaSelection::Next(assignment) =
+            discover_agenda(&repo, &state.before_changes).unwrap()
+        else {
+            panic!("expected the next unarchived slice");
+        };
+        assert_eq!(assignment.change, "0006-delivery-qualification");
+        state.change = Some(assignment.change.clone());
+        state.agenda = Some(assignment);
+        let before = serde_json::to_value(&state).unwrap();
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert!(view.bootstrap_complete);
+        assert_eq!(
+            view.completed
+                .iter()
+                .map(|c| c.change.as_str())
+                .collect::<Vec<_>>(),
+            ["0001-core", "0002-transactions", "0002-1-observations"]
+        );
+        assert!(view.completed.iter().all(|c| c.iteration.is_none()));
+        assert!(
+            view.completed
+                .iter()
+                .all(|c| c.elapsed_seconds.is_none() && c.final_head.is_none())
+        );
+        assert_eq!(view.upcoming, ["9999-project-acceptance"]);
+        assert_eq!(view.iteration, 1);
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+
+        // Archive can finish before the checkpoint records the current iteration.
+        fs::create_dir(
+            repo.join("openspec/changes/archive/2026-10-26-0006-delivery-qualification"),
+        )
+        .unwrap();
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert_eq!(view.completed.len(), 3);
+
+        // A recorded completion keeps its actual name, duration and commit, once.
+        state
+            .campaign
+            .as_mut()
+            .unwrap()
+            .completed
+            .push(CompletedIteration {
+                iteration: 1,
+                change: "prefix-0006-delivery-qualification".into(),
+                proposal_head: None,
+                final_head: Some("1234567890abcdef".into()),
+                elapsed_seconds: Some(65),
+            });
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert_eq!(view.completed.len(), 4);
+        let completed = view.completed.last().unwrap();
+        assert_eq!(completed.iteration, Some(1));
+        assert_eq!(completed.change, "prefix-0006-delivery-qualification");
+        assert_eq!(completed.final_head.as_deref(), Some("1234567890abcdef"));
+        assert_eq!(completed.elapsed_seconds, Some(65));
+
+        // A free-form campaign must not borrow this agenda's archived work.
+        state.agenda = None;
+        let view = campaign_progress(&repo, &state).unwrap().unwrap();
+        assert_eq!(view.completed.len(), 1);
+        assert!(!view.bootstrap_complete);
         fs::remove_dir_all(repo).unwrap();
     }
 

@@ -27,16 +27,28 @@ pub fn is_terminal_assignment(assignment: &AgendaAssignment) -> bool {
     assignment.path == TERMINAL_SLICE_PATH
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgendaProgress {
+    pub bootstrap_complete: bool,
+    pub archived: Vec<String>,
+    pub pending: Vec<String>,
+}
+
 /// Read-only presentation data. Numeric order and archive matching follow the
 /// scheduler, but a partially written bootstrap agenda need not be valid yet.
-pub fn progress(repo: &Path) -> Result<(bool, Vec<String>)> {
+pub fn progress(repo: &Path) -> Result<AgendaProgress> {
     let archived = directory_names(&repo.join("openspec/changes/archive"))?;
     let bootstrap_complete =
         unique_match(&archived, crate::bootstrap::BOOTSTRAP_CHANGE, "archived")?.is_some();
     let directory = repo.join(SLICES_DIR);
     if !directory.is_dir() {
-        return Ok((bootstrap_complete, Vec::new()));
+        return Ok(AgendaProgress {
+            bootstrap_complete,
+            archived: Vec::new(),
+            pending: Vec::new(),
+        });
     }
+    let mut completed = Vec::new();
     let mut pending = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -51,13 +63,17 @@ pub fn progress(repo: &Path) -> Result<(bool, Vec<String>)> {
         };
         if unique_match(&archived, &change, "archived")?.is_none() {
             pending.push((ordinal, change));
+        } else {
+            completed.push((ordinal, change));
         }
     }
+    completed.sort();
     pending.sort();
-    Ok((
+    Ok(AgendaProgress {
         bootstrap_complete,
-        pending.into_iter().map(|(_, change)| change).collect(),
-    ))
+        archived: completed.into_iter().map(|(_, change)| change).collect(),
+        pending: pending.into_iter().map(|(_, change)| change).collect(),
+    })
 }
 
 pub fn has_subdivision(repo: &Path, assignment: &AgendaAssignment) -> Result<bool> {
@@ -268,15 +284,16 @@ mod tests {
         fs::create_dir(repo.join("openspec/changes/archive/2026-10-22-0001-done")).unwrap();
         assert_eq!(
             progress(&repo).unwrap(),
-            (
-                true,
-                vec![
+            AgendaProgress {
+                bootstrap_complete: true,
+                archived: vec!["0001-done".into()],
+                pending: vec![
                     "0002-2-earlier".into(),
                     "0002-10-later".into(),
                     "0010-last".into(),
                     "9999-project-acceptance".into()
-                ]
-            )
+                ],
+            }
         );
         fs::remove_dir_all(repo).unwrap();
     }

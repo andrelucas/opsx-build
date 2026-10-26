@@ -2084,6 +2084,10 @@ Campaign mode adds the iteration number to the header and retains a compact
 summary row for every completed change. Bootstrap appears in the same progress
 list, without consuming implementation iteration 1. Once its archive exists,
 subsequent agenda iterations retain its completed summary.
+After `--forget` and a new `advance`, the progress list also recovers completed
+agenda slices from their OpenSpec archives. Recovered rows show `archived`;
+iteration numbers, timings and commit IDs appear only when retained in the
+checkpoint. This display recovery does not alter the checkpoint or scheduling.
 Bootstrap's row shows its running elapsed time, then retains its final duration
 and completion commit when available. New runs save these details in the
 checkpoint so they survive handoff and resume; paused time is excluded. Older

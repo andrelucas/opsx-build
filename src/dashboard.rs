@@ -51,7 +51,7 @@ pub(crate) struct CampaignDashboardView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CampaignIterationDashboardView {
-    pub iteration: u32,
+    pub iteration: Option<u32>,
     pub change: String,
     pub final_head: Option<String>,
     pub elapsed_seconds: Option<u64>,
@@ -924,11 +924,12 @@ impl StreamDashboard {
                     .as_deref()
                     .map(short_hash)
                     .map_or_else(String::new, |head| format!(" · {head}"));
+                let label = iteration.iteration.map_or_else(
+                    || format!("{} · archived", iteration.change),
+                    |number| format!("iteration {number} · {}", iteration.change),
+                );
                 RenderLine {
-                    text: format!(
-                        "  ✓ iteration {} · {}{elapsed}{head}",
-                        iteration.iteration, iteration.change
-                    ),
+                    text: format!("  ✓ {label}{elapsed}{head}"),
                     color: Color::Green,
                     bold: true,
                     panel: None,
@@ -943,7 +944,7 @@ impl StreamDashboard {
                 && !campaign
                     .completed
                     .iter()
-                    .any(|c| c.iteration == campaign.iteration)
+                    .any(|c| c.iteration == Some(campaign.iteration))
             {
                 lines.push(RenderLine {
                     text: format!("  ◆ iteration {} · current{change}", campaign.iteration),
@@ -1838,7 +1839,7 @@ mod tests {
             iteration: 2,
             max_iterations: Some(10),
             completed: vec![CampaignIterationDashboardView {
-                iteration: 1,
+                iteration: Some(1),
                 change: "slice-a".to_owned(),
                 final_head: Some("1234567890abcdef".to_owned()),
                 elapsed_seconds: Some(65),
@@ -1869,6 +1870,44 @@ mod tests {
         let lines = dashboard.render_lines_at(Instant::now());
         assert_eq!(lines[1].text, "  ◆ iteration 2 · current · slice-b");
         assert!(lines[2].text.contains("[2/6] Propose"));
+    }
+
+    #[test]
+    fn archived_rows_do_not_hide_the_first_iteration_after_forget() {
+        let mut dashboard = dashboard();
+        dashboard.set_campaign(Some(CampaignDashboardView {
+            iteration: 1,
+            max_iterations: None,
+            completed: vec![CampaignIterationDashboardView {
+                iteration: None,
+                change: "0001-core".into(),
+                final_head: None,
+                elapsed_seconds: None,
+            }],
+            bootstrap: false,
+            bootstrap_complete: true,
+            bootstrap_elapsed: None,
+            bootstrap_started_at: None,
+            bootstrap_final_head: None,
+            upcoming: vec!["9999-project-acceptance".into()],
+        }));
+        dashboard.set_change_name(Some("0006-delivery-qualification".into()));
+        dashboard.set_stage(StageView {
+            current: 4,
+            total: 6,
+            title: "Verify".into(),
+            started_at: Instant::now(),
+        });
+        let lines = dashboard.render_lines_at(Instant::now());
+        assert_eq!(lines[0].text, "  ✓ Bootstrap");
+        assert_eq!(lines[1].text, "  ✓ 0001-core · archived");
+        assert_eq!(lines[1].color, Color::Green);
+        assert_eq!(
+            lines[2].text,
+            "  ◆ iteration 1 · current · 0006-delivery-qualification"
+        );
+        assert!(lines[3].text.contains("Verify"));
+        assert_eq!(lines[4].text, "  ○ planned · 9999-project-acceptance");
     }
 
     #[test]

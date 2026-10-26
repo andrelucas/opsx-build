@@ -33,7 +33,8 @@ pub struct CampaignView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignIterationView {
-    pub iteration: u32,
+    // Archive-only rows have no retained campaign iteration or timing record.
+    pub iteration: Option<u32>,
     pub change: String,
     pub final_head: Option<String>,
     pub elapsed_seconds: Option<u64>,
