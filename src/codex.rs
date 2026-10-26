@@ -1835,6 +1835,32 @@ mod tests {
     }
 
     #[test]
+    fn native_openspec_skill_precedes_claude_skill_and_retains_stage_instructions() {
+        let repo = std::env::temp_dir().join(format!("opsx-codex-native-{}", uuid::Uuid::new_v4()));
+        for directory in [".agents/skills", ".claude/skills"] {
+            let path = repo.join(directory).join("openspec-apply-change/SKILL.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "---\nname: openspec-apply-change\n---\n").unwrap();
+        }
+        let input = codex_turn_input(
+            &repo,
+            "/openspec-apply-change slice\n\nSupplied scope, current acceptance and stage-result protocol",
+        );
+        assert_eq!(input[0]["type"], "skill");
+        assert_eq!(
+            input[0]["path"],
+            repo.join(".agents/skills/openspec-apply-change/SKILL.md")
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            input[1]["text"],
+            "slice\n\nSupplied scope, current acceptance and stage-result protocol"
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn turns_a_project_slash_skill_into_explicit_codex_input() {
         let repo = std::env::temp_dir().join(format!("opsx-codex-skill-{}", uuid::Uuid::new_v4()));
         let skill = repo.join(".claude/skills/propose-unattended/SKILL.md");

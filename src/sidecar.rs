@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{bootstrap::render_project_config, git::metadata_dir, process::CommandSpec, ui::Ui};
+use crate::{
+    bootstrap::render_project_config, cli::BackendKind, git::metadata_dir, process::CommandSpec,
+    ui::Ui,
+};
 
 const ASSOCIATION_SCHEMA: u32 = 1;
 const ASSOCIATION_FILE: &str = "sidecar.json";
@@ -101,11 +104,11 @@ impl SidecarPlan {
         ])
     }
 
-    pub fn init_command(&self) -> CommandSpec {
+    pub fn init_command(&self, backend: BackendKind) -> CommandSpec {
         CommandSpec::new("openspec", &self.association.product_root).args([
             "init".to_owned(),
             "--tools".to_owned(),
-            "claude".to_owned(),
+            backend.to_string(),
             "--no-animation".to_owned(),
             self.association.planning_root.display().to_string(),
         ])
@@ -296,7 +299,12 @@ mod tests {
         );
         assert!(plan.setup_command().display().contains("store setup"));
         assert!(plan.setup_command().display().contains("--init-git"));
-        assert!(plan.init_command().display().contains("--tools claude"));
+        assert!(
+            plan.init_command(BackendKind::Claude)
+                .display()
+                .contains("--tools claude")
+        );
+        assert_eq!(plan.init_command(BackendKind::Codex).args[2], "codex");
         assert!(plan.needs_setup());
         let setup_json = serde_json::json!({
             "store": {

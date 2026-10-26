@@ -338,6 +338,10 @@ pub struct SkillCommands {
 
 impl SkillCommands {
     pub fn discover(repo: &Path, cli: &Cli) -> Result<Self> {
+        Self::discover_for(repo, cli, cli.worker_connection.backend)
+    }
+
+    pub(crate) fn discover_for(repo: &Path, cli: &Cli, backend: BackendKind) -> Result<Self> {
         Ok(Self {
             explore: resolve_bundled_command(cli.explore_command.as_deref(), "explore-unattended"),
             propose: resolve_bundled_command(cli.propose_command.as_deref(), "propose-unattended"),
@@ -345,6 +349,7 @@ impl SkillCommands {
                 repo,
                 cli.apply_command.as_deref(),
                 &[
+                    SkillCandidate::native_skill("openspec-apply-change", backend),
                     SkillCandidate::skill("openspec-apply-change"),
                     SkillCandidate::opencode_skill("openspec-apply-change"),
                     SkillCandidate::command("opsx/apply.md", "opsx:apply"),
@@ -357,6 +362,7 @@ impl SkillCommands {
                 repo,
                 cli.verify_command.as_deref(),
                 &[
+                    SkillCandidate::native_skill("openspec-verify-change", backend),
                     SkillCandidate::skill("openspec-verify-change"),
                     SkillCandidate::opencode_skill("openspec-verify-change"),
                     SkillCandidate::command("opsx/verify.md", "opsx:verify"),
@@ -369,6 +375,7 @@ impl SkillCommands {
                 repo,
                 cli.archive_command.as_deref(),
                 &[
+                    SkillCandidate::native_skill("openspec-archive-change", backend),
                     SkillCandidate::skill("openspec-archive-change"),
                     SkillCandidate::opencode_skill("openspec-archive-change"),
                     SkillCandidate::command("opsx/archive.md", "opsx:archive"),
@@ -394,6 +401,15 @@ struct SkillCandidate {
 }
 
 impl SkillCandidate {
+    fn native_skill(name: &str, backend: BackendKind) -> Self {
+        Self {
+            relative_path: PathBuf::from(backend.skill_directory())
+                .join(name)
+                .join("SKILL.md"),
+            invocation: format!("/{name}"),
+        }
+    }
+
     fn skill(name: &str) -> Self {
         Self {
             relative_path: PathBuf::from(format!(".claude/skills/{name}/SKILL.md")),
@@ -441,7 +457,7 @@ fn resolve_command(
     }
 
     bail!(
-        "could not discover the {stage} workflow in `.claude` or `.opencode`; pass `--{stage}-command /your-command`"
+        "could not discover the {stage} workflow in `.agents`, `.claude` or `.opencode`; install the OpenSpec {stage} skill or pass `--{stage}-command /your-command`"
     )
 }
 

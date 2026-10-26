@@ -695,8 +695,9 @@ impl<U: Ui> App<U> {
                     ));
                 }
                 self.ui.info(&format!(
-                    "Install Claude workflows: {}",
-                    plan.init_command().display()
+                    "Install OpenSpec workflows: {}",
+                    plan.init_command(self.cli.worker_connection.backend)
+                        .display()
                 ));
                 self.ui.info(if self.cli.yolo {
                     "Run local Propose, Apply, Verify/repair, Archive, product commit, and sidecar archive commit (YOLO: no proposal commit)"
@@ -721,8 +722,8 @@ impl<U: Ui> App<U> {
                     .info("Recovering native sidecar store from an interrupted setup");
             }
             runner.checked(
-                &plan.init_command(),
-                "Installing OpenSpec Claude workflows in the sidecar",
+                &plan.init_command(self.cli.worker_connection.backend),
+                "Installing OpenSpec workflows in the sidecar",
             )?;
             plan.finish(&self.ui)?;
             self.ui.success("Created and associated OpenSpec sidecar");
@@ -1053,20 +1054,27 @@ impl<U: Ui> App<U> {
     }
 
     fn synchronize_skills(&self, repo: &Path) -> Result<usize> {
-        let changes = ensure_unattended_skills(repo, self.cli.dry_run)?;
-        for installed in &changes {
-            let action = match installed.action {
-                SkillInstallAction::Installed => "Installed",
-                SkillInstallAction::Updated => "Updated",
-                SkillInstallAction::WouldInstall => "Would install",
-                SkillInstallAction::WouldUpdate => "Would update",
-            };
-            self.ui.info(&format!(
-                "{action} bundled agent skill `{}` in target repository",
-                installed.name
-            ));
+        let mut backends = vec![self.cli.worker_connection.backend];
+        if !backends.contains(&self.cli.frontier_connection.backend) {
+            backends.push(self.cli.frontier_connection.backend);
         }
-        let mut changed = changes.len();
+        let mut changed = 0;
+        for backend in backends {
+            let changes = ensure_unattended_skills(repo, self.cli.dry_run, backend)?;
+            for installed in &changes {
+                let action = match installed.action {
+                    SkillInstallAction::Installed => "Installed",
+                    SkillInstallAction::Updated => "Updated",
+                    SkillInstallAction::WouldInstall => "Would install",
+                    SkillInstallAction::WouldUpdate => "Would update",
+                };
+                self.ui.info(&format!(
+                    "{action} bundled {backend} skill `{}` in target repository",
+                    installed.name
+                ));
+            }
+            changed += changes.len();
+        }
         if (self.cli.worker_connection.backend == BackendKind::Codex
             || self.cli.frontier_connection.backend == BackendKind::Codex)
             && ensure_codex_guidance(repo, self.cli.dry_run)?
@@ -1105,7 +1113,11 @@ impl<U: Ui> App<U> {
             "Project context: `{}`",
             scaffold.context_path.display()
         ));
-        let init = init_command(repo);
+        let init = init_command(
+            repo,
+            self.cli.worker_connection.backend,
+            self.cli.frontier_connection.backend,
+        );
 
         if self.cli.dry_run {
             self.ui
@@ -2451,6 +2463,16 @@ impl<U: Ui> App<U> {
             let use_terminal_frontier = uses_terminal_frontier(&state, frontier_agent.is_some());
             let stage_uses_frontier =
                 stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
+            let frontier_commands = stage_uses_frontier
+                .then(|| {
+                    SkillCommands::discover_for(
+                        repo,
+                        &self.cli,
+                        self.cli.frontier_connection.backend,
+                    )
+                })
+                .transpose()?;
+            let commands = frontier_commands.as_ref().unwrap_or(commands);
             let stage_role = if stage_uses_frontier {
                 "frontier"
             } else {

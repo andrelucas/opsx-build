@@ -27,6 +27,14 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    pub(crate) fn skill_directory(self) -> &'static str {
+        match self {
+            Self::Claude => ".claude/skills",
+            Self::OpenCode => ".opencode/skills",
+            Self::Codex => ".agents/skills",
+        }
+    }
+
     fn default_command(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -3542,5 +3550,56 @@ mod tests {
             CliArgs::try_parse_from(["opsx-build", "build something", "--", "--effort", "xhigh",])
                 .is_err()
         );
+    }
+    #[test]
+    fn discovers_native_codex_workflows_without_requiring_claude_files() {
+        let repo =
+            std::env::temp_dir().join(format!("opsx-native-workflow-{}", uuid::Uuid::new_v4()));
+        for action in ["apply", "verify", "archive"] {
+            let path = repo.join(format!(".agents/skills/openspec-{action}-change/SKILL.md"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "Native Codex workflow\n").unwrap();
+        }
+        let cli = Cli::resolve(
+            <crate::cli::CliArgs as clap::Parser>::try_parse_from([
+                "opsx-build",
+                "--no-config",
+                "--no-campaign-config",
+                "--worker-backend=codex",
+                "advance",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let native = crate::claude::SkillCommands::discover(&repo, &cli).unwrap();
+        assert_eq!(native.apply, "/openspec-apply-change");
+        assert_eq!(native.verify, "/openspec-verify-change");
+        assert_eq!(native.archive, "/openspec-archive-change");
+        assert!(!repo.join(".claude").exists());
+        for action in ["apply", "verify", "archive"] {
+            let path = repo.join(format!(".claude/commands/opsx/{action}.md"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "Claude command\n").unwrap();
+        }
+        // Mixed backends discover their own procedures from the same repository.
+        assert_eq!(
+            crate::claude::SkillCommands::discover_for(&repo, &cli, BackendKind::Claude)
+                .unwrap()
+                .apply,
+            "/opsx:apply"
+        );
+        assert_eq!(
+            crate::claude::SkillCommands::discover_for(&repo, &cli, BackendKind::Codex).unwrap(),
+            native
+        );
+        let mut explicit = cli;
+        explicit.apply_command = Some("custom-apply".to_owned());
+        assert_eq!(
+            crate::claude::SkillCommands::discover_for(&repo, &explicit, BackendKind::Codex)
+                .unwrap()
+                .apply,
+            "/custom-apply"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 }

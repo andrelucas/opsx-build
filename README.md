@@ -1850,9 +1850,20 @@ overrides. Codex permission profiles require a recent Codex CLI and must not be
 combined with legacy global `sandbox_mode` or `sandbox_workspace_write`
 settings; see the official [Codex permissions documentation][codex-permissions].
 
-Bundled and OpenSpec skills discovered under `.claude/skills`,
-`.agents/skills`, or `.opencode/skills` are passed as explicit App Server skill
-inputs. Claude/OpenSpec command files are handled the same way. When Codex is selected, opsx-build also adds or refreshes its marked guidance
+New bootstrap runs initialize OpenSpec for the selected worker and frontier
+backends. Codex uses OpenSpec's native `.agents/skills/openspec-*` skills for
+Apply, Verify and Archive when installed. The OpenSpec workflow profile must
+include those actions, including Verify. Mixed backends select their own stage
+procedures; explicit `--apply-command`, `--verify-command` and `--archive-command`
+overrides remain authoritative. Bundled unattended Explore/Propose skills are
+installed in each selected backend's native skill directory.
+
+Codex receives native skills as explicit App Server skill inputs, with the
+runner's assignment, source boundaries and result protocol retained separately.
+Existing Claude/OpenSpec command files remain a fallback and are inlined as text
+when no native skill is installed. Native skills still contain interactive
+workflow guidance; selecting them does not by itself prove correct unattended
+behavior. When Codex is selected, opsx-build also adds or refreshes its marked guidance
 block in `AGENTS.md`, preserving every byte outside the managed markers.
 Bootstrap now creates both `CLAUDE.md` and `AGENTS.md` guidance so either backend can follow
 the same project rules.

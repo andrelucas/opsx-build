@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    agenda::parse_slice_name, model_confusions::claude_md_guidance as model_confusion_guidance,
-    process::CommandSpec,
+    agenda::parse_slice_name, cli::BackendKind,
+    model_confusions::claude_md_guidance as model_confusion_guidance, process::CommandSpec,
 };
 
 pub const BOOTSTRAP_CHANGE: &str = "bootstrap-implementation-slices";
@@ -155,8 +155,13 @@ impl BootstrapScaffold {
     }
 }
 
-pub fn init_command(repo: &Path) -> CommandSpec {
-    CommandSpec::new("openspec", repo).args(["init", "--tools", "claude", "--no-animation", "."])
+pub fn init_command(repo: &Path, worker: BackendKind, frontier: BackendKind) -> CommandSpec {
+    let tools = if worker == frontier {
+        worker.to_string()
+    } else {
+        format!("{worker},{frontier}")
+    };
+    CommandSpec::new("openspec", repo).args(["init", "--tools", &tools, "--no-animation", "."])
 }
 
 pub fn instructions(frontier_worker: bool) -> String {
@@ -554,7 +559,7 @@ mod tests {
             );
             assert_eq!(saved.contains("frontier-capable model"), frontier_worker);
             assert!(saved.contains("Several files, subsystems, test cases"));
-            crate::skills::ensure_unattended_skills(&repo, false).unwrap();
+            crate::skills::ensure_unattended_skills(&repo, false, BackendKind::Claude).unwrap();
             for path in [
                 BOOTSTRAP_PATH,
                 CLAUDE_PATH,
@@ -673,11 +678,27 @@ mod tests {
 
     #[test]
     fn constructs_noninteractive_openspec_initialization() {
-        let command = init_command(Path::new("/tmp/example"));
+        let command = init_command(
+            Path::new("/tmp/example"),
+            BackendKind::Claude,
+            BackendKind::Claude,
+        );
         assert_eq!(command.program, "openspec");
         assert_eq!(
             command.args,
             ["init", "--tools", "claude", "--no-animation", "."]
         );
+        for (worker, frontier, tools) in [
+            (BackendKind::Codex, BackendKind::Codex, "codex"),
+            (BackendKind::Codex, BackendKind::Claude, "codex,claude"),
+            (BackendKind::Claude, BackendKind::Codex, "claude,codex"),
+            (BackendKind::OpenCode, BackendKind::Codex, "opencode,codex"),
+        ] {
+            let command = init_command(Path::new("/tmp/example"), worker, frontier);
+            assert_eq!(
+                command.args,
+                ["init", "--tools", tools, "--no-animation", "."]
+            );
+        }
     }
 }

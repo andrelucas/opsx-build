@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use crate::cli::BackendKind;
 use anyhow::{Context, Result};
 
 const BUNDLED_SKILLS: &[BundledSkill] = &[
@@ -32,20 +33,25 @@ pub struct SkillInstall {
     pub action: SkillInstallAction,
 }
 
-pub fn ensure_unattended_skills(repo: &Path, dry_run: bool) -> Result<Vec<SkillInstall>> {
+pub fn ensure_unattended_skills(
+    repo: &Path,
+    dry_run: bool,
+    backend: BackendKind,
+) -> Result<Vec<SkillInstall>> {
     let mut changes = Vec::new();
     for skill in BUNDLED_SKILLS {
         let contents = crate::authority::render(skill.contents);
         let path = repo
-            .join(".claude/skills")
+            .join(backend.skill_directory())
             .join(skill.name)
             .join("SKILL.md");
         let existing = match fs::read(&path) {
             Ok(contents) => Some(contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not read Claude skill `{}`", path.display()));
+                return Err(error).with_context(|| {
+                    format!("could not read {backend} skill `{}`", path.display())
+                });
             }
         };
         if existing.as_deref() == Some(contents.as_bytes()) {
@@ -62,12 +68,13 @@ pub fn ensure_unattended_skills(repo: &Path, dry_run: bool) -> Result<Vec<SkillI
             let parent = path.parent().expect("skill path has a parent");
             fs::create_dir_all(parent).with_context(|| {
                 format!(
-                    "could not create Claude skill directory `{}`",
+                    "could not create {backend} skill directory `{}`",
                     parent.display()
                 )
             })?;
-            fs::write(&path, contents)
-                .with_context(|| format!("could not install Claude skill `{}`", path.display()))?;
+            fs::write(&path, contents).with_context(|| {
+                format!("could not install {backend} skill `{}`", path.display())
+            })?;
         }
         changes.push(SkillInstall {
             name: skill.name,
@@ -117,7 +124,7 @@ mod tests {
         let repo = temporary_repo("install");
         fs::create_dir_all(&repo).unwrap();
 
-        let installed = ensure_unattended_skills(&repo, false).unwrap();
+        let installed = ensure_unattended_skills(&repo, false, BackendKind::Claude).unwrap();
         assert_eq!(installed.len(), 2);
         assert!(
             installed
@@ -127,7 +134,7 @@ mod tests {
 
         let explore = repo.join(".claude/skills/explore-unattended/SKILL.md");
         fs::write(&explore, "stale").unwrap();
-        let repaired = ensure_unattended_skills(&repo, false).unwrap();
+        let repaired = ensure_unattended_skills(&repo, false, BackendKind::Claude).unwrap();
         assert_eq!(
             repaired,
             [SkillInstall {
@@ -135,9 +142,40 @@ mod tests {
                 action: SkillInstallAction::Updated,
             }]
         );
-        assert!(ensure_unattended_skills(&repo, false).unwrap().is_empty());
+        assert!(
+            ensure_unattended_skills(&repo, false, BackendKind::Claude)
+                .unwrap()
+                .is_empty()
+        );
 
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn installs_bundled_skills_in_the_selected_backends_native_directory() {
+        for backend in [BackendKind::Codex, BackendKind::OpenCode] {
+            let repo = temporary_repo("native");
+            fs::create_dir_all(&repo).unwrap();
+            let changes = ensure_unattended_skills(&repo, false, backend).unwrap();
+            assert_eq!(changes.len(), 2);
+            for skill in BUNDLED_SKILLS {
+                let path = repo
+                    .join(backend.skill_directory())
+                    .join(skill.name)
+                    .join("SKILL.md");
+                assert_eq!(
+                    fs::read_to_string(path).unwrap(),
+                    crate::authority::render(skill.contents)
+                );
+            }
+            assert!(!repo.join(".claude").exists());
+            assert!(
+                ensure_unattended_skills(&repo, false, backend)
+                    .unwrap()
+                    .is_empty()
+            );
+            fs::remove_dir_all(repo).unwrap();
+        }
     }
 
     #[test]
@@ -145,7 +183,7 @@ mod tests {
         let repo = temporary_repo("dry-run");
         fs::create_dir_all(&repo).unwrap();
 
-        let changes = ensure_unattended_skills(&repo, true).unwrap();
+        let changes = ensure_unattended_skills(&repo, true, BackendKind::Claude).unwrap();
         assert_eq!(changes.len(), 2);
         assert!(
             changes
