@@ -22,6 +22,7 @@ pub mod openspec;
 pub mod operating_policy;
 pub mod process;
 pub mod review;
+mod run_summary;
 mod runner_executable;
 pub mod sidecar;
 pub mod skills;

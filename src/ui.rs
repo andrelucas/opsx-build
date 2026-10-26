@@ -90,6 +90,9 @@ pub trait Ui {
     fn stream_item(&self, item: &StreamItem);
     fn finish_stream(&self, success: bool, message: &str);
     fn finish_dashboard(&self);
+    fn run_summary(&self, text: &str) {
+        self.info(text);
+    }
     fn output(&self, stdout: &str, stderr: &str);
     fn start_activity(&self, message: &str) -> Option<ProgressBar>;
     fn finish_activity(&self, spinner: Option<ProgressBar>, success: bool, message: &str);
@@ -494,6 +497,11 @@ impl Ui for TerminalUi {
         if let Some(mut dashboard) = self.state.lock().unwrap().dashboard.take() {
             dashboard.leave();
         }
+    }
+
+    fn run_summary(&self, text: &str) {
+        self.finish_dashboard();
+        self.write_line(text);
     }
 
     fn output(&self, stdout: &str, stderr: &str) {

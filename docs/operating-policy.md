@@ -70,6 +70,8 @@ The checkpoint references a private Git-metadata directory, normally:
   owner.lock
   stop.json
   stop.txt
+  summary.json
+  summary.txt
 ```
 
 The ledger retains selected limits and policy revisions, request identities,
@@ -81,6 +83,14 @@ Normal resume, bootstrap-to-delivery handoff and campaign iteration changes keep
 the same ledger. Review histories superseded by supported decomposition remain
 recorded; new scope does not reset cumulative request/usage evidence. Check-helper
 scope is also carried across those iteration changes.
+
+Run summaries are observations saved on completion, failure and clean pause.
+They include bootstrap/slice durations and commits, wall-clock and active time,
+and run-scoped model/request totals. They do not reset allowances or establish
+acceptance. Detailed usage is selected by this ledger's request IDs, so historical
+runs in the shared usage log do not inflate the result. Older timing/usage gaps
+stay explicit. Slice timing remains durable across resume; wall clock includes
+offline time, while active time and request time are separate measurements.
 
 A stop occurs after retaining a completed stage result and before the next model
 request. An in-flight timeout uses cancellation instead; that stage is incomplete.

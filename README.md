@@ -763,6 +763,35 @@ If `loop = true` is configured as a default, `--no-loop` runs one change while
 preserving the rest of that configuration. On `--resume`, it finishes the
 current campaign change and pauses before the following iteration.
 
+## End-of-run summary
+
+After an unattended workflow has started, it prints a summary when the interactive
+dashboard closes, including on failure or a clean pause. It lists the bootstrap and completed
+delivery slices with their recorded active duration and optional completion
+commit, plus the unfinished phase when applicable. Campaign totals retain the
+same run scope across resume, bootstrap handoff and delivery iterations.
+
+Wall-clock time spans the recorded workflow start through its end, including
+time between resumes. Runner active time excludes that offline time; summed
+agent-request time is reported separately. Slice timers survive resume and include
+repair/review and recovery work. Missing historical timing stays unknown, and
+interrupted intervals are labelled as recorded subtotals.
+
+Compact model totals show dispatched requests, input/cached-input/output tokens
+and provider-reported cost, alongside repair, incomplete and provider-error attempt
+counts. Cached input is already part of input; reasoning tokens are part of output.
+Mixed reported models remain grouped, and requested-only model names are labelled.
+`unknown` means no observation; `+?` marks a known subtotal with missing or partial
+usage. No token or cost estimate is substituted for absent data.
+
+The terminal prints the saved report path. Normally the same run's private metadata
+contains `.git/opsx-build/policy/<run-id>/summary.json` and `summary.txt`. The JSON
+retains exact counts and full commit hashes. Aggregation selects only that run's
+request IDs from `usage.jsonl`, using the latest valid observation per ID. Other
+runs, configuration conversations and connection tests do not enter these totals.
+Summary generation makes no model calls or acceptance decisions; a reporting
+failure warns without changing the workflow's exit status.
+
 ## Installation
 
 ```sh

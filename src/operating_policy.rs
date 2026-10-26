@@ -96,6 +96,8 @@ struct Ledger {
     incomplete_review: Option<Progress>,
     #[serde(default)]
     unfinished_stage: Option<String>,
+    #[serde(default)]
+    summary_timing: crate::run_summary::Timing,
     no_progress: u32,
     unassessable: u32,
     recurrences: BTreeMap<String, u32>,
@@ -151,6 +153,7 @@ impl Run {
                 reviews: Vec::new(),
                 incomplete_review: None,
                 unfinished_stage: None,
+                summary_timing: crate::run_summary::Timing::start(),
                 no_progress: 0,
                 unassessable: 0,
                 recurrences: BTreeMap::new(),
@@ -189,6 +192,15 @@ impl Run {
                 ledger.unresolved.push(id.clone());
                 ledger.active_time_has_gap = true;
             }
+        }
+        let interrupted_changes = ledger
+            .requests
+            .values()
+            .filter(|request| request.outcome.is_none())
+            .map(|request| request.context.change.clone())
+            .collect::<Vec<_>>();
+        for change in interrupted_changes {
+            ledger.summary_timing.interrupted(change.as_deref());
         }
         for id in acknowledgements {
             if ledger.unresolved.contains(&id)
@@ -232,6 +244,13 @@ impl Guard {
     pub(crate) fn boundary(&self, change: Option<&str>, next_stage: &str) -> Result<()> {
         {
             let mut ledger = self.ledger.lock().unwrap();
+            let known_start = !ledger
+                .requests
+                .values()
+                .any(|request| request.context.change.as_deref() == change);
+            ledger
+                .summary_timing
+                .boundary(change, next_stage, self.elapsed_ms(), known_start);
             if ledger.change.as_deref() != change
                 || !ledger
                     .next_stage
@@ -265,6 +284,8 @@ impl Guard {
                 return self.stop("request_limit", "the stage exhausted its request allowance without reaching its next durable stage result");
             }
             ledger.stage_requests += 1;
+            ledger.summary_timing.finished_at_unix_ms = None;
+            ledger.summary_timing.finished_active_ms = None;
             let request = ledger
                 .requests
                 .entry(usage.id.clone())
@@ -313,6 +334,67 @@ impl Guard {
         }
         self.ledger.lock().unwrap().unfinished_stage = Some(remaining);
         self.save()
+    }
+
+    pub(crate) fn checkpoint_path(&self) -> PathBuf {
+        self.directory
+            .parent()
+            .and_then(Path::parent)
+            .expect("policy metadata root")
+            .join("last-run.json")
+    }
+
+    pub(crate) fn change_elapsed_seconds(&self, change: &str) -> Option<u64> {
+        let ledger = self.ledger.lock().unwrap();
+        ledger
+            .summary_timing
+            .elapsed_seconds(change, self.elapsed_ms())
+    }
+
+    pub(crate) fn summary_work_started(&self) {
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.summary_timing.finished_at_unix_ms = None;
+        ledger.summary_timing.finished_active_ms = None;
+    }
+
+    pub(crate) fn summary_context(&self, complete: bool) -> Result<crate::run_summary::Context> {
+        let active_ms = self.elapsed_ms();
+        let mut ledger = self.ledger.lock().unwrap();
+        if complete {
+            ledger
+                .summary_timing
+                .finished_at_unix_ms
+                .get_or_insert_with(crate::run_summary::now_ms);
+            ledger
+                .summary_timing
+                .finished_active_ms
+                .get_or_insert(active_ms);
+        }
+        let context = crate::run_summary::Context {
+            directory: self.directory.clone(),
+            timing: ledger.summary_timing.clone(),
+            active_ms,
+            active_time_has_gap: ledger.active_time_has_gap,
+            requests: ledger
+                .requests
+                .iter()
+                .map(|(id, request)| {
+                    (
+                        id.clone(),
+                        crate::run_summary::Request {
+                            backend: request.backend.clone(),
+                            context: request.context.clone(),
+                            elapsed_ms: request.elapsed_ms,
+                            outcome: request.outcome.clone(),
+                            dispatches: request.dispatches,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        drop(ledger);
+        self.save()?;
+        Ok(context)
     }
 
     pub(crate) fn incomplete_review(&self, mut progress: Progress) -> Result<()> {

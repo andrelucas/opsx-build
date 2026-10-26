@@ -421,7 +421,10 @@ fn repair_loop_retains_findings_and_handoffs_and_still_runs_the_exact_final_gate
 fn campaign_iterations_keep_the_same_policy_ledger_and_check_helper_scope() {
     let f = Fixture::new();
     f.review_workflow(true);
-    let initial = f.state();
+    let mut initial = f.state();
+    initial["bootstrap_progress"] =
+        serde_json::json!({"elapsed":{"secs":65,"nanos":0},"final_head":"0123456789abcdef"});
+    f.save_state(&initial);
     fs::write(
         f.root.join("repo/automation/slices/0002-followup.md"),
         "# Followup\n\n## Objective\nFinish the next bounded change.\n",
@@ -497,6 +500,59 @@ print(json.dumps({'type':'result','subtype':'success','session_id':'fixture-sess
             .unwrap()
             .contains(initial["checks"]["scope"].as_str().unwrap())
     );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["outcome"], "complete");
+    assert_eq!(
+        summary["attempts"].as_u64().unwrap() as usize,
+        ledger["requests"].as_object().unwrap().len()
+    );
+    assert_eq!(summary["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(summary["rows"][0]["name"], "Bootstrap");
+    assert_eq!(summary["rows"][0]["elapsed_seconds"], 65);
+    assert_eq!(summary["rows"][0]["commit"], "0123456789abcdef");
+    assert_eq!(summary["rows"][1]["name"], "0001-delivery");
+    assert_eq!(summary["rows"][2]["name"], "0002-followup");
+    assert!(summary["rows"][1]["elapsed_seconds"].is_number());
+    assert!(summary["rows"][1]["commit"].is_string());
+    assert!(summary["wall_clock_seconds"].is_number());
+    assert!(stderr.contains("RUN SUMMARY — COMPLETE"));
+    assert!(stderr.contains("Saved run summary:"));
+    assert!(!summary["models"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn summary_write_failure_does_not_change_a_successful_build_exit() {
+    let f = Fixture::new();
+    f.review_workflow(true);
+    let directory = PathBuf::from(f.state()["operating"]["directory"].as_str().unwrap());
+    fs::remove_file(directory.join("summary.json")).unwrap();
+    fs::create_dir(directory.join("summary.json")).unwrap();
+    fs::write(f.root.join("bin/claude"), r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'Claude fixture'; exit 0; fi
+for arg in "$@"; do
+ case "$arg" in /rename\ *) echo '{"type":"result","subtype":"success","result":"Renamed"}'; exit 0;; esac
+ case "$arg" in stream-json) streamed=true;; esac
+done
+if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
+count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
+status=READY
+case "$count" in
+ 1) printf 'implemented\n' > candidate.txt;;
+ 2) status=VERIFIED;;
+ 3) mkdir -p openspec/changes/archive; mv openspec/changes/0001-delivery openspec/changes/archive/2026-10-26-0001-delivery;;
+ 4) git add candidate.txt openspec; git commit -qm 'Fixture completion' || exit 90;;
+ *) exit 91;;
+esac
+printf '{"type":"result","subtype":"success","session_id":"fixture-session","structured_output":{"opsx_status":"%s","summary":"Fixture completed"}}\n' "$status"
+"#).unwrap();
+    let result = f.run("ordinary", true);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(f.state()["stage"], "complete");
+    assert!(stderr.contains("RUN SUMMARY — COMPLETE"));
+    assert!(stderr.contains("Could not save the run summary"));
 }
 
 #[test]

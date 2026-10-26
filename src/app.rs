@@ -463,7 +463,8 @@ impl<U: Ui> App<U> {
     }
 
     pub fn run(self) -> Result<()> {
-        match self.run_inner() {
+        let mut paused = false;
+        let result = match self.run_inner() {
             Err(error) if crate::operating_policy::is_stop(&error) => {
                 self.ui.finish_dashboard();
                 if let Some(guard) = self.ui.operating_policy() {
@@ -473,6 +474,7 @@ impl<U: Ui> App<U> {
                 }
             }
             Err(error) if error.downcast_ref::<PauseRequested>().is_some() => {
+                paused = true;
                 let pause = error
                     .downcast_ref::<PauseRequested>()
                     .expect("pause error was checked above");
@@ -484,7 +486,100 @@ impl<U: Ui> App<U> {
                 Ok(())
             }
             result => result,
+        };
+        if let Some(guard) = self.ui.operating_policy()
+            && let Err(error) = self.show_run_summary(&guard, &result, paused)
+        {
+            self.ui
+                .warn(&format!("Could not produce the run summary: {error:#}"));
         }
+        result
+    }
+
+    fn show_run_summary(
+        &self,
+        guard: &crate::operating_policy::Guard,
+        result: &Result<()>,
+        paused: bool,
+    ) -> Result<()> {
+        use crate::run_summary::{Row, Summary};
+        self.ui.finish_dashboard();
+        let state = load_state_file(&guard.checkpoint_path())?;
+        let complete = result.is_ok()
+            && !paused
+            && (state.stage == Stage::Done
+                || (state.stage == Stage::Complete && state.campaign.is_none()));
+        let outcome = if result.is_err() {
+            "failed"
+        } else if complete {
+            "complete"
+        } else {
+            "paused"
+        };
+        let context = guard.summary_context(complete)?;
+        let mut rows = Vec::new();
+        if let Some(bootstrap) = &state.bootstrap_progress {
+            let done = !state.bootstrap || matches!(state.stage, Stage::Complete | Stage::Done);
+            rows.push(Row {
+                name: "Bootstrap".into(),
+                status: if done {
+                    "complete".into()
+                } else {
+                    format!("unfinished: {}", state.stage.title())
+                },
+                elapsed_seconds: if context.active_time_has_gap
+                    && guard.change_elapsed_seconds(BOOTSTRAP_CHANGE).is_none()
+                {
+                    None
+                } else {
+                    Some(bootstrap.elapsed.as_secs())
+                },
+                commit: bootstrap
+                    .final_head
+                    .clone()
+                    .or_else(|| state.bootstrap.then(|| state.final_head.clone()).flatten()),
+            });
+        }
+        if let Some(campaign) = &state.campaign {
+            rows.extend(campaign.completed.iter().map(|entry| Row {
+                name: entry.change.clone(),
+                status: "complete".into(),
+                elapsed_seconds: entry.elapsed_seconds,
+                commit: entry.final_head.clone(),
+            }));
+        }
+        if !state.bootstrap
+            && let Some(change) = &state.change
+            && !rows.iter().any(|row| row.name == *change)
+        {
+            rows.push(Row {
+                name: change.clone(),
+                status: if matches!(state.stage, Stage::Complete | Stage::Done) {
+                    "complete".into()
+                } else {
+                    format!("unfinished: {}", state.stage.title())
+                },
+                elapsed_seconds: guard.change_elapsed_seconds(change),
+                commit: state.final_head.clone(),
+            });
+        }
+        let summary = Summary::collect(
+            &context,
+            outcome,
+            state.stage.title(),
+            result.as_ref().err().map(|error| format!("{error:#}")),
+            rows,
+        );
+        self.ui.run_summary(&summary.render());
+        match summary.save(&context) {
+            Ok(path) => self
+                .ui
+                .info(&format!("Saved run summary: {}", path.display())),
+            Err(error) => self
+                .ui
+                .warn(&format!("Could not save the run summary: {error:#}")),
+        }
+        Ok(())
     }
 
     fn run_inner(&self) -> Result<()> {
@@ -1436,9 +1531,6 @@ impl<U: Ui> App<U> {
                 }
             }
             self.present_campaign(repo, &state);
-            let iteration_started = (matches!(state.stage, Stage::Explore | Stage::Propose)
-                && state.planning_session.is_none())
-            .then(Instant::now);
             let stage_launcher = if state.bootstrap {
                 frontier_launcher.context("bootstrap requires a frontier connection")?
             } else {
@@ -1590,8 +1682,7 @@ impl<U: Ui> App<U> {
                                 change: change.clone(),
                                 proposal_head: completed_state.proposal_head.clone(),
                                 final_head: completed_state.final_head.clone(),
-                                elapsed_seconds: iteration_started
-                                    .map(|started| started.elapsed().as_secs()),
+                                elapsed_seconds: guard.change_elapsed_seconds(&change),
                             });
                         persist_state(repo, &completed_state, &self.ui)?;
                     }
@@ -3266,6 +3357,9 @@ impl<U: Ui> App<U> {
             .as_mut()
             .and_then(|c| c.acceptance.take())
             .context("acceptance stage has no recorded gate")?;
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.summary_work_started();
+        }
         let result = gate.run(repo, state.change.as_deref(), &self.ui, || {
             state.contracts.as_ref().unwrap().check_inputs(repo)
         });

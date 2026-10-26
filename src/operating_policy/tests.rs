@@ -176,6 +176,38 @@ fn repeated_reopening_in_partial_reviews_still_triggers_the_existing_guard() {
 }
 
 #[test]
+fn completed_summary_clock_is_preserved_across_resume() {
+    let f = Fixture::new(Policy::default());
+    let guard = f.run.open(None).unwrap();
+    guard.boundary(Some("delivery"), "Propose").unwrap();
+    guard.boundary(Some("delivery"), "Complete").unwrap();
+    let finished = guard.summary_context(true).unwrap();
+    drop(guard);
+    let resumed = f.run.open(None).unwrap();
+    let repeated = resumed.summary_context(true).unwrap();
+    assert_eq!(
+        finished.timing.started_at_unix_ms,
+        repeated.timing.started_at_unix_ms
+    );
+    assert_eq!(
+        finished.timing.finished_at_unix_ms,
+        repeated.timing.finished_at_unix_ms
+    );
+    assert_eq!(
+        finished.timing.finished_active_ms,
+        repeated.timing.finished_active_ms
+    );
+    assert_eq!(resumed.change_elapsed_seconds("delivery"), Some(0));
+    resumed.summary_work_started();
+    let requalification = resumed.summary_context(false).unwrap();
+    assert_eq!(
+        requalification.timing.started_at_unix_ms,
+        finished.timing.started_at_unix_ms
+    );
+    assert!(requalification.timing.finished_at_unix_ms.is_none());
+}
+
+#[test]
 fn request_allowance_covers_retries_and_compaction_and_survives_resume_and_policy_changes() {
     let f = Fixture::new(Policy {
         max_requests_per_stage: 2,
