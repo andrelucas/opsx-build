@@ -226,6 +226,28 @@ impl Run {
 }
 
 impl Guard {
+    /// Explicit maintainer correction grants another local attempt, preserving
+    /// all requests, reviews, usage and unresolved backend operations.
+    pub(crate) fn accept_changes(&self) -> Result<()> {
+        {
+            let mut ledger = self.ledger.lock().unwrap();
+            if !ledger.unresolved.is_empty() {
+                bail!(
+                    "a backend request is still unresolved; establish that it has stopped before accepting changed inputs"
+                );
+            }
+            ledger.stage_key.clear();
+            ledger.stage_requests = 0;
+            ledger.no_progress = 0;
+            ledger.unassessable = 0;
+            ledger.recurrences.clear();
+            ledger.replans_without_progress = 0;
+            ledger.incomplete_review = None;
+            ledger.unfinished_stage = None;
+        }
+        self.save()
+    }
+
     fn elapsed_ms(&self) -> u64 {
         self.saved_active_ms.saturating_add(
             self.active_since

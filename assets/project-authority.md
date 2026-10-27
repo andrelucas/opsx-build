@@ -34,10 +34,10 @@ planning-only. Do not repair work during verification. Use BLOCKED only when
 authoritative inputs require an external decision or necessary external input
 is unavailable; cite the gap and the smallest decision needed.
 
-### Ordinary context workflow: anti-Karen rule
+### Review materiality: anti-Karen rule
 
-Unless this run explicitly uses the supplied-contract workflow (OpenSpec schema
-`opsx-supplied-contracts`), apply a materiality threshold to review. Report RETRY
+In both ordinary and supplied-contract workflows, apply a materiality threshold
+to review. Report RETRY
 only for a concrete defect that prevents delivery or verification of the
 requested behaviour: a missing requirement, incorrect observable behaviour,
 failed required check, or an unworkable plan. State the consequence and the
@@ -47,6 +47,10 @@ effect on the required outcome are non-blocking observations. Return VERIFIED
 when required outcomes and checks pass despite such observations. Do not turn
 observations into mandatory repair tasks or expand the scope on successive
 reviews. Actual correctness defects and missing required tests still block.
+In supplied-contract mode, preserve exact source meaning, ownership, conditions,
+exceptions and protected acceptance. A missing repeated summary or optional
+design is not evidence of missing scope. Required structural/source checks still
+apply; harmless wording alone does not justify another repair cycle.
 
 During ordinary bootstrap, verify coverage, usable slice boundaries, observable
 acceptance criteria and the final whole-project gate. Leave implementation
@@ -66,3 +70,6 @@ test mistakes against those contracts, citing the governing source and affected
 artifacts. Apply/Repair synchronize affected derived plans, specs,
 implementation and tests. A contradiction introduced by generated planning is
 the campaign's responsibility to correct; do not defer it or weaken the contract.
+Only the overseeing maintainer may correct supplied inputs and invoke
+`accept-changes`. Builders must report authoritative contradictions as BLOCKED;
+they must never invoke that command to approve their own input changes.

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod maintenance;
+mod supplied;
+
 use crate::{
     agenda::{
         AgendaAssignment, AgendaSelection, discover as discover_agenda, has_subdivision,
@@ -70,7 +73,7 @@ const ASSIGNMENT_VERIFY_CONTEXT: &str = "Independently verify the complete suppl
 
 const TOTAL_STAGES: usize = 7;
 const AGENDA_TOTAL_STAGES: usize = 6;
-const STATE_SCHEMA_VERSION: u32 = 6;
+const STATE_SCHEMA_VERSION: u32 = 7;
 const MAX_FRONTIER_REPLANS: u32 = 3;
 const BOOTSTRAP_STRUCTURAL_FINDING: &str = "The deterministic bootstrap agenda check failed:";
 
@@ -239,6 +242,12 @@ struct RunState {
     local_only: bool,
     #[serde(default)]
     contracts: Option<crate::contracts::SuppliedContracts>,
+    #[serde(default)]
+    context_path: Option<PathBuf>,
+    #[serde(default)]
+    context_definitions: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    maintainer_correction: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +335,9 @@ impl RunState {
             planning_final_head: None,
             local_only: false,
             contracts: None,
+            context_path: None,
+            context_definitions: std::collections::BTreeMap::new(),
+            maintainer_correction: false,
         }
     }
 
@@ -377,6 +389,9 @@ impl RunState {
             planning_final_head: None,
             local_only: false,
             contracts: None,
+            context_path: None,
+            context_definitions: std::collections::BTreeMap::new(),
+            maintainer_correction: false,
         }
     }
 
@@ -622,6 +637,9 @@ impl<U: Ui> App<U> {
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let product_repo = repository_root(&requested_repo, &self.ui)?;
+        if self.cli.request == "accept-changes" {
+            return self.accept_changes(&product_repo);
+        }
         if matches!(self.cli.request.as_str(), "render-agenda" | "check-agenda") {
             let state = load_state(&product_repo, &self.ui)?;
             let contracts = state
@@ -965,6 +983,10 @@ impl<U: Ui> App<U> {
         };
         state.local_only |= local_only;
         state.contracts = contracts;
+        state.context_path = repo
+            .join("context.md")
+            .is_file()
+            .then(|| repo.join("context.md"));
         if sidecar.is_none() {
             self.assign_requested_change(&mut state)?;
             self.assign_agenda(&repo, &mut state)?;
@@ -998,6 +1020,31 @@ impl<U: Ui> App<U> {
                 self.ui.info("Ordered agenda is complete");
             }
             AgendaSelection::Next(assignment) => {
+                if supplied::compact(state)
+                    && is_terminal_assignment(&assignment)
+                    && state
+                        .campaign
+                        .as_ref()
+                        .is_some_and(|c| c.completed.iter().any(|i| i.change == assignment.change))
+                    && state.terminal_review_complete
+                    && !state.maintainer_correction
+                    && state
+                        .contracts
+                        .as_ref()
+                        .unwrap()
+                        .acceptance
+                        .as_ref()
+                        .map(|gate| gate.is_current(repo, None, &self.ui))
+                        .transpose()?
+                        .unwrap_or(true)
+                {
+                    state.agenda = None;
+                    state.change = None;
+                    state.stage = Stage::Done;
+                    state.terminal_summary =
+                        Some("independent project acceptance is complete".into());
+                    return Ok(());
+                }
                 self.ui.info(&format!(
                     "Advancing agenda with `{}` — {}",
                     assignment.path, assignment.title
@@ -1023,6 +1070,9 @@ impl<U: Ui> App<U> {
                     Stage::Propose
                 };
                 state.agenda = Some(assignment);
+                if supplied::direct(state) && !state.maintainer_correction {
+                    self.prepare_direct_acceptance(repo, state)?;
+                }
             }
         }
         Ok(())
@@ -1143,9 +1193,13 @@ impl<U: Ui> App<U> {
             } else {
                 ", proposal commit"
             };
-            self.ui.info(&format!(
-                "Run `{BOOTSTRAP_CHANGE}` through Propose{proposal_commit}, Apply, Verify/repair, Archive, and completion commit on the frontier connection"
-            ));
+            if contracts.as_ref().is_some_and(|c| c.compact) {
+                self.ui.info("Assign supplied work directly; check coverage mechanically, independently review multi-slice decomposition, and commit the agenda. No bootstrap OpenSpec change.");
+            } else {
+                self.ui.info(&format!(
+                    "Run `{BOOTSTRAP_CHANGE}` through Propose{proposal_commit}, Apply, Verify/repair, Archive, and completion commit on the frontier connection"
+                ));
+            }
             self.ui.info(
                 "Require an ordered agenda ending at `automation/slices/9999-project-acceptance.md`",
             );
@@ -1168,6 +1222,8 @@ impl<U: Ui> App<U> {
         let before_changes = openspec_snapshot(repo, &self.ui)?;
         let mut state = RunState::bootstrap(before_changes, self.cli.frontier_worker);
         state.contracts = contracts;
+        state.context_path = Some(scaffold.context_path.clone());
+        state.context_definitions = self.cli.bootstrap_defines.clone();
         if state.contracts.is_some()
             && let Some(agenda) = state.agenda.as_mut()
         {
@@ -1522,7 +1578,11 @@ impl<U: Ui> App<U> {
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
                 contracts.check_schema(repo)?;
-                if has_assignments(&state) && !state.bootstrap && state.stage == Stage::Propose {
+                if has_assignments(&state)
+                    && !state.bootstrap
+                    && state.stage == Stage::Propose
+                    && !state.maintainer_correction
+                {
                     contracts.check_agenda(repo)?;
                 }
             }
@@ -1621,9 +1681,11 @@ impl<U: Ui> App<U> {
                     if completed_state.bootstrap && completed_state.campaign.is_some() {
                         if self.ui.stop_after_iteration_requested() {
                             self.ui.finish_dashboard();
-                            self.ui.success(
-                                "PAUSED after bootstrap: the agenda is verified, archived, and committed; no implementation slice has started",
-                            );
+                            self.ui.success(if supplied::compact(&completed_state) {
+                                "PAUSED after bootstrap: the agenda is checked and committed; no implementation slice has started"
+                            } else {
+                                "PAUSED after bootstrap: the agenda is verified, archived, and committed; no implementation slice has started"
+                            });
                             self.ui.info(&format!(
                                 "Continue with: opsx-build --repo {} --resume",
                                 shell_quote(&repo.to_string_lossy()),
@@ -1640,6 +1702,9 @@ impl<U: Ui> App<U> {
                         state.checks = completed_state.checks.clone();
                         state.contracts = completed_state.contracts.take();
                         state.bootstrap_progress = completed_state.bootstrap_progress.take();
+                        state.context_path = completed_state.context_path.take();
+                        state.context_definitions =
+                            std::mem::take(&mut completed_state.context_definitions);
                         state.campaign = Some(campaign);
                         self.assign_agenda(repo, &mut state)?;
                         arm_slice_baseline(repo, &mut state, &self.ui)?;
@@ -1723,11 +1788,21 @@ impl<U: Ui> App<U> {
                     state.checks = completed_state.checks.clone();
                     state.contracts = completed_state.contracts.take();
                     state.bootstrap_progress = completed_state.bootstrap_progress.take();
+                    state.context_path = completed_state.context_path.take();
+                    state.context_definitions =
+                        std::mem::take(&mut completed_state.context_definitions);
+                    // A one-slice delivery was reviewed against the complete scope.
+                    // Reuse it only if the delivered tree survived archive/commit.
+                    if supplied::compact(&state) {
+                        state.verification = completed_state.verification.take();
+                    }
                     state.campaign = Some(campaign);
                     state.pending_direction = pending_direction;
                     state.terminal_remediations = completed_state.terminal_remediations;
+                    if supplied::compact(&state) {
+                        state.terminal_review_complete = completed_state.terminal_review_complete;
+                    }
                     self.assign_agenda(repo, &mut state)?;
-                    arm_slice_baseline(repo, &mut state, &self.ui)?;
                     if state.stage != Stage::Done
                         && max_iterations.is_some_and(|maximum| iteration >= maximum)
                     {
@@ -1745,6 +1820,7 @@ impl<U: Ui> App<U> {
                         ));
                         return Ok(());
                     }
+                    arm_slice_baseline(repo, &mut state, &self.ui)?;
                     persist_state(repo, &state, &self.ui)?;
                 }
             }
@@ -2419,7 +2495,9 @@ impl<U: Ui> App<U> {
             if let Some(contracts) = &state.contracts {
                 contracts.check_inputs(repo)?;
                 contracts.check_schema(repo)?;
-                if matches!(state.stage, Stage::ProposalCommit | Stage::Apply) {
+                if !supplied::direct(&state)
+                    && matches!(state.stage, Stage::ProposalCommit | Stage::Apply)
+                {
                     let change = require_change(&state)?;
                     let status = planning_status(repo, &change, &self.ui)?;
                     contracts.check_proposal(repo, &change, status.schema_name.as_deref())?;
@@ -2461,8 +2539,12 @@ impl<U: Ui> App<U> {
             }
 
             let use_terminal_frontier = uses_terminal_frontier(&state, frontier_agent.is_some());
-            let stage_uses_frontier =
-                stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
+            let corrected_planning = state.maintainer_correction
+                && state.stage == Stage::Propose
+                && frontier_agent.is_some()
+                && !state.local_only;
+            let stage_uses_frontier = corrected_planning
+                || stage_uses_frontier_model(state.stage, state.bootstrap, use_terminal_frontier);
             let frontier_commands = stage_uses_frontier
                 .then(|| {
                     SkillCommands::discover_for(
@@ -2496,7 +2578,7 @@ impl<U: Ui> App<U> {
                 model_stage_title(state.stage.title(), stage_role, launcher)
             };
             self.ui.stage(stage_number, total_stages, &stage_title);
-            let planning_agent: &dyn AgentBackend = if use_terminal_frontier {
+            let planning_agent: &dyn AgentBackend = if use_terminal_frontier || corrected_planning {
                 frontier_agent
                     .as_deref()
                     .context("terminal Propose requires a frontier connection")?
@@ -2518,6 +2600,19 @@ impl<U: Ui> App<U> {
                 worker_agent.as_ref()
             };
             let stage_result = match state.stage {
+                Stage::Propose | Stage::Apply | Stage::Repair
+                    if supplied::direct(&state) && state.bootstrap =>
+                {
+                    self.run_assignment(repo, worker_agent.as_ref(), &mut state)
+                }
+                Stage::Propose if supplied::direct(&state) && is_terminal_gate(&state) => {
+                    if state.maintainer_correction {
+                        self.plan_corrected_terminal(repo, planning_agent, &mut state)
+                    } else {
+                        self.prepare_direct_acceptance(repo, &mut state)
+                            .and_then(|()| persist_state(repo, &state, &self.ui))
+                    }
+                }
                 Stage::Explore => {
                     self.run_explore(repo, worker_agent.as_ref(), commands, &mut state)
                 }
@@ -2654,6 +2749,14 @@ impl<U: Ui> App<U> {
             "{}\n\n{planning_context} Run every OpenSpec command synchronously: never background or detach commands, and do not return while a command or subagent is still working.",
             campaign_subject(state, self.cli.frontier_worker)
         );
+        let base = if state.maintainer_correction {
+            format!(
+                "{base}\n\n{}\nThe correction may affect earlier completed work. Add necessary corrections to this change's tasks and affected assignment contributions without dropping completed accountability. Preserve unrelated open findings; earlier passes do not establish changed requirements. The maintainer's corrected inputs govern this plan.",
+                state.pending_direction.as_deref().unwrap_or("")
+            )
+        } else {
+            base
+        };
         let mut retrying_postcondition = false;
         let mut contract_failure = None;
         loop {
@@ -2708,6 +2811,11 @@ impl<U: Ui> App<U> {
             let mut after = openspec_snapshot(repo, &self.ui)?;
             match result.signal {
                 StageSignal::Done => {
+                    if state.maintainer_correction {
+                        bail!(
+                            "a maintainer correction still requires independent review; complete the current change's planning and return READY rather than declaring the campaign DONE"
+                        );
+                    }
                     if let Some(assignment) = &state.agenda {
                         bail!(
                             "Propose returned DONE despite assigned agenda slice `{}`; the assignment remains preserved in the checkpoint",
@@ -2824,6 +2932,7 @@ impl<U: Ui> App<U> {
                     result.text.trim()
                 );
             }
+            state.maintainer_correction = false;
             state.change = Some(change.clone());
             self.ui.change_name(Some(&change));
             self.ui
@@ -2981,7 +3090,11 @@ impl<U: Ui> App<U> {
         }
         let verification_inputs =
             verification::capture(repo, state.product_repo.as_deref(), &self.ui);
-        let verify_subject = if state.bootstrap && has_assignments(state) {
+        let verify_subject = if supplied::direct(state) && !state.bootstrap {
+            format!(
+                "{change}\n\nIndependently review the complete supplied project goal against the current introduction, original requirements, assignments, implementation and collected delivery evidence. Check integration and gaps without automatically repeating completed reviews or tests. Required delivery reports must be complete. Report concrete defects together as RETRY, or authoritative contradictions as BLOCKED. Missing terminal OpenSpec documents are intentional: do not create them, repair code, or archive anything. Return VERIFIED only when the delivered project meets its required scope. The runner then executes the exact final commands independently."
+            )
+        } else if state.bootstrap && has_assignments(state) {
             format!("{change}\n\n{ASSIGNMENT_VERIFY_CONTEXT}")
         } else {
             verification_subject(
@@ -2991,6 +3104,18 @@ impl<U: Ui> App<U> {
                 self.cli.frontier_worker,
                 state.contracts.is_some(),
             )
+        };
+        let verify_subject = if supplied::compact(state)
+            && !state.bootstrap
+            && !is_terminal_gate(state)
+            && has_assignments(state)
+            && state.contracts.as_ref().unwrap().delivery_count(repo)? == 1
+        {
+            format!(
+                "{verify_subject}\n\nThis is the only delivery slice. Your independent review covers the complete project, including preserved behaviour, original conditions and exceptions, all acceptance obligations and required delivery reports. A separate terminal review is unnecessary when this full review remains applicable; final commands still run independently."
+            )
+        } else {
+            verify_subject
         };
         let verify_subject = with_sidecar_context(state, &verify_subject);
         let verify_subject = format!(
@@ -3009,7 +3134,15 @@ impl<U: Ui> App<U> {
             invoke_fresh(
                 claude,
                 &format!("{change}-verify-{}", state.verify_retries + 1),
-                &stage_prompt(&commands.verify, &verify_subject, StageProtocol::Verify),
+                &stage_prompt(
+                    if supplied::direct(state) {
+                        ""
+                    } else {
+                        &commands.verify
+                    },
+                    &verify_subject,
+                    StageProtocol::Verify,
+                ),
                 if state.bootstrap {
                     "Frontier agent is verifying the bootstrap agenda"
                 } else if frontier_terminal {
@@ -3067,7 +3200,21 @@ impl<U: Ui> App<U> {
                     &self.ui,
                 ));
                 state.pending_repair = None;
-                state.stage = state.stage.after_verified()?;
+                if supplied::direct(state) {
+                    if !state.bootstrap {
+                        state.terminal_review_complete = true;
+                    }
+                    if !state.bootstrap
+                        && let Some(gate) = state.contracts.as_mut().unwrap().acceptance.as_mut()
+                    {
+                        gate.next_stage = Stage::FinalCommit;
+                        state.stage = Stage::Acceptance;
+                    } else {
+                        state.stage = Stage::FinalCommit;
+                    }
+                } else {
+                    state.stage = state.stage.after_verified()?;
+                }
                 persist_state(repo, state, &self.ui)
             }
             StageSignal::Retry => {
@@ -3150,7 +3297,7 @@ impl<U: Ui> App<U> {
             errors.push(format!("{error:#}"));
         }
         let active_change = repo.join("openspec/changes").join(require_change(state)?);
-        if !active_change.is_dir() {
+        if !supplied::compact(state) && !active_change.is_dir() {
             errors.push(format!(
                 "bootstrap change must remain active at `{}` until Verify succeeds. If it was prematurely archived, restore the generated bootstrap artifacts to this active location; leave supplied inputs unchanged",
                 active_change.display()
@@ -3211,11 +3358,20 @@ impl<U: Ui> App<U> {
         state: &mut RunState,
         frontier_terminal: bool,
     ) -> Result<()> {
-        if state
-            .contracts
-            .as_ref()
-            .and_then(|c| c.acceptance.as_ref())
-            .is_some_and(|gate| gate.next_stage == Stage::FinalCommit)
+        if let Some(gate) = state.contracts.as_ref().and_then(|c| c.acceptance.as_ref())
+            && gate.failures > self.cli.max_verify_retries
+        {
+            bail!(
+                "maintainer acceptance repair limit reached; work and findings are preserved. Resume with --max-verify-retries {} (or higher)",
+                gate.failures
+            );
+        }
+        if !supplied::direct(state)
+            && state
+                .contracts
+                .as_ref()
+                .and_then(|c| c.acceptance.as_ref())
+                .is_some_and(|gate| gate.next_stage == Stage::FinalCommit)
         {
             let change = require_change(state)?;
             let subject = with_contract_context(
@@ -3252,7 +3408,11 @@ impl<U: Ui> App<U> {
         );
         let structural_bootstrap =
             state.bootstrap && finding.starts_with(BOOTSTRAP_STRUCTURAL_FINDING);
-        let base = if structural_bootstrap {
+        let base = if supplied::direct(state) && !state.bootstrap {
+            format!(
+                "{change}\n\nRepair the concrete implementation or report defects below against the current supplied requirements. Preserve unrelated work, open findings and protected inputs. Do not create terminal proposal/design/tasks or run Archive. Make the smallest complete correction, add meaningful regressions where needed, complete required delivery reports and run relevant checks. A fresh independent review and the exact final commands follow.\n\n{finding}"
+            )
+        } else if structural_bootstrap {
             format!(
                 "{change}\n\nRepair only the runner-reported structural or source-reference defects below. Read the affected artifacts and source locations needed to correct those findings. Make the smallest correction in the affected agenda/bootstrap files and directly affected copies, preserving requirement meaning, coverage, slice identity and order. A link correction does not call for a new contract review, expanded test catalogue, or rewritten acceptance criteria. Do not repeat the complete Apply workflow or audit unrelated planning. The subsequent Verify stage owns semantic review. Preserve all supplied inputs, unrelated work and product files unchanged. Do not archive or commit it; leave the bootstrap change active. Check the repaired structure/references and return READY.\n\nRunner findings (diagnostic data):\n{finding}"
             )
@@ -3403,6 +3563,9 @@ impl<U: Ui> App<U> {
             Ok(Some(finding)) => {
                 gate.failures += 1;
                 state.pending_repair = Some(finding.clone());
+                if state.change.is_some() {
+                    state.stage = Stage::Repair;
+                }
                 if gate.failures > self.cli.max_verify_retries || state.change.is_none() {
                     Err(anyhow::anyhow!(
                         "maintainer acceptance remains unsatisfied; work and evidence are preserved. {finding}"
@@ -3525,15 +3688,27 @@ impl<U: Ui> App<U> {
         let handoff = state
             .verification
             .as_ref()
-            .filter(|evidence| evidence.change == change)
+            .filter(|evidence| {
+                evidence.change == change || (supplied::direct(state) && !state.bootstrap)
+            })
             .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
-            .unwrap_or_else(verification::missing_handoff);
-        let archive_handoff = state
-            .archive
-            .as_ref()
-            .filter(|evidence| evidence.change == change)
-            .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
-            .unwrap_or_else(verification::missing_archive_handoff);
+            .unwrap_or_else(|| {
+                if supplied::direct(state) {
+                    String::new()
+                } else {
+                    verification::missing_handoff()
+                }
+            });
+        let archive_handoff = if supplied::direct(state) {
+            String::new()
+        } else {
+            state
+                .archive
+                .as_ref()
+                .filter(|evidence| evidence.change == change)
+                .map(|evidence| evidence.handoff(repo, state.product_repo.as_deref(), &self.ui))
+                .unwrap_or_else(verification::missing_archive_handoff)
+        };
         let planning_baseline = current_head(repo, &self.ui)?;
         let product_repo = state.product_repo.clone();
         let product_baseline = product_repo
@@ -3541,7 +3716,11 @@ impl<U: Ui> App<U> {
             .map(|product| current_head(product, &self.ui))
             .transpose()?
             .flatten();
-        let task = if state.bootstrap {
+        let task = if supplied::direct(state) {
+            format!(
+                "Create the completion Git commit for `{change}`. Inspect the relevant diff and commit only this workflow's completed work. Bootstrap commits its assignment, briefs and new workflow setup; terminal acceptance commits any remaining verified delivery/report work. No bootstrap or terminal OpenSpec change exists to archive. Preserve unrelated work and all supplied inputs. Do not amend or rewrite history. Reuse completed review and acceptance; do not repeat audits to write a commit message. {commit_message} If all relevant work is already committed, report READY."
+            )
+        } else if state.bootstrap {
             format!(
                 "Create the completion milestone Git commit for bootstrap OpenSpec change `{change}`. Inspect Git status and relevant diffs. Commit the generated `automation/slices/` agenda, archived bootstrap change artifacts, and any remaining files belonging only to this bootstrap workflow. {commit_message} Preserve all unrelated work, including the source Markdown supplied to the bootstrap command unless it was already deliberately tracked as project documentation. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
@@ -3555,7 +3734,7 @@ impl<U: Ui> App<U> {
                 "Create the completion milestone Git commit for OpenSpec change `{change}`. Inspect Git status and relevant diffs. Commit the implementation, tests, synchronized specifications, archived change artifacts, and documentation that belong to this completed change. {commit_message} Preserve all unrelated work. Never reset, stash, restore, discard, amend, or rewrite existing history. If all relevant work is already committed and nothing remains to commit, confirm that and report READY."
             )
         };
-        let task = if state.contracts.is_some() {
+        let task = if state.contracts.is_some() && !supplied::direct(state) {
             format!(
                 "{task}\n\nPreserve all supplied contracts and acceptance inputs unchanged. This workflow archives proposal, design and tasks without specification synchronization. Contract interpretation, coverage and source-reference authoring belong to Propose, Apply and Verify; do not repeat them during this commit."
             )
@@ -4305,7 +4484,8 @@ fn campaign_progress(repo: &Path, state: &RunState) -> Result<Option<CampaignVie
 }
 
 fn needs_terminal_review(state: &RunState) -> bool {
-    is_terminal_gate(state)
+    !supplied::compact(state)
+        && is_terminal_gate(state)
         && state.stage == Stage::Propose
         && !state.terminal_review_complete
         && state.too_large.is_none()
@@ -4818,7 +4998,7 @@ fn load_state_file(path: &Path) -> Result<RunState> {
         .unwrap_or(0) as u32;
     match schema {
         STATE_SCHEMA_VERSION => serde_json::from_value(value).context("invalid current checkpoint"),
-        5 => {
+        5 | 6 => {
             let mut value = value;
             value["schema_version"] = Value::from(STATE_SCHEMA_VERSION);
             serde_json::from_value(value).context("invalid version 5 checkpoint")
@@ -4922,6 +5102,9 @@ fn migrate_v2(value: Value) -> Result<RunState> {
         planning_final_head: None,
         local_only: false,
         contracts: None,
+        context_path: None,
+        context_definitions: std::collections::BTreeMap::new(),
+        maintainer_correction: false,
     })
 }
 
@@ -4940,7 +5123,10 @@ fn campaign_limit_resume_command(repo: &Path, current_limit: u32) -> String {
 }
 
 fn single_advance_continuation_command(repo: &Path, state: &RunState) -> Option<String> {
-    if state.request != "advance" || state.campaign.is_some() {
+    if state.request != "advance"
+        || state.campaign.is_some()
+        || (supplied::direct(state) && !state.bootstrap)
+    {
         return None;
     }
     matches!(

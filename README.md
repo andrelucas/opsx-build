@@ -111,10 +111,11 @@ The command:
    language-server-first navigation, and scoped canonical source-formatting
    policy, plus instructions to escape the selected agent's sandbox narrowly
    when it prevents a required build or test from executing;
-5. runs the planning-only `bootstrap-implementation-slices` change through the
-   existing Propose, milestone commit, Apply, Verify/repair, Archive, and final
-   commit stages; Propose writes only OpenSpec planning artifacts, while Apply
-   materializes the implementation agenda; and
+5. in ordinary mode, runs the planning-only `bootstrap-implementation-slices`
+   change through Propose, milestone commit, Apply, Verify/repair, Archive and
+   final commit. New supplied-contract runs instead write the assignment and
+   briefs directly, check coverage mechanically, review a multi-slice split
+   independently and commit the agenda; and
 6. checks that the result is a parseable ordered agenda with a README, bounded
    slice contracts, and the terminal whole-project gate
    `automation/slices/9999-project-acceptance.md`.
@@ -127,14 +128,14 @@ subordinate change artifacts. Consistency among generated specs, code, and tests
 does not excuse contradicting their inputs. A dependency's interface contract
 does not assign its implementation to this component.
 
-Ordinary context campaigns apply the **anti-Karen rule**: deliver the requested
+Both workflows apply the **anti-Karen rule**: deliver the requested
 behaviour and verify it with meaningful checks. Bootstrap checks goal coverage,
 coherent slices, observable acceptance criteria and the final gate; detailed
 implementation and test design belong to the implementing worker. It does not
 require per-criterion source citations, verbatim requirement tables or duplicated
 implementation recipes.
 
-Bootstrap Propose decides slice boundaries, dependencies and a compact coverage
+In the ordinary workflow, Bootstrap Propose decides slice boundaries, dependencies and a compact coverage
 map. In ordinary mode it develops the required outcomes and material assumptions
 from the brief, retaining all normal OpenSpec artifacts and required acceptance
 scenarios. Bootstrap Apply writes the detailed agenda and its acceptance criteria
@@ -181,21 +182,33 @@ The ordinary specification workflow remains the default. These options are
 campaign/CLI settings, rather than global TOML defaults. Sidecar operation is
 not supported by this workflow yet.
 
-This installs the bundled `opsx-supplied-contracts` OpenSpec schema. Propose
-creates **proposal, design and tasks**, with no generated spec deltas. The
-proposal maps source references to implementation work; design records internal
-decisions; tasks describe coherent, testable steps. Bootstrap assigns those same
-source requirements to slices and a coverage index. Acceptance criteria refer
-to supplied expectations instead of rewriting them. Apply and Verify read the
-governing original sources, and Archive has no spec synchronization to perform.
+New supplied-contract runs install version 2 of the bundled
+`opsx-supplied-contracts` schema. Delivery planning needs a short **proposal and
+tasks**; a separate design is optional. Explain the change, important decisions
+and regression risks. Reference inherited coverage instead of listing every
+preserved obligation again. No replacement behavioural specifications are written.
 
-New supplied-contract `bootstrap`/`execute` runs also require a protected
-maintainer-owned `--obligation-inventory PATH`. Bootstrap assigns those IDs to
-work in one durable `automation/slices/assignments.json` record. The runner
-generates coverage views, source-reference sections, prerequisites and exact
-terminal-command listings; incomplete assignments and stale views fail before
-semantic review. Standard mode remains unchanged. See the
-[assignment format and Sirocco preparation instructions](docs/supplied-assignments.md).
+New supplied-contract `bootstrap`/`execute` runs require a maintainer-owned
+`--obligation-inventory PATH`. The planner writes one durable
+`automation/slices/assignments.json` and human-readable briefs directly. The runner
+generates coverage views, source references, prerequisites and exact final command
+listings. A narrow repair normally has one delivery slice, with permitted
+prerequisite/startup checks as its first tasks. A substantial split gets independent
+planning review. Intermediate tests must be runnable with the APIs and fixtures
+available at that point; the full final suite stays required.
+
+Keep `context.md` (or the selected introduction) as the human entry point. Briefs
+explain the work and why it matters, then link to detailed coverage. Required
+delivery reports belong to implementation tasks. The final 9999 brief remains,
+but there is no bootstrap or terminal OpenSpec proposal/design/tasks package.
+Independent final review leads directly to the pinned commands. For a single
+slice, its independent review covers the complete goal and is reused when only
+its own planning archive has moved; source or other input changes require review.
+Final commands still execute independently. A failed final run goes through
+repair and independent review before testing again.
+
+Older checkpoints retain their version-1 schema and planning stages. Ordinary
+planning is unchanged. See the [assignment format](docs/supplied-assignments.md).
 
 Each proposal, slice and agenda README contains a `## Supplied requirements`
 section with Markdown links to declared source files and the work that covers
@@ -220,9 +233,9 @@ For example, from `openspec/changes/0001-delivery/proposal.md`:
 Before accepting Propose, the runner checks the selected schema, absence of a
 generated `specs/` directory, and the source references. A rejected proposal gets
 one corrective turn in its existing planning session before the runner stops;
-it cannot proceed to the proposal commit or Apply. Bootstrap checks agenda
-structure, source links and that its change is still active before spending a
-model Verify turn, and checks again before accepting its result. Apply and
+it cannot proceed to the proposal commit or Apply. Bootstrap checks agenda structure and source links before spending a model
+review turn, and checks again before accepting its result. Older bootstrap
+checkpoints also retain their active-change check. Apply and
 Repair must leave archiving to the runner's Archive stage. All source-link
 findings are reported together with line numbers. Exhausted repairs retain their latest findings in
 the checkpoint; correcting the generated agenda allows resume without resetting
@@ -236,7 +249,7 @@ does not repeat the full Apply workflow or semantic contract review.
 The checkpoint records content fingerprints, resolved paths and executable bits
 for the declared inputs. The runner checks them between stages and on resume.
 If a protected input changes or disappears, the run stops and preserves the work;
-restore the approved input or deliberately start a new run with revised inputs.
+a maintainer can accept an intentional correction with `accept-changes`, then resume.
 Resumes retain the recorded workflow and versions even without repeating flags;
 an existing ordinary run cannot be converted by adding this option to `--resume`.
 `--no-supplied-contracts` selects the ordinary workflow for a new run.
@@ -286,28 +299,50 @@ test output ignored. Snapshots do not cover ignored dependencies, external
 services or environment changes. The gate proves only the coverage of the
 supplied checks; the project's maintainer owns scenario meaning and completeness.
 
-Once the final `9999` slice is archived, `advance` has a concrete definition of
-DONE.
+In new supplied-contract runs, 9999 performs independent whole-project review
+and runner-executed final acceptance without creating another OpenSpec change.
+The independent review uses delivered evidence and looks for concrete integration
+gaps. A one-slice delivery's complete review can serve this purpose when its
+inputs remain unchanged. Failed checks return to repair and independent review;
+required reports are not deferred to a terminal Apply cycle.
 
-When `9999-project-acceptance` becomes the next agenda slice, opsx-build returns
-to the configured frontier connection that established the project goal. Before
-creating the terminal OpenSpec change, the frontier reviews the original
-project context, accumulated OpenSpec record, implementation, and real tests.
-If the project is ready, the frontier creates, applies, repairs, and verifies
-the terminal whole-project acceptance change before normal archival. Bounded
-remediation slices inserted before `9999` remain worker-owned. Active stage
-headings show both the model role and selected connection so a handoff is
-visible while the campaign runs.
+Ordinary campaigns and older supplied-contract checkpoints retain the terminal
+OpenSpec lifecycle: frontier acceptance assessment, terminal planning,
+implementation, review and archive. Their existing bounded remediation and
+`--local-only` behaviour remain available.
 
-If that review—or a later failed terminal attempt—exposes material missing
-functionality, opsx-build restores the recorded pre-`9999` baseline. The
-frontier may then commit bounded remediation slices whose ordinals place them
-after existing delivery work but before the byte-for-byte unchanged `9999`
-gate. The campaign resumes at the first remediation slice and revisits `9999`
-later. Frontier agenda edits are limited to `automation/slices/`, checked
-against Git and OpenSpec postconditions, and limited to three terminal
-remediation rounds within one durable campaign run. `--local-only` explicitly
-skips this frontier policy and runs `9999` with the worker connection.
+### Accepting maintainer corrections
+
+While the campaign is stopped, the overseeing maintainer may edit its working
+directory with normal tools and record the correction in Git. Then run:
+
+```sh
+opsx-build accept-changes
+opsx-build --resume
+```
+
+`accept-changes` invokes no agent or tests. It adopts current registered file
+contents and the campaign's recorded contract/test selection, inventory and final
+commands, order and timeout. Edit the arguments block in `opsx-build.md` to change
+those settings; explicit input/gate options can also be supplied to this command.
+With no campaign configuration or replacement options, existing selections remain.
+The command preserves the workflow and installed schema version. A campaign
+using obligation assignments must retain a valid inventory, which may be replaced
+with a corrected one. It does not switch an ordinary campaign to supplied-contract
+mode.
+
+The command refreshes hashes, clears the stop and local retry counts, and preserves
+implementation, findings, receipts and usage history. It does not declare the code
+correct or close findings. Resume sends corrections to the planner, including work
+needed in already completed slices, before the builder continues. Review and final
+acceptance assess the corrected result. A live campaign still owns its run lock;
+stop it before editing. Unresolved backend operations remain unresolved.
+
+The human introduction remains in place; a recorded introduction is refreshed in
+the generated OpenSpec context when accepted. Update any project-specific input
+manifest or checker in the same normal correction. opsx-build does not understand
+those formats. Git and existing logs retain the history; no amendment audit or
+additional campaign report is required. `accept-changes --dry-run` changes nothing.
 
 Bootstrap uses the same durable checkpoint and fresh-session stage engine as a
 normal build. If it is interrupted after initialization, continue with:

@@ -1,6 +1,6 @@
 name: opsx-supplied-contracts
-version: 1
-description: Implement supplied contracts through source references, design and tasks.
+version: 2
+description: Plan and implement changes under supplied contracts.
 artifacts:
   - id: proposal
     generates: proposal.md
@@ -11,36 +11,32 @@ artifacts:
       Identify the supplied requirements this change implements using Markdown
       links under ## Supplied requirements. Use paths relative to proposal.md or
       absolute paths; include a heading anchor or exact requirement ID where available.
-      Associate each reference with implementation work and supplied scenarios.
+      Explain the change, affected dependencies and regression risks. Reference
+      inherited coverage through the assignment's Planning references instead of
+      enumerating every preserved requirement again. Keep direct original links
+      for the requirements relevant to the change.
       Do not write replacement requirements or spec deltas. Explain scope and impact
-      briefly; put internal choices in design.md and testable steps in tasks.md.
+      briefly; explain material internal choices here and put steps in tasks.md.
+      For substantial decisions, add design.md as an optional supporting document.
+      A separate design is not a completion condition.
       Correct any contradictory generated agenda while keeping its slice identity.
       Never edit supplied contracts or maintainer-owned acceptance expectations.
     requires: []
-  - id: design
-    generates: design.md
-    description: Internal implementation decisions constrained by supplied contracts.
-    template: design.md
-    instruction: |
-      Read the proposal's original source references, including their conditions
-      and exceptions. Explain internal decisions, dependencies and implementation
-      risks. Reference requirements instead of restating externally observable
-      behaviour. Resolve implementation choices yourself. Report BLOCKED only
-      for an authoritative-input gap requiring an external decision.
-    requires: [proposal]
   - id: tasks
     generates: tasks.md
     description: Coherent, testable implementation steps and contract checks.
     template: tasks.md
     instruction: |
-      Read the original requirements referenced by the proposal and the design.
+      Read the original requirements referenced by the proposal and any optional design.
       Write checkboxes with numbered tasks, e.g. - [ ] 1.1 Implement ... .
       Group implementation and checks into practical testable steps within this
       change; do not subdivide merely because several steps are identifiable.
       Reference supplied acceptance scenarios and preserve their expected results.
       Add relevant implementation tests, including failure paths. Do not invent
       substitute acceptance expectations or copy requirements into a new spec.
-    requires: [proposal, design]
+      Include all project-required delivery reports as ordinary implementation
+      tasks. Final acceptance has no separate Apply stage to finish them later.
+    requires: [proposal]
 apply:
   requires: [tasks]
   tracks: tasks.md

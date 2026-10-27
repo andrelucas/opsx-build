@@ -97,6 +97,40 @@ pub(crate) fn capture<U: Ui>(
 }
 
 impl VerificationEvidence {
+    /// Only the reviewed delivery's own archive moves are ignored. All other
+    /// tracked/non-ignored files, including requirements and tests, must match.
+    pub fn delivery_unchanged<U: Ui>(&self, repo: &Path, ui: &U) -> bool {
+        let [repository] = self.repositories.as_slice() else {
+            return false;
+        };
+        if repository.root != repo {
+            return false;
+        }
+        let Some(before) = &repository.files else {
+            return false;
+        };
+        let Ok(after) = snapshot(repo, ui) else {
+            return false;
+        };
+        let active = format!("openspec/changes/{}/", self.change);
+        let relevant = |path: &&String| {
+            !path.starts_with(&active)
+                && !path
+                    .strip_prefix("openspec/changes/archive/")
+                    .is_some_and(|p| {
+                        p.split('/').next().and_then(|d| d.get(11..)) == Some(self.change.as_str())
+                    })
+        };
+        before
+            .keys()
+            .filter(relevant)
+            .eq(after.keys().filter(relevant))
+            && before
+                .iter()
+                .filter(|(p, _)| relevant(p))
+                .all(|(p, value)| after.get(p) == Some(value))
+    }
+
     pub fn finish<U: Ui>(
         change: &str,
         summary: String,
@@ -337,6 +371,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn single_delivery_review_survives_its_archive_but_not_changes_to_other_inputs() {
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        let change = repo.0.join("openspec/changes/0001-repair");
+        fs::create_dir_all(&change).unwrap();
+        fs::write(change.join("tasks.md"), "done").unwrap();
+        let evidence = VerificationEvidence::finish(
+            "0001-repair",
+            "Whole project reviewed".into(),
+            capture(&repo.0, None, &ui),
+            &ui,
+        );
+        fs::create_dir_all(repo.0.join("openspec/changes/archive")).unwrap();
+        fs::rename(
+            &change,
+            repo.0
+                .join("openspec/changes/archive/2026-10-27-0001-repair"),
+        )
+        .unwrap();
+        assert!(evidence.delivery_unchanged(&repo.0, &ui));
+        fs::write(repo.0.join("requirements.md"), "Changed requirement").unwrap();
+        assert!(!evidence.delivery_unchanged(&repo.0, &ui));
+        fs::remove_file(repo.0.join("requirements.md")).unwrap();
+        fs::write(repo.0.join("code.go"), "Changed code").unwrap();
+        assert!(!evidence.delivery_unchanged(&repo.0, &ui));
     }
 
     #[test]

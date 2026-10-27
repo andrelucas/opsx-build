@@ -69,6 +69,7 @@ pub struct Cli {
     pub operating_policy_explicit: bool,
     pub acceptance_files: Vec<PathBuf>,
     pub acceptance_commands: Vec<String>,
+    pub acceptance_disabled: bool,
     pub acceptance_timeout_seconds: Option<u64>,
     pub repo: PathBuf,
     pub sidecar: bool,
@@ -203,7 +204,7 @@ impl Cli {
                     let bootstrap = args
                         .request
                         .as_deref()
-                        .is_some_and(|v| matches!(v, "bootstrap" | "execute"));
+                        .is_some_and(|v| matches!(v, "bootstrap" | "execute" | "accept-changes"));
                     if matches!(name, "--context" | "--define")
                         && !bootstrap
                         && !sidecar_context
@@ -305,6 +306,23 @@ impl Cli {
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
+        if cli.request == "accept-changes" {
+            if cli.resume
+                || cli.interactive
+                || cli.forget
+                || cli.continue_existing
+                || cli.execute
+                || cli.test_connection.is_some()
+                || cli.update_skills
+                || cli.rewind_target.is_some()
+                || cli.change.is_some()
+                || cli.direction.is_some()
+                || cli.yes
+            {
+                anyhow::bail!("run `accept-changes` separately, then use `--resume`");
+            }
+            return Ok(cli);
+        }
         if matches!(cli.request.as_str(), "render-agenda" | "check-agenda") {
             if cli.resume
                 || cli.interactive
@@ -457,7 +475,7 @@ impl Cli {
     args_override_self = true
 )]
 pub(crate) struct CliArgs {
-    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, `rewind`, or `check` (see `check --help`).
+    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, `accept-changes`, `rewind`, or `check` (see `check --help`).
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
@@ -1179,6 +1197,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
             .filter(|_| !args.no_supplied_contracts),
         acceptance_files: args.acceptance_file,
         acceptance_commands: args.acceptance_command,
+        acceptance_disabled: args.no_acceptance_checks,
         acceptance_timeout_seconds: args.acceptance_timeout_seconds,
         repo: args.repo,
         sidecar: !args.no_sidecar && (args.sidecar || config.sidecar.unwrap_or(false)),

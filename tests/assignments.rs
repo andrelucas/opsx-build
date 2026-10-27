@@ -57,6 +57,57 @@ impl Fixture {
                     .success()
             );
         }
+        // Keep the old bootstrap lifecycle covered using a real version-6
+        // checkpoint. Fresh runs use the proportional workflow in proportional.rs.
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("openspec/schemas/opsx-supplied-contracts/templates"))
+            .unwrap();
+        fs::create_dir_all(repo.join("automation")).unwrap();
+        fs::create_dir_all(repo.join(".git/opsx-build")).unwrap();
+        fs::write(
+            repo.join("openspec/config.yaml"),
+            "schema: opsx-supplied-contracts\n",
+        )
+        .unwrap();
+        let bootstrap = include_str!("../assets/supplied-contracts-legacy/bootstrap.md");
+        fs::write(repo.join("automation/bootstrap.md"), bootstrap).unwrap();
+        for (file, contents) in [
+            (
+                "schema.yaml",
+                include_str!("../assets/supplied-contracts-legacy/schema.yaml"),
+            ),
+            (
+                "templates/proposal.md",
+                include_str!("../assets/supplied-contracts-legacy/proposal.md"),
+            ),
+            (
+                "templates/design.md",
+                include_str!("../assets/supplied-contracts-legacy/design.md"),
+            ),
+            (
+                "templates/tasks.md",
+                include_str!("../assets/supplied-contracts-legacy/tasks.md"),
+            ),
+        ] {
+            fs::write(
+                repo.join("openspec/schemas/opsx-supplied-contracts")
+                    .join(file),
+                contents,
+            )
+            .unwrap();
+        }
+        let inputs = ["contract.md", "acceptance.sh", "inventory.json"].iter().map(|name| {
+            let path = repo.join(name).canonicalize().unwrap();
+            let hash = Command::new("git").current_dir(&repo).args(["hash-object", "--", name]).output().unwrap();
+            serde_json::json!({"path":path,"resolved":path,"hash":String::from_utf8(hash.stdout).unwrap().trim(),"executable":false,"contract":*name != "acceptance.sh"})
+        }).collect::<Vec<_>>();
+        fs::write(repo.join(".git/opsx-build/last-run.json"), serde_json::to_vec(&serde_json::json!({
+            "schema_version":6,"request":"bootstrap","change":"bootstrap-implementation-slices","stage":"propose","verify_retries":0,
+            "before_changes":{"changes":{}},"planning_session":null,"pending_repair":null,"pending_direction":null,"proposal_head":null,"final_head":null,
+            "bootstrap":true,"agenda":{"path":"automation/bootstrap.md","change":"bootstrap-implementation-slices","title":"Legacy bootstrap","content":bootstrap},
+            "contracts":{"inputs":inputs,"obligation_inventory":repo.join("inventory.json").canonicalize().unwrap(),
+                "acceptance":{"commands":["sh acceptance.sh"],"timeout_seconds":37,"next_stage":"archive","failures":0,"evidence":null}}
+        })).unwrap()).unwrap();
         fs::write(
             root.join("bin/openspec"),
             r#"#!/bin/sh
@@ -173,8 +224,7 @@ printf '{"type":"result","subtype":"success","session_id":"assignment-fixture","
                 "--acceptance-file=acceptance.sh",
                 "--acceptance-command=sh acceptance.sh",
                 "--acceptance-timeout-seconds=37",
-                "bootstrap",
-                "--context=context.md",
+                "--resume",
             ])
             .output()
             .unwrap()
@@ -210,7 +260,7 @@ fn bootstrap_materializes_assignment_and_independently_reviews_without_running_a
     );
     assert_eq!(f.calls(), 5);
     assert_eq!(f.state()["stage"], "archive");
-    assert_eq!(f.state()["schema_version"], 6);
+    assert_eq!(f.state()["schema_version"], 7);
     assert!(
         f.state()["contracts"]["obligation_inventory"]
             .as_str()
@@ -398,8 +448,45 @@ fn successful_verify_cannot_leave_a_broken_assignment_for_a_delivery_slice() {
 }
 
 #[test]
+fn legacy_checkpoint_accepts_a_maintainer_correction_without_switching_its_schema() {
+    let f = Fixture::new();
+    f.run("valid");
+    let before = f.state();
+    assert_eq!(before["contracts"]["compact"], false);
+    let calls = f.calls();
+    let path = f.root.join("repo/contract.md");
+    fs::write(
+        &path,
+        format!(
+            "{}\nMaintainer clarification.\n",
+            fs::read_to_string(&path).unwrap()
+        ),
+    )
+    .unwrap();
+    let result = f.command().arg("accept-changes").output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(f.calls(), calls);
+    assert_eq!(f.state()["contracts"]["compact"], false);
+    assert_eq!(f.state()["review"], before["review"]);
+    let schema = fs::read_to_string(
+        f.root
+            .join("repo/openspec/schemas/opsx-supplied-contracts/schema.yaml"),
+    )
+    .unwrap();
+    assert_eq!(
+        schema,
+        include_str!("../assets/supplied-contracts-legacy/schema.yaml")
+    );
+}
+
+#[test]
 fn inventory_is_required_only_for_new_supplied_contract_bootstrap() {
     let f = Fixture::new();
+    let checkpoint = fs::read(f.root.join("repo/.git/opsx-build/last-run.json")).unwrap();
     let result = f
         .command()
         .args([
@@ -414,6 +501,9 @@ fn inventory_is_required_only_for_new_supplied_contract_bootstrap() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("requires --obligation-inventory"));
-    assert!(!f.root.join("repo/automation").exists());
+    assert_eq!(
+        checkpoint,
+        fs::read(f.root.join("repo/.git/opsx-build/last-run.json")).unwrap()
+    );
     assert_eq!(f.calls(), 0);
 }

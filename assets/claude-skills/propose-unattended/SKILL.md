@@ -78,8 +78,8 @@ Otherwise:
        openspec new change "<name>"
 
    If the assignment explicitly selects the supplied-contract workflow, use
-   `--schema opsx-supplied-contracts` on that command. Its proposal, design and
-   tasks reference the original supplied requirements; do not create spec
+   `--schema opsx-supplied-contracts` on that command. Its schema determines the required artifacts.
+   Reference the original supplied requirements; do not create spec
    deltas or substitute the normal spec-driven templates. Otherwise preserve
    the project's configured schema.
 

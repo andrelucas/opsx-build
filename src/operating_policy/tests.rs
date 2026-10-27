@@ -75,6 +75,32 @@ fn review(number: u32, closed: &[&str], reopened: &[&str]) -> Progress {
 }
 
 #[test]
+fn maintainer_correction_replenishes_local_allowances_without_erasing_history() {
+    let f = Fixture::new(Policy {
+        max_requests_per_stage: 1,
+        ..Policy::default()
+    });
+    let guard = f.run.open(None).unwrap();
+    let request = request(&f.root, "completed request");
+    guard.before_request(&request).unwrap();
+    guard.record_usage(&request);
+    guard.review(review(1, &[], &[])).unwrap();
+    guard.review(review(2, &[], &[])).unwrap();
+    guard.review(review(3, &[], &[])).unwrap();
+    assert!(guard.check(true).is_err());
+    let before = f.ledger();
+    guard.accept_changes().unwrap();
+    guard.check(true).unwrap();
+    let after = f.ledger();
+    assert_eq!(after.requests.len(), before.requests.len());
+    assert_eq!(after.reviews.len(), before.reviews.len());
+    assert_eq!(after.policy, before.policy);
+    assert!(after.active_ms >= before.active_ms);
+    assert_eq!(after.stage_requests, 0);
+    assert_eq!(after.no_progress, 0);
+}
+
+#[test]
 fn a_reopened_defect_remains_blocking_despite_other_closures_or_changed_inputs() {
     let f = Fixture::new(Policy::default());
     let guard = f.run.open(None).unwrap();

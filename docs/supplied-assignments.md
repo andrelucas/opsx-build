@@ -1,4 +1,4 @@
-# Supplied-contract assignment workflow (0.28)
+# Supplied-contract assignment workflow (0.37)
 
 New supplied-contract `bootstrap` and `execute` runs require
 `--obligation-inventory PATH`. Standard mode still develops requirements, designs
@@ -12,6 +12,33 @@ of the required behaviour. The original contracts and their declared precedence
 remain authoritative. Conflicting authoritative inputs require a maintainer
 decision. Mistakes introduced in the generated assignment are runner work to
 repair.
+
+## Proportional planning
+
+Fresh supplied-contract runs write assignments and concise briefs directly,
+without a bootstrap OpenSpec package. Mechanical checks establish declared
+coverage and ordering; multi-slice decomposition also gets independent planning
+review. A narrow repair normally needs one delivery slice. Where the supplied
+policy permits, put dependency checks and baseline startup first in its tasks.
+Check that intermediate tests do not compile APIs assigned to later slices.
+
+Delivery changes require a short proposal and tasks, with an optional supporting
+design. Preserve the introduction in context.md. Explain each brief's work and
+purpose before linking to the inventory. Keep every obligation assigned without
+repeated authored inventories. Required delivery reports are delivery tasks.
+
+Terminal review and exact final commands run directly. A single delivery's
+complete independent review may be reused after its own archive move; changes to
+other files require review. Failed final acceptance returns to repair and
+independent review before another execution. Older checkpoints retain their
+original schema and bootstrap/terminal OpenSpec stages.
+
+Maintainers can edit files and registered input/gate settings in the stopped
+campaign and run `opsx-build accept-changes`, then `opsx-build --resume`. This
+adopts the correction without approving the implementation or clearing unrelated
+findings. The planner arranges work affected by the correction, including
+completed slices. Project-specific manifests must be corrected by their owner.
+See the README for invocation details.
 
 ## Current delivery and later qualification
 
@@ -120,12 +147,15 @@ selected the right obligations or whether a review route is semantically adequat
 
 The inventory is pinned with the other inputs. Resume cannot select a different
 inventory, change its contents or executable bit, or recapture it. Revise inputs
-in preparation for a new run. Checkpoints written by 0.28 use format 6 so an older
-runner cannot resume them while ignoring the new assignment checks.
+with `accept-changes` as a deliberate maintainer correction, or prepare a new
+run. New checkpoints use format 7. Older supported checkpoints keep their
+recorded planning workflow.
 
 ## Generated assignment, version 1
 
-During bootstrap Propose the agent writes
+New bootstrap writes `automation/slices/assignments.json` directly and renders
+its briefs. The following draft/move sequence applies to older checkpoints:
+during bootstrap Propose the agent writes
 `openspec/changes/bootstrap-implementation-slices/assignments.json`. Proposal,
 design and tasks reference that draft under Planning references; they retain
 direct original links under Supplied requirements. No agenda files are created

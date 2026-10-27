@@ -258,11 +258,39 @@ printf '{"type":"result","subtype":"success","session_id":"fixture-session","res
             .collect()
     }
 
+    fn keep_legacy_schema(&self, state: &mut serde_json::Value) {
+        state["contracts"]["compact"] = false.into();
+        let root = self
+            .root
+            .join("repo/openspec/schemas/opsx-supplied-contracts");
+        for (path, contents) in [
+            (
+                "schema.yaml",
+                include_str!("../assets/supplied-contracts-legacy/schema.yaml"),
+            ),
+            (
+                "templates/proposal.md",
+                include_str!("../assets/supplied-contracts-legacy/proposal.md"),
+            ),
+            (
+                "templates/design.md",
+                include_str!("../assets/supplied-contracts-legacy/design.md"),
+            ),
+            (
+                "templates/tasks.md",
+                include_str!("../assets/supplied-contracts-legacy/tasks.md"),
+            ),
+        ] {
+            fs::write(root.join(path), contents).unwrap();
+        }
+    }
+
     fn bootstrap_review(&self) {
         self.run("repair", false);
         let mut state = self.state();
         state["stage"] = "verify".into();
         state["bootstrap"] = true.into();
+        self.keep_legacy_schema(&mut state);
         state["change"] = "bootstrap-implementation-slices".into();
         state["agenda"] = serde_json::Value::Null;
         state["pending_repair"] = serde_json::Value::Null;
@@ -1549,6 +1577,7 @@ fn bootstrap_reference_preflight_repairs_before_model_verify_and_preserves_exhau
         let mut state = fixture.state();
         state["stage"] = "verify".into();
         state["bootstrap"] = true.into();
+        fixture.keep_legacy_schema(&mut state);
         state["change"] = "bootstrap-implementation-slices".into();
         state["agenda"] = serde_json::Value::Null;
         fixture.save_state(&state);

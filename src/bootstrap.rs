@@ -292,7 +292,7 @@ pub fn render_project_config(context: &str) -> String {
     rendered
 }
 
-fn render_context_template(
+pub(crate) fn render_context_template(
     template: &str,
     definitions: &BTreeMap<String, String>,
 ) -> Result<String> {
@@ -408,9 +408,9 @@ mod tests {
     #[test]
     fn supplied_contract_bootstrap_assigns_original_requirements_without_spec_deltas() {
         let instructions = instructions_for(true, true);
-        assert!(instructions.contains("opsx-supplied-contracts"));
-        assert!(instructions.contains("## Supplied requirements"));
-        assert!(instructions.contains("does not author replacement behavioural specifications"));
+        assert!(instructions.contains("Write `automation/slices/assignments.json`"));
+        assert!(instructions.contains("Supplied requirements"));
+        assert!(instructions.contains("Do not create a bootstrap OpenSpec change"));
         assert!(instructions.contains("frontier-capable"));
         assert!(!instructions.contains("define observable acceptance criteria"));
         assert!(instructions.contains(crate::authority::GUIDANCE.trim()));
@@ -429,8 +429,8 @@ mod tests {
             assert!(!ordinary.contains("## Supplied requirements"));
 
             let contracts = instructions_for(frontier_worker, true);
-            assert!(contracts.contains("## Supplied requirements"));
-            assert!(contracts.contains("must target a declared supplied input"));
+            assert!(contracts.contains("Supplied requirements"));
+            assert!(contracts.contains("Preserve conditions, exceptions"));
             assert!(contracts.contains("assignments.json"));
             assert!(!contracts.contains("Keep this ordinary context bootstrap proportionate"));
         }
@@ -524,13 +524,13 @@ mod tests {
         for supplied_contracts in [false, true] {
             let instructions = instructions_for(true, supplied_contracts);
             if supplied_contracts {
-                assert!(instructions.contains("Reference the assignment record"));
-                assert!(instructions.contains("do not copy\nits coverage map"));
+                assert!(instructions.contains("Write `automation/slices/assignments.json`"));
+                assert!(instructions.contains("Do not hand-copy inventories or commands"));
             } else {
                 assert!(instructions.contains("Reference that map from"));
                 assert!(instructions.contains("copying the finished agenda back"));
             }
-            assert!(instructions.contains("coverage map"));
+            assert!(instructions.contains("coverage"));
             assert!(instructions.contains("Required Tests"));
             assert!(instructions.contains("9999-project-acceptance.md"));
         }

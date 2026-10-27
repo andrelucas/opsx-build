@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA: &str = "opsx-supplied-contracts";
 const SOURCE_REFERENCE_GUIDANCE: &str = "Every Markdown link inside `## Supplied requirements` must point directly to a declared supplied input. Generated proposals (including archived proposals), agenda READMEs, coverage tables and other slices are planning artifacts, not supplied inputs. Keep navigation or planning-evidence links under a separate level-two heading such as `## Planning references`. Replace indirect requirement references with links to the original declared files; moving a link must not remove its requirements from coverage. Do not add generated artifacts to the protected-input list or edit supplied inputs to satisfy this check. Correct all reported references together.";
-pub(crate) const CONFIGURE_GUIDANCE: &str = "\n\nWorkflow choice: read the campaign context file (the selected --context, otherwise context.md if present) and its declared relevant inputs. When these supply precise existing behavioural contracts and component ownership, suggest --supplied-contracts and explain that it plans implementation through original source references, design and tasks without generating replacement specifications. For exploratory work that still develops requirements, suggest the ordinary workflow. Let the user accept the suggestion in the configuration conversation; never silently switch an existing choice. Record the agreed workflow, repeatable --contract PATH arguments naming the exact authoritative files, and optional --acceptance-file PATH arguments naming maintainer-owned checks/fixtures to preserve. Paths are relative to the campaign root; files must already exist, and directories/globs are not supported. Identify supplied acceptance expectations separately from tests the campaign should implement. Acceptance files are protected inputs; listing them does not execute checks. If input completeness or ownership is unclear, explain that uncertainty rather than assuming it. The actual runner uses only the recorded selection and never infers its workflow from context at launch. For new supplied-contract bootstrap/execute runs, also record --obligation-inventory PATH: an existing maintainer-owned version-1 JSON inventory of owned obligations, dependency owners, context and acceptance obligations (including builder-required tests). The inventory is protected automatically; never generate or rewrite it during configure/autoconfigure. Missing or ambiguous authoritative ownership needs a maintainer decision. The inventory format is documented in docs/supplied-assignments.md in opsx-build. Standalone supplied-contract changes need no agenda inventory. Disabling this option for a new run does not change the workflow recorded by an existing resumable run.";
+pub(crate) const CONFIGURE_GUIDANCE: &str = "\n\nWorkflow choice: read the campaign context file (the selected --context, otherwise context.md if present) and its declared relevant inputs. When these supply precise existing behavioural contracts and component ownership, suggest --supplied-contracts and explain that it plans implementation through a short proposal and tasks, with a supporting design when useful, without generating replacement specifications. For exploratory work that still develops requirements, suggest the ordinary workflow. Let the user accept the suggestion in the configuration conversation; never silently switch an existing choice. Record the agreed workflow, repeatable --contract PATH arguments naming the exact authoritative files, and optional --acceptance-file PATH arguments naming maintainer-owned checks/fixtures to preserve. Paths are relative to the campaign root; files must already exist, and directories/globs are not supported. Identify supplied acceptance expectations separately from tests the campaign should implement. Acceptance files are protected inputs; listing them does not execute checks. If input completeness or ownership is unclear, explain that uncertainty rather than assuming it. The actual runner uses only the recorded selection and never infers its workflow from context at launch. For new supplied-contract bootstrap/execute runs, also record --obligation-inventory PATH: an existing maintainer-owned version-1 JSON inventory of owned obligations, dependency owners, context and acceptance obligations (including builder-required tests). The inventory is protected automatically; never generate or rewrite it during configure/autoconfigure. Missing or ambiguous authoritative ownership needs a maintainer decision. The inventory format is documented in docs/supplied-assignments.md in opsx-build. Standalone supplied-contract changes need no agenda inventory. Disabling this option for a new run does not change the workflow recorded by an existing resumable run.";
 const ASSETS: &[(&str, &str)] = &[
     (
         "schema.yaml",
@@ -32,6 +32,25 @@ const ASSETS: &[(&str, &str)] = &[
     ),
 ];
 
+const LEGACY_ASSETS: &[(&str, &str)] = &[
+    (
+        "schema.yaml",
+        include_str!("../assets/supplied-contracts-legacy/schema.yaml"),
+    ),
+    (
+        "templates/proposal.md",
+        include_str!("../assets/supplied-contracts-legacy/proposal.md"),
+    ),
+    (
+        "templates/design.md",
+        include_str!("../assets/supplied-contracts-legacy/design.md"),
+    ),
+    (
+        "templates/tasks.md",
+        include_str!("../assets/supplied-contracts-legacy/tasks.md"),
+    ),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Input {
     path: PathBuf,
@@ -44,6 +63,9 @@ struct Input {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SuppliedContracts {
     inputs: Vec<Input>,
+    /// Older checkpoints keep the original planning and schema bundle.
+    #[serde(default)]
+    pub compact: bool,
     /// Absent in legacy checkpoints. Never inferred or added while resuming.
     #[serde(default)]
     pub obligation_inventory: Option<PathBuf>,
@@ -107,6 +129,7 @@ impl SuppliedContracts {
         }
         Ok(Self {
             inputs,
+            compact: true,
             obligation_inventory: None,
             acceptance: None,
             runner: None,
@@ -148,7 +171,7 @@ impl SuppliedContracts {
                 != Some(repo.join(path).canonicalize()?)
         {
             bail!(
-                "obligation inventory differs from the checkpoint; start a new run instead of migrating on resume"
+                "obligation inventory differs from the checkpoint; use `accept-changes` to accept a maintainer correction"
             );
         }
         Ok(())
@@ -215,7 +238,7 @@ impl SuppliedContracts {
         };
         if paths(self) != paths(&selected) {
             bail!(
-                "supplied input selection differs from the checkpoint; resume with the original inputs or start a new run"
+                "supplied input selection differs from the checkpoint; use `accept-changes` to accept a maintainer correction"
             );
         }
         Ok(())
@@ -233,7 +256,7 @@ impl SuppliedContracts {
                 || executable(&input.path)? != input.executable
             {
                 bail!(
-                    "protected supplied input changed: `{}`; work is preserved. Restore the approved input or start a new run after reviewing the change",
+                    "protected supplied input changed: `{}`; work is preserved. If the maintainer intended this correction, run `opsx-build accept-changes`, then `opsx-build --resume`",
                     input.path.display()
                 );
             }
@@ -242,6 +265,26 @@ impl SuppliedContracts {
     }
 
     pub fn guidance(&self) -> String {
+        let text = self.legacy_guidance();
+        if !self.compact {
+            return text;
+        }
+        text.replace(
+            "Produce proposal, design and tasks only; no spec deltas or new canonical OpenSpec specifications.",
+            "Produce a short proposal and tasks; add a supporting design only when it helps. No spec deltas or new canonical specifications are needed.",
+        ).replace(
+            "Propose maps requirements to work; design explains internal decisions; tasks are coherent, testable implementation steps within the assigned slice.",
+            "The proposal explains the change, important decisions and regression risks. Reference inherited coverage in Planning references instead of enumerating preserved obligations again. Tasks include required delivery reports and coherent implementation and verification steps.",
+        ).replace(
+            "Archive the proposal, design and tasks without synchronizing specs.",
+            "Archive delivery artifacts without synchronizing specs. Bootstrap and terminal acceptance do not create OpenSpec changes.",
+        ).replace(
+            &format!("During bootstrap Propose draft it at `{}`; do not create the agenda yet. Apply moves it to its durable path, authors concise slice briefs, and runs `opsx-build render-agenda`. Keep proposal/design/tasks at decomposition level and reference the assignment from a Planning references section; do not duplicate the complete coverage map.", crate::assignment::DRAFT),
+            "During bootstrap write it directly, author concise slice briefs and run `opsx-build render-agenda`. Start with the human-readable project introduction. Explain each brief's work and purpose, then reference the detailed inventory; do not replace useful prose with ID lists. No bootstrap OpenSpec package is needed.",
+        ) + "\n\nPROPORTIONATE PLANNING AND REVIEW\nA narrow repair to a working seed normally uses one delivery slice. Where the supplied inputs permit, put dependency checks and baseline startup first in its tasks. Separate slices need useful implementation, integration or recovery boundaries. Check that intermediate test packages and fixtures do not require APIs assigned to later slices. Preserve the full final suite. Independent review blocks for concrete missing behaviour, incorrect code, required checks, ownership violations or an unworkable plan; harmless wording, missing repetition and an absent optional design are not blockers. Final acceptance follows independent review directly, without terminal proposal/design/tasks or Apply. A single delivery's independent review must cover the complete supplied scope, including preserved behaviour and required reports. Only the maintainer may correct supplied inputs through accept-changes; a builder must report contradictory originals as BLOCKED.\n"
+    }
+
+    fn legacy_guidance(&self) -> String {
         let mut text = String::from(
             "\n\nSUPPLIED-CONTRACT WORKFLOW\nThe maintainer selected implementation of existing contracts. Read the relevant original inputs listed below before planning, applying, repairing, or verifying; follow their declared reading boundaries and precedence. Generated agenda, proposal, design, tasks and tests cannot replace these requirements. Do not edit supplied inputs or weaken their conditions or exceptions. Internal implementation choices remain yours; only a genuine gap in externally observable requirements needs an external decision.\n\nCreate changes with `openspec new change <name> --schema opsx-supplied-contracts`. Produce proposal, design and tasks only; no spec deltas or new canonical OpenSpec specifications. This workflow replaces spec-generation instructions in the ordinary workflow. Keep its schema and templates unchanged. Propose maps requirements to work; design explains internal decisions; tasks are coherent, testable implementation steps within the assigned slice. Do not subdivide merely to make a task list.\n\nIn each proposal, agenda slice, and agenda README include `## Supplied requirements`. Use Markdown links to the original input files, relative to that document (absolute paths are also accepted). Link to a heading anchor or exact requirement/scenario ID with #fragment where available. Beside each link identify the work/tasks or slices that cover it; do not rewrite the requirement or expected result. Every such document must link at least one declared contract. Link supplied acceptance files where relevant. Keep the normal Objective, Prerequisites, Acceptance Criteria and Required Tests headings in slices, using source references for required behaviour and expectations. Add implementation-specific tests without substituting them for supplied scenarios.\n\nVerify against the original linked requirements and supplied expectations, including conditions and exceptions. Missing generated specs are intentional. Repair incorrect derived plans, code and tests together. Archive the proposal, design and tasks without synchronizing specs. The terminal 9999 slice covers all supplied in-scope requirements and checks; it cannot redefine acceptance.\n\nProtected inputs (versions recorded in the checkpoint):\n",
         );
@@ -275,7 +318,7 @@ impl SuppliedContracts {
 
     pub fn install_schema(&self, repo: &Path) -> Result<()> {
         let root = schema_root(repo);
-        for (relative, contents) in ASSETS {
+        for (relative, contents) in self.assets() {
             let path = root.join(relative);
             if path.exists() {
                 if fs::read_to_string(&path)? != *contents {
@@ -293,7 +336,7 @@ impl SuppliedContracts {
     }
 
     pub fn check_schema(&self, repo: &Path) -> Result<()> {
-        for (relative, contents) in ASSETS {
+        for (relative, contents) in self.assets() {
             let path = schema_root(repo).join(relative);
             if fs::read_to_string(&path).ok().as_deref() != Some(*contents) {
                 bail!(
@@ -318,7 +361,8 @@ impl SuppliedContracts {
             );
         }
         self.check_references(&root.join("proposal.md"))?;
-        if change == crate::bootstrap::BOOTSTRAP_CHANGE
+        if !self.compact
+            && change == crate::bootstrap::BOOTSTRAP_CHANGE
             && let Some(inventory) = self.inventory(repo)?
         {
             // Apply has already moved the draft when later stages revisit this boundary.
@@ -332,6 +376,16 @@ impl SuppliedContracts {
             assignment.validate(&inventory)?;
         }
         Ok(())
+    }
+
+    fn assets(&self) -> &'static [(&'static str, &'static str)] {
+        if self.compact { ASSETS } else { LEGACY_ASSETS }
+    }
+
+    pub fn delivery_count(&self, repo: &Path) -> Result<usize> {
+        let assignment: crate::assignment::Assignment =
+            crate::assignment::read(&repo.join(crate::assignment::RECORD))?;
+        Ok(assignment.slices.len())
     }
 
     pub fn check_agenda(&self, repo: &Path) -> Result<()> {
