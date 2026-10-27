@@ -116,6 +116,8 @@ mod tests {
         for skill in BUNDLED_SKILLS {
             assert!(skill.contents.contains("TOO_LARGE:"));
             assert!(skill.contents.contains("decomposition"));
+            assert!(skill.contents.contains("AGENTS.md"));
+            assert!(skill.contents.contains("CLAUDE.md"));
         }
     }
 

@@ -66,8 +66,9 @@ Prefer this order:
 
 1. Read the supplied project context and all declared required inputs within
    their stated reading boundaries, including contracts and component scope.
-2. Read relevant OpenSpec artifacts and root/nested CLAUDE.md/project guidance
-   as subordinate evidence; identify any contradiction with the supplied inputs.
+2. Read relevant OpenSpec artifacts and applicable root/nested AGENTS.md,
+   CLAUDE.md and other project guidance as subordinate evidence; identify any
+   contradiction with the supplied inputs.
 3. Use repository structure to identify likely subsystems.
 4. Use targeted search, symbol lookup, references, tests, and call paths.
 5. Read only files needed to understand the relevant behaviour.

@@ -41,7 +41,7 @@ use crate::{
     opencode::{
         OpenCodeBackend, OpenCodeLauncher,
         build_connection_test_command as build_opencode_connection_test_command,
-        build_interactive_opencode_command, build_opencode_command,
+        build_interactive_opencode_command, build_opencode_server_command,
         parse_connection_test_output as parse_opencode_connection_test_output,
     },
     opencode_server::OpenCodeServer,
@@ -4024,9 +4024,7 @@ fn build_agent_dry_run_command(
             ClaudeOutputFormat::Json,
             Some(protocol.json_schema()),
         ),
-        AgentLauncher::OpenCode(launcher) => {
-            build_opencode_command(repo, launcher, session, prompt)
-        }
+        AgentLauncher::OpenCode(launcher) => build_opencode_server_command(repo, launcher),
         AgentLauncher::Codex(launcher) => launcher.server_command(repo),
     }
 }

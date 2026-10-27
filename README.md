@@ -31,9 +31,9 @@ pre-existing staged, unstaged, or untracked work.
 `opsx-build` bundles the canonical `explore-unattended` and
 `propose-unattended` agent skills. Before a workflow starts, it installs
 missing copies and replaces stale copies in the repository selected by
-`--repo`, under `.claude/skills`, a compatibility location recognized by both
-Claude Code and OpenCode. Codex receives those same files as explicit skill
-inputs through App Server. In sidecar mode they instead live in the
+`--repo`, under the selected backend's native directory: `.claude/skills`,
+`.agents/skills`, or `.opencode/skills`. Codex and OpenCode receive the selected
+skills as explicit inputs through their native APIs. In sidecar mode they live in the
 external planning repository, leaving the product checkout untouched by
 OpenSpec integration files. `--dry-run` reports the installation or update
 without writing it. The retired monolithic `build-unattended` skill is not
@@ -1692,65 +1692,79 @@ The corresponding environment variables are:
 
 ## OpenCode backend compatibility
 
-Set `backend = "opencode"` on a named worker or frontier connection. As a
-worker it handles normal Propose, proposal commit, Apply, Verify/repair,
-Archive, and completion-commit stages. As a frontier it handles bootstrap,
-oversized-slice replanning, and terminal acceptance. The adapter lazily starts
-one private OpenCode server on an ephemeral loopback port for the workflow, creates and names sessions through
-its HTTP API, and attaches a blocking `opencode run --format json --auto`
-subprocess for each turn. It passes `--model provider/model` when configured,
-captures the CLI's JSON events, and records the real OpenCode session ID in the
-durable checkpoint.
+OpenCode **V2 2.2 or newer in the V2 series** is required. V1 server APIs are
+unsupported; startup reports an actionable upgrade error before submitting work.
+Set `backend = "opencode"` on a named worker or frontier connection. The worker
+handles Propose, Apply, Verify/repair and Archive; the frontier handles bootstrap,
+oversized-slice replanning and terminal acceptance. Repository, OpenSpec, Git,
+checkpoint and acceptance postconditions are shared across backends.
 
-The server is a local control plane, not another LLM gateway. It inherits the
-selected OpenCode connection's provider credentials and environment. Any
-inherited `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are removed
-for this process because the server is short-lived, bound only to
-`127.0.0.1`, and launched for this opsx-build process. It is stopped when the
-workflow backend is dropped.
+The adapter owns one private `opencode serve --stdio` process for the workflow.
+It reads the startup URL, keeps the stdin ownership lease open, and authenticates
+HTTP requests with a randomly generated password. The server binds to loopback
+on an OS-selected port. Credentials are redacted from displayed commands; V2
+removes the lease password from tool environments. Closing the lease and dropping
+the backend stops this private server. The user's shared OpenCode service is not
+used or stopped. No global OpenCode configuration is rewritten.
 
-OpenCode's native `.opencode/skills` and `.opencode/commands` layouts are
-discovered. The bundled unattended skills remain under `.claude/skills`
-because OpenCode supports that compatibility location as well as its native
-one. A leading installed skill is expressed as an explicit instruction to use
-the skill tool; an OpenCode command is invoked through `run --command`.
+Unattended phases use the V2 HTTP and event APIs. Native skills, including the
+bundled unattended skills under `.opencode/skills`, are supplied as explicit
+skill attachments. Custom workflow commands use the native command callback API.
+Configured `provider/model#variant` selections are applied through native model
+references. Resumed sessions must belong to the campaign's actual directory.
 
-`--test-connection`, `--basic-connection-test`, `--interactive`, `--dry-run`,
-the terminal dashboard, stage timeout, process pause, process stop, hard
-phase-boundary compaction, and manual frontier escalation all work with an
-OpenCode connection. `--stream-agent` is an alias for the backwards-compatible
-`--stream-claude` option. Streamed model text is labelled `opencode` in the
-dashboard and linear output.
+The event subscription is established before admission. The adapter correlates
+inbox delivery with the submitted input and waits for execution settlement;
+old events, child sessions, partial text and admission acknowledgements cannot
+complete a phase. Lost event streams stop with completion unconfirmed and
+interrupt the active session. Compaction likewise waits for its completion and
+execution settlement, and records reported usage rather than treating enqueue
+as success. Token and cost statistics use reported step events with durable
+IDs for deduplication.
 
-The `c`, `C`, and `i` live controls also work. Each first aborts the active
-OpenCode session turn through the server, then stops the attached CLI if it
-does not exit promptly. `c` summarizes the session before resuming the same
-stage, `C` reports the latest-turn and cumulative token counts before resuming,
-and `i` resumes with the operator's steering text. Set `context_window` on the
-connection profile to make `C` include capacity and percentage. Pause, stop,
-frontier escalation, and stage timeout likewise abort the server-side turn so
-detaching the local CLI does not leave model work running in the background.
+`--test-connection`, `--basic-connection-test`, `--interactive`, `--dry-run`, the
+terminal dashboard and live controls support V2. Connection probes use a private
+`opencode run --standalone` process; dry-run previews private-server startup.
+`--stream-agent` aliases `--stream-claude`. Raw streaming exposes V2 events;
+reasoning filters include reasoning, and model text is labelled `opencode`.
 
-The OpenCode adapter still has a few intentional limitations:
+Pause, stop, escalation, timeout, and operating-policy stops interrupt the
+server-side execution. The `c`, `C`, and `i` controls interrupt before compacting,
+reporting context, or applying operator direction, then continue the same stage.
+The original stage deadline and request/repair limits remain in force. Tool
+permission requests owned by this run are approved once, matching the previous
+unattended `--auto` behavior. Requests for external input stop with the form and
+session evidence; supply the missing decision with `--direction` before resuming.
 
-- sidecar repositories are not yet supported by an OpenCode worker;
-- schema-validated terminal output and compact-then-continue recovery for a
-  stage that simply omits its terminal result remain unavailable;
+Structured provider errors retain their type, status, response details and
+`retryAfterMs`. Retryable failures and output-limit continuations reuse the
+session within the existing allowances; reported quota exhaustion is not
+retried as transient capacity. HTTP admission failures are not automatically
+resubmitted because acceptance may be ambiguous. Context reports identify
+latest-step estimates and distinguish unavailable observations from zero usage.
+
+Remaining adapter limitations:
+
+- sidecar repositories are not supported by an OpenCode worker;
+- V2 does not receive a response schema, so terminal status and review JSON use
+  the existing `OPSX_STATUS` and `OPSX_REVIEW` text protocols;
 - automatic context-threshold compaction remains OpenCode's responsibility;
-  the profile's auto-compaction fields are not translated into
-  OpenCode configuration.
+  profile auto-compaction fields are not translated into OpenCode configuration.
 
-OpenCode does detect typed output-limit and retryable provider errors and
-continues the same session under the configured retry limits.
+Regression tests use a simulated V2 control/event server. The optional isolated
+native API smoke test exercises an actual V2 executable without model calls:
 
-These are adapter limitations, not workflow-state limitations. Repository,
-OpenSpec, Git, and checkpoint postconditions are shared by all agent backends.
+```sh
+OPSX_TEST_OPENCODE=/absolute/path/to/opencode cargo test \
+  native_v2_private_server_lifecycle -- --ignored --nocapture
+```
 
-This adapter targets OpenCode 1.18.31's documented `run` JSON event format,
-CLI session flags, and session server API. See the
-[OpenCode CLI documentation][opencode-cli],
-[skills documentation][opencode-skills], and
-[server documentation][opencode-server].
+Both native tests can be run with `cargo test native_v2_ -- --ignored` and the
+same environment variable. `native_v2_turn_with_local_provider` exercises an
+actual tool round-trip, compaction and resume through V2, using a local simulated
+inference provider. No external model calls are made. The tests create temporary
+configuration, data, cache, state and database paths, with no campaign directories,
+global provider credentials or shared OpenCode service.
 
 ## Codex backend compatibility
 

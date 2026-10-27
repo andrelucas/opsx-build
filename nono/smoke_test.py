@@ -146,7 +146,7 @@ def codex_check():
 
 def opencode_check():
     run("opencode", "--version")
-    output = run("opencode", "run", "--format", "json", "--auto",
+    output = run("opencode", "run", "--standalone", "--format", "json", "--auto",
                  "--title", "nono harness smoke test", HARNESS_PROMPT)
     parts = []
     for event in json_events(output):

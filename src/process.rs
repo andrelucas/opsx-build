@@ -76,7 +76,7 @@ pub struct BackendStreamControlRequested {
 }
 
 impl BackendStreamControlRequested {
-    fn new(control: StreamControl) -> Self {
+    pub(crate) fn new(control: StreamControl) -> Self {
         Self { control }
     }
 

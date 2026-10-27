@@ -133,7 +133,7 @@ Prefer:
 - supplied contracts and component scope;
 - existing exploration conclusions consistent with those inputs;
 - OpenSpec artifacts;
-- CLAUDE.md/project documentation;
+- applicable AGENTS.md, CLAUDE.md and other project documentation;
 - targeted symbol and text search;
 - relevant tests and implementation files.
 

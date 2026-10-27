@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -20,10 +21,10 @@ use crate::{
         stage_prompt,
     },
     cli::{AgentConnection, BackendKind, ConnectionEnvironmentValue},
-    opencode_server::OpenCodeServer,
+    opencode_server::{OpenCodeServer, OpenCodeServerClient},
     process::{
-        BackendStreamControlDisposition, BackendStreamControlRequested, CommandSpec, ProcessOutput,
-        ProcessRunner, WorkerEscalationRequested, diagnostic_text,
+        BackendStreamControlRequested, CommandSpec, PauseRequested, ProcessOutput,
+        WorkerEscalationRequested, diagnostic_text,
     },
     stream::{StreamControl, StreamFilter, StreamItem},
     ui::Ui,
@@ -39,6 +40,7 @@ struct OpenCodeApiError {
     message: String,
     transient: bool,
     session_id: Option<SessionId>,
+    retry_after: Option<Duration>,
 }
 
 impl fmt::Display for OpenCodeApiError {
@@ -142,56 +144,14 @@ impl OpenCodeLauncher {
 pub(crate) fn build_opencode_server_command(
     repo: &Path,
     launcher: &OpenCodeLauncher,
-    port: u16,
 ) -> CommandSpec {
     let mut args = launcher.prefix_args.clone();
-    args.extend([
-        "serve".to_owned(),
-        "--hostname".to_owned(),
-        "127.0.0.1".to_owned(),
-        "--port".to_owned(),
-        port.to_string(),
-    ]);
+    args.extend(["serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0"].map(str::to_owned));
     with_launcher_environment(
         CommandSpec::new(&launcher.program, repo).args(args),
         launcher,
     )
-    .remove_env("OPENCODE_SERVER_PASSWORD")
-    .remove_env("OPENCODE_SERVER_USERNAME")
-}
-
-fn build_attached_opencode_command(
-    repo: &Path,
-    launcher: &OpenCodeLauncher,
-    server_url: &str,
-    session_id: &SessionId,
-    prompt: &str,
-) -> CommandSpec {
-    let invocation = resolve_invocation(repo, prompt);
-    let mut args = launcher.prefix_args.clone();
-    args.extend([
-        "run".to_owned(),
-        "--format".to_owned(),
-        "json".to_owned(),
-        "--auto".to_owned(),
-        "--attach".to_owned(),
-        server_url.to_owned(),
-        "--session".to_owned(),
-        session_id.to_string(),
-    ]);
-    if let Some(model) = &launcher.model {
-        args.extend(["--model".to_owned(), model.clone()]);
-    }
-    if let Some(command) = invocation.command {
-        args.extend(["--command".to_owned(), command]);
-    }
-    if !invocation.message.is_empty() {
-        args.push(invocation.message);
-    }
-    with_launcher_environment(
-        CommandSpec::new(&launcher.program, repo).args(args),
-        launcher,
-    )
+    .remove_env("OPENCODE_PASSWORD")
     .remove_env("OPENCODE_SERVER_PASSWORD")
     .remove_env("OPENCODE_SERVER_USERNAME")
 }
@@ -204,7 +164,7 @@ pub fn build_opencode_command(
 ) -> CommandSpec {
     let invocation = resolve_invocation(repo, prompt);
     let mut args = launcher.prefix_args.clone();
-    args.extend(["run".to_owned(), "--format".to_owned(), "json".to_owned()]);
+    args.extend(["run", "--standalone", "--format", "json"].map(str::to_owned));
     args.push("--auto".to_owned());
     if let Some(model) = &launcher.model {
         args.extend(["--model".to_owned(), model.clone()]);
@@ -219,11 +179,20 @@ pub fn build_opencode_command(
             args.extend(["--session".to_owned(), id.to_string()]);
         }
     }
-    if let Some(command) = invocation.command {
-        args.extend(["--command".to_owned(), command]);
-    }
-    if !invocation.message.is_empty() {
-        args.push(invocation.message);
+    // Workflow command callbacks are dispatched through the V2 HTTP API.
+    // This CLI form is only a preview for those requests.
+    let message = match invocation.command {
+        Some(command) => format!("/{command} {}", invocation.message),
+        None => match invocation.skill {
+            Some(skill) => format!(
+                "Use the skill tool to load and follow the `{skill}` skill for this assignment.\n\n{}",
+                invocation.message
+            ),
+            None => invocation.message,
+        },
+    };
+    if !message.is_empty() {
+        args.push(message);
     }
     with_launcher_environment(
         CommandSpec::new(&launcher.program, repo).args(args),
@@ -343,7 +312,6 @@ pub struct OpenCodeBackend<'a, U: Ui> {
     stage_timeout: Option<Duration>,
     resume_repo: Option<PathBuf>,
     ui: &'a U,
-    runner: ProcessRunner<'a, U>,
 }
 
 impl<'a, U: Ui> OpenCodeBackend<'a, U> {
@@ -366,7 +334,6 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
             stage_timeout: None,
             resume_repo: None,
             ui,
-            runner: ProcessRunner::new(ui),
         }
     }
 
@@ -392,9 +359,16 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         self
     }
 
-    fn observed_compaction(&self, session: &SessionId) -> Result<()> {
+    fn observed_compaction(&self, session: &SessionId, limit: Option<Duration>) -> Result<()> {
+        let started = Instant::now();
+        if limit.is_some_and(|limit| limit.is_zero()) {
+            return Err(WorkerEscalationRequested::new(
+                "OpenCode stage deadline expired before compaction",
+            )
+            .into());
+        }
         let invocation = uuid::Uuid::new_v4().to_string();
-        let usage = Attempt::new(
+        let mut usage = Attempt::new(
             self.ui,
             self.repo,
             Identity {
@@ -408,24 +382,81 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
             },
             "Compacting OpenCode session",
         );
+        let client = self.server.client(self.ui)?;
+        client.subscribe()?;
+        let id = new_input_id();
         usage.before_request()?;
-        // The existing summarize response exposes no usage; do not query the model again.
-        let guard = self.ui.operating_policy();
-        let result = self.server.client(self.ui)?.compact_session(
-            session.as_str(),
-            guard.as_ref().map(|guard| guard.remaining_request_time()),
-        );
-        if let Some(guard) = &guard
-            && let Err(error) = guard.poll()
+        let mut result = (|| {
+            client.admit_compaction(session.as_str(), &id)?;
+            let output = self.wait_for_turn(
+                &client,
+                session,
+                &id,
+                true,
+                Some(
+                    limit
+                        .unwrap_or(Duration::MAX)
+                        .min(self.stage_timeout.unwrap_or(Duration::from_secs(3600)))
+                        .saturating_sub(started.elapsed()),
+                ),
+                &mut usage,
+            )?;
+            if !output.success {
+                return Err(opencode_stage_failure(&output));
+            }
+            Ok(output)
+        })();
+        if let Err(error) = &result
+            && let Err(cleanup) = self.cancel_failed_turn(&client, session, error)
         {
-            if let Err(cleanup) = self.server.client(self.ui)?.abort_session(session.as_str()) {
+            result = Err(cleanup);
+        }
+        usage.finish(match &result {
+            Ok(_) => "completed",
+            Err(error) => crate::usage::error_outcome(error),
+        });
+        result.map(|_| ())
+    }
+
+    fn apply_manual_control(
+        &self,
+        client: &OpenCodeServerClient,
+        session: &SessionId,
+        control: &StreamControl,
+        limit: Option<Duration>,
+    ) -> Result<()> {
+        match control {
+            StreamControl::Compact => {
+                self.observed_compaction(session, limit)?;
+                self.ui.stream_item(&StreamItem::Lifecycle(format!(
+                    "OpenCode compacted session {session}"
+                )));
+            }
+            StreamControl::Context => self.ui.stream_item(&StreamItem::Lifecycle(
+                client.context_report(session.as_str())?,
+            )),
+            StreamControl::Inject(_) => {}
+            _ => unreachable!("only manual restart controls are applied"),
+        }
+        Ok(())
+    }
+
+    fn cancel_failed_turn(
+        &self,
+        client: &OpenCodeServerClient,
+        session: &SessionId,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        if let Err(cleanup) = client.abort_session(session.as_str()) {
+            if let Some(guard) = self.ui.operating_policy() {
                 guard.cancellation_unconfirmed(cleanup.to_string());
             }
-            usage.finish("policy_stop_incomplete");
-            return Err(error);
+            // Do not preserve a retry/escalation type when cancellation is unknown.
+            bail!(
+                "OpenCode cancellation is unconfirmed after {error:#}: {cleanup:#}. Automatic continuation is refused; inspect session {session} before resuming. The private server will be stopped"
+            );
         }
-        usage.finish(if result.is_ok() { "completed" } else { "error" });
-        result
+        Ok(())
     }
 
     fn invoke_once(
@@ -436,89 +467,273 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         timeout: Option<Duration>,
         usage: &mut Attempt<'_, U>,
     ) -> Result<OpenCodeAttempt> {
-        self.ui
-            .debug(&format!("OpenCode session: resume {session_id}"));
+        let started = Instant::now();
+        self.ui.debug(&format!("OpenCode V2 session: {session_id}"));
         self.ui.debug_prompt(activity, prompt);
         let client = self.server.client(self.ui)?;
-        let spec = build_attached_opencode_command(
-            self.repo,
-            self.launcher,
-            client.base_url(),
-            session_id,
-            prompt,
-        );
-        let spec = if let Some(repo) = self.resume_repo.as_deref() {
-            spec.resume_from(repo)
-        } else {
-            spec
-        };
+        client.prepare_session(session_id.as_str())?;
+        client.subscribe()?;
+        let mut invocation = resolve_invocation(self.repo, prompt);
+        invocation.message.push_str("\n\nThis OpenCode request supplies no structured result schema. Return the required final OPSX_STATUS line. For verification, emit the OPSX_REVIEW JSON object before that line.");
+        let id = new_input_id();
         usage.before_request()?;
-        let spec = spec.policy_request();
-        let output = if self.stream_transport {
-            self.runner.run_streaming_with_timeout_and_controls(
-                &spec,
-                activity,
-                timeout,
-                |line| {
-                    usage.line(line);
-                    if let Some(filter) = self.stream_filter {
-                        for item in filter_opencode_line(line, filter) {
-                            self.ui.stream_item(&item);
-                        }
-                    }
-                },
-                |control| {
-                    client.abort_session(session_id.as_str())?;
-                    let disposition = match control {
-                        StreamControl::Compact => {
-                            self.ui.stream_message_sent(
-                                "OpenCode acknowledged compaction request; waiting for active work to stop",
-                            );
-                            BackendStreamControlDisposition::RestartStage
-                        }
-                        StreamControl::Context => {
-                            self.ui.stream_message_sent(
-                                "OpenCode acknowledged context request; waiting for active work to stop",
-                            );
-                            BackendStreamControlDisposition::RestartStage
-                        }
-                        StreamControl::Inject(_) => {
-                            self.ui.stream_message_sent(
-                                "OpenCode acknowledged steering request; waiting for active work to stop",
-                            );
-                            BackendStreamControlDisposition::RestartStage
-                        }
-                        StreamControl::Interrupt
-                        | StreamControl::Pause
-                        | StreamControl::Escalate
-                        | StreamControl::None => BackendStreamControlDisposition::Unhandled,
-                    };
-                    Ok(disposition)
-                },
-            )?
-        } else {
-            self.runner.run(&spec, activity)?
-        };
-        usage.output(&output.stdout);
-        if output_hit_token_limit(&output) {
-            let session_id =
-                output_session_id(&output.stdout).unwrap_or_else(|| session_id.clone());
-            return Ok(OpenCodeAttempt::OutputLimit(session_id));
+        if self.stream_transport {
+            self.ui.start_stream(activity);
         }
-        if !output.success {
-            return Err(opencode_stage_failure(&output));
+        let mut result = (|| {
+            let admitted = client.prompt(
+                session_id.as_str(),
+                &id,
+                &invocation.message,
+                invocation.skill.as_deref(),
+                invocation.command.as_deref(),
+            )?;
+            let output = self.wait_for_turn(
+                &client,
+                session_id,
+                &admitted,
+                false,
+                timeout.map(|limit| limit.saturating_sub(started.elapsed())),
+                usage,
+            )?;
+            if output_hit_token_limit(&output) {
+                return Ok(OpenCodeAttempt::OutputLimit(session_id.clone()));
+            }
+            if !output.success {
+                return Err(opencode_stage_failure(&output));
+            }
+            let mut result = parse_opencode_output(&output.stdout)?;
+            result.session_id = Some(session_id.to_string());
+            Ok(OpenCodeAttempt::Complete(result))
+        })();
+        if let Err(error) = &result
+            && let Err(cleanup) = self.cancel_failed_turn(&client, session_id, error)
+        {
+            result = Err(cleanup);
         }
-        let mut result = parse_opencode_output(&output.stdout)?;
+        if self.stream_transport {
+            self.ui.finish_stream(result.is_ok(), activity);
+        }
         result
-            .session_id
-            .get_or_insert_with(|| session_id.to_string());
-        Ok(OpenCodeAttempt::Complete(result))
+    }
+
+    fn wait_for_turn(
+        &self,
+        client: &OpenCodeServerClient,
+        session: &SessionId,
+        input: &str,
+        compact: bool,
+        timeout: Option<Duration>,
+        usage: &mut Attempt<'_, U>,
+    ) -> Result<ProcessOutput> {
+        let started = Instant::now();
+        let mut input = input.to_owned();
+        let mut enqueued = false;
+        let mut delivered = false;
+        let mut compacted = false;
+        let mut failed = false;
+        let mut output = String::new();
+        let mut tools = BTreeMap::new();
+        loop {
+            if let Some(guard) = self.ui.operating_policy() {
+                guard.poll()?;
+            }
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                return Err(WorkerEscalationRequested::new(
+                    "OpenCode exceeded its stage timeout before confirmed completion",
+                )
+                .into());
+            }
+            if !enqueued && started.elapsed() >= Duration::from_secs(10) {
+                bail!(
+                    "OpenCode V2 did not enqueue the submitted input; no phase completion is confirmed. Inspect the session before resuming"
+                );
+            }
+            if self.stream_transport {
+                match self.ui.poll_stream() {
+                    StreamControl::None => {}
+                    StreamControl::Pause => {
+                        return Err(PauseRequested::new(
+                            self.resume_repo
+                                .clone()
+                                .unwrap_or_else(|| self.repo.to_path_buf()),
+                        )
+                        .into());
+                    }
+                    StreamControl::Escalate => {
+                        return Err(WorkerEscalationRequested::new(
+                            "operator requested frontier escalation",
+                        )
+                        .into());
+                    }
+                    StreamControl::Interrupt => bail!(
+                        "OpenCode turn interrupted by the operator; resume the preserved checkpoint to continue"
+                    ),
+                    control => return Err(BackendStreamControlRequested::new(control).into()),
+                }
+            }
+            let Some(event) = client.next_event(Duration::from_millis(50))? else {
+                continue;
+            };
+            let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+            let data = &event["data"];
+            if kind == "permission.asked" {
+                let owner = data["sessionID"]
+                    .as_str()
+                    .context("OpenCode permission omitted its session")?;
+                if client.owns_session(owner, session.as_str())? {
+                    let id = data["id"]
+                        .as_str()
+                        .context("OpenCode permission omitted its ID")?;
+                    client.approve_permission(owner, id)?;
+                }
+                continue;
+            }
+            if kind == "form.created" {
+                let form = &data["form"];
+                let owner = form["sessionID"]
+                    .as_str()
+                    .context("OpenCode form omitted its session")?;
+                if owner == "global" || client.owns_session(owner, session.as_str())? {
+                    bail!(
+                        "OpenCode requires external input for form {} in session {owner}: {}. Review the request and resume with --direction when resolved",
+                        form["id"],
+                        form
+                    );
+                }
+                continue;
+            }
+            if data.get("sessionID").and_then(Value::as_str) != Some(session.as_str()) {
+                continue;
+            }
+            if kind == "session.inbox.enqueued" {
+                let id = data["inboxID"]
+                    .as_str()
+                    .context("OpenCode enqueue event omitted inboxID")?;
+                // Command callbacks generate their own input IDs.
+                if input.is_empty() {
+                    input = id.to_owned();
+                }
+                if id == input {
+                    enqueued = true;
+                }
+            }
+            if kind == "session.inbox.delivered" && data["inboxID"].as_str() == Some(input.as_str())
+            {
+                delivered = true;
+                enqueued = true;
+            }
+            if kind == "session.inbox.cancelled" && data["inboxID"].as_str() == Some(input.as_str())
+            {
+                bail!(
+                    "OpenCode cancelled submitted input {input}; no phase completion is confirmed. Inspect session {session} before resuming"
+                );
+            }
+            if compact
+                && kind == "session.compaction.started"
+                && data["inputID"].as_str() == Some(input.as_str())
+            {
+                delivered = true;
+                enqueued = true;
+            }
+            // Old executions and child sessions cannot complete this input.
+            if !enqueued {
+                continue;
+            }
+            // Steering may be admitted while an older step is still finishing.
+            // Its content and usage cannot satisfy or be charged to this input.
+            if !delivered
+                && !matches!(
+                    kind,
+                    "session.execution.failed" | "session.execution.interrupted"
+                )
+            {
+                continue;
+            }
+            if kind == "session.retry.scheduled" {
+                let note = format!(
+                    "OpenCode native retry: type={}, status={}, retryAfterMs={}",
+                    data["error"]["type"], data["error"]["status"], data["error"]["retryAfterMs"]
+                );
+                usage.note(&note);
+                if self.stream_filter.is_some() {
+                    self.ui.stream_item(&StreamItem::Lifecycle(format!(
+                        "{note}; attempt {}",
+                        data["attempt"]
+                    )));
+                }
+            }
+            if let Some(normalized) = normalize_v2_event(&event, &mut tools) {
+                let line = normalized.to_string();
+                usage.line(&line);
+                if let Some(filter) = self.stream_filter {
+                    let items = if filter == StreamFilter::Raw {
+                        vec![StreamItem::Raw(event.to_string())]
+                    } else {
+                        filter_opencode_line(&line, filter)
+                    };
+                    for item in items {
+                        self.ui.stream_item(&item);
+                    }
+                }
+                output.push_str(&line);
+                output.push('\n');
+            } else if self.stream_filter == Some(StreamFilter::Raw) {
+                self.ui.stream_item(&StreamItem::Raw(event.to_string()));
+            }
+            match kind {
+                "session.step.failed"
+                | "session.execution.failed"
+                | "session.compaction.failed" => {
+                    // Wait for execution settlement, retaining the original error.
+                    failed = true;
+                    if kind == "session.execution.failed" || kind == "session.compaction.failed" {
+                        return Ok(ProcessOutput {
+                            success: false,
+                            code: Some(1),
+                            stdout: output,
+                            stderr: String::new(),
+                        });
+                    }
+                }
+                "session.compaction.ended" if compact && delivered => compacted = true,
+                "session.execution.interrupted" => bail!(
+                    "OpenCode session {session} was interrupted ({}) before this input completed; inspect and resume the preserved checkpoint",
+                    data["reason"]
+                ),
+                "session.execution.succeeded" if delivered && (!compact || compacted) => {
+                    return Ok(ProcessOutput {
+                        success: !failed,
+                        code: Some(if failed { 1 } else { 0 }),
+                        stdout: output,
+                        stderr: String::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 }
 
 impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
     fn name(&self) -> &'static str {
         "OpenCode"
+    }
+
+    fn prepare_session(&self, session: SessionMode) -> Result<SessionMode> {
+        let client = self.server.client(self.ui)?;
+        client.check_version()?;
+        let id = match session {
+            SessionMode::New { name, .. } => {
+                SessionId::new(client.create_session(name.as_deref())?)
+            }
+            SessionMode::Resume { id } => {
+                client.prepare_session(id.as_str())?;
+                id
+            }
+        };
+        // Planning checkpoints must retain this ID even if the first turn fails.
+        Ok(SessionMode::Resume { id })
     }
 
     fn invoke(
@@ -528,13 +743,8 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         activity: &str,
         protocol: StageProtocol,
     ) -> Result<StageResult> {
+        let mut current_session = self.prepare_session(session)?.id().clone();
         let client = self.server.client(self.ui)?;
-        let mut current_session = match session {
-            SessionMode::New { name, .. } => {
-                SessionId::new(client.create_session(name.as_deref())?)
-            }
-            SessionMode::Resume { id } => id,
-        };
         let mut current_prompt = prompt.to_owned();
         let mut current_activity = activity.to_owned();
         let mut output_recoveries = 0;
@@ -552,6 +762,12 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
             });
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(WorkerEscalationRequested::new(
+                    "OpenCode stage deadline expired before another request could be dispatched",
+                )
+                .into());
+            }
             attempt_number += 1;
             let mut usage = Attempt::new(
                 self.ui,
@@ -600,20 +816,12 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                         .expect("guard established backend stream control")
                         .control()
                         .clone();
-                    match &control {
-                        StreamControl::Compact => {
-                            self.observed_compaction(&current_session)?;
-                            self.ui.stream_item(&StreamItem::Lifecycle(format!(
-                                "OpenCode compacted session {current_session}"
-                            )));
-                        }
-                        StreamControl::Context => {
-                            let report = client.context_report(current_session.as_str())?;
-                            self.ui.stream_item(&StreamItem::Lifecycle(report));
-                        }
-                        StreamControl::Inject(_) => {}
-                        _ => unreachable!("only restart controls produce this result"),
-                    }
+                    self.apply_manual_control(
+                        &client,
+                        &current_session,
+                        &control,
+                        deadline.map(|d| d.saturating_duration_since(Instant::now())),
+                    )?;
                     current_prompt = manual_control_continuation_prompt(protocol, &control);
                     current_activity =
                         format!("{activity} (after {})", manual_control_label(&control));
@@ -626,10 +834,24 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                 {
                     provider_retries += 1;
                     let delay =
-                        provider_retry_delay(self.provider_retry_base_delay, provider_retries);
-                    if remaining.is_some_and(|remaining| delay >= remaining) {
+                        provider_retry_delay(self.provider_retry_base_delay, provider_retries).max(
+                            error
+                                .downcast_ref::<OpenCodeApiError>()
+                                .and_then(|e| e.retry_after)
+                                .unwrap_or_default(),
+                        );
+                    let allowance = deadline
+                        .map(|d| d.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::MAX)
+                        .min(
+                            self.ui
+                                .operating_policy()
+                                .map(|g| g.remaining_request_time())
+                                .unwrap_or(PROVIDER_RETRY_MAX_DELAY),
+                        );
+                    if delay >= allowance {
                         return Err(error.context(
-                            "transient provider failure could not be retried before the stage timeout",
+                            "provider retry delay exceeds the remaining automatic time allowance; inspect provider status and operating policy before resuming",
                         ));
                     }
                     let session_id = error
@@ -641,9 +863,47 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                         delay.as_secs(),
                         self.max_provider_retries
                     ));
-                    thread::sleep(delay);
+                    let retry_at = Instant::now().checked_add(delay).context("OpenCode provider retry timing exceeds the supported clock range; retry manually after the provider limit clears")?;
+                    let mut pending_controls = Vec::new();
+                    while Instant::now() < retry_at {
+                        if let Some(guard) = self.ui.operating_policy() {
+                            guard.poll()?;
+                        }
+                        if deadline.is_some_and(|d| Instant::now() >= d) {
+                            return Err(error.context(
+                                "OpenCode stage deadline expired during provider retry backoff",
+                            ));
+                        }
+                        if self.stream_transport {
+                            match self.ui.poll_stream() {
+                                StreamControl::None => {},
+                                StreamControl::Pause => return Err(PauseRequested::new(self.resume_repo.clone().unwrap_or_else(||self.repo.to_path_buf())).into()),
+                                StreamControl::Escalate => return Err(WorkerEscalationRequested::new("operator requested frontier escalation during provider backoff").into()),
+                                StreamControl::Interrupt => bail!("OpenCode provider retry interrupted; resume the preserved checkpoint to continue"),
+                                control => { pending_controls.push(control); self.ui.stream_message_sent("Queued until the provider retry delay ends"); },
+                            }
+                        }
+                        thread::sleep(
+                            retry_at
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(50)),
+                        );
+                    }
                     current_session = session_id;
                     current_prompt = transient_provider_continuation_prompt(protocol);
+                    for control in pending_controls {
+                        self.apply_manual_control(
+                            &client,
+                            &current_session,
+                            &control,
+                            deadline.map(|d| d.saturating_duration_since(Instant::now())),
+                        )?;
+                        if let StreamControl::Inject(message) = control {
+                            current_prompt.push_str(&format!(
+                                "\n\nOperator direction while waiting for the provider:\n{message}"
+                            ));
+                        }
+                    }
                     current_activity = format!(
                         "{activity} (provider recovery {provider_retries}/{})",
                         self.max_provider_retries
@@ -730,16 +990,95 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         self.ui.info(&format!(
             "Hard-compacting OpenCode session after {completed_phase}"
         ));
-        self.observed_compaction(session_id)?;
+        self.observed_compaction(session_id, None)?;
         self.ui
             .success(&format!("Compacted OpenCode session {session_id}"));
         Ok(())
     }
 }
 
+fn new_input_id() -> String {
+    format!("msg_{}", uuid::Uuid::new_v4().simple())
+}
+
+// Normalize V2 events into the existing backend-neutral usage/display input.
+// Durable event IDs retain deduplication; provider details stay intact.
+fn normalize_v2_event(event: &Value, tools: &mut BTreeMap<String, Value>) -> Option<Value> {
+    let data = &event["data"];
+    let session = data.get("sessionID")?;
+    let kind = event.get("type")?.as_str()?;
+    let mut part = serde_json::json!({"id":event["id"], "modelID":data.pointer("/model/id")});
+    let normalized = match kind {
+        "session.step.started" => "step_start",
+        "session.text.ended" | "session.reasoning.ended" => {
+            part["text"] = data["text"].clone();
+            if kind == "session.text.ended" {
+                "text"
+            } else {
+                "reasoning"
+            }
+        }
+        "session.step.ended" | "session.compaction.ended" => {
+            part["tokens"] = data["tokens"].clone();
+            part["cost"] = data["cost"].clone();
+            part["reason"] = data["finish"].clone();
+            "step_finish"
+        }
+        "session.step.failed" | "session.execution.failed" | "session.compaction.failed" => {
+            return Some(
+                serde_json::json!({"type":"error", "sessionID":session, "error":data["error"]}),
+            );
+        }
+        "session.tool.input.started"
+        | "session.tool.called"
+        | "session.tool.success"
+        | "session.tool.failed" => {
+            let id = data.get("id")?.as_str()?;
+            let key = format!("{}:{id}", data.get("assistantMessageID")?.as_str()?);
+            let tool = tools
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::json!({"id":id, "tool":"tool", "state":{}}));
+            if let Some(name) = data.get("name") {
+                tool["tool"] = name.clone();
+            }
+            if let Some(input) = data.get("input") {
+                tool["state"]["input"] = input.clone();
+            }
+            tool["state"]["status"] = match kind {
+                "session.tool.success" => "completed",
+                "session.tool.failed" => "error",
+                _ => "running",
+            }
+            .into();
+            if let Some(content) = data.get("content").and_then(Value::as_array) {
+                tool["state"]["output"] = content
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into();
+            }
+            if let Some(metadata) = data.get("metadata") {
+                tool["state"]["metadata"] = metadata.clone();
+            }
+            if let Some(error) = data.get("error") {
+                tool["state"]["error"] = error["message"].clone();
+            }
+            part = tool.clone();
+            if matches!(kind, "session.tool.success" | "session.tool.failed") {
+                tools.remove(&key);
+            }
+            "tool_use"
+        }
+        _ => return None,
+    };
+    Some(serde_json::json!({"type":normalized, "sessionID":session, "part":part}))
+}
+
 #[derive(Debug)]
 struct Invocation {
     command: Option<String>,
+    skill: Option<String>,
     message: String,
 }
 
@@ -748,6 +1087,7 @@ fn resolve_invocation(repo: &Path, prompt: &str) -> Invocation {
     let Some(after_slash) = trimmed.strip_prefix('/') else {
         return Invocation {
             command: None,
+            skill: None,
             message: prompt.to_owned(),
         };
     };
@@ -759,13 +1099,13 @@ fn resolve_invocation(repo: &Path, prompt: &str) -> Invocation {
     if matches!(name, "explore-unattended" | "propose-unattended") || skill_exists(repo, name) {
         Invocation {
             command: None,
-            message: format!(
-                "Use the skill tool to load and follow the `{name}` skill for this assignment.\n\n{arguments}"
-            ),
+            skill: Some(name.to_owned()),
+            message: arguments.to_owned(),
         }
     } else {
         Invocation {
             command: Some(name.to_owned()),
+            skill: None,
             message: arguments.to_owned(),
         }
     }
@@ -807,7 +1147,7 @@ fn parse_opencode_output(stdout: &str) -> Result<StageResult> {
         .join("\n");
     let signal = parse_terminal_signal(&text).ok_or_else(|| {
         MissingTerminalResult::new(
-            "OpenCode response did not contain an `OPSX_STATUS` terminal marker; rerun with --stream-claude=raw to inspect it",
+            "OpenCode response did not contain an `OPSX_STATUS` terminal marker; rerun with --stream-agent=raw to inspect it",
             Some(&text),
         )
     })?;
@@ -837,45 +1177,44 @@ fn opencode_stage_failure(output: &ProcessOutput) -> anyhow::Error {
 }
 
 fn opencode_api_error(event: &Value) -> Option<OpenCodeApiError> {
-    if event.get("type").and_then(Value::as_str) != Some("error")
-        || event.pointer("/error/name").and_then(Value::as_str) != Some("APIError")
-    {
+    if event.get("type").and_then(Value::as_str) != Some("error") {
         return None;
     }
-    let message = event
-        .pointer("/error/data/message")
+    let error = event.get("error")?;
+    let message = error.get("message").and_then(Value::as_str)?;
+    let status = error.get("status").and_then(Value::as_u64);
+    let kind = error
+        .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("OpenCode provider API error")
-        .to_owned();
-    let status = event
-        .pointer("/error/data/statusCode")
-        .and_then(Value::as_u64);
-    let transient = event
-        .pointer("/error/data/isRetryable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || matches!(status, Some(408 | 425 | 429 | 500..=599));
+        .unwrap_or("unknown");
+    let transient = match kind {
+        "provider.rate-limit" | "provider.transport" | "provider.internal" | "provider.timeout" => {
+            true
+        }
+        "provider.quota"
+        | "provider.free-limit"
+        | "provider.budget-limit"
+        | "provider.model-budget-limit"
+        | "provider.auth"
+        | "provider.content-filter"
+        | "provider.invalid-request"
+        | "provider.unsupported-operation"
+        | "provider.no-route"
+        | "provider.unknown" => false,
+        _ => matches!(status, Some(408 | 425 | 429 | 500..=599)),
+    };
     Some(OpenCodeApiError {
-        message: format!("OpenCode API error: {message}"),
+        message: format!("OpenCode {kind}: {message}; provider details: {error}"),
         transient,
         session_id: event
             .get("sessionID")
             .and_then(Value::as_str)
             .map(SessionId::new),
+        retry_after: error
+            .get("retryAfterMs")
+            .and_then(Value::as_u64)
+            .map(Duration::from_millis),
     })
-}
-
-fn output_session_id(stdout: &str) -> Option<SessionId> {
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|event| {
-            event
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map(SessionId::new)
-        })
-        .next_back()
 }
 
 fn output_hit_token_limit(output: &ProcessOutput) -> bool {
@@ -977,6 +1316,11 @@ fn filter_opencode_line(line: &str, filter: StreamFilter) -> Vec<StreamItem> {
             .and_then(Value::as_str)
             .filter(|text| !text.trim().is_empty())
             .map(|text| vec![StreamItem::OpenCode(text.to_owned())])
+            .unwrap_or_default(),
+        Some("reasoning") if filter.includes_reasoning() => event
+            .pointer("/part/text")
+            .and_then(Value::as_str)
+            .map(|text| vec![StreamItem::Reasoning(text.to_owned())])
             .unwrap_or_default(),
         Some("tool_use") => {
             let tool = event
@@ -1120,13 +1464,6 @@ fn split_command(command: &str) -> Result<Vec<String>> {
 mod tests {
     use std::fs;
 
-    #[cfg(unix)]
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
-        thread::JoinHandle,
-    };
-
     use super::*;
     use crate::{backend::StageSignal, cli::BackendKind};
     #[cfg(unix)]
@@ -1137,7 +1474,11 @@ mod tests {
     use uuid::Uuid;
 
     #[cfg(unix)]
-    struct QuietUi;
+    #[derive(Default)]
+    struct QuietUi {
+        controls: std::sync::Mutex<std::collections::VecDeque<StreamControl>>,
+        after_stream: std::sync::Mutex<Option<StreamControl>>,
+    }
 
     #[cfg(unix)]
     impl Ui for QuietUi {
@@ -1153,65 +1494,25 @@ mod tests {
         fn debug_prompt(&self, _: &str, _: &str) {}
         fn start_stream(&self, _: &str) {}
         fn poll_stream(&self) -> StreamControl {
-            StreamControl::None
+            self.controls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(StreamControl::None)
         }
         fn stream_message_sent(&self, _: &str) {}
         fn stream_item(&self, _: &StreamItem) {}
-        fn finish_stream(&self, _: bool, _: &str) {}
+        fn finish_stream(&self, _: bool, _: &str) {
+            if let Some(control) = self.after_stream.lock().unwrap().take() {
+                self.controls.lock().unwrap().push_back(control);
+            }
+        }
         fn finish_dashboard(&self) {}
         fn output(&self, _: &str, _: &str) {}
         fn start_activity(&self, _: &str) -> Option<indicatif::ProgressBar> {
             None
         }
         fn finish_activity(&self, _: Option<indicatif::ProgressBar>, _: bool, _: &str) {}
-    }
-
-    #[cfg(unix)]
-    fn fake_session_server() -> (String, JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_http_request(&mut stream);
-            assert!(request.starts_with("POST /session?directory="));
-            let body = r#"{"id":"ses_created"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        (url, thread)
-    }
-
-    #[cfg(unix)]
-    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = stream.read(&mut buffer).unwrap();
-            if count == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..count]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            if request.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-        String::from_utf8(request).unwrap()
     }
 
     fn launcher() -> OpenCodeLauncher {
@@ -1243,6 +1544,7 @@ mod tests {
             fresh.args,
             [
                 "run",
+                "--standalone",
                 "--format",
                 "json",
                 "--auto",
@@ -1271,58 +1573,28 @@ mod tests {
     }
 
     #[test]
-    fn constructs_private_server_and_attached_stage_commands() {
-        let repo = Path::new("/repo");
+    fn constructs_private_v2_server_with_a_stdin_lease_and_redacted_password() {
         let mut launcher = launcher();
         launcher.environment.push(LauncherEnvironment {
-            name: "OPENCODE_SERVER_PASSWORD".to_owned(),
-            value: "inherited-secret".to_owned(),
+            name: "OPENCODE_PASSWORD".into(),
+            value: "inherited-secret".into(),
             redacted: true,
         });
-        let server = build_opencode_server_command(repo, &launcher, 43123);
+        let server = build_opencode_server_command(Path::new("/repo"), &launcher)
+            .secret_env("OPENCODE_PASSWORD", "lease-secret");
         assert_eq!(
             server.args,
-            ["serve", "--hostname", "127.0.0.1", "--port", "43123"]
+            ["serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0"]
         );
+        assert!(!server.display().contains("lease-secret"));
+        assert!(!server.display().contains("inherited-secret"));
+        assert!(server.display().contains("OPENCODE_PASSWORD=<redacted>"));
         assert!(
             server
                 .env_remove
                 .iter()
-                .any(|name| name == "OPENCODE_SERVER_PASSWORD")
+                .any(|n| n == "OPENCODE_SERVER_PASSWORD")
         );
-        assert!(
-            server
-                .env
-                .iter()
-                .all(|(name, _)| name != "OPENCODE_SERVER_PASSWORD")
-        );
-
-        let attached = build_attached_opencode_command(
-            repo,
-            &launcher,
-            "http://127.0.0.1:43123",
-            &SessionId::new("ses_123"),
-            "/opsx-apply slice-a",
-        );
-        assert!(
-            attached
-                .args
-                .windows(2)
-                .any(|pair| { pair == ["--attach", "http://127.0.0.1:43123"] })
-        );
-        assert!(
-            attached
-                .args
-                .windows(2)
-                .any(|pair| pair == ["--session", "ses_123"])
-        );
-        assert!(
-            attached
-                .args
-                .windows(2)
-                .any(|pair| pair == ["--command", "opsx-apply"])
-        );
-        assert_eq!(attached.args.last().map(String::as_str), Some("slice-a"));
     }
 
     #[test]
@@ -1387,23 +1659,15 @@ mod tests {
     }
 
     #[test]
-    fn uses_opencode_command_mode_when_the_leading_name_is_not_a_skill() {
-        let command = build_opencode_command(
-            Path::new("/repo"),
-            &launcher(),
-            &SessionMode::New {
-                id: SessionId::new("provisional"),
-                name: None,
-            },
-            "/opsx:apply change-name",
-        );
-        assert!(
-            command
-                .args
-                .windows(2)
-                .any(|pair| pair == ["--command", "opsx:apply"])
-        );
-        assert_eq!(command.args.last().map(String::as_str), Some("change-name"));
+    fn resolves_native_skills_and_command_callbacks_separately() {
+        let skill = resolve_invocation(Path::new("/repo"), "/propose-unattended assigned work");
+        assert_eq!(skill.skill.as_deref(), Some("propose-unattended"));
+        assert!(skill.command.is_none());
+        assert_eq!(skill.message, "assigned work");
+        let command = resolve_invocation(Path::new("/repo"), "/opsx:apply change-name");
+        assert_eq!(command.command.as_deref(), Some("opsx:apply"));
+        assert!(command.skill.is_none());
+        assert_eq!(command.message, "change-name");
     }
 
     #[test]
@@ -1464,7 +1728,7 @@ mod tests {
     #[test]
     fn classifies_typed_provider_and_output_limit_events() {
         let transient: Value = serde_json::from_str(
-            r#"{"type":"error","sessionID":"ses_retry","error":{"name":"APIError","data":{"message":"busy","statusCode":429,"isRetryable":false}}}"#,
+            r#"{"type":"error","sessionID":"ses_retry","error":{"type":"provider.rate-limit","message":"busy","status":429,"retryAfterMs":1}}"#,
         )
         .unwrap();
         let error = opencode_api_error(&transient).unwrap();
@@ -1481,16 +1745,31 @@ mod tests {
             stderr: String::new(),
         };
         assert!(output_hit_token_limit(&output));
-        assert_eq!(
-            output_session_id(&output.stdout).unwrap().as_str(),
-            "ses_limit"
-        );
+        assert_eq!(error.retry_after, Some(Duration::from_millis(1)));
     }
 
-    #[cfg(unix)]
+    fn test_backend<'a, U: Ui>(
+        repo: &'a Path,
+        launcher: &'a OpenCodeLauncher,
+        ui: &'a U,
+        server: &crate::opencode_server::tests::FakeServer,
+    ) -> OpenCodeBackend<'a, U> {
+        OpenCodeBackend::new(repo, launcher, true, None, ui).with_server(Arc::new(
+            OpenCodeServer::external(repo, launcher, server.url.clone()),
+        ))
+    }
+
+    fn new_session() -> SessionMode {
+        SessionMode::New {
+            id: SessionId::new("provisional"),
+            name: None,
+        }
+    }
+
     #[test]
     fn explicit_incomplete_reuses_the_session_and_has_a_separate_bounded_recovery() {
-        for (protocol, first, second, turns, expected) in [
+        use crate::opencode_server::tests::{FakeServer, turn};
+        for (protocol, first, second, count, expected) in [
             (
                 StageProtocol::Worker,
                 "INCOMPLETE",
@@ -1514,194 +1793,761 @@ mod tests {
                 Some(StageSignal::Incomplete),
             ),
         ] {
-            let directory =
-                std::env::temp_dir().join(format!("opsx-opencode-incomplete-{}", Uuid::new_v4()));
-            fs::create_dir_all(&directory).unwrap();
-            let script = directory.join("agent.sh");
-            fs::write(&script, format!(r#"
-if [ -f calls ]; then status={second}; else status={first}; fi
-printf 'call\n' >> calls
-printf '%s\n' "$@" >> arguments
-printf '{{"type":"text","sessionID":"ses_created","part":{{"type":"text","text":"OPSX_STATUS: %s"}}}}\n' "$status"
-"#)).unwrap();
-            let launcher = OpenCodeLauncher {
-                connection_name: None,
-                environment_name: None,
-                program: "sh".into(),
-                prefix_args: vec![script.display().to_string()],
-                model: None,
-                context_window: None,
-                environment: Vec::new(),
-                unset_environment: Vec::new(),
-            };
-            let ui = crate::usage::tests::RecordingUi::default();
-            let mut backend =
-                OpenCodeBackend::new(&directory, &launcher, true, None, &ui).with_retries(0, 0);
-            let (url, server) = fake_session_server();
-            backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, url));
-            let result = backend.invoke(
-                SessionMode::New {
-                    id: SessionId::new("provisional"),
-                    name: None,
-                },
-                "finish work",
-                "test phase",
-                protocol,
+            let repo = std::env::temp_dir().join(format!("opsx-v2-{}", Uuid::new_v4()));
+            fs::create_dir_all(&repo).unwrap();
+            let server = FakeServer::start(
+                &repo,
+                vec![
+                    turn(&format!("OPSX_STATUS: {first}")),
+                    turn(&format!("OPSX_STATUS: {second}")),
+                ],
             );
-            if let Some(signal) = expected {
-                assert_eq!(result.unwrap().signal, signal);
-            } else {
-                assert!(
+            let launcher = launcher();
+            let ui = crate::usage::tests::RecordingUi::default();
+            let backend = test_backend(&repo, &launcher, &ui, &server);
+            let result = backend.invoke(new_session(), "finish work", "test phase", protocol);
+            match expected {
+                Some(signal) => assert_eq!(result.unwrap().signal, signal),
+                None => assert!(
                     result
                         .unwrap_err()
                         .to_string()
                         .contains("remains INCOMPLETE after one continuation")
+                ),
+            }
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.iter().filter(|(line,_,_)|line.starts_with("POST /api/session/ses_created/prompt ")).count(),count);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(line, _, _)| line.starts_with("POST /api/session "))
+                    .count(),
+                1
+            );
+            assert_eq!(ui.records.lock().unwrap().len(), count);
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepared_planning_session_survives_a_failed_first_turn() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![
+                vec![event(
+                    "session.execution.failed",
+                    serde_json::json!({"error":{"type":"provider.rate-limit","status":429,"message":"busy"}}),
+                )],
+                turn("OPSX_STATUS: READY"),
+            ],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+        let prepared = backend.prepare_session(new_session()).unwrap();
+        assert_eq!(prepared.id().as_str(), "ses_created");
+        assert!(
+            backend
+                .invoke(prepared.clone(), "plan", "Propose", StageProtocol::Propose)
+                .is_err()
+        );
+        assert_eq!(
+            backend
+                .invoke(
+                    prepared,
+                    "continue planning",
+                    "Propose",
+                    StageProtocol::Propose
+                )
+                .unwrap()
+                .signal,
+            StageSignal::Ready
+        );
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _, _)| p == "POST /api/session HTTP/1.1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v2_provider_failures_retain_details_and_retry_only_within_allowance() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        for (kind, tries, success) in [
+            ("provider.rate-limit", 1, true),
+            ("provider.rate-limit", 0, false),
+            ("provider.quota", 2, false),
+        ] {
+            let server = FakeServer::start(
+                Path::new("/repo"),
+                vec![
+                    vec![event(
+                        "session.execution.failed",
+                        serde_json::json!({"error":{"type":kind,"status":429,"message":"provider rejected request","response":{"body":"limit-specific evidence"},"retryAfterMs":1}}),
+                    )],
+                    turn("OPSX_STATUS: READY"),
+                ],
+            );
+            let launcher = launcher();
+            let ui = crate::usage::tests::RecordingUi::default();
+            let mut backend =
+                test_backend(Path::new("/repo"), &launcher, &ui, &server).with_retries(0, tries);
+            backend.provider_retry_base_delay = Duration::ZERO;
+            let result =
+                backend.invoke(new_session(), "finish work", "Apply", StageProtocol::Worker);
+            if success {
+                assert_eq!(result.unwrap().signal, StageSignal::Ready);
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains("limit-specific evidence") && error.contains("429"),
+                    "{error}"
                 );
             }
             assert_eq!(
-                fs::read_to_string(directory.join("calls"))
-                    .unwrap()
-                    .lines()
-                    .count(),
-                turns
+                ui.records.lock().unwrap().len(),
+                if success { 2 } else { 1 }
             );
-            let args = fs::read_to_string(directory.join("arguments")).unwrap();
-            assert_eq!(args.matches("--session\nses_created").count(), turns);
-            let records = ui.records.lock().unwrap();
-            assert_eq!(records.len(), turns);
-            assert_eq!(records[0].outcome, first.to_ascii_lowercase());
-            server.join().unwrap();
-            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn output_limit_recovery_and_usage_use_native_step_events() {
+        use crate::opencode_server::tests::{FakeServer, turn};
+        let mut limited = turn("partial output");
+        limited[1]["data"]["finish"] = "length".into();
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![limited, turn("OPSX_STATUS: READY")],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server).with_retries(1, 0);
+        assert_eq!(
+            backend
+                .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+                .unwrap()
+                .signal,
+            StageSignal::Ready
+        );
+        let records = ui.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].outcome, "output_limit");
+        assert_eq!(records[1].tokens.input, Some(15));
+        assert_eq!(records[1].tokens.output, Some(5));
+        assert_eq!(records[1].session_id, "ses_created");
+    }
+
+    #[test]
+    fn v2_submits_native_skill_attachments_and_preserves_command_callbacks() {
+        use crate::opencode_server::tests::{FakeServer, turn};
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![turn("OPSX_STATUS: READY"), turn("OPSX_STATUS: READY")],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+        backend
+            .invoke(
+                new_session(),
+                "/propose-unattended assigned work",
+                "Propose",
+                StageProtocol::Propose,
+            )
+            .unwrap();
+        backend
+            .invoke(
+                SessionMode::Resume {
+                    id: SessionId::new("ses_created"),
+                },
+                "/custom-command assigned work",
+                "Apply",
+                StageProtocol::Worker,
+            )
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        let prompt = &requests
+            .iter()
+            .find(|(p, _, _)| p.starts_with("POST /api/session/ses_created/prompt "))
+            .unwrap()
+            .1;
+        assert_eq!(
+            prompt["skills"],
+            serde_json::json!([{"id":"propose-unattended"}])
+        );
+        assert!(
+            prompt["text"]
+                .as_str()
+                .unwrap()
+                .contains("no structured result schema")
+        );
+        let command = &requests
+            .iter()
+            .find(|(p, _, _)| p.starts_with("POST /api/session/ses_created/command "))
+            .unwrap()
+            .1;
+        assert_eq!(command["name"], "custom-command");
+        assert!(command.get("command").is_none());
+    }
+
+    #[test]
+    fn stream_loss_and_execution_failure_do_not_accept_a_ready_marker() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        for last in [
+            serde_json::json!({"_disconnect":true}),
+            event(
+                "session.execution.failed",
+                serde_json::json!({"error":{"type":"unknown","message":"failed after text"}}),
+            ),
+        ] {
+            let mut events = turn("OPSX_STATUS: READY");
+            events.truncate(1);
+            events.push(last);
+            let server = FakeServer::start(Path::new("/repo"), vec![events]);
+            let launcher = launcher();
+            let ui = crate::usage::tests::RecordingUi::default();
+            let backend =
+                test_backend(Path::new("/repo"), &launcher, &ui, &server).with_retries(0, 2);
+            assert!(
+                backend
+                    .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+                    .is_err()
+            );
+            assert_eq!(ui.records.lock().unwrap().len(), 1);
+            assert!(
+                server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(p, _, _)| p.contains("/interrupt "))
+            );
+        }
+    }
+
+    #[test]
+    fn stale_text_before_delivery_cannot_complete_the_new_input() {
+        use crate::opencode_server::tests::{FakeServer, event};
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![vec![event(
+                "session.execution.succeeded",
+                serde_json::json!({}),
+            )]],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let error = test_backend(Path::new("/repo"), &launcher, &ui, &server)
+            .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+            .unwrap_err();
+        assert!(error.downcast_ref::<MissingTerminalResult>().is_some());
+    }
+
+    #[test]
+    fn unconfirmed_cancellation_refuses_automatic_retry() {
+        use crate::opencode_server::tests::{FakeServer, event};
+        let mut failure = event(
+            "session.execution.failed",
+            serde_json::json!({"error":{"type":"provider.rate-limit","status":429,"message":"busy"}}),
+        );
+        failure["_interrupt_error"] = true.into();
+        let server = FakeServer::start(Path::new("/repo"), vec![vec![failure]]);
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server).with_retries(0, 2);
+        let error = backend
+            .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+            .unwrap_err();
+        assert!(error.to_string().contains("cancellation is unconfirmed"));
+        assert!(error.downcast_ref::<OpenCodeApiError>().is_none());
+        assert_eq!(ui.records.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn child_sessions_cannot_supply_the_parent_result() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        let mut events = vec![
+            event(
+                "session.text.ended",
+                serde_json::json!({"sessionID":"ses_child","text":"OPSX_STATUS: BLOCKED"}),
+            ),
+            event(
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"ses_child"}),
+            ),
+        ];
+        events.extend(turn("OPSX_STATUS: READY"));
+        let server = FakeServer::start(Path::new("/repo"), vec![events]);
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        assert_eq!(
+            test_backend(Path::new("/repo"), &launcher, &ui, &server)
+                .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+                .unwrap()
+                .signal,
+            StageSignal::Ready
+        );
+    }
+
+    #[test]
+    fn compaction_waits_for_completion_and_records_actual_usage() {
+        use crate::opencode_server::tests::{FakeServer, event};
+        let mut ended = event(
+            "session.compaction.ended",
+            serde_json::json!({"tokens":{"input":10,"output":3,"reasoning":2,"cache":{"read":4,"write":1}},"cost":0.01}),
+        );
+        ended["_delay_ms"] = 60.into();
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![vec![
+                ended,
+                event("session.execution.succeeded", serde_json::json!({})),
+            ]],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+        let start = Instant::now();
+        backend
+            .observed_compaction(&SessionId::new("ses_created"), None)
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        assert_eq!(ui.records.lock().unwrap()[0].tokens.input, Some(15));
+    }
+
+    #[test]
+    fn an_expired_stage_deadline_cannot_dispatch_another_input() {
+        use crate::opencode_server::tests::FakeServer;
+        let server = FakeServer::start(Path::new("/repo"), vec![]);
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let error = test_backend(Path::new("/repo"), &launcher, &ui, &server)
+            .with_stage_timeout(Duration::ZERO)
+            .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+            .unwrap_err();
+        assert!(error.downcast_ref::<WorkerEscalationRequested>().is_some());
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.contains("/prompt "))
+        );
+        assert!(ui.records.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compaction_admission_alone_cannot_complete_and_deadlines_interrupt() {
+        use crate::opencode_server::tests::FakeServer;
+        let server = FakeServer::start(Path::new("/repo"), vec![vec![]]);
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server)
+            .with_stage_timeout(Duration::from_millis(20));
+        let error = backend
+            .observed_compaction(&SessionId::new("ses_created"), None)
+            .unwrap_err();
+        assert!(error.downcast_ref::<WorkerEscalationRequested>().is_some());
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.contains("/interrupt "))
+        );
+        assert_eq!(ui.records.lock().unwrap()[0].outcome, "escalated");
+    }
+
+    #[test]
+    fn v2_review_repair_and_resume_keep_the_common_result_contract() {
+        use crate::opencode_server::tests::{FakeServer, turn};
+        let report: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/review-report.json")).unwrap();
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![
+                turn("OPSX_STATUS: READY"),
+                turn("OPSX_STATUS: RETRY"),
+                turn("OPSX_STATUS: READY"),
+                turn(&format!("OPSX_REVIEW: {report}\nOPSX_STATUS: VERIFIED")),
+                turn("OPSX_STATUS: READY"),
+            ],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+        for (protocol, signal) in [
+            (StageProtocol::Worker, StageSignal::Ready),
+            (StageProtocol::Verify, StageSignal::Retry),
+            (StageProtocol::Worker, StageSignal::Ready),
+            (StageProtocol::Verify, StageSignal::Verified),
+            (StageProtocol::Ready, StageSignal::Ready),
+        ] {
+            let result = backend
+                .invoke(
+                    SessionMode::Resume {
+                        id: SessionId::new("ses_created"),
+                    },
+                    "continue assigned phase",
+                    "phase",
+                    protocol,
+                )
+                .unwrap();
+            assert_eq!(result.signal, signal);
+            if signal == StageSignal::Verified {
+                assert_eq!(result.review.unwrap().areas[0].id, "required-outcome");
+            }
+        }
+        assert_eq!(ui.records.lock().unwrap().len(), 5);
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == "POST /api/session HTTP/1.1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_request_limit_stops_before_another_v2_admission() {
+        use crate::{
+            opencode_server::tests::{FakeServer, turn},
+            operating_policy::{Policy, Run},
+        };
+        let repo = std::env::temp_dir().join(format!("opsx-v2-policy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ui = crate::usage::tests::RecordingUi::default();
+        let run = Run::new(
+            &repo,
+            Policy {
+                max_requests_per_stage: 1,
+                ..Policy::default()
+            },
+            &ui,
+        )
+        .unwrap();
+        ui.set_operating_policy(Arc::new(run.open(None).unwrap()))
+            .unwrap();
+        let server = FakeServer::start(&repo, vec![turn("OPSX_STATUS: INCOMPLETE")]);
+        let launcher = launcher();
+        let backend = test_backend(&repo, &launcher, &ui, &server);
+        let error = backend
+            .invoke(
+                new_session(),
+                "finish assigned work",
+                "Apply",
+                StageProtocol::Worker,
+            )
+            .unwrap_err();
+        assert!(crate::operating_policy::is_stop(&error), "{error:#}");
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _, _)| p.contains("/prompt "))
+                .count(),
+            1
+        );
+        drop(backend);
+        drop(ui);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn permissions_are_approved_once_and_forms_stop_with_actionable_evidence() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        let mut events = vec![event("permission.asked", serde_json::json!({"id":"ask_1"}))];
+        events.extend(turn("OPSX_STATUS: READY"));
+        let server = FakeServer::start(
+            Path::new("/repo"),
+            vec![
+                events,
+                vec![event(
+                    "form.created",
+                    serde_json::json!({"form":{"sessionID":"ses_created","id":"form_1","title":"Need an authoritative choice"}}),
+                )],
+            ],
+        );
+        let launcher = launcher();
+        let ui = crate::usage::tests::RecordingUi::default();
+        let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+        backend
+            .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+            .unwrap();
+        let error = backend
+            .invoke(
+                SessionMode::Resume {
+                    id: SessionId::new("ses_created"),
+                },
+                "finish",
+                "Apply",
+                StageProtocol::Worker,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("form_1") && error.contains("--direction"),
+            "{error}"
+        );
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, b, _)| p.contains("/ask_1/reply ") && b["decision"] == "once")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_backoff_remains_pausable_and_keeps_queued_direction() {
+        use crate::opencode_server::tests::{FakeServer, event, turn};
+        for control in [
+            StreamControl::Pause,
+            StreamControl::Inject("preserve the public API".into()),
+        ] {
+            let server = FakeServer::start(
+                Path::new("/repo"),
+                vec![
+                    vec![event(
+                        "session.execution.failed",
+                        serde_json::json!({"error":{"type":"provider.rate-limit","status":429,"message":"busy","retryAfterMs":50}}),
+                    )],
+                    turn("OPSX_STATUS: READY"),
+                ],
+            );
+            let launcher = launcher();
+            let ui = QuietUi::default();
+            *ui.after_stream.lock().unwrap() = Some(control.clone());
+            let mut backend =
+                test_backend(Path::new("/repo"), &launcher, &ui, &server).with_retries(0, 1);
+            backend.provider_retry_base_delay = Duration::ZERO;
+            let result = backend.invoke(new_session(), "finish", "Apply", StageProtocol::Worker);
+            if control == StreamControl::Pause {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<PauseRequested>()
+                        .is_some()
+                );
+                assert_eq!(
+                    server
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(p, _, _)| p.contains("/prompt "))
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(result.unwrap().signal, StageSignal::Ready);
+                assert!(
+                    server
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rfind(|(p, _, _)| p.contains("/prompt "))
+                        .unwrap()
+                        .1["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("preserve the public API")
+                );
+            }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn transient_provider_failure_resumes_the_emitted_session() {
-        let directory =
-            std::env::temp_dir().join(format!("opsx-opencode-retry-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let state = directory.join("count");
-        let arguments = directory.join("arguments");
-        let script = directory.join("fake-opencode.sh");
-        let source = r#"
-state='__STATE__'
-arguments='__ARGUMENTS__'
-if [ ! -f "$state" ]; then
-  : > "$state"
-  printf '%s\n' '{"type":"step_finish","sessionID":"ses_actual","part":{"id":"step1","cost":0.01,"tokens":{"input":10,"output":20,"reasoning":30,"cache":{"read":40,"write":5}}}}'
-  printf '%s\n' '{"type":"error","sessionID":"ses_actual","error":{"name":"APIError","data":{"message":"provider overloaded","statusCode":503,"isRetryable":true}}}'
-  exit 1
-fi
-printf '%s\n' "$*" > "$arguments"
-printf '%s\n' '{"type":"step_finish","sessionID":"ses_actual","part":{"id":"step2","cost":0.02,"tokens":{"input":20,"output":30,"reasoning":40,"cache":{"read":50,"write":5}}}}'
-printf '%s\n' '{"type":"text","sessionID":"ses_actual","part":{"type":"text","text":"continued\nOPSX_STATUS: READY"}}'
-"#
-        .replace("__STATE__", &state.display().to_string())
-        .replace("__ARGUMENTS__", &arguments.display().to_string());
-        fs::write(&script, source).unwrap();
-        let launcher = OpenCodeLauncher {
-            connection_name: None,
-            environment_name: None,
-            program: "sh".to_owned(),
-            prefix_args: vec![script.display().to_string()],
-            model: None,
-            context_window: None,
-            environment: Vec::new(),
-            unset_environment: Vec::new(),
-        };
-        let ui = crate::usage::tests::RecordingUi::default();
-        let mut backend =
-            OpenCodeBackend::new(&directory, &launcher, true, None, &ui).with_retries(0, 1);
-        let (server_url, server) = fake_session_server();
-        backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, server_url));
-        backend.provider_retry_base_delay = Duration::from_millis(1);
-
-        let result = backend
-            .invoke(
-                SessionMode::New {
-                    id: SessionId::new("provisional"),
-                    name: None,
-                },
-                "do the work",
-                "OpenCode test",
-                StageProtocol::Worker,
-            )
-            .unwrap();
-
-        assert_eq!(result.signal, StageSignal::Ready);
-        let resumed_arguments = fs::read_to_string(arguments).unwrap();
-        assert!(resumed_arguments.contains("--session ses_actual"));
-        let records = ui.records.lock().unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].outcome, "provider_error");
-        assert_eq!(records[0].session_id, "ses_actual");
-        assert_eq!(records[0].tokens.input, Some(55));
-        assert_eq!(records[1].tokens.input, Some(75));
-        assert_eq!(records[1].tokens.output, Some(70));
-        assert_eq!(records[1].attempt, 2);
-        assert_eq!(records[0].invocation_id, records[1].invocation_id);
-        assert_eq!(records[1].outcome, "ready");
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
+    fn pause_and_escalation_confirm_interrupt_before_unwinding() {
+        use crate::opencode_server::tests::FakeServer;
+        for control in [
+            StreamControl::Pause,
+            StreamControl::Escalate,
+            StreamControl::Interrupt,
+        ] {
+            let server = FakeServer::start(Path::new("/repo"), vec![vec![]]);
+            let launcher = launcher();
+            let ui = QuietUi::default();
+            ui.controls.lock().unwrap().push_back(control.clone());
+            let backend = test_backend(Path::new("/repo"), &launcher, &ui, &server);
+            let error = backend
+                .invoke(new_session(), "finish", "Apply", StageProtocol::Worker)
+                .unwrap_err();
+            if control == StreamControl::Pause {
+                assert!(error.downcast_ref::<PauseRequested>().is_some());
+            }
+            if control == StreamControl::Escalate {
+                assert!(error.downcast_ref::<WorkerEscalationRequested>().is_some());
+            }
+            assert!(
+                server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(p, _, _)| p.contains("/interrupt "))
+            );
+        }
     }
 
-    #[cfg(unix)]
+    fn isolated_native_launcher(config: Value) -> (PathBuf, OpenCodeLauncher) {
+        let binary = std::env::var("OPSX_TEST_OPENCODE").expect("set OPSX_TEST_OPENCODE");
+        let repo = std::env::temp_dir().join(format!("opsx-native-opencode-{}", Uuid::new_v4()));
+        fs::create_dir_all(repo.join("config")).unwrap();
+        fs::write(repo.join("config/opencode.json"), config.to_string()).unwrap();
+        let mut launcher = launcher();
+        launcher.program = binary;
+        launcher.model = None;
+        launcher.environment = [
+            ("OPENCODE_CONFIG_DIR", "config"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("OPENCODE_DB", "native.sqlite"),
+        ]
+        .into_iter()
+        .map(|(name, path)| LauncherEnvironment {
+            name: name.into(),
+            value: repo.join(path).display().to_string(),
+            redacted: false,
+        })
+        .collect();
+        launcher.unset_environment =
+            vec!["OPENCODE_CONFIG".into(), "OPENCODE_CONFIG_CONTENT".into()];
+        launcher.environment.push(LauncherEnvironment {
+            name: "OPENCODE_DISABLE_FREE_MODELS".into(),
+            value: "1".into(),
+            redacted: false,
+        });
+        launcher
+            .unset_environment
+            .extend(std::env::vars().map(|(name, _)| name).filter(|name| {
+                name.ends_with("_API_KEY") || name.ends_with("_TOKEN") || name.ends_with("_SECRET")
+            }));
+        (repo, launcher)
+    }
+
     #[test]
-    fn output_limit_resumes_the_emitted_session() {
-        let directory =
-            std::env::temp_dir().join(format!("opsx-opencode-limit-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let state = directory.join("count");
-        let arguments = directory.join("arguments");
-        let script = directory.join("fake-opencode.sh");
-        let source = r#"
-state='__STATE__'
-arguments='__ARGUMENTS__'
-if [ ! -f "$state" ]; then
-  : > "$state"
-  printf '%s\n' '{"type":"error","sessionID":"ses_limit","error":{"name":"MessageOutputLengthError","data":{}}}'
-  exit 1
-fi
-printf '%s\n' "$*" > "$arguments"
-printf '%s\n' '{"type":"text","sessionID":"ses_limit","part":{"type":"text","text":"continued\nOPSX_STATUS: READY"}}'
-"#
-        .replace("__STATE__", &state.display().to_string())
-        .replace("__ARGUMENTS__", &arguments.display().to_string());
-        fs::write(&script, source).unwrap();
-        let launcher = OpenCodeLauncher {
-            connection_name: None,
-            environment_name: None,
-            program: "sh".to_owned(),
-            prefix_args: vec![script.display().to_string()],
-            model: None,
-            context_window: None,
-            environment: Vec::new(),
-            unset_environment: Vec::new(),
-        };
-        let ui = QuietUi;
-        let mut backend =
-            OpenCodeBackend::new(&directory, &launcher, false, None, &ui).with_retries(1, 0);
-        let (server_url, server) = fake_session_server();
-        backend.server = Arc::new(OpenCodeServer::external(&directory, &launcher, server_url));
+    #[ignore = "requires OPSX_TEST_OPENCODE pointing to an OpenCode V2 2.2+ executable"]
+    fn native_v2_private_server_lifecycle() {
+        let (repo, launcher) = isolated_native_launcher(serde_json::json!({"update":"disable"}));
+        let ui = crate::usage::tests::RecordingUi::default();
+        {
+            let server = OpenCodeServer::new(&repo, &launcher);
+            let client = server.client(&ui).unwrap();
+            let session = client
+                .create_session(Some("opsx-build isolated V2 API smoke test"))
+                .unwrap();
+            client.prepare_session(&session).unwrap();
+            client
+                .rename_session(&session, "renamed isolated API smoke test")
+                .unwrap();
+            client.subscribe().unwrap();
+            client.abort_session(&session).unwrap();
+            assert!(
+                client
+                    .context_report(&session)
+                    .unwrap()
+                    .contains("unavailable")
+            );
+        }
+        assert!(
+            ui.records.lock().unwrap().is_empty(),
+            "API smoke test must not make model calls"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
 
-        let result = backend
-            .invoke(
-                SessionMode::New {
-                    id: SessionId::new("provisional"),
-                    name: None,
-                },
-                "do the work",
-                "OpenCode test",
-                StageProtocol::Worker,
-            )
-            .unwrap();
-
-        assert_eq!(result.signal, StageSignal::Ready);
-        let resumed_arguments = fs::read_to_string(arguments).unwrap();
-        assert!(resumed_arguments.contains("--session ses_limit"));
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
+    #[test]
+    #[ignore = "requires OPSX_TEST_OPENCODE; all inference is served by a local fixture"]
+    fn native_v2_turn_with_local_provider() {
+        use crate::opencode_server::tests::FakeServer;
+        let provider = FakeServer::start(Path::new("/fixture"), vec![]);
+        let config = serde_json::json!({
+            "update":"disable", "enabled_providers":["fixture"],
+            "model":"fixture/fixture", "small_model":"fixture/fixture",
+            "providers":{"fixture":{
+                "name":"isolated fixture provider", "package":"aisdk:@ai-sdk/openai-compatible",
+                "settings":{"baseURL":format!("{}/v1",provider.url),"apiKey":"fixture-only"},
+                "models":{"fixture":{"name":"fixture","limit":{"context":128000,"output":4096}}}
+            }}
+        });
+        let (repo, mut launcher) = isolated_native_launcher(config);
+        launcher.model = Some("fixture/fixture".into());
+        let ui = crate::usage::tests::RecordingUi::default();
+        {
+            let backend = OpenCodeBackend::new(&repo, &launcher, true, None, &ui)
+                .with_stage_timeout(Duration::from_secs(30));
+            let result = backend
+                .invoke(
+                    new_session(),
+                    "OPSX_NATIVE_TOOL_PROBE: run the isolated shell compatibility probe. Do no repository work. Finish with OPSX_STATUS: READY.",
+                    "isolated native V2 turn",
+                    StageProtocol::Ready,
+                )
+                .unwrap();
+            assert_eq!(result.signal, StageSignal::Ready);
+            let session = result.session_id.unwrap();
+            assert!(session.starts_with("ses"));
+            backend
+                .observed_compaction(&SessionId::new(&session), None)
+                .unwrap();
+            assert_eq!(
+                backend
+                    .invoke(
+                        SessionMode::Resume {
+                            id: SessionId::new(session)
+                        },
+                        "Continue without repository work. Finish with OPSX_STATUS: READY.",
+                        "isolated native V2 resume",
+                        StageProtocol::Ready
+                    )
+                    .unwrap()
+                    .signal,
+                StageSignal::Ready
+            );
+        }
+        assert!(
+            provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.contains("/v1/chat/completions"))
+        );
+        assert_eq!(ui.records.lock().unwrap().len(), 3);
+        let records = ui.records.lock().unwrap();
+        assert_eq!(records[0].tokens.input, Some(20));
+        assert_eq!(records[0].tools.len(), 1);
+        assert_eq!(records[0].tools[0].failed, Some(false));
+        assert!(records[0].tools[0].result_chars.is_some_and(|n| n > 0));
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

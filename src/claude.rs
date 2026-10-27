@@ -1873,12 +1873,12 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
     let model_confusions = model_confusion_guidance();
     let test_execution_policy = match protocol {
         StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
-            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen the coding-agent runtime's sandbox prevents a required project build or test from running, use the runtime's narrowest available permission override to rerun only the affected command. In Claude Code, use the Bash tool with `dangerouslyDisableSandbox: true`; in another backend, use its native equivalent. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate the agent sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
+            "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen the coding-agent runtime's sandbox prevents a required project build or test from running, use the runtime's narrowest available permission override to rerun only the affected command. Use only permission controls actually provided by this runtime. Do not invent tool names, flags, or permission overrides from another backend. If no permitted native override is available, report the execution-environment blocker and the exact command that still needs to run. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate the agent sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
         }
         StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under the original stage timeout; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nReturn the supplied structured output with `opsx_status` set to exactly one of: {terminal_values}. Include a concise `summary`. If structured output is unavailable, you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under the original stage timeout; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nIf this invocation supplies a structured result schema, return that object with `opsx_status` set to exactly one of: {terminal_values}, and a concise `summary`. A backend without a supplied schema must use the text result protocol: you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -2625,7 +2625,9 @@ mod tests {
         ] {
             let prompt = stage_prompt("/opsx:apply", "change", protocol);
             assert!(prompt.contains("sandbox prevents a required project build or test"));
-            assert!(prompt.contains("dangerouslyDisableSandbox: true"));
+            assert!(prompt.contains("permission controls actually provided by this runtime"));
+            assert!(!prompt.contains("dangerouslyDisableSandbox"));
+            assert!(prompt.contains("If no permitted native override is available"));
             assert!(prompt.contains("Do not rewrite production code or tests"));
             assert!(prompt.contains("synthetic or weaker coverage"));
         }
@@ -2638,6 +2640,29 @@ mod tests {
 
         let propose = stage_prompt("/propose-unattended", "change", StageProtocol::Propose);
         assert!(!propose.contains("PROJECT TEST EXECUTION POLICY"));
+    }
+
+    #[test]
+    fn shared_result_instructions_do_not_assume_a_schema_is_supplied() {
+        for protocol in [
+            StageProtocol::Ready,
+            StageProtocol::Worker,
+            StageProtocol::Propose,
+            StageProtocol::Verify,
+            StageProtocol::Frontier,
+            StageProtocol::TerminalReview,
+        ] {
+            let prompt = stage_prompt("", "assigned work", protocol);
+            assert!(prompt.contains("If this invocation supplies a structured result schema"));
+            assert!(
+                prompt.contains(
+                    "A backend without a supplied schema must use the text result protocol"
+                )
+            );
+            assert!(prompt.contains(protocol.terminal_values()));
+            assert!(prompt.contains("OPSX_STATUS: <value>"));
+            assert!(!prompt.contains("Return the supplied structured output"));
+        }
     }
 
     #[test]
