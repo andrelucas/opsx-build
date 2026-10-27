@@ -159,7 +159,17 @@ impl Drop for Fixture {
 #[test]
 fn seeded_repair_has_one_delivery_review_report_and_independent_final_gate() {
     let f = Fixture::new();
-    Fixture::success(&f.execute("repair"));
+    let output = f.execute("repair");
+    Fixture::success(&output);
+    let progress = String::from_utf8_lossy(&output.stderr);
+    let bootstrap = progress.split("Bootstrap complete —").next().unwrap();
+    assert!(bootstrap.contains("[1/2] Propose"), "{bootstrap}");
+    assert!(bootstrap.contains("[2/2] Completion commit"), "{bootstrap}");
+    assert!(!bootstrap.contains("[6/6]"), "{bootstrap}");
+    assert!(
+        progress.contains("[1/2] Maintainer acceptance"),
+        "{progress}"
+    );
     let calls = f.calls();
     assert_eq!(calls.iter().filter(|c| c["stage"] == "verify").count(), 1);
     assert!(
@@ -198,7 +208,16 @@ fn seeded_repair_has_one_delivery_review_report_and_independent_final_gate() {
 #[test]
 fn rebuild_keeps_multiple_slices_planning_review_and_final_integration_review() {
     let f = Fixture::new();
-    Fixture::success(&f.execute("rebuild"));
+    let output = f.execute("rebuild");
+    Fixture::success(&output);
+    let progress = String::from_utf8_lossy(&output.stderr);
+    assert!(progress.contains("[1/2] Verify"), "{progress}");
+    assert!(progress.contains("[1/3] Verify"), "{progress}");
+    assert!(
+        progress.contains("[2/3] Maintainer acceptance"),
+        "{progress}"
+    );
+    assert!(progress.contains("[3/3] Completion commit"), "{progress}");
     let calls = f.calls();
     assert!(
         calls

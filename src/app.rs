@@ -2560,12 +2560,15 @@ impl<U: Ui> App<U> {
             } else {
                 "worker"
             };
-            let (stage_number, total_stages) = displayed_stage_position(
-                state.stage,
-                state.agenda.is_some(),
-                use_terminal_frontier,
-                self.cli.yolo,
-            );
+            let (stage_number, total_stages) = supplied::displayed_stage_position(&state)
+                .unwrap_or_else(|| {
+                    displayed_stage_position(
+                        state.stage,
+                        state.agenda.is_some(),
+                        use_terminal_frontier,
+                        self.cli.yolo,
+                    )
+                });
             let stage_title = if state.stage == Stage::Acceptance {
                 "Maintainer acceptance · runner".to_owned()
             } else if stage_uses_frontier {

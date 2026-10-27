@@ -8,6 +8,38 @@ pub(super) fn direct(state: &RunState) -> bool {
     compact(state) && (state.bootstrap || is_terminal_gate(state))
 }
 
+pub(super) fn displayed_stage_position(state: &RunState) -> Option<(usize, usize)> {
+    if !direct(state) {
+        return None;
+    }
+    if state.bootstrap {
+        // Assignment review and repairs belong to the planning phase. Whether
+        // that review is needed is known only after the assignment is written.
+        return Some((
+            if state.stage == Stage::FinalCommit {
+                2
+            } else {
+                1
+            },
+            2,
+        ));
+    }
+    let reused_review = !matches!(state.stage, Stage::Propose | Stage::Verify | Stage::Repair)
+        && state
+            .verification
+            .as_ref()
+            .is_some_and(|review| Some(review.change.as_str()) != state.change.as_deref());
+    let review_steps = usize::from(!reused_review);
+    let acceptance_steps = usize::from(state.contracts.as_ref()?.acceptance.is_some());
+    let total = review_steps + acceptance_steps + 1;
+    let number = match state.stage {
+        Stage::Acceptance => review_steps + 1,
+        Stage::FinalCommit => total,
+        _ => 1,
+    };
+    Some((number, total))
+}
+
 impl<U: Ui> App<U> {
     pub(super) fn run_assignment(
         &self,
