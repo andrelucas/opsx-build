@@ -303,7 +303,7 @@ fn successful_preflight_is_reused_until_inputs_or_commands_change() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("accept-changes"));
     Fixture::success(&f.command().arg("accept-changes").output().unwrap());
     Fixture::success(&f.command().arg("preflight").output().unwrap());
-    assert_eq!(f.preflights().len(), 2);
+    assert_eq!(f.preflights().len(), 3);
     Fixture::success(
         &f.command()
             .args([
@@ -317,7 +317,88 @@ fn successful_preflight_is_reused_until_inputs_or_commands_change() {
             .output()
             .unwrap(),
     );
+    assert_eq!(f.preflights().len(), 4);
+}
+
+#[test]
+fn standalone_preflight_always_refreshes_passing_and_blocked_reports() {
+    for blocked in [false, true] {
+        let f = Fixture::new();
+        let contract = f.root.join("repo/contract.md");
+        if blocked {
+            let text = fs::read_to_string(&contract).unwrap();
+            fs::write(&contract, format!("{text}\nCONTRADICTORY\n")).unwrap();
+        }
+        let before = fs::read(&contract).unwrap();
+        for count in 1..=2 {
+            let result = f.preflight();
+            assert_eq!(result.status.success(), !blocked);
+            assert_eq!(f.preflights().len(), count);
+            assert_eq!(fs::read(&contract).unwrap(), before);
+            assert!(f.calls().is_empty());
+            assert!(!f.root.join("repo/.git/opsx-build/last-run.json").exists());
+        }
+    }
+}
+
+#[test]
+fn explicit_flush_refreshes_once_across_bootstrap_and_delivery_and_on_resume() {
+    let f = Fixture::new();
+    Fixture::success(&f.preflight());
+    let result = f
+        .command()
+        .args([
+            "--flush-preflight-cache",
+            "--supplied-contracts",
+            "--contract=contract.md",
+            "--obligation-inventory=inventory.json",
+            "--acceptance-file=acceptance.sh",
+            "--acceptance-command=sh acceptance.sh",
+            "--acceptance-timeout-seconds=37",
+            "execute",
+        ])
+        .output()
+        .unwrap();
+    Fixture::success(&result);
+    assert_eq!(f.state()["stage"], "done");
+    assert_eq!(f.preflights().len(), 2);
+    let calls = f.calls().len();
+    Fixture::success(
+        &f.command()
+            .args(["--flush-preflight-cache", "--resume"])
+            .output()
+            .unwrap(),
+    );
     assert_eq!(f.preflights().len(), 3);
+    assert_eq!(f.calls().len(), calls);
+    Fixture::success(&f.command().arg("--resume").output().unwrap());
+    assert_eq!(f.preflights().len(), 3);
+}
+
+#[test]
+fn flush_dry_run_preserves_cached_report_checkpoint_and_model_calls() {
+    let f = Fixture::new();
+    Fixture::success(&f.execute("repair"));
+    let metadata = f.root.join("repo/.git/opsx-build");
+    let report = fs::read(metadata.join("contract-preflight.json")).unwrap();
+    let checkpoint = fs::read(metadata.join("last-run.json")).unwrap();
+    for args in [
+        vec!["--dry-run", "preflight"],
+        vec!["--flush-preflight-cache", "--dry-run", "--resume"],
+    ] {
+        let result = f.command().args(args).output().unwrap();
+        Fixture::success(&result);
+        assert!(String::from_utf8_lossy(&result.stderr).contains("would flush"));
+        assert_eq!(
+            fs::read(metadata.join("contract-preflight.json")).unwrap(),
+            report
+        );
+        assert_eq!(
+            fs::read(metadata.join("last-run.json")).unwrap(),
+            checkpoint
+        );
+        assert_eq!(f.preflights().len(), 1);
+    }
 }
 
 #[test]

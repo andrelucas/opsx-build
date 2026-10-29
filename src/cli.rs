@@ -63,6 +63,7 @@ pub struct Cli {
     pub bootstrap_context: Option<PathBuf>,
     pub bootstrap_defines: BTreeMap<String, String>,
     pub supplied_contracts: bool,
+    pub flush_preflight_cache: bool,
     pub contract_files: Vec<PathBuf>,
     pub obligation_inventory: Option<PathBuf>,
     pub operating_policy: Option<PathBuf>,
@@ -519,6 +520,10 @@ pub(crate) struct CliArgs {
     /// Implement supplied contracts without generating replacement behaviour specifications.
     #[arg(long, overrides_with = "no_supplied_contracts")]
     supplied_contracts: bool,
+
+    /// Discard this campaign's saved contract preflight before proceeding (standalone preflight always refreshes).
+    #[arg(long)]
+    flush_preflight_cache: bool,
 
     /// Use the ordinary specification workflow for a new run (resumes retain their workflow).
     #[arg(long, overrides_with = "supplied_contracts")]
@@ -1215,6 +1220,7 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         bootstrap_context: args.context,
         bootstrap_defines,
         supplied_contracts: args.supplied_contracts && !args.no_supplied_contracts,
+        flush_preflight_cache: args.flush_preflight_cache,
         contract_files: args.contract,
         obligation_inventory: args
             .obligation_inventory
@@ -1429,6 +1435,7 @@ fn campaign_setting(id: &str) -> bool {
             | "no_config"
             | "no_campaign_config"
             | "dry_run"
+            | "flush_preflight_cache"
             | "help"
             | "version"
     )
@@ -2147,6 +2154,7 @@ mod tests {
             "--repo=/elsewhere",
             "--config=secrets.toml",
             "--dry-run",
+            "--flush-preflight-cache",
             "execute",
             "--made-up=1",
         ] {

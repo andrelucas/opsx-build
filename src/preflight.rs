@@ -25,6 +25,23 @@ struct Report {
     summary: String,
 }
 
+pub(crate) fn flush<U: Ui>(repo: &Path, ui: &U, dry_run: bool) -> Result<()> {
+    let path = metadata_path(repo, ui, "opsx-build")?.join("contract-preflight.json");
+    if dry_run {
+        ui.info("DRY RUN — would flush the saved contract preflight; the next check reviews current inputs afresh");
+        return Ok(());
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => ui.info("Flushed the saved contract preflight"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot flush preflight cache `{}`", path.display()));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run<U: Ui>(
     repo: &Path,
     contracts: &SuppliedContracts,
@@ -54,18 +71,14 @@ pub(crate) fn run<U: Ui>(
         "supplied": contracts.preflight_inputs(), "context": context,
     });
     let path = metadata_path(repo, ui, "opsx-build")?.join("contract-preflight.json");
+    if dry_run {
+        ui.info("DRY RUN — frontier contract preflight before planning or implementation; report only, no corrections");
+        return Ok(());
+    }
     let cached = fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Report>(&bytes).ok())
         .filter(|report| report.inputs == inputs);
-    if dry_run {
-        ui.info(if cached.is_some() {
-            "DRY RUN — reuse the recorded contract preflight for these unchanged inputs"
-        } else {
-            "DRY RUN — frontier contract preflight before planning or implementation; report only, no corrections"
-        });
-        return Ok(());
-    }
     let report = if let Some(report) = cached {
         ui.info("Reusing contract preflight for unchanged supplied inputs");
         report

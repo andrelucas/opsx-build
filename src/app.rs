@@ -638,6 +638,9 @@ impl<U: Ui> App<U> {
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let product_repo = repository_root(&requested_repo, &self.ui)?;
+        if self.cli.flush_preflight_cache || self.cli.request == "preflight" {
+            crate::preflight::flush(&product_repo, &self.ui, self.cli.dry_run)?;
+        }
         if self.cli.request == "accept-changes" {
             return self.accept_changes(&product_repo);
         }

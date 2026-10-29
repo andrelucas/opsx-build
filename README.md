@@ -213,6 +213,15 @@ inputs as maintainer; use `accept-changes` before resuming an existing checkpoin
 Standalone preflight can inspect those edits before they are adopted. Reports
 live in private Git metadata at `opsx-build/contract-preflight.json`.
 
+Standalone `opsx-build preflight` always discards the cached verdict and runs a
+fresh review. Automatic build checks still reuse unchanged reports. To force a
+fresh automatic check, use `--flush-preflight-cache`, for example
+`opsx-build --flush-preflight-cache --resume` or
+`opsx-build --flush-preflight-cache advance`. The flag applies once per invocation
+and is not saved as a campaign setting. It clears only the preflight report;
+protected-input adoption still requires `accept-changes`. With `--dry-run`, the
+report and checkpoint remain unchanged.
+
 `--dry-run preflight` validates the selected inputs and previews the review
 without invoking a model or writing a report. A preflight pass is a model's
 consistency review of the declared inputs; independent implementation review
