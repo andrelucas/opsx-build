@@ -35,6 +35,7 @@
       "$XDG_DATA_HOME/openspec",
       "$XDG_DATA_HOME/opsx-build"
     ],
+    "read_file": ["$HOME/.gitignore"],
     "allow_file": ["$HOME/.claude.json"],
     "unix_socket_subtree": ["$HOME/.dap-cli"]
   },

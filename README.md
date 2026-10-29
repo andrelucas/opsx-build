@@ -1377,6 +1377,7 @@ directory. A config-file symlink pointing outside it still relies on access to
 its target; replacing that target can invalidate an individual Landlock file
 grant. For a Dotbot-managed layout, linking the whole Git directory to a dedicated
 directory in dotfiles lets the directory grant cover its config files.
+The profile also grants read-only access to `~/.gitignore` when present.
 
 The same setting is available as `harness_sandbox = false` in the TOML config,
 `OPSX_BUILD_HARNESS_SANDBOX=false` in the environment, or a recorded campaign
