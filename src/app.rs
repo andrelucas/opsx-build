@@ -503,6 +503,7 @@ impl<U: Ui> App<U> {
             result => result,
         };
         if let Some(guard) = self.ui.operating_policy()
+            && self.cli.request != "preflight"
             && let Err(error) = self.show_run_summary(&guard, &result, paused)
         {
             self.ui
@@ -639,6 +640,9 @@ impl<U: Ui> App<U> {
         let product_repo = repository_root(&requested_repo, &self.ui)?;
         if self.cli.request == "accept-changes" {
             return self.accept_changes(&product_repo);
+        }
+        if self.cli.request == "preflight" {
+            return self.preflight(&product_repo);
         }
         if matches!(self.cli.request.as_str(), "render-agenda" | "check-agenda") {
             let state = load_state(&product_repo, &self.ui)?;
@@ -1194,6 +1198,7 @@ impl<U: Ui> App<U> {
                 ", proposal commit"
             };
             if contracts.as_ref().is_some_and(|c| c.compact) {
+                self.ui.info("First run a read-only frontier contract preflight; input conflicts stop planning and implementation");
                 self.ui.info("Assign supplied work directly; check coverage mechanically, independently review multi-slice decomposition, and commit the agenda. No bootstrap OpenSpec change.");
             } else {
                 self.ui.info(&format!(
@@ -1585,6 +1590,13 @@ impl<U: Ui> App<U> {
                 {
                     contracts.check_agenda(repo)?;
                 }
+                self.contract_preflight(
+                    repo,
+                    frontier_launcher.unwrap_or(launcher),
+                    contracts,
+                    state.context_path.as_deref(),
+                    &state.context_definitions,
+                )?;
             }
             if needs_terminal_review(&state) {
                 if state.local_only {
@@ -1832,13 +1844,14 @@ impl<U: Ui> App<U> {
         repo: &'a Path,
         launcher: &'a AgentLauncher,
         model_confusion_plugin: &Path,
+        permission_mode: &'a str,
     ) -> Box<dyn AgentBackend + 'a> {
         match launcher {
             AgentLauncher::Claude(launcher) => Box::new(
                 ClaudeBackend::new(
                     repo,
                     launcher,
-                    &self.cli.permission_mode,
+                    permission_mode,
                     self.ui.supports_stream_input(),
                     self.cli.stream_claude,
                     self.cli.max_output_retries,
@@ -1861,7 +1874,7 @@ impl<U: Ui> App<U> {
                 CodexBackend::new(
                     repo,
                     launcher,
-                    &self.cli.permission_mode,
+                    permission_mode,
                     self.cli.stream_claude,
                     &self.ui,
                 )
@@ -1923,7 +1936,12 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
+        let frontier = self.frontier_backend(
+            repo,
+            frontier_launcher,
+            &model_confusion_plugin,
+            &self.cli.permission_mode,
+        );
         let mut session = SessionId::new(Uuid::new_v4().to_string());
         let stage_number = outcome.stage.number().saturating_sub(1).max(1);
         self.ui.stage(
@@ -2124,7 +2142,12 @@ impl<U: Ui> App<U> {
         }
 
         let model_confusion_plugin = ensure_model_confusion_plugin(repo, &self.ui)?;
-        let frontier = self.frontier_backend(repo, frontier_launcher, &model_confusion_plugin);
+        let frontier = self.frontier_backend(
+            repo,
+            frontier_launcher,
+            &model_confusion_plugin,
+            &self.cli.permission_mode,
+        );
         let mut session = SessionId::new(Uuid::new_v4().to_string());
         self.present_campaign(repo, &state);
         self.ui.stage(
@@ -2487,8 +2510,14 @@ impl<U: Ui> App<U> {
                 Box::new(client)
             }
         };
-        let frontier_agent = frontier_launcher
-            .map(|launcher| self.frontier_backend(repo, launcher, &model_confusion_plugin));
+        let frontier_agent = frontier_launcher.map(|launcher| {
+            self.frontier_backend(
+                repo,
+                launcher,
+                &model_confusion_plugin,
+                &self.cli.permission_mode,
+            )
+        });
         self.ui.change_name(state.change.as_deref());
 
         loop {
@@ -3801,6 +3830,9 @@ impl<U: Ui> App<U> {
     ) -> Result<()> {
         self.ui
             .warn("DRY RUN — no workflow state or subprocesses will be created");
+        if self.cli.supplied_contracts {
+            self.ui.info("First run a read-only frontier contract preflight; input conflicts stop planning and implementation");
+        }
         let mut dry_state = if self.cli.loop_workflow {
             RunState::new_campaign(
                 self.cli.request.clone(),
@@ -3901,6 +3933,9 @@ impl<U: Ui> App<U> {
     fn print_resume_dry_run(&self, state: &RunState, commands: &SkillCommands) -> Result<()> {
         self.ui
             .warn("DRY RUN — checkpoint and repository will not be changed");
+        if state.contracts.is_some() {
+            self.ui.info("Check recorded contract preflight first; frontier reviews changed or previously unreviewed inputs before further work");
+        }
         let next_stage = if self.cli.yolo && state.stage == Stage::ProposalCommit {
             Stage::Apply
         } else {

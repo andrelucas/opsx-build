@@ -131,6 +131,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$ASSIGNMENT_ROOT/calls"
 count=$(wc -l < "$ASSIGNMENT_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" "$prompt" > "$ASSIGNMENT_ROOT/prompt-$count"

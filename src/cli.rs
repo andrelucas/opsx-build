@@ -201,10 +201,9 @@ impl Cli {
                             return false;
                         }
                     }
-                    let bootstrap = args
-                        .request
-                        .as_deref()
-                        .is_some_and(|v| matches!(v, "bootstrap" | "execute" | "accept-changes"));
+                    let bootstrap = args.request.as_deref().is_some_and(|v| {
+                        matches!(v, "bootstrap" | "execute" | "accept-changes" | "preflight")
+                    });
                     if matches!(name, "--context" | "--define")
                         && !bootstrap
                         && !sidecar_context
@@ -213,7 +212,8 @@ impl Cli {
                         return false;
                     }
                     if matches!(name, "--loop" | "--no-loop" | "--max-iterations")
-                        && (args.interactive || args.request.as_deref() == Some("bootstrap"))
+                        && (args.interactive
+                            || matches!(args.request.as_deref(), Some("bootstrap" | "preflight")))
                     {
                         return false;
                     }
@@ -306,6 +306,29 @@ impl Cli {
         let (mut config, config_path) = load_config(&args)?;
         apply_legacy_environment(&mut config)?;
         let cli = resolve_values(args, config, config_path)?;
+        if cli.request == "preflight" {
+            if cli.resume
+                || cli.interactive
+                || cli.forget
+                || cli.continue_existing
+                || cli.test_connection.is_some()
+                || cli.update_skills
+                || cli.change.is_some()
+                || cli.direction.is_some()
+                || cli.sidecar
+                || cli.local_only
+                || cli.loop_workflow
+                || cli.rewind_target.is_some()
+                || cli.yes
+            {
+                anyhow::bail!("run `preflight` separately from campaign actions");
+            }
+            if cli.supplied_contracts && cli.contract_files.is_empty() {
+                anyhow::bail!("--supplied-contracts requires at least one --contract PATH");
+            }
+            validate_acceptance_options(&cli)?;
+            return Ok(cli);
+        }
         if cli.request == "accept-changes" {
             if cli.resume
                 || cli.interactive
@@ -475,7 +498,7 @@ impl Cli {
     args_override_self = true
 )]
 pub(crate) struct CliArgs {
-    /// Change request, `configure`, `autoconfigure`, `advance`, `bootstrap`, `execute`, `accept-changes`, `rewind`, or `check` (see `check --help`).
+    /// Change request, `configure`, `autoconfigure`, `preflight`, `advance`, `bootstrap`, `execute`, `accept-changes`, `rewind`, or `check` (see `check --help`).
     request: Option<String>,
 
     /// Git revision used by `opsx-build rewind` (defaults to `post-bootstrap`).
@@ -1166,7 +1189,8 @@ fn resolve_values(args: CliArgs, config: FileConfig, config_path: Option<PathBuf
         None => "advance".to_owned(),
     };
     let execute = request == "execute";
-    let uses_campaign_defaults = request != "bootstrap" && !args.interactive;
+    let uses_campaign_defaults =
+        !matches!(request.as_str(), "bootstrap" | "preflight") && !args.interactive;
     let request = if execute {
         "advance".to_owned()
     } else {

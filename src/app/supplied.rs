@@ -41,6 +41,102 @@ pub(super) fn displayed_stage_position(state: &RunState) -> Option<(usize, usize
 }
 
 impl<U: Ui> App<U> {
+    pub(super) fn contract_preflight(
+        &self,
+        repo: &Path,
+        launcher: &AgentLauncher,
+        contracts: &crate::contracts::SuppliedContracts,
+        context: Option<&Path>,
+        definitions: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let plugin = if self.cli.dry_run {
+            PathBuf::new()
+        } else {
+            ensure_model_confusion_plugin(repo, &self.ui)?
+        };
+        let mut launcher = launcher.clone();
+        if let AgentLauncher::Codex(launcher) = &mut launcher {
+            launcher.harness_sandbox = true;
+        }
+        let reviewer = self.frontier_backend(repo, &launcher, &plugin, "plan");
+        crate::preflight::run(
+            repo,
+            contracts,
+            context,
+            definitions,
+            reviewer.as_ref(),
+            &self.ui,
+            self.cli.dry_run,
+        )
+    }
+
+    pub(super) fn preflight(&self, repo: &Path) -> Result<()> {
+        let path = crate::git::metadata_path(repo, &self.ui, "opsx-build")?.join("last-run.json");
+        let saved = if path.exists() {
+            Some(load_state_file(&path)?)
+        } else {
+            None
+        };
+        let contracts = match self.capture_contracts(repo)? {
+            Some(contracts) => contracts,
+            None => {
+                let previous = saved.as_ref().and_then(|state| state.contracts.as_ref())
+                    .context("preflight requires supplied contracts from campaign settings, --supplied-contracts --contract PATH, or an existing supplied-contract checkpoint")?;
+                let (contracts, tests) = previous.paths();
+                // Inspect current maintainer edits without adopting them into the run.
+                let mut current = crate::contracts::SuppliedContracts::capture_with_inventory(
+                    repo,
+                    &contracts,
+                    &tests,
+                    previous.obligation_inventory.as_deref(),
+                )?;
+                current.acceptance = previous.acceptance.clone();
+                current
+            }
+        };
+        let context = self
+            .cli
+            .bootstrap_context
+            .clone()
+            .or_else(|| saved.as_ref().and_then(|state| state.context_path.clone()))
+            .or_else(|| {
+                repo.join("context.md")
+                    .is_file()
+                    .then(|| repo.join("context.md"))
+            });
+        let mut definitions = saved
+            .as_ref()
+            .map(|state| state.context_definitions.clone())
+            .unwrap_or_default();
+        definitions.extend(self.cli.bootstrap_defines.clone());
+        let launcher = AgentLauncher::from_connection(
+            &self.cli.frontier_connection,
+            self.cli.harness_sandbox,
+        )?;
+        let _guard = if self.cli.dry_run {
+            None
+        } else {
+            let policy = self
+                .cli
+                .operating_policy
+                .as_ref()
+                .map(|path| crate::operating_policy::Policy::read(&repo.join(path)))
+                .transpose()?
+                .unwrap_or_default();
+            let run = crate::operating_policy::Run::new(repo, policy, &self.ui)?;
+            let guard = Arc::new(run.open(None)?);
+            self.ui.set_operating_policy(guard.clone())?;
+            Some(guard)
+        };
+        self.contract_preflight(
+            repo,
+            &launcher,
+            &contracts,
+            context.as_deref(),
+            &definitions,
+        )
+    }
+
     pub(super) fn run_assignment(
         &self,
         repo: &Path,

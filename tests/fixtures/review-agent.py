@@ -17,6 +17,9 @@ if any(arg.startswith("/rename ") for arg in sys.argv):
 
 root = Path(os.environ["CONTRACT_TEST_ROOT"])
 prompt = sys.stdin.readline() if "stream-json" in sys.argv else "\n".join(sys.argv)
+if "CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY" in prompt:
+    print(json.dumps({'type': 'result', 'subtype': 'success', 'structured_output': {'opsx_status': 'READY', 'summary': 'Fixture contract preflight found consistent inputs'}}))
+    raise SystemExit
 with (root / "calls").open("a") as out:
     out.write("call\n")
 count = len((root / "calls").read_text().splitlines())

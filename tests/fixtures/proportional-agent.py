@@ -15,6 +15,21 @@ if any(arg.startswith("/rename ") for arg in sys.argv):
 
 root = Path(os.environ["PROPORTIONAL_ROOT"])
 prompt = sys.stdin.readline() if "stream-json" in sys.argv else "\n".join(sys.argv)
+if ("CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY" in prompt or
+        (os.environ.get("PROPORTIONAL_MODE") == "incomplete-preflight" and not Path(".git/opsx-build/last-run.json").exists())):
+    with (root / "preflights.jsonl").open("a") as out:
+        out.write(json.dumps({"prompt": prompt, "arguments": sys.argv}) + "\n")
+    status = "BLOCKED" if "CONTRADICTORY" in Path("contract.md").read_text() else "READY"
+    summary = ("contract.md#OWN-01 requires a successful UNAVAILABLE reply, but acceptance.sh:3 requires an unavailable error under the same reuse profile. The maintainer must reconcile the protected assertion before implementation."
+               if status == "BLOCKED" else "Reviewed contract.md, inventory.json and acceptance.sh. Consistent repair inputs; a failing seed is expected.")
+    mode = os.environ.get("PROPORTIONAL_MODE", "repair")
+    if mode == "edit-preflight":
+        Path("program.py").write_text("print('unauthorized correction')\n")
+    if mode == "incomplete-preflight":
+        status = "INCOMPLETE"
+        summary = "Acceptance oracle review remains unfinished."
+    print(json.dumps({"type": "result", "subtype": "success", "structured_output": {"opsx_status": status, "summary": summary}}))
+    raise SystemExit
 state = json.loads(Path(".git/opsx-build/last-run.json").read_text())
 stage = state["stage"]
 name = state["change"]

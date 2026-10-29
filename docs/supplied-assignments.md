@@ -13,6 +13,15 @@ remain authoritative. Conflicting authoritative inputs require a maintainer
 decision. Mistakes introduced in the generated assignment are runner work to
 repair.
 
+Run `opsx-build preflight` during campaign preparation to check the selected
+contracts against the actual protected acceptance assertions before delivery.
+The configured frontier connection reports concrete conflicts and possible
+maintainer corrections without editing campaign files or running tests. The
+same review gates bootstrap and advance automatically, reusing its report only
+while the declared inputs, context and final commands remain unchanged. See the
+[preflight instructions](../README.md#implementing-supplied-contracts) for input
+selection, reports and correction/resume behaviour.
+
 ## Proportional planning
 
 Fresh supplied-contract runs write assignments and concise briefs directly,

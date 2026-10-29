@@ -69,6 +69,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" > "$CONTRACT_TEST_ROOT/args-$count"
@@ -222,6 +227,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"
@@ -322,6 +332,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"
@@ -445,6 +460,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 case "$count" in
@@ -560,6 +580,9 @@ if '--version' in sys.argv: print('Claude fixture'); raise SystemExit
 if any(arg.startswith('/rename ') for arg in sys.argv): print(json.dumps({'type':'result', 'subtype':'success', 'result':'Renamed'})); raise SystemExit
 root = Path(os.environ['CONTRACT_TEST_ROOT'])
 prompt = sys.stdin.readline() if 'stream-json' in sys.argv else '\n'.join(sys.argv)
+if "CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY" in prompt:
+    print(json.dumps({'type': 'result', 'subtype': 'success', 'structured_output': {'opsx_status': 'READY', 'summary': 'Fixture contract preflight found consistent inputs'}}))
+    raise SystemExit
 with (root / 'calls').open('a') as out: out.write('call\n')
 count = len((root / 'calls').read_text().splitlines())
 (root / f'args-{count}').write_text(prompt)
@@ -646,6 +669,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 status=READY
@@ -795,7 +823,7 @@ fn a_cumulative_time_stop_during_acceptance_retains_an_incomplete_gate_and_its_p
     let f = Fixture::new();
     f.acceptance("printf 'started\\n'\nsleep 30\n");
     let policy = f.root.join("active-time.json");
-    fs::write(&policy, r#"{"max_active_seconds":1}"#).unwrap();
+    fs::write(&policy, r#"{"max_active_seconds":2}"#).unwrap();
     let option = format!("--operating-policy={}", policy.display());
     let result = f.run_with("pass", true, &[&option]);
     assert!(
@@ -1275,6 +1303,11 @@ for arg in "$@"; do
  case "$arg" in stream-json) streamed=true;; esac
 done
 if [ "$streamed" = true ]; then IFS= read -r prompt; fi
+case "$* $prompt" in
+ *"CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY"*)
+  printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"opsx_status":"READY","summary":"Fixture contract preflight found consistent inputs"}}'
+  exit 0;;
+esac
 printf 'call\n' >> "$CONTRACT_TEST_ROOT/calls"
 count=$(wc -l < "$CONTRACT_TEST_ROOT/calls" | tr -d ' ')
 printf '%s\n' "$@" "$prompt" > "$CONTRACT_TEST_ROOT/args-$count"

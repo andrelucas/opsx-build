@@ -182,6 +182,42 @@ The ordinary specification workflow remains the default. These options are
 campaign/CLI settings, rather than global TOML defaults. Sidecar operation is
 not supported by this workflow yet.
 
+Before preparing or launching delivery, the maintainer can check the campaign:
+
+```sh
+opsx-build preflight
+```
+
+This reads the saved campaign settings in `opsx-build.md`, or the supplied input
+selection from an existing checkpoint. A new packet can instead pass the same
+`--supplied-contracts`, `--contract`, `--obligation-inventory`, `--acceptance-file`
+and `--acceptance-command` options used for its build. `--context` and `--define`
+are also accepted. It needs no OpenSpec setup or existing bootstrap.
+
+Preflight checks input structure first, then uses the configured frontier
+connection to review the original contracts alongside the actual protected test
+assertions, gate drivers, fixtures and negative controls. It reports all concrete
+input conflicts it finds, with source locations, affected checks and suggested
+maintainer corrections. It only inspects and reports; it does not correct files,
+run tests, adopt inputs, change a checkpoint or start delivery. A failing repair
+baseline alone is not a contract defect. Claude uses plan permissions and Codex
+uses its read-only sandbox; repository changes invalidate any review result.
+
+Supplied-contract bootstrap, execute and advance workflows perform this check
+automatically before their first planning or implementation request. Resume also
+checks campaigns that have no recorded preflight. Unchanged declared inputs,
+context and final command settings reuse the report, including a blocked report,
+without another model request. Changed inputs require a fresh review. A blocked
+campaign stops before delivery and returns a nonzero exit status. Correct its
+inputs as maintainer; use `accept-changes` before resuming an existing checkpoint.
+Standalone preflight can inspect those edits before they are adopted. Reports
+live in private Git metadata at `opsx-build/contract-preflight.json`.
+
+`--dry-run preflight` validates the selected inputs and previews the review
+without invoking a model or writing a report. A preflight pass is a model's
+consistency review of the declared inputs; independent implementation review
+and the final acceptance commands remain required.
+
 New supplied-contract runs install version 2 of the bundled
 `opsx-supplied-contracts` schema. Delivery planning needs a short **proposal and
 tasks**; a separate design is optional. Explain the change, important decisions

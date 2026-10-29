@@ -445,7 +445,7 @@ pub fn legacy_metadata_dir<U: Ui>(repo: &Path, ui: &U) -> Result<PathBuf> {
     metadata_path(repo, ui, "ospx-build")
 }
 
-fn metadata_path<U: Ui>(repo: &Path, ui: &U, name: &str) -> Result<PathBuf> {
+pub(crate) fn metadata_path<U: Ui>(repo: &Path, ui: &U, name: &str) -> Result<PathBuf> {
     let spec = CommandSpec::new("git", repo).args(["rev-parse", "--git-path", name]);
     let output = ProcessRunner::new(ui).checked(&spec, "Locating run metadata")?;
     let path = PathBuf::from(output.stdout.trim());

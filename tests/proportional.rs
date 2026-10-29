@@ -129,6 +129,28 @@ else: raise AssertionError(sys.argv)
             .output()
             .unwrap()
     }
+    fn preflight(&self) -> Output {
+        self.command()
+            .args([
+                "--supplied-contracts",
+                "--contract=contract.md",
+                "--obligation-inventory=inventory.json",
+                "--acceptance-file=acceptance.sh",
+                "--acceptance-command=sh acceptance.sh",
+                "--acceptance-timeout-seconds=37",
+                "--frontier-model=frontier-preflight",
+                "preflight",
+            ])
+            .output()
+            .unwrap()
+    }
+    fn preflights(&self) -> Vec<Value> {
+        fs::read_to_string(self.root.join("preflights.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
     fn state(&self) -> Value {
         serde_json::from_slice(
             &fs::read(self.root.join("repo/.git/opsx-build/last-run.json")).unwrap(),
@@ -171,6 +193,7 @@ fn seeded_repair_has_one_delivery_review_report_and_independent_final_gate() {
         "{progress}"
     );
     let calls = f.calls();
+    assert_eq!(f.preflights().len(), 1);
     assert_eq!(calls.iter().filter(|c| c["stage"] == "verify").count(), 1);
     assert!(
         calls
@@ -203,6 +226,188 @@ fn seeded_repair_has_one_delivery_review_report_and_independent_final_gate() {
         1
     );
     assert_eq!(f.state()["stage"], "done");
+}
+
+#[test]
+fn maintainer_preflight_reports_conflict_and_bootstrap_reuses_the_stop_before_planning() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let contract = fs::read_to_string(repo.join("contract.md")).unwrap();
+    fs::write(
+        repo.join("contract.md"),
+        format!("{contract}\nCONTRADICTORY: resolve-delete must succeed with UNAVAILABLE.\n"),
+    )
+    .unwrap();
+    fs::write(repo.join("acceptance.sh"), "#!/bin/sh\n# Same reuse profile, after retirement.\n# resolve-delete must fail with OUTCOME_UNAVAILABLE.\nexit 1\n").unwrap();
+    let before = fs::read(repo.join("acceptance.sh")).unwrap();
+    let result = f.preflight();
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("BLOCKED during contract preflight"),
+        "{error}"
+    );
+    assert!(
+        error.contains("contract.md#OWN-01") && error.contains("acceptance.sh:3"),
+        "{error}"
+    );
+    assert_eq!(f.preflights().len(), 1);
+    assert!(
+        f.preflights()[0]["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "frontier-preflight")
+    );
+    let prompt = f.preflights()[0]["prompt"].as_str().unwrap().to_owned();
+    assert!(prompt.contains("negative controls") && prompt.contains("unchanged `retirement`"));
+    assert!(prompt.contains("Do not edit, generate, format, stage, commit, repair or correct"));
+    assert!(!repo.join(".git/opsx-build/last-run.json").exists());
+    assert!(!repo.join("automation").exists());
+
+    let bootstrap = f.execute("repair");
+    assert!(!bootstrap.status.success());
+    assert!(
+        String::from_utf8_lossy(&bootstrap.stderr).contains("BLOCKED during contract preflight")
+    );
+    assert_eq!(f.preflights().len(), 1);
+    assert!(f.calls().is_empty());
+    assert!(!repo.join("automation/slices/assignments.json").exists());
+    assert_eq!(fs::read(repo.join("acceptance.sh")).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(repo.join("program.py")).unwrap(),
+        "print('seed')\n"
+    );
+}
+
+#[test]
+fn successful_preflight_is_reused_until_inputs_or_commands_change() {
+    let f = Fixture::new();
+    Fixture::success(&f.preflight());
+    Fixture::success(&f.execute("repair"));
+    assert_eq!(f.preflights().len(), 1);
+    let checkpoint = fs::read(f.root.join("repo/.git/opsx-build/last-run.json")).unwrap();
+    fs::write(
+        f.root.join("repo/acceptance.sh"),
+        "#!/bin/sh\n# maintainer correction\nexit 0\n",
+    )
+    .unwrap();
+    Fixture::success(&f.command().arg("preflight").output().unwrap());
+    assert_eq!(f.preflights().len(), 2);
+    assert_eq!(
+        fs::read(f.root.join("repo/.git/opsx-build/last-run.json")).unwrap(),
+        checkpoint
+    );
+    let result = f.command().arg("--resume").output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("accept-changes"));
+    Fixture::success(&f.command().arg("accept-changes").output().unwrap());
+    Fixture::success(&f.command().arg("preflight").output().unwrap());
+    assert_eq!(f.preflights().len(), 2);
+    Fixture::success(
+        &f.command()
+            .args([
+                "--supplied-contracts",
+                "--contract=contract.md",
+                "--obligation-inventory=inventory.json",
+                "--acceptance-file=acceptance.sh",
+                "--acceptance-command=true",
+                "preflight",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(f.preflights().len(), 3);
+}
+
+#[test]
+fn preflight_rejects_reviewer_edits_and_unfinished_review() {
+    for mode in ["edit-preflight", "incomplete-preflight"] {
+        let f = Fixture::new();
+        let output = f
+            .command()
+            .env("PROPORTIONAL_MODE", mode)
+            .args([
+                "--supplied-contracts",
+                "--contract=contract.md",
+                "--acceptance-file=acceptance.sh",
+                "preflight",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(if mode == "edit-preflight" {
+                "changed repository files"
+            } else {
+                "unfinished"
+            }),
+            "{error}"
+        );
+        assert!(
+            !f.root
+                .join("repo/.git/opsx-build/contract-preflight.json")
+                .exists()
+        );
+        assert!(f.calls().is_empty());
+    }
+}
+
+#[test]
+fn preflight_missing_inputs_and_dry_run_never_dispatch_a_model() {
+    let f = Fixture::new();
+    Fixture::success(
+        &f.command()
+            .args([
+                "--supplied-contracts",
+                "--contract=contract.md",
+                "--acceptance-file=acceptance.sh",
+                "--dry-run",
+                "preflight",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(!f.root.join("repo/.git/opsx-build").exists());
+    fs::remove_file(f.root.join("repo/acceptance.sh")).unwrap();
+    let result = f.preflight();
+    assert!(!result.status.success());
+    assert!(f.preflights().is_empty());
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn advance_checks_changed_contracts_before_dispatching_delivery() {
+    let f = Fixture::new();
+    let settings = [
+        "--supplied-contracts",
+        "--contract=contract.md",
+        "--obligation-inventory=inventory.json",
+        "--acceptance-file=acceptance.sh",
+        "--acceptance-command=sh acceptance.sh",
+    ];
+    Fixture::success(
+        &f.command()
+            .args(settings)
+            .arg("bootstrap")
+            .output()
+            .unwrap(),
+    );
+    let calls = f.calls().len();
+    let path = f.root.join("repo/contract.md");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{text}\nCONTRADICTORY\n")).unwrap();
+    let result = f.command().args(settings).arg("advance").output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("BLOCKED during contract preflight"));
+    assert_eq!(f.calls().len(), calls);
+    assert_eq!(f.preflights().len(), 2);
+    assert!(!f.root.join("repo/openspec/changes/0001-delivery").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/program.py")).unwrap(),
+        "print('seed')\n"
+    );
 }
 
 #[test]
@@ -346,7 +551,8 @@ fn contradictory_input_stops_once_then_accepts_maintainer_edit_without_model_cal
     fs::write(&contract, format!("{source}\nCONTRADICTORY\n")).unwrap();
     let result = f.execute("repair");
     assert!(!result.status.success());
-    assert_eq!(f.calls().len(), 1);
+    assert_eq!(f.calls().len(), 0);
+    assert_eq!(f.preflights().len(), 1);
     fs::write(&contract, source).unwrap();
     let resume = f.command().arg("--resume").output().unwrap();
     assert!(!resume.status.success());

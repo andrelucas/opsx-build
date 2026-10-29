@@ -21,6 +21,7 @@ pub mod opencode;
 mod opencode_server;
 pub mod openspec;
 pub mod operating_policy;
+mod preflight;
 pub mod process;
 pub mod review;
 mod run_summary;

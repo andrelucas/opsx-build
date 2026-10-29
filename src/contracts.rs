@@ -76,6 +76,21 @@ pub(crate) struct SuppliedContracts {
 }
 
 impl SuppliedContracts {
+    pub(crate) fn preflight_inputs(&self) -> serde_json::Value {
+        serde_json::json!({
+            "files": self.inputs,
+            "obligation_inventory": self.obligation_inventory,
+            "commands": self.acceptance.as_ref().map(|gate| &gate.commands),
+            "timeout_seconds": self.acceptance.as_ref().map(|gate| gate.timeout_seconds),
+        })
+    }
+
+    pub(crate) fn check_preflight(&self, repo: &Path) -> Result<()> {
+        self.check_inputs(repo)?;
+        self.inventory(repo)?;
+        Ok(())
+    }
+
     pub fn paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let (contracts, acceptance): (Vec<_>, Vec<_>) =
             self.inputs.iter().partition(|i| i.contract);
