@@ -22,6 +22,8 @@ use crate::{
 };
 
 static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
+const MAX_DEPENDENCY_ENTRIES: usize = 4096;
+const MAX_DEPENDENCY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(unix)]
 extern "C" fn interrupt(signal: libc::c_int) {
@@ -110,8 +112,10 @@ impl History {
             shell_quote(&repo.to_string_lossy()),
             self.scope,
         );
+        text.push_str("Choose checks by coverage within this stage. Inspect what the required project gate actually runs. Do not run a standalone full suite and then a gate that already includes that suite on unchanged inputs. Use focused tests while developing, then one encompassing gate for final validation in this stage; add checks only for uncovered requirements, changed inputs, failures or an explicit fresh-check policy. Independent Verify still reviews the work and runs required fresh checks in its own stage; an Apply pass does not replace that review or those executions. The runner's final acceptance remains a separate execution even if the same gate passed earlier.\n");
         text.push_str("The helper executes /bin/sh -c, retains actual stdout/stderr and exit status under private Git metadata, and returns a JSON receipt with evidence paths. Keep secrets out of commands and logs. Use a stable key for the same check within this change. It may reuse only the latest successful receipt with identical execution inputs and intact logs; a failure never falls back to an older pass. Do not claim reused execution ran in this stage.\nAll tracked and non-ignored files in both repositories are inputs by default, including shared helpers, tests, build/dependency configuration and governing requirements. List ignored/external dependencies and fixtures in additional_inputs (paths relative to cwd or absolute), and all executable tools in tools. The helper fingerprints executable bytes; this does not discover transitive dependencies, libraries, services or toolchains. Use runtime unknown unless you establish that this complete execution boundary and runtime premises are stable; live services, clocks, native/system qualification or unknown impact require fresh execution (runtime live or unknown). Explain the premise in runtime_reason.\nFor an individual evidence-only file that the command does not consume, review_only may contain {\"path\":\"absolute/file/path\",\"reason\":\"why this command does not consume it\"}. Establish that boundary before declaring it. No directory/glob or blanket documentation exclusions; protected inputs cannot be excluded. These declarations are diagnostic claims for independent review, not coverage or acceptance waivers. An affected/shared input, missing dependency/tool identity, new failing evidence or an explicit fresh-check requirement requires execution; use runtime unknown to force it. Review source conditions, test adequacy and declared boundaries independently. Missing receipts do not fabricate failures or require unrelated checks. The runner's final acceptance commands, order and timeouts are unchanged and always independent of this cache.\n");
         text.push_str("Preserve the check's own exit status; do not hide failures behind a pipeline or trailing echo/tail. If the helper is unavailable or unsuitable for the required interface/sandbox, run the required check normally with existing permissions and report its actual outcome and limitations. No reusable receipt is claimed for that execution.\n");
+        text.push_str("Input fingerprinting is skipped when runtime is live/unknown or executable tools are undeclared, since those checks must run fresh. For reusable checks, dependency traversal is bounded to 4096 entries and 64 MiB; exceeding the budget disables reuse and executes the command normally. Declare actual dependencies, not entire mutable build/module caches merely to obtain a receipt. An incomplete fingerprint never certifies unchanged inputs.\n");
         let mut records = match latest_records(&directory, change) {
             Ok(records) => records,
             Err(error) => {
@@ -120,7 +124,10 @@ impl History {
             }
         };
         records.sort_by(|a, b| a.key.cmp(&b.key));
-        let current = (!records.is_empty()).then(|| repository_snapshots(&context, ui));
+        let current = records
+            .iter()
+            .any(|record| record.inputs.is_some())
+            .then(|| repository_snapshots(&context, ui));
         for record in records.iter().take(30) {
             text.push_str(&format!(
                 "\nCheck {}: {} in {}; recorded at {} during {}. Receipt: {}. stdout: {}; stderr: {}.\n",
@@ -407,14 +414,7 @@ fn run<U: Ui>(
             Some(format!("receipt history incomplete/unreadable: {error:#}")),
         ),
     };
-    let captured = capture(repo, context, &spec, ui);
-    let (inputs, mut limitations) = match captured {
-        Ok(inputs) => (Some(inputs), Vec::new()),
-        Err(error) => (
-            None,
-            vec![format!("execution inputs unavailable: {error:#}")],
-        ),
-    };
+    let mut limitations = Vec::new();
     if spec.runtime != Runtime::Stable {
         limitations.push(format!(
             "runtime premise is {:?}: {}",
@@ -424,6 +424,19 @@ fn run<U: Ui>(
     if spec.tools.is_empty() {
         limitations.push("executable tool/dependency boundary was not declared".into());
     }
+    // Fingerprints can only establish reuse. Fresh runtime checks still retain
+    // their actual command, status and logs without walking external caches.
+    let inputs = if limitations.is_empty() {
+        match capture(repo, context, &spec, ui) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                limitations.push(format!("execution inputs unavailable: {error:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut reasons = limitations.clone();
     reasons.extend(history_error);
     if let Some(prior) = &prior {
@@ -520,11 +533,12 @@ fn run<U: Ui>(
     }
     write_json(&record.path, &record)?;
     execute(&mut record)?;
-    match (&record.inputs, capture(repo, context, &record.spec, ui)) {
-        (Some(before), Ok(after)) if *before == after => {}
-        _ => record
+    if let Some(before) = &record.inputs
+        && !capture(repo, context, &record.spec, ui).is_ok_and(|after| *before == after)
+    {
+        record
             .reuse_limitations
-            .push("execution inputs changed during the check or could not be revalidated".into()),
+            .push("execution inputs changed during the check or could not be revalidated".into());
     }
     record.log_hashes = log_hashes(repo, &record.stdout, &record.stderr).ok();
     write_json(&record.path, &record)?;
@@ -593,11 +607,50 @@ fn repository_snapshots<U: Ui>(context: &Context, ui: &U) -> Result<BTreeMap<Pat
 fn capture<U: Ui>(repo: &Path, context: &Context, spec: &Spec, ui: &U) -> Result<Inputs> {
     let repositories = repository_snapshots(context, ui)?;
     let mut additional = Files::new();
+    let mut entries = 0;
+    let mut bytes = 0;
     for path in &context.protected {
-        collect_files(repo, &absolute(repo, path)?, &mut additional)?;
+        collect_files(
+            &absolute(repo, path)?,
+            &mut additional,
+            &mut entries,
+            &mut bytes,
+        )?;
     }
     for path in &spec.additional_inputs {
-        collect_files(repo, &absolute(&spec.cwd, path)?, &mut additional)?;
+        collect_files(
+            &absolute(&spec.cwd, path)?,
+            &mut additional,
+            &mut entries,
+            &mut bytes,
+        )?;
+    }
+    // Bound traversal before reading any dependency contents, then hash in
+    // batches rather than spawning one Git process per cache entry.
+    let paths = additional
+        .iter()
+        .filter(|(_, (hash, _))| hash.is_empty())
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    for batch in paths.chunks(128) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["hash-object", "--no-filters", "--"])
+            .args(batch)
+            .output()?;
+        let output_text = String::from_utf8(output.stdout)?;
+        let hashes = output_text.lines().collect::<Vec<_>>();
+        if !output.status.success()
+            || hashes.len() != batch.len()
+            || hashes
+                .iter()
+                .any(|hash| hash.len() < 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            bail!("incomplete dependency fingerprints");
+        }
+        for (path, hash) in batch.iter().zip(hashes) {
+            additional.get_mut(path).unwrap().0 = hash.to_owned();
+        }
     }
     let mut tools = BTreeMap::new();
     for tool in std::iter::once("/bin/sh").chain(spec.tools.iter().map(String::as_str)) {
@@ -629,7 +682,16 @@ fn capture<U: Ui>(repo: &Path, context: &Context, spec: &Spec, ui: &U) -> Result
     })
 }
 
-fn collect_files(repo: &Path, path: &Path, files: &mut Files) -> Result<()> {
+fn collect_files(
+    path: &Path,
+    files: &mut Files,
+    entries: &mut usize,
+    bytes: &mut u64,
+) -> Result<()> {
+    *entries += 1;
+    if *entries > MAX_DEPENDENCY_ENTRIES {
+        bail!("dependency fingerprint budget exceeded (4096 entries)");
+    }
     let name = path.to_str().context("dependency path is not UTF-8")?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
@@ -638,13 +700,14 @@ fn collect_files(repo: &Path, path: &Path, files: &mut Files) -> Result<()> {
     if metadata.is_dir() {
         files.insert(name.to_owned(), ("directory".into(), false));
         for entry in fs::read_dir(path)? {
-            collect_files(repo, &entry?.path(), files)?;
+            collect_files(&entry?.path(), files, entries, bytes)?;
         }
     } else if metadata.is_file() {
-        files.insert(
-            name.to_owned(),
-            (fingerprint(repo, path)?, executable(path)?),
-        );
+        *bytes = bytes.saturating_add(metadata.len());
+        if *bytes > MAX_DEPENDENCY_BYTES {
+            bail!("dependency fingerprint budget exceeded (64 MiB)");
+        }
+        files.insert(name.to_owned(), (String::new(), executable(path)?));
     } else {
         bail!("non-file dependency {} requires inspection", path.display());
     }

@@ -1091,6 +1091,13 @@ and evidence paths. A reused receipt points to the original execution; it never
 claims that the current stage reran the command. This works in both standard and
 supplied-contract modes and requires no new campaign input or obligation format.
 
+Within each stage, agents inspect the coverage of the required project gate and
+avoid running a standalone full suite followed by a gate containing that same
+suite on unchanged inputs. Focused development tests remain useful; extra checks
+are warranted for missing coverage, changed inputs, failures or explicit policy.
+Independent Verify still reviews the work and performs its required fresh checks.
+The runner's final acceptance remains a separate execution.
+
 Agents receive a preserved matching-version helper command:
 `opsx-build check --repo PATH --scope UUID`. It reads one JSON object on stdin:
 
@@ -1127,6 +1134,14 @@ may be declared as `{"path":"delivery.md","reason":"why this command does not
 consume it"}` in `review_only`. Directory/glob and blanket documentation exclusions
 are not supported; protected contracts and acceptance inputs cannot be excluded.
 These declarations remain claims for independent review, not new specifications.
+
+Checks with `unknown`/`live` runtime or undeclared tools skip input fingerprinting
+and run fresh, retaining actual status and logs. For checks eligible for reuse,
+dependency traversal is limited to 4,096 entries and 64 MiB, with file contents
+hashed in batches. If that budget is exceeded or any fingerprint is unavailable,
+the helper records the limitation and runs the command fresh without offering a
+partial snapshot for reuse. Declare actual dependencies rather than entire
+mutable build or module caches merely to obtain a receipt.
 
 Only the latest successful attempt for the same named check in the same change
 and run can be reused. Commands, working directories, timeouts, declared boundaries,

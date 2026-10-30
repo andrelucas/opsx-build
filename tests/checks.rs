@@ -290,6 +290,101 @@ fn unknown_live_and_undeclared_tool_premises_require_execution() {
 }
 
 #[test]
+fn fresh_runtime_checks_do_not_fingerprint_external_caches() {
+    let f = Fixture::new();
+    let cache = f.root.join("external-cache");
+    fs::create_dir(&cache).unwrap();
+    fs::write(cache.join("dependency"), "cached dependency\n").unwrap();
+    let bin = f.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let git = String::from_utf8(git.stdout).unwrap();
+    let marker = f.root.join("cache-fingerprints");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nfor arg do\n case \"$arg\" in '{}/'*) printf 'fingerprinted\\n' >> '{}' ;; esac\ndone\nexec '{}' \"$@\"\n",
+            cache.display(), marker.display(), git.trim(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for runtime in ["unknown", "live"] {
+        let mut spec = f.spec();
+        spec["runtime"] = runtime.into();
+        spec["additional_inputs"] = json!([cache]);
+        for _ in 0..2 {
+            let result = receipt(&f.run_with(&spec, |command| {
+                command.env("PATH", &path);
+            }));
+            assert_eq!(result["outcome"], "passed");
+            assert_eq!(result["executed"], true);
+            assert!(Fixture::record(&result)["inputs"].is_null());
+        }
+    }
+    assert!(
+        !marker.exists(),
+        "fresh checks traversed the external cache"
+    );
+    assert_eq!(f.count(), 4);
+}
+
+#[test]
+fn oversized_external_inputs_run_fresh_without_a_partial_cached_pass() {
+    let f = Fixture::new();
+    let cache = f.root.join("large-cache-file");
+    fs::File::create(&cache)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    let mut spec = f.spec();
+    spec["additional_inputs"] = json!([cache]);
+    for _ in 0..2 {
+        let result = f.run(&spec);
+        assert_eq!(result["outcome"], "passed");
+        assert_eq!(result["executed"], true);
+        assert!(Fixture::record(&result)["inputs"].is_null());
+        assert!(
+            result["reuse_limitations"]
+                .to_string()
+                .contains("fingerprint budget")
+        );
+    }
+    assert_eq!(f.count(), 2);
+}
+
+#[test]
+fn external_directory_entry_budget_also_forces_fresh_execution() {
+    let f = Fixture::new();
+    let cache = f.root.join("many-cache-entries");
+    fs::create_dir(&cache).unwrap();
+    for index in 0..4096 {
+        fs::write(cache.join(index.to_string()), "").unwrap();
+    }
+    let mut spec = f.spec();
+    spec["additional_inputs"] = json!([cache]);
+    for _ in 0..2 {
+        let result = f.run(&spec);
+        assert_eq!(result["outcome"], "passed");
+        assert_eq!(result["executed"], true);
+        assert!(Fixture::record(&result)["inputs"].is_null());
+        assert!(
+            result["reuse_limitations"]
+                .to_string()
+                .contains("fingerprint budget")
+        );
+    }
+    assert_eq!(f.count(), 2);
+}
+
+#[test]
 fn latest_failure_is_not_hidden_by_an_older_matching_pass() {
     let f = Fixture::new();
     let spec = f.spec();

@@ -964,6 +964,9 @@ fn check_receipts_survive_resume_in_both_modes_and_cannot_waive_the_same_final_c
         for count in 2..=5 {
             let prompt = fs::read_to_string(f.root.join(format!("args-{count}"))).unwrap();
             assert!(prompt.contains("RECORDED EXECUTION EVIDENCE"));
+            assert!(prompt.contains("Do not run a standalone full suite"));
+            assert!(prompt.contains("Independent Verify still reviews the work"));
+            assert!(prompt.contains("required fresh checks in its own stage"));
             assert!(prompt.contains("Execution boundary (diagnostic claim)"));
             assert!(prompt.contains("Receipt:"));
             if ordinary && count == 2 {
