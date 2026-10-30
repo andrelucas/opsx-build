@@ -39,6 +39,8 @@ pub enum StreamItem {
     Subagent(String),
     Tool(String),
     ToolResult(String),
+    Stdout(String),
+    Stderr(String),
     Lifecycle(String),
     Raw(String),
 }

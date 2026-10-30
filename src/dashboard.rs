@@ -435,6 +435,8 @@ impl StreamDashboard {
             StreamItem::Reasoning(text) => ("thinking", Color::DarkGrey, text),
             StreamItem::Tool(text) => ("tool", Color::Yellow, text),
             StreamItem::ToolResult(text) => ("result", Color::DarkGrey, text),
+            StreamItem::Stdout(text) => ("stdout", Color::DarkGrey, text),
+            StreamItem::Stderr(text) => ("stderr", Color::Yellow, text),
             StreamItem::Lifecycle(text) => ("event", Color::Magenta, text),
             StreamItem::Raw(text) => ("json", Color::DarkGrey, text),
         };
@@ -1516,6 +1518,36 @@ mod tests {
                 color: Color::DarkGrey,
             })
         );
+    }
+
+    #[test]
+    fn acceptance_output_keeps_stream_labels_and_literal_text() {
+        let mut dashboard = dashboard();
+        dashboard.push(&StreamItem::Stdout("**literal stdout**".into()));
+        dashboard.push(&StreamItem::Stderr("`literal stderr`".into()));
+        let lines = dashboard.render_lines_at(Instant::now());
+        let output = lines
+            .iter()
+            .filter(|line| line.source.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(output.len(), 2);
+        for (line, label, color, text) in [
+            (output[0], "stdout", Color::DarkGrey, "**literal stdout**"),
+            (output[1], "stderr", Color::Yellow, "`literal stderr`"),
+        ] {
+            assert_eq!(line.text, text);
+            assert_eq!(
+                line.source,
+                Some(SourceLabel {
+                    text: label.into(),
+                    color
+                })
+            );
+            let mut rendered = Vec::new();
+            draw_render_row(&mut rendered, 0, 80, line).unwrap();
+            let rendered = String::from_utf8(rendered).unwrap();
+            assert!(console::strip_ansi_codes(&rendered).contains(&format!("{label} {text}")));
+        }
     }
 
     #[test]

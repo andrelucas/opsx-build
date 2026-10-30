@@ -15,7 +15,7 @@ use crate::{
     git::{current_head, metadata_dir},
     process::{PauseRequested, configure_stream_process, kill_stream_process},
     state::Stage,
-    stream::StreamControl,
+    stream::{StreamControl, StreamItem},
     ui::Ui,
     verification::{Files, snapshot},
 };
@@ -149,9 +149,12 @@ impl AcceptanceGate {
                 self.commands.len()
             );
             ui.start_stream(&activity);
-            let execution = run_check(repo, &mut result, self.timeout_seconds, ui);
+            let execution = run_check(repo, &mut result, self.timeout_seconds, &activity, ui);
             let success = result.outcome == "passed";
-            ui.finish_stream(success, &activity);
+            ui.finish_stream(
+                success,
+                &format!("{activity} ({}s elapsed)", result.elapsed_ms / 1000),
+            );
             report.results.push(result);
             report.outcome = if success { "running" } else { "failed" }.to_owned();
             write_report(&report_path, &report)?;
@@ -224,7 +227,57 @@ fn tail(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U) -> Result<()> {
+/// Read the evidence files without putting pipes or output backpressure in the check's path.
+struct LiveOutput {
+    file: File,
+    pending: Vec<u8>,
+}
+
+impl LiveOutput {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: File::open(path)?,
+            pending: Vec::new(),
+        })
+    }
+
+    fn forward<U: Ui>(
+        &mut self,
+        ui: &U,
+        item: fn(String) -> StreamItem,
+        finished: bool,
+    ) -> Result<()> {
+        loop {
+            // Bound each poll's work so noisy checks still honour controls and timeouts.
+            let mut bytes = [0; 8192];
+            let count = self.file.read(&mut bytes)?;
+            self.pending.extend_from_slice(&bytes[..count]);
+            let end = if finished && count == 0 {
+                self.pending.len()
+            } else {
+                self.pending
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(0, |index| index + 1)
+            };
+            for line in String::from_utf8_lossy(&self.pending[..end]).lines() {
+                ui.stream_item(&item(line.to_owned()));
+            }
+            self.pending.drain(..end);
+            if !finished || count == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn run_check<U: Ui>(
+    repo: &Path,
+    result: &mut CheckResult,
+    timeout: u64,
+    activity: &str,
+    ui: &U,
+) -> Result<()> {
     let mut command = Command::new("/bin/sh");
     command
         .args(["-c", &result.command])
@@ -232,6 +285,8 @@ fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U)
         .stdin(Stdio::null())
         .stdout(File::create(&result.stdout)?)
         .stderr(File::create(&result.stderr)?);
+    let mut stdout = LiveOutput::open(&result.stdout)?;
+    let mut stderr = LiveOutput::open(&result.stderr)?;
     configure_stream_process(&mut command);
     let started = Instant::now();
     let mut child = match command.spawn() {
@@ -241,6 +296,7 @@ fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U)
             return Ok(());
         }
     };
+    let mut last_elapsed = None;
     let execution = (|| {
         loop {
             if let Some(guard) = ui.operating_policy()
@@ -248,6 +304,13 @@ fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U)
             {
                 result.outcome = "operating-policy stop; incomplete".into();
                 return Err(error);
+            }
+            stdout.forward(ui, StreamItem::Stdout, false)?;
+            stderr.forward(ui, StreamItem::Stderr, false)?;
+            let elapsed = started.elapsed().as_secs();
+            if last_elapsed != Some(elapsed) {
+                ui.stream_progress(&format!("{elapsed}s elapsed · {activity}"));
+                last_elapsed = Some(elapsed);
             }
             if let Some(status) = child.try_wait().context("waiting for acceptance check")? {
                 result.exit_code = status.code();
@@ -278,10 +341,14 @@ fn run_check<U: Ui>(repo: &Path, result: &mut CheckResult, timeout: u64, ui: &U)
     // Also stop descendants if a driver exits without joining them.
     let cleanup = kill_stream_process(&mut child);
     let reaped = child.wait();
+    let output = stdout
+        .forward(ui, StreamItem::Stdout, true)
+        .and_then(|()| stderr.forward(ui, StreamItem::Stderr, true));
     result.elapsed_ms = started.elapsed().as_millis();
     execution?;
     cleanup.context("stopping acceptance process group")?;
     reaped.context("reaping acceptance process")?;
+    output.context("streaming acceptance output")?;
     Ok(())
 }
 
@@ -290,7 +357,13 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    struct ControlUi(Mutex<Option<StreamControl>>);
+    #[derive(Default)]
+    struct ControlUi {
+        control: Mutex<Option<StreamControl>>,
+        items: Mutex<Vec<StreamItem>>,
+        progress: Mutex<Vec<String>>,
+        release: Option<PathBuf>,
+    }
     impl Ui for ControlUi {
         fn banner(&self, _: &str) {}
         fn change_name(&self, _: Option<&str>) {}
@@ -303,11 +376,30 @@ mod tests {
         fn debug(&self, _: &str) {}
         fn debug_prompt(&self, _: &str, _: &str) {}
         fn start_stream(&self, _: &str) {}
+        fn stream_progress(&self, message: &str) {
+            self.progress.lock().unwrap().push(message.to_owned());
+        }
         fn poll_stream(&self) -> StreamControl {
-            self.0.lock().unwrap().take().unwrap_or_default()
+            if let Some(release) = &self.release {
+                let items = self.items.lock().unwrap();
+                let progress = self.progress.lock().unwrap();
+                if items.contains(&StreamItem::Stdout("first".into()))
+                    && items.contains(&StreamItem::Stderr("warning".into()))
+                    && progress.iter().any(|message| {
+                        message.split_once("s elapsed").is_some_and(|(seconds, _)| {
+                            seconds.parse::<u64>().is_ok_and(|seconds| seconds >= 1)
+                        })
+                    })
+                {
+                    fs::write(release, "continue").unwrap();
+                }
+            }
+            self.control.lock().unwrap().take().unwrap_or_default()
         }
         fn stream_message_sent(&self, _: &str) {}
-        fn stream_item(&self, _: &crate::stream::StreamItem) {}
+        fn stream_item(&self, item: &StreamItem) {
+            self.items.lock().unwrap().push(item.clone());
+        }
         fn finish_stream(&self, _: bool, _: &str) {}
         fn finish_dashboard(&self) {}
         fn output(&self, _: &str, _: &str) {}
@@ -336,7 +428,11 @@ mod tests {
                 &root,
                 &mut result,
                 60,
-                &ControlUi(Mutex::new(Some(control))),
+                "Acceptance check 1/1: sleep 30",
+                &ControlUi {
+                    control: Mutex::new(Some(control)),
+                    ..Default::default()
+                },
             )
             .unwrap_err();
             assert_eq!(error.downcast_ref::<PauseRequested>().is_some(), pause);
@@ -360,7 +456,7 @@ mod tests {
                 .success()
         );
         fs::write(root.join("product"), "original").unwrap();
-        let ui = ControlUi(Mutex::new(None));
+        let ui = ControlUi::default();
         let mut gate = AcceptanceGate::new(
             vec![
                 "true".to_owned(),
@@ -383,6 +479,78 @@ mod tests {
                 .contains("changed tracked or non-ignored product inputs")
         );
         assert!(!gate.is_current(&root, None, &ui).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn output_and_elapsed_time_are_visible_before_the_check_exits() {
+        let root = std::env::temp_dir().join(format!("opsx-check-live-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let ui = ControlUi {
+            release: Some(root.join("release")),
+            ..Default::default()
+        };
+        let mut result = CheckResult {
+            command: "printf 'first\\n'; printf 'warning\\n' >&2; while [ ! -f release ]; do sleep 0.02; done; printf 'last'; printf 'tail' >&2; exit 17".into(),
+            outcome: "running".into(),
+            exit_code: None,
+            elapsed_ms: 0,
+            stdout: root.join("stdout"),
+            stderr: root.join("stderr"),
+        };
+        run_check(&root, &mut result, 3, "Acceptance check 1/1", &ui).unwrap();
+        assert_eq!(result.outcome, "failed");
+        assert_eq!(result.exit_code, Some(17));
+        assert!(result.elapsed_ms >= 1000);
+        assert_eq!(fs::read(&result.stdout).unwrap(), b"first\nlast");
+        assert_eq!(fs::read(&result.stderr).unwrap(), b"warning\ntail");
+        let items = ui.items.lock().unwrap();
+        let stdout = items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::Stdout(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let stderr = items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::Stderr(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stdout, ["first", "last"]);
+        assert_eq!(stderr, ["warning", "tail"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_output_preserves_split_utf8_and_flushes_the_final_partial_line_once() {
+        let root = std::env::temp_dir().join(format!("opsx-check-output-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("stdout");
+        let line = format!("{}é", "x".repeat(8191));
+        let text = format!("{line}\nfinal partial line");
+        fs::write(&path, &text).unwrap();
+        let mut output = LiveOutput::open(&path).unwrap();
+        let ui = ControlUi::default();
+        output.forward(&ui, StreamItem::Stdout, false).unwrap();
+        assert!(ui.items.lock().unwrap().is_empty());
+        output.forward(&ui, StreamItem::Stdout, false).unwrap();
+        assert_eq!(
+            *ui.items.lock().unwrap(),
+            [StreamItem::Stdout(line.clone())]
+        );
+        output.forward(&ui, StreamItem::Stdout, true).unwrap();
+        output.forward(&ui, StreamItem::Stdout, true).unwrap();
+        assert_eq!(
+            *ui.items.lock().unwrap(),
+            [
+                StreamItem::Stdout(line),
+                StreamItem::Stdout("final partial line".into())
+            ]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
         fs::remove_dir_all(root).unwrap();
     }
 }

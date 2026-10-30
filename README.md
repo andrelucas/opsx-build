@@ -317,6 +317,13 @@ over a pipeline that might hide the test process's exit status. Do not put
 credentials in command strings. Configure records agreed commands without
 executing them.
 
+While each acceptance command runs, the dashboard shows its elapsed time and
+streams its output as `stdout` and `stderr` rows, independently of agent stream
+filters or `--verbose`. The same output appears as linear text outside the
+dashboard. Complete, separate output logs remain in the acceptance evidence
+directory. Output redirected by the check into its own files remains there;
+the runner displays only what the command writes to stdout and stderr.
+
 The runner executes the gate after successful Verify on the terminal `9999`
 slice, or on a standalone change without an agenda, before Archive. It does not
 run final checks during bootstrap or intermediate slices. A failing check goes

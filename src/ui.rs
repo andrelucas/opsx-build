@@ -84,6 +84,8 @@ pub trait Ui {
     fn debug(&self, message: &str);
     fn debug_prompt(&self, label: &str, prompt: &str);
     fn start_stream(&self, message: &str);
+    /// Update the current activity without resetting stream controls.
+    fn stream_progress(&self, _message: &str) {}
     /// Poll dashboard input for a command to send to the current subprocess.
     fn poll_stream(&self) -> StreamControl;
     /// Report that a queued message was written to the subprocess input pipe.
@@ -439,6 +441,12 @@ impl Ui for TerminalUi {
         }
     }
 
+    fn stream_progress(&self, message: &str) {
+        if let Some(dashboard) = self.state.lock().unwrap().dashboard.as_mut() {
+            dashboard.start_activity(message);
+        }
+    }
+
     fn poll_stream(&self) -> StreamControl {
         self.state
             .lock()
@@ -468,6 +476,8 @@ impl Ui for TerminalUi {
             StreamItem::Subagent(text) => ("agent", Style::new().blue(), text),
             StreamItem::Tool(text) => ("tool", Style::new().yellow(), text),
             StreamItem::ToolResult(text) => ("result", Style::new().dim(), text),
+            StreamItem::Stdout(text) => ("stdout", Style::new().dim(), text),
+            StreamItem::Stderr(text) => ("stderr", Style::new().yellow(), text),
             StreamItem::Lifecycle(text) => ("event", Style::new().magenta(), text),
             StreamItem::Raw(text) => ("json", Style::new().dim(), text),
         };

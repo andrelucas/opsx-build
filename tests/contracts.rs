@@ -1502,13 +1502,17 @@ fn completed_bootstrap_handoff_keeps_the_original_input_versions() {
 #[test]
 fn supplied_acceptance_failure_repairs_then_reruns_before_archive() {
     let fixture = Fixture::new();
-    fixture.acceptance("echo 'fixed public expectation'\ntest -f implementation.ready\n");
+    fixture.acceptance("echo 'fixed public expectation'\necho 'public warning' >&2\ntest -f implementation.ready\n");
     let result = fixture.run("repair-gate", true);
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let progress = String::from_utf8_lossy(&result.stderr);
+    assert!(progress.contains("stdout fixed public expectation"));
+    assert!(progress.contains("stderr public warning"));
+    assert!(progress.contains("s elapsed)"));
     assert_eq!(fixture.calls(), 4);
     assert_eq!(fixture.state()["stage"], "complete");
     let reports = fixture.acceptance_reports();
