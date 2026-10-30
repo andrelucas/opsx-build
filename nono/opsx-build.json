@@ -47,6 +47,7 @@
       "filesystem": {
         "allow": [
           "$XDG_CACHE_HOME/go-build",
+          "$XDG_CACHE_HOME/gopls",
           "$XDG_CACHE_HOME/pip",
           "/tmp",
           "$HOME/.ccache",
@@ -69,6 +70,7 @@
         "allow": [
           "$HOME/Library/Keychains",
           "$HOME/Library/Caches/go-build",
+          "$HOME/Library/Caches/gopls",
           "$HOME/Library/Caches/pip"
         ],
         "bypass_protection": ["$HOME/Library/Keychains"]

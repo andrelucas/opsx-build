@@ -31,6 +31,42 @@ def run(command, cwd, timeout):
     return output.strip()
 
 
+def gopls_check(scratch, timeout):
+    cache_home = os.environ.get('GOPLSCACHE')
+    if not cache_home:
+        if sys.platform == 'darwin':
+            cache_home = Path.home() / 'Library/Caches'
+        else:
+            cache_home = os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache'
+    cache = Path(cache_home) / 'gopls'
+    print(f'Gopls cache: {cache}', flush=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix='opsx-preflight-', dir=cache) as probe:
+        probe.write(b'preflight\n')
+        probe.flush()
+        if Path(probe.name).read_bytes() != b'preflight\n':
+            raise ValueError('gopls cache read/write probe failed')
+    fixture = scratch / 'gopls'
+    fixture.mkdir()
+    (fixture / 'go.mod').write_text('module example.invalid/opsx-preflight\n\ngo 1.21\n')
+    source = fixture / 'main.go'
+    source.write_text('''package main
+
+import "fmt"
+
+var proof int = "opsx-gopls-diagnostic"
+
+func main() {
+\tfmt.Println(proof)
+}
+''')
+    output = run(['gopls', 'check', str(source)], fixture, timeout)
+    if 'permission denied' in output.lower():
+        raise ValueError('gopls reported permission denied')
+    if str(source) + ':' not in output or 'cannot use "opsx-gopls-diagnostic"' not in output:
+        raise ValueError('gopls did not report the expected Go diagnostic')
+
+
 def inside(args):
     campaign = args.campaign.resolve()
     failures = []
@@ -49,6 +85,7 @@ def inside(args):
         run([executable, *version_args], campaign, args.timeout)
     for name, version_args in [
         ('go', ['version']),
+        ('gopls', ['version']),
         ('protoc', ['--version']),
         ('protoc-gen-go', ['--version']),
         ('protoc-gen-go-grpc', ['--version']),
@@ -59,6 +96,7 @@ def inside(args):
         ['git', 'rev-parse', '--git-path', 'opsx-build'], campaign, args.timeout))
     with tempfile.TemporaryDirectory(prefix='opsx-preflight-') as temporary:
         scratch = Path(temporary)
+        check('Gopls cache read/write and diagnostics', lambda: gopls_check(scratch, args.timeout))
         def git_commit():
             run(['git', 'init', '-q', str(scratch)], campaign, args.timeout)
             (scratch / 'proof.txt').write_text('preflight\n')

@@ -1368,7 +1368,9 @@ nono run --profile /path/to/opsx-build/nono/opsx-build.json --allow-cwd -- \
 
 The bundled profile allows network access and Go's default module downloads,
 checksum database (`~/go/pkg/sumdb`), installed tools (`~/go/bin`), and build
-cache on macOS and Linux, plus the Buf cache (`~/.cache/buf`). On Linux, it
+cache on macOS and Linux, plus the Buf cache (`~/.cache/buf`). It also grants
+read/write access to gopls's separate cache (`$XDG_CACHE_HOME/gopls`, normally
+`~/.cache/gopls`, on Linux; `~/Library/Caches/gopls` on macOS). On Linux, it
 also grants temporary-file access, ccache state, and read access to Fedora's
 compiler helpers, headers, Python wheels, MIME database, and certificate stores.
 Read access to `/proc` lets child agent runtimes inspect their own process state
@@ -1426,12 +1428,15 @@ actual named worker and frontier connections; omitting it skips model checks
 and prints that omission. Connection checks make real model requests and test
 one harmless shell-tool round trip using the configured models and environments.
 
-The preflight reports the PATH-selected Go, `protoc`, `protoc-gen-go`, and
+The preflight reports the PATH-selected Go, `gopls`, `protoc`, `protoc-gen-go`, and
 `protoc-gen-go-grpc` paths (including resolved symlink targets), and executes
 each version command inside the sandbox. Missing or blocked tools fail the
-preflight, even before Go modules exist. It also checks Git configuration and
-metadata, a commit in a disposable
-repository (excluding hooks and signing), OpenSpec startup/discovery, configuration
+preflight, even before Go modules exist. It also checks gopls cache read/write
+access and a real diagnostic on a disposable Go module.
+The diagnostic check rejects permission errors even when gopls exits zero.
+`GOPLSCACHE` overrides the cache base directory; custom locations need their own
+sandbox grants. Other checks cover Git configuration and metadata, a commit in a
+disposable repository (excluding hooks and signing), OpenSpec startup/discovery, configuration
 resolution, and each Go module's selected toolchain, writable caches and compiler.
 It does not initialize OpenSpec, advance a campaign, change project files, or
 commit in the campaign repository. Toolchain resolution may download into shared
