@@ -1108,17 +1108,29 @@ done
     }
 
     #[test]
-    fn model_turn_recovery_continues_same_thread_and_obeys_retry_budget() {
+    fn codex_turn_recovery_continues_same_thread_and_obeys_retry_budget() {
         let model_turn_error = json!({
             "error": {"code": 400, "metadata": {"raw":
                 "Requests ending with a model turn are not supported."}}
         })
         .to_string();
-        for (message, failures, retries, expected_turns, succeeds) in [
-            (model_turn_error.as_str(), 1, 1, 2, true),
-            (model_turn_error.as_str(), 2, 1, 2, false),
-            (model_turn_error.as_str(), 1, 0, 1, false),
-            ("Request contains an invalid argument.", 1, 2, 1, false),
+        let model_turn_error = json!({"message": model_turn_error});
+        let overload_error = json!({
+            "message": "Selected model is at capacity. Please try a different model.",
+            "codexErrorInfo": "serverOverloaded"
+        });
+        for (error, failures, retries, expected_turns, succeeds) in [
+            (model_turn_error.clone(), 1, 1, 2, true),
+            (model_turn_error.clone(), 2, 1, 2, false),
+            (model_turn_error, 1, 0, 1, false),
+            (overload_error, 1, 1, 2, true),
+            (
+                json!({"message": "Request contains an invalid argument."}),
+                1,
+                2,
+                1,
+                false,
+            ),
         ] {
             let directory =
                 std::env::temp_dir().join(format!("opsx-codex-user-turn-{}", Uuid::new_v4()));
@@ -1129,7 +1141,7 @@ done
             let failure = json!({
                 "method": "turn/completed",
                 "params": {"threadId": "actual-thread", "turn": {
-                    "id": "turn-%s", "status": "failed", "error": {"message": message}
+                    "id": "turn-%s", "status": "failed", "error": error
                 }}
             })
             .to_string()
@@ -1170,7 +1182,12 @@ done
                 assert_eq!(result.session_id.as_deref(), Some("actual-thread"));
                 assert_eq!(result.signal, crate::backend::StageSignal::Ready);
             } else {
-                assert!(result.unwrap_err().to_string().contains(message));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains(error["message"].as_str().unwrap())
+                );
             }
             let requests: Vec<Value> = std::fs::read_to_string(directory.join("requests.jsonl"))
                 .unwrap()
@@ -1206,7 +1223,12 @@ done
             }
             if let Some(recovery) = turns.get(1) {
                 let prompt = recovery["params"]["input"][0]["text"].as_str().unwrap();
-                assert!(prompt.contains("This user message supplies the required continuation"));
+                let reason = if error["codexErrorInfo"] == "serverOverloaded" {
+                    "The preceding turn was interrupted by a transient provider or network failure."
+                } else {
+                    "This user message supplies the required continuation"
+                };
+                assert!(prompt.contains(reason));
                 assert!(prompt.contains("Preserve correct partial work"));
                 assert!(prompt.contains(StageProtocol::Ready.json_schema()));
             }

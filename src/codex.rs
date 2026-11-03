@@ -1379,6 +1379,8 @@ fn classify_turn_error(details: Value) -> CodexTurnError {
     ]
     .iter()
     .any(|marker| lowercase.contains(marker));
+    let server_overloaded =
+        details.get("codexErrorInfo").and_then(Value::as_str) == Some("serverOverloaded");
     let transient = [
         "rate limit",
         "rate_limit",
@@ -1395,7 +1397,8 @@ fn classify_turn_error(details: Value) -> CodexTurnError {
         "504",
     ]
     .iter()
-    .any(|marker| lowercase.contains(marker));
+    .any(|marker| lowercase.contains(marker))
+        || server_overloaded;
     CodexTurnError {
         message: format!("Codex turn failed: {message}"),
         details,
