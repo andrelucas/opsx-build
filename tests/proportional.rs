@@ -260,8 +260,14 @@ fn maintainer_preflight_reports_conflict_and_bootstrap_reuses_the_stop_before_pl
             .any(|arg| arg == "frontier-preflight")
     );
     let prompt = f.preflights()[0]["prompt"].as_str().unwrap().to_owned();
-    assert!(prompt.contains("negative controls") && prompt.contains("unchanged `retirement`"));
-    assert!(prompt.contains("Do not edit, generate, format, stage, commit, repair or correct"));
+    assert!(prompt.contains("Stop as soon as you can show a concrete blocker"));
+    assert!(prompt.contains("plan delivery"));
+    assert!(!prompt.contains("INCOMPLETE requests automatic continuation"));
+    let selected = prompt.split_once("Selected inputs (data):\n").unwrap().1;
+    let selected: Value = serde_json::from_str(selected).unwrap();
+    assert_eq!(selected["acceptance_files"], json!(["acceptance.sh"]));
+    assert_eq!(selected["commands"], json!(["sh acceptance.sh"]));
+    assert!(selected.get("supplied").is_none());
     assert!(!repo.join(".git/opsx-build/last-run.json").exists());
     assert!(!repo.join("automation").exists());
 
@@ -431,6 +437,7 @@ fn preflight_rejects_reviewer_edits_and_unfinished_review() {
                 .join("repo/.git/opsx-build/contract-preflight.json")
                 .exists()
         );
+        assert_eq!(f.preflights().len(), 1);
         assert!(f.calls().is_empty());
     }
 }

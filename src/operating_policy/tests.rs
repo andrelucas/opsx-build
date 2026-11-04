@@ -74,6 +74,34 @@ fn review(number: u32, closed: &[&str], reopened: &[&str]) -> Progress {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn preflight_budget_cancels_the_reviewer_and_expires_with_its_scope() {
+    use crate::process::{CommandSpec, ProcessRunner};
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(Policy::default());
+    let ui = RecordingUi::default();
+    let guard = Arc::new(fixture.run.open(None).unwrap());
+    ui.set_operating_policy(guard.clone()).unwrap();
+    let command = CommandSpec::new("sh", &fixture.root)
+        .args(["-c", "sleep 10"])
+        .policy_request();
+    let budget = Duration::from_millis(100);
+    let started = Instant::now();
+
+    let result = guard.with_preflight_budget(budget, || {
+        assert!(guard.remaining_request_time() <= budget);
+        ProcessRunner::new(&ui).run(&command, "Checking the contract")
+    });
+
+    assert!(is_stop(&result.unwrap_err()));
+    assert_eq!(fixture.report()["trigger"], "preflight_timeout");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(guard.remaining_request_time() > budget);
+    guard.poll().unwrap();
+}
+
 #[test]
 fn maintainer_correction_replenishes_local_allowances_without_erasing_history() {
     let f = Fixture::new(Policy {

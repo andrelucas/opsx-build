@@ -15,8 +15,7 @@ if any(arg.startswith("/rename ") for arg in sys.argv):
 
 root = Path(os.environ["PROPORTIONAL_ROOT"])
 prompt = sys.stdin.readline() if "stream-json" in sys.argv else "\n".join(sys.argv)
-if ("CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY" in prompt or
-        (os.environ.get("PROPORTIONAL_MODE") == "incomplete-preflight" and not Path(".git/opsx-build/last-run.json").exists())):
+if "CONTRACT PREFLIGHT — READ ONLY, REPORT ONLY" in prompt:
     with (root / "preflights.jsonl").open("a") as out:
         out.write(json.dumps({"prompt": prompt, "arguments": sys.argv}) + "\n")
     status = "BLOCKED" if "CONTRADICTORY" in Path("contract.md").read_text() else "READY"

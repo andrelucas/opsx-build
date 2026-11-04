@@ -882,6 +882,10 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                 }
             });
             match attempt {
+                Ok(TurnOutcome::Complete(result)) if protocol == StageProtocol::Preflight => {
+                    return Ok(result);
+                }
+                Err(error) if protocol == StageProtocol::Preflight => return Err(error),
                 Ok(TurnOutcome::Complete(result)) if result.signal == StageSignal::Incomplete => {
                     if let Some(guard) = self.ui.operating_policy() {
                         guard.incomplete_stage(&result)?;

@@ -1,5 +1,5 @@
 //! Read-only review of supplied requirements before any delivery work.
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use crate::{
     backend::{AgentBackend, SessionId, SessionMode, StageProtocol, StageSignal},
     bootstrap::render_context_template,
-    claude::stage_prompt,
     contracts::SuppliedContracts,
     git::{current_head, metadata_path},
     process::{CommandSpec, ProcessRunner},
@@ -16,6 +15,7 @@ use crate::{
     verification::{changed_paths, snapshot},
 };
 
+const REVIEW_BUDGET: Duration = Duration::from_secs(120);
 const INSTRUCTIONS: &str = include_str!("../assets/contract-preflight.md");
 
 #[derive(Serialize, Deserialize)]
@@ -83,25 +83,42 @@ pub(crate) fn run<U: Ui>(
         ui.info("Reusing contract preflight for unchanged supplied inputs");
         report
     } else {
-        ui.info("Contract preflight · frontier · read-only review of requirements and acceptance assertions");
+        ui.info("Contract preflight · frontier · input validity and obvious omissions (2-minute review budget)");
         let before = snapshot(repo, ui)?;
         let head = current_head(repo, ui)?;
         let index = index_diff(repo, ui)?;
-        let selected = json!({"supplied": inputs["supplied"], "context": inputs["context"]});
-        let prompt = stage_prompt(
-            "",
-            &format!("{INSTRUCTIONS}\n\nSelected inputs (data):\n{selected}"),
-            StageProtocol::Ready,
+        let (mut contract_paths, mut acceptance_paths) = contracts.paths();
+        for path in contract_paths.iter_mut().chain(&mut acceptance_paths) {
+            if let Ok(relative) = path.strip_prefix(repo) {
+                *path = relative.to_owned();
+            }
+        }
+        let selected = json!({
+            "contracts": contract_paths,
+            "acceptance_files": acceptance_paths,
+            "obligation_inventory": inputs["supplied"]["obligation_inventory"],
+            "commands": inputs["supplied"]["commands"],
+            "acceptance_timeout_seconds": inputs["supplied"]["timeout_seconds"],
+            "context": inputs["context"],
+        });
+        let prompt = format!(
+            "{INSTRUCTIONS}\nReview budget: {} seconds.\n\nSelected inputs (data):\n{selected}",
+            REVIEW_BUDGET.as_secs()
         );
-        let result = reviewer.invoke(
-            SessionMode::New {
-                id: SessionId::new(uuid::Uuid::new_v4().to_string()),
-                name: Some("contract-preflight".into()),
-            },
-            &prompt,
-            "Frontier is checking the campaign contracts and acceptance inputs",
-            StageProtocol::Ready,
-        );
+        let guard = ui
+            .operating_policy()
+            .context("contract preflight requires operating-policy accounting")?;
+        let result = guard.with_preflight_budget(REVIEW_BUDGET, || {
+            reviewer.invoke(
+                SessionMode::New {
+                    id: SessionId::new(uuid::Uuid::new_v4().to_string()),
+                    name: Some("contract-preflight".into()),
+                },
+                &prompt,
+                "Frontier is checking the campaign contracts and acceptance inputs",
+                StageProtocol::Preflight,
+            )
+        });
         contracts.check_inputs(repo)?;
         let after = snapshot(repo, ui)?;
         let changed = changed_paths(&before, &after);
@@ -112,7 +129,7 @@ pub(crate) fn run<U: Ui>(
                 changed.join(", ")
             );
         }
-        let result = result?;
+        let result = result.context("contract preflight did not finish; no pass recorded")?;
         if let Some(context) = inputs["context"].as_object() {
             let current = fs::read_to_string(context["path"].as_str().unwrap())?;
             if render_context_template(&current, definitions)? != context["text"].as_str().unwrap()

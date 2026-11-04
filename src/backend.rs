@@ -54,6 +54,7 @@ pub enum StageSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageProtocol {
     Ready,
+    Preflight,
     Worker,
     Propose,
     Verify,
@@ -64,7 +65,7 @@ pub enum StageProtocol {
 impl StageProtocol {
     pub fn terminal_values(self) -> &'static str {
         match self {
-            Self::Ready => "READY, BLOCKED, or INCOMPLETE",
+            Self::Ready | Self::Preflight => "READY, BLOCKED, or INCOMPLETE",
             Self::Worker => "READY, TOO_LARGE, BLOCKED, or INCOMPLETE",
             Self::Propose => "READY, DONE, TOO_LARGE, BLOCKED, or INCOMPLETE",
             Self::Verify => "VERIFIED, RETRY, BLOCKED, or INCOMPLETE",
@@ -75,6 +76,9 @@ impl StageProtocol {
 
     pub(crate) fn json_schema(self) -> &'static str {
         match self {
+            Self::Preflight => {
+                r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","BLOCKED","INCOMPLETE"]},"summary":{"type":"string","description":"Concise input validity result. For BLOCKED, cite the concrete input defect. For INCOMPLETE, name what remains unchecked."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
+            }
             Self::Ready => {
                 r#"{"type":"object","properties":{"opsx_status":{"type":"string","enum":["READY","BLOCKED","INCOMPLETE"]},"summary":{"type":"string","description":"For INCOMPLETE, describe unfinished work and pending delegated results that can continue without external input. Concise stage result. For BLOCKED, include the exact blocker and evidence needed for a human decision."}},"required":["opsx_status","summary"],"additionalProperties":false}"#
             }
@@ -267,6 +271,7 @@ mod tests {
     fn incomplete_is_available_in_every_stage_schema_and_both_wire_formats() {
         for protocol in [
             StageProtocol::Ready,
+            StageProtocol::Preflight,
             StageProtocol::Worker,
             StageProtocol::Propose,
             StageProtocol::Verify,

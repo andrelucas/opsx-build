@@ -929,6 +929,13 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
             };
             usage.finish(&outcome);
             match attempt {
+                Ok(ClaudeAttempt::Complete(result)) if protocol == StageProtocol::Preflight => {
+                    return Ok(result);
+                }
+                Ok(ClaudeAttempt::OutputLimit) if protocol == StageProtocol::Preflight => {
+                    bail!("contract reviewer reached its output limit");
+                }
+                Err(error) if protocol == StageProtocol::Preflight => return Err(error),
                 Err(error)
                     if is_transient_api_error(&error)
                         && provider_retries < self.max_provider_retries =>
@@ -1875,7 +1882,10 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         StageProtocol::Worker | StageProtocol::Verify | StageProtocol::TerminalReview => {
             "\n\nPROJECT TEST EXECUTION POLICY\n\nWhen the coding-agent runtime's sandbox prevents a required project build or test from running, use the runtime's narrowest available permission override to rerun only the affected command. Use only permission controls actually provided by this runtime. Do not invent tool names, flags, or permission overrides from another backend. If no permitted native override is available, report the execution-environment blocker and the exact command that still needs to run. Treat a sandbox denial as an execution-environment limitation, not a product defect. Do not rewrite production code or tests to accommodate the agent sandbox, add sandbox-specific behavior, substitute synthetic or weaker coverage for the required test, skip the gate, or mark it complete without a real run. The sandbox escape is for the minimum required project build or test command, not unrelated activity. No stage may report success while tests required by that phase remain unexecuted. A worker must not return READY in that state; verification must not return VERIFIED; terminal acceptance review must not return READY. Report the appropriate correctable-failure status with the missing validation when applicable."
         }
-        StageProtocol::Ready | StageProtocol::Propose | StageProtocol::Frontier => "",
+        StageProtocol::Ready
+        | StageProtocol::Preflight
+        | StageProtocol::Propose
+        | StageProtocol::Frontier => "",
     };
     format!(
         "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under the original stage timeout; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nIf this invocation supplies a structured result schema, return that object with `opsx_status` set to exactly one of: {terminal_values}, and a concise `summary`. A backend without a supplied schema must use the text result protocol: you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."

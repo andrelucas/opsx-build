@@ -113,6 +113,7 @@ pub struct Guard {
     active_since: Instant,
     saved_active_ms: u64,
     request_started: Mutex<Option<Instant>>,
+    preflight_deadline: Mutex<Option<Instant>>,
     failure: Mutex<Option<String>>,
     owner_lock: File,
 }
@@ -217,6 +218,7 @@ impl Run {
             ledger: Mutex::new(ledger),
             active_since: Instant::now(),
             request_started: Mutex::new(None),
+            preflight_deadline: Mutex::new(None),
             failure: Mutex::new(None),
             owner_lock: lock,
         };
@@ -511,6 +513,35 @@ impl Guard {
         self.save()
     }
 
+    pub(crate) fn with_preflight_budget<T>(
+        &self,
+        budget: Duration,
+        review: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        *self.preflight_deadline.lock().unwrap() = Some(Instant::now() + budget);
+        let result = review().and_then(|result| {
+            self.check_preflight_budget()?;
+            Ok(result)
+        });
+        *self.preflight_deadline.lock().unwrap() = None;
+        result
+    }
+
+    fn check_preflight_budget(&self) -> Result<()> {
+        let expired = self
+            .preflight_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if expired {
+            return self.stop(
+                "preflight_timeout",
+                "contract preflight exceeded its review budget and remains incomplete",
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn poll(&self) -> Result<()> {
         let request_elapsed = self
             .request_started
@@ -539,6 +570,9 @@ impl Guard {
             remaining = remaining.min(
                 Duration::from_secs(limit).saturating_sub(Duration::from_millis(self.elapsed_ms())),
             );
+        }
+        if let Some(deadline) = *self.preflight_deadline.lock().unwrap() {
+            remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
         }
         remaining
     }
@@ -585,6 +619,7 @@ impl Guard {
     }
 
     fn check(&self, before_request: bool) -> Result<()> {
+        self.check_preflight_budget()?;
         if let Some(failure) = self.failure.lock().unwrap().clone() {
             return self.stop("accounting_unavailable", &failure);
         }
@@ -649,6 +684,9 @@ impl Guard {
             .map(|review| review.open.clone())
             .unwrap_or_default();
         let action = match kind {
+            "preflight_timeout" => {
+                "Inspect the preflight session for the unfinished input check. Retry the bounded review once the input or runtime issue is resolved."
+            }
             "review_evidence_gap" => {
                 "Inspect the retained review records and reporting failure. Establish structured independent findings and closure evidence before another product repair. Missing evidence does not prove the implementation is defective or the work was wasted. Supply the reporting correction with --direction and explicitly increase the review allowance only for a justified bounded resume."
             }

@@ -826,6 +826,13 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                     current_activity =
                         format!("{activity} (after {})", manual_control_label(&control));
                 }
+                Ok(OpenCodeAttempt::Complete(result)) if protocol == StageProtocol::Preflight => {
+                    return Ok(result);
+                }
+                Ok(OpenCodeAttempt::OutputLimit(_)) if protocol == StageProtocol::Preflight => {
+                    bail!("contract reviewer reached its output limit");
+                }
+                Err(error) if protocol == StageProtocol::Preflight => return Err(error),
                 Err(error)
                     if error
                         .downcast_ref::<OpenCodeApiError>()

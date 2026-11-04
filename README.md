@@ -194,14 +194,18 @@ selection from an existing checkpoint. A new packet can instead pass the same
 and `--acceptance-command` options used for its build. `--context` and `--define`
 are also accepted. It needs no OpenSpec setup or existing bootstrap.
 
-Preflight checks input structure first, then uses the configured frontier
-connection to review the original contracts alongside the actual protected test
-assertions, gate drivers, fixtures and negative controls. It reports all concrete
-input conflicts it finds, with source locations, affected checks and suggested
-maintainer corrections. It only inspects and reports; it does not correct files,
-run tests, adopt inputs, change a checkpoint or start delivery. A failing repair
-baseline alone is not a contract defect. Claude uses plan permissions and Codex
-uses its read-only sandbox; repository changes invalidate any review result.
+Preflight checks input structure first, then gives the configured frontier
+reviewer two minutes to check whether the supplied contract is usable. The
+reviewer starts with the acceptance entry points and checks for obvious missing
+inputs, direct contradictions and assertions that cannot establish their stated
+outcomes. It stops at the first proven blocker and cites the evidence and the
+maintainer decision needed. A timeout or unfinished review stops the run
+without recording a pass.
+
+Preflight is read-only and leaves planning, implementation review and running
+the gate to later stages. A failing repair baseline is expected when the
+contract calls for a repair. Claude uses plan permissions and Codex uses its
+read-only sandbox. Repository changes invalidate any review result.
 
 Supplied-contract bootstrap, execute and advance workflows perform this check
 automatically before their first planning or implementation request. Resume also
@@ -223,9 +227,9 @@ protected-input adoption still requires `accept-changes`. With `--dry-run`, the
 report and checkpoint remain unchanged.
 
 `--dry-run preflight` validates the selected inputs and previews the review
-without invoking a model or writing a report. A preflight pass is a model's
-consistency review of the declared inputs; independent implementation review
-and the final acceptance commands remain required.
+without invoking a model or writing a report. A preflight pass records a
+limited check of input validity and obvious omissions. Independent
+implementation review and final acceptance still follow.
 
 New supplied-contract runs install version 2 of the bundled
 `opsx-supplied-contracts` schema. Delivery planning needs a short **proposal and
