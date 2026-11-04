@@ -1,6 +1,6 @@
 //! Runner-observed check receipts. These never replace independent acceptance.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -97,6 +97,9 @@ impl History {
             generation: self.generation,
         };
         write_json(&directory.join("context.json"), &context)?;
+        if let Some(guard) = ui.operating_policy() {
+            guard.observe_check_directory(directory.clone());
+        }
         let runner = self
             .runner
             .as_ref()
@@ -313,30 +316,129 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn latest_records(directory: &Path, change: &str) -> Result<Vec<Record>> {
-    let mut records: BTreeMap<String, Record> = BTreeMap::new();
-    for entry in fs::read_dir(directory)? {
+fn read_records(directory: &Path) -> Result<impl Iterator<Item = Result<Record>>> {
+    let read_record = |entry: std::io::Result<fs::DirEntry>| -> Result<Option<Record>> {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
-            continue;
+            return Ok(None);
         }
         let path = entry.path().join("result.json");
         if !path.exists() {
             bail!("missing check receipt {}", path.display());
         }
-        let record: Record = serde_json::from_slice(&fs::read(&path)?)
+        let record = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("unreadable check receipt {}", path.display()))?;
-        if record.change != change {
-            continue;
-        }
-        if records
-            .get(&record.key)
-            .is_none_or(|previous| record.sequence > previous.sequence)
+        Ok(Some(record))
+    };
+    Ok(fs::read_dir(directory)?.filter_map(move |entry| read_record(entry).transpose()))
+}
+
+fn latest_records(directory: &Path, change: &str) -> Result<Vec<Record>> {
+    let mut records: BTreeMap<String, Record> = BTreeMap::new();
+    for record in read_records(directory)? {
+        let record = record?;
+        if record.change == change
+            && records
+                .get(&record.key)
+                .is_none_or(|previous| record.sequence > previous.sequence)
         {
             records.insert(record.key.clone(), record);
         }
     }
     Ok(records.into_values().collect())
+}
+
+pub(crate) struct ProgressEvidence {
+    pub receipt: PathBuf,
+    pub outcome: String,
+    pub valid_for: Duration,
+}
+
+pub(crate) fn progress_evidence(
+    directory: &Path,
+    repo: &Path,
+    change: &str,
+    stage: &str,
+    dispatched_at: u64,
+    grace_seconds: u64,
+    observed_checks: &BTreeSet<PathBuf>,
+) -> Option<ProgressEvidence> {
+    let mut records = Vec::new();
+    for record in read_records(directory).ok()? {
+        let record = record.ok()?;
+        if record.change == change && record.reused_from.is_none() {
+            records.push(record);
+        }
+    }
+    records.sort_unstable_by_key(|record| std::cmp::Reverse(record.started_at_unix_ms));
+    let now = u128::from(crate::run_summary::now_ms());
+    let dispatched_at = u128::from(dispatched_at);
+    for record in &records {
+        let started = record.started_at_unix_ms;
+        if record.stage != stage || started < dispatched_at || started > now {
+            continue;
+        }
+        let earlier_equivalent = || {
+            records.iter().filter(|other| {
+                other.started_at_unix_ms < started
+                    && other.spec.command == record.spec.command
+                    && other.spec.cwd == record.spec.cwd
+            })
+        };
+        let changed_inputs = |prior: &Record| matches!((&record.inputs, &prior.inputs), (Some(current), Some(previous)) if current != previous);
+        let until = match record.outcome.as_str() {
+            "running" => {
+                let deadline =
+                    started.saturating_add(u128::from(record.spec.timeout_seconds) * 1000);
+                if deadline <= now
+                    || earlier_equivalent()
+                        .find(|prior| observed_checks.contains(&prior.path))
+                        .is_some_and(|prior| !changed_inputs(prior))
+                    || records
+                        .iter()
+                        .any(|other| other.key == record.key && other.sequence > record.sequence)
+                {
+                    continue;
+                }
+                // The helper holds the lock until cleanup and its final receipt.
+                // A stale "running" receipt cannot keep a dispatch alive.
+                let held = hash_bytes(repo, record.key.as_bytes())
+                    .ok()
+                    .and_then(|hash| File::open(directory.join(format!("{hash}.lock"))).ok())
+                    .is_some_and(|lock| {
+                        matches!(lock.try_lock_shared(), Err(fs::TryLockError::WouldBlock))
+                    });
+                if !held {
+                    continue;
+                }
+                deadline
+            }
+            "passed" | "failed" if record.exit_code.is_some() => {
+                let finished = started.saturating_add(record.elapsed_ms);
+                let previous = earlier_equivalent()
+                    .find(|other| matches!(other.outcome.as_str(), "passed" | "failed"));
+                if finished > now
+                    || previous.is_some_and(|prior| {
+                        !(changed_inputs(prior)
+                            || (record.outcome == "passed" && prior.outcome == "failed"))
+                    })
+                {
+                    continue;
+                }
+                finished.saturating_add(u128::from(grace_seconds) * 1000)
+            }
+            _ => continue,
+        };
+        let remaining = until.saturating_sub(u128::from(crate::run_summary::now_ms()));
+        if remaining > 0 {
+            return Some(ProgressEvidence {
+                receipt: record.path.clone(),
+                outcome: record.outcome.clone(),
+                valid_for: Duration::from_millis(remaining.min(u128::from(u64::MAX)) as u64),
+            });
+        }
+    }
+    None
 }
 
 fn absolute(base: &Path, path: &Path) -> Result<PathBuf> {

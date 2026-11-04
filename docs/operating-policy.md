@@ -19,7 +19,8 @@ output/provider retry, remediation and capacity-recovery limits still apply.
 | `max_recurring_finding_reviews` | 2 | Reopening rounds for the same independently closed finding within a change. Other closures cannot disguise repeated regression of that finding. |
 | `max_requests_per_stage` | 12 | Runner-dispatched backend requests for a stage/change, including continuations, compatibility retries and billable compaction/naming operations. |
 | `max_replans_without_verified_progress` | 2 | Capacity-recovery attempts without an intervening independent Verify/acceptance milestone. Checked before restoring a candidate's baseline. |
-| `max_request_seconds` | 3600 | Model-request runtime, followed by supported cancellation and owned-process cleanup. |
+| `max_request_seconds` | 3600 | Model-request runtime before checking for continued progress or cancelling. |
+| `request_progress_grace_seconds` | 900 | Time after new check evidence before Apply or Repair is considered stalled. |
 | `max_active_seconds` | unset | Optional cumulative active time across normal resumes, including independent acceptance. Paused/offline time is excluded. |
 
 These are operating defaults, not claims that a particular round count diagnoses
@@ -59,6 +60,26 @@ snapshots and original review records remain available for diagnosis, with that
 uncertainty stated. Native/live premise changes can require repeated execution;
 the existing conservative check-receipt rules still govern reuse. The guard
 neither suppresses new findings nor substitutes a cheaper acceptance route.
+
+### Progress-aware implementation timeouts
+
+At the request limit, Apply or Repair continues while an eligible check started
+through `opsx-build check` is running within its own timeout, or for 15 minutes
+after new check evidence. Each new result can move that deadline. A first
+completed execution, a failure-to-pass transition, or a fresh execution with
+known changed inputs counts. A live command can run to its own timeout. Once a
+receipt for that command and working directory has supported continuing the
+dispatch, a repeat can qualify while running if the receipts show changed
+execution inputs.
+Cached receipts, repeated results without changed inputs, and agent output
+alone do not move the deadline.
+
+The runner rechecks live receipts, records the evidence for continuing, and
+stops when that evidence expires. Earlier worker-stage and cumulative
+active-time limits still apply. Contract preflight and independent acceptance
+use their own deadlines. Set `request_progress_grace_seconds` to another
+positive number to change the window after a result, or to `null` for a fixed
+request limit.
 
 ## Durable state and reports
 

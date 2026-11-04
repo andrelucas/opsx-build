@@ -114,8 +114,12 @@ else: raise AssertionError(sys.argv)
         c
     }
     fn execute(&self, mode: &str) -> Output {
+        self.execute_with(mode, &[])
+    }
+    fn execute_with(&self, mode: &str, options: &[&str]) -> Output {
         self.command()
             .env("PROPORTIONAL_MODE", mode)
+            .args(options)
             .args([
                 "--supplied-contracts",
                 "--contract=contract.md",
@@ -176,6 +180,126 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn timed_apply(mode: &str) -> (Fixture, Output, Value) {
+    let f = Fixture::new();
+    let policy = f.root.join("progress-policy.json");
+    let bounds = match mode {
+        "progress-repeated" => {
+            json!({"max_request_seconds": 3, "request_progress_grace_seconds": 1})
+        }
+        "progress-dried-up"
+        | "progress-rolling"
+        | "progress-repeated-live"
+        | "progress-check-timeout" => {
+            json!({"max_request_seconds": 2, "request_progress_grace_seconds": 2})
+        }
+        _ => json!({"max_request_seconds": 2}),
+    };
+    fs::write(&policy, bounds.to_string()).unwrap();
+    let output = f.execute_with(mode, &[&format!("--operating-policy={}", policy.display())]);
+    let state = f.state();
+    let directory = PathBuf::from(state["operating"]["directory"].as_str().unwrap());
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(directory.join("ledger.json")).unwrap()).unwrap();
+    let apply = ledger["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|request| request["context"]["stage"] == "Apply")
+        .unwrap()
+        .clone();
+    (f, output, apply)
+}
+
+#[test]
+fn a_running_check_earns_time_by_default_and_the_campaign_finishes() {
+    let (fixture, output, apply) = timed_apply("progress-running");
+    Fixture::success(&output);
+    assert_eq!(fixture.state()["stage"], "done");
+    let extensions = apply["progress_extensions"].as_array().unwrap();
+    assert_eq!(extensions[0]["outcome"], "running");
+    assert!(fixture.root.join("repo/.git/gate-calls").is_file());
+}
+
+#[test]
+fn a_recent_new_check_result_earns_time_to_finish_apply() {
+    let (fixture, output, apply) = timed_apply("progress-completed");
+    Fixture::success(&output);
+    assert_eq!(fixture.state()["stage"], "done");
+    assert_eq!(apply["progress_extensions"][0]["outcome"], "passed");
+}
+
+#[test]
+fn apply_without_check_evidence_stops_at_its_original_limit() {
+    let (fixture, output, apply) = timed_apply("progress-stalled");
+    assert!(!output.status.success());
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert_eq!(apply["outcome"], "policy_stop_incomplete");
+    assert!(apply.get("progress_extensions").is_none());
+}
+
+#[test]
+fn a_repeated_result_cannot_earn_grace_under_a_new_check_key() {
+    let (fixture, output, apply) = timed_apply("progress-repeated");
+    assert!(fixture.root.join("repeated-check-ran").is_file());
+    assert!(!output.status.success());
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert_eq!(apply["outcome"], "policy_stop_incomplete");
+    assert!(apply.get("progress_extensions").is_none());
+}
+
+#[test]
+fn distinct_checks_keep_apply_running_past_the_old_extension_cap() {
+    let (fixture, output, apply) = timed_apply("progress-rolling");
+    Fixture::success(&output);
+    assert_eq!(fixture.state()["stage"], "done");
+    assert!(apply["elapsed_ms"].as_u64().unwrap() > 4_000);
+    let receipts = apply["progress_extensions"].as_array().unwrap();
+    assert!(
+        receipts
+            .iter()
+            .any(|entry| entry["receipt"] != receipts[0]["receipt"])
+    );
+}
+
+#[test]
+fn a_repeated_running_check_cannot_keep_apply_alive_under_a_new_key() {
+    let (fixture, output, apply) = timed_apply("progress-repeated-live");
+    assert!(fixture.root.join("repeated-check-started").is_file());
+    assert!(!output.status.success());
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert_eq!(apply["outcome"], "policy_stop_incomplete");
+    assert!(!fixture.root.join("repeated-check-ran").exists());
+    let receipts = apply["progress_extensions"].as_array().unwrap();
+    assert_eq!(receipts[0]["outcome"], "running");
+    assert!(
+        receipts
+            .iter()
+            .all(|entry| entry["receipt"] == receipts[0]["receipt"])
+    );
+}
+
+#[test]
+fn apply_stops_when_check_progress_dries_up() {
+    let (fixture, output, apply) = timed_apply("progress-dried-up");
+    assert!(!output.status.success());
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert_eq!(apply["outcome"], "policy_stop_incomplete");
+    assert_eq!(apply["progress_extensions"][0]["outcome"], "running");
+    assert_eq!(apply["progress_extensions"][1]["outcome"], "passed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stopped making check progress"));
+}
+
+#[test]
+fn a_check_cannot_keep_apply_alive_past_its_own_timeout() {
+    let (fixture, output, apply) = timed_apply("progress-check-timeout");
+    assert!(!output.status.success());
+    assert_eq!(fixture.state()["stage"], "apply");
+    assert_eq!(apply["outcome"], "policy_stop_incomplete");
+    assert_eq!(apply["progress_extensions"][0]["outcome"], "running");
+    assert!(apply["elapsed_ms"].as_u64().unwrap() < 6_000);
 }
 
 #[test]

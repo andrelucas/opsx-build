@@ -1,6 +1,6 @@
 //! Decisions about continuing work, never decisions about product acceptance.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -25,6 +25,7 @@ pub(crate) struct Policy {
     pub max_requests_per_stage: u32,
     pub max_replans_without_verified_progress: u32,
     pub max_request_seconds: u64,
+    pub request_progress_grace_seconds: Option<u64>,
     pub max_active_seconds: Option<u64>,
     pub acknowledge_unresolved_requests: Vec<String>,
 }
@@ -37,6 +38,7 @@ impl Default for Policy {
             max_requests_per_stage: 12,
             max_replans_without_verified_progress: 2,
             max_request_seconds: 3600,
+            request_progress_grace_seconds: Some(900),
             max_active_seconds: None,
             acknowledge_unresolved_requests: Vec::new(),
         }
@@ -52,6 +54,7 @@ impl Policy {
             || policy.max_requests_per_stage == 0
             || policy.max_replans_without_verified_progress == 0
             || policy.max_request_seconds == 0
+            || policy.request_progress_grace_seconds == Some(0)
             || policy.max_active_seconds == Some(0)
         {
             bail!("operating-policy limits must be positive");
@@ -76,6 +79,33 @@ struct Request {
     outcome: Option<String>,
     elapsed_ms: u64,
     reported_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    progress_extensions: Vec<ProgressExtension>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProgressExtension {
+    receipt: PathBuf,
+    outcome: String,
+    extra_seconds: u64,
+}
+
+struct ActiveRequest {
+    id: String,
+    started: Instant,
+    dispatched_at: u64,
+    check_directory: Option<PathBuf>,
+    repo: PathBuf,
+    context: crate::usage::UsageContext,
+    progress: Option<RequestProgress>,
+    observed_checks: BTreeSet<PathBuf>,
+}
+
+struct RequestProgress {
+    receipt: PathBuf,
+    outcome: String,
+    valid_until: Duration,
+    recheck_at: Duration,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,7 +142,8 @@ pub struct Guard {
     ledger: Mutex<Ledger>,
     active_since: Instant,
     saved_active_ms: u64,
-    request_started: Mutex<Option<Instant>>,
+    active_request: Mutex<Option<ActiveRequest>>,
+    check_directory: Mutex<Option<PathBuf>>,
     preflight_deadline: Mutex<Option<Instant>>,
     failure: Mutex<Option<String>>,
     owner_lock: File,
@@ -217,7 +248,8 @@ impl Run {
             saved_active_ms: ledger.active_ms,
             ledger: Mutex::new(ledger),
             active_since: Instant::now(),
-            request_started: Mutex::new(None),
+            active_request: Mutex::new(None),
+            check_directory: Mutex::new(None),
             preflight_deadline: Mutex::new(None),
             failure: Mutex::new(None),
             owner_lock: lock,
@@ -291,6 +323,10 @@ impl Guard {
         self.check(false)
     }
 
+    pub(crate) fn observe_check_directory(&self, directory: PathBuf) {
+        *self.check_directory.lock().unwrap() = Some(directory);
+    }
+
     pub(crate) fn before_request(&self, usage: &UsageRecord) -> Result<()> {
         self.check(true)?;
         let key = format!(
@@ -323,11 +359,21 @@ impl Guard {
                     outcome: None,
                     elapsed_ms: 0,
                     reported_cost_usd: None,
+                    progress_extensions: Vec::new(),
                 });
             request.dispatches += 1;
             request.outcome = None;
         }
-        *self.request_started.lock().unwrap() = Some(Instant::now());
+        *self.active_request.lock().unwrap() = Some(ActiveRequest {
+            id: usage.id.clone(),
+            started: Instant::now(),
+            dispatched_at: crate::run_summary::now_ms(),
+            check_directory: self.check_directory.lock().unwrap().clone(),
+            repo: usage.repo.clone(),
+            context: usage.context.clone(),
+            progress: None,
+            observed_checks: BTreeSet::new(),
+        });
         self.save()
     }
 
@@ -343,7 +389,7 @@ impl Guard {
                     .filter(|cost| cost.is_finite() && *cost >= 0.0);
             }
         }
-        *self.request_started.lock().unwrap() = None;
+        *self.active_request.lock().unwrap() = None;
         if let Err(error) = self.save() {
             *self.failure.lock().unwrap() =
                 Some(format!("could not preserve policy accounting: {error:#}"));
@@ -543,29 +589,101 @@ impl Guard {
     }
 
     pub(crate) fn poll(&self) -> Result<()> {
-        let request_elapsed = self
-            .request_started
-            .lock()
-            .unwrap()
-            .map(|started| started.elapsed());
-        if request_elapsed.is_some_and(|elapsed| {
-            elapsed >= Duration::from_secs(self.ledger.lock().unwrap().policy.max_request_seconds)
-        }) {
-            return self.stop("request_timeout", "the active model request exceeded its time allowance; its stage is incomplete and requires diagnosis before another attempt");
+        self.check(false)?;
+        let (limit, grace) = {
+            let ledger = self.ledger.lock().unwrap();
+            (
+                ledger.policy.max_request_seconds,
+                ledger.policy.request_progress_grace_seconds,
+            )
+        };
+        let mut active = self.active_request.lock().unwrap();
+        let Some(request) = active.as_mut() else {
+            return Ok(());
+        };
+        let next_check = request
+            .progress
+            .as_ref()
+            .map_or(Duration::from_secs(limit), |progress| progress.recheck_at);
+        if request.started.elapsed() < next_check {
+            return Ok(());
         }
-        self.check(false)
+        if let Some(grace) = grace
+            && let Some(stage @ ("Apply" | "Repair")) = request.context.stage.as_deref()
+            && let Some(change) = request.context.change.as_deref()
+            && let Some(directory) = &request.check_directory
+            && let Some(evidence) = crate::checks::progress_evidence(
+                directory,
+                &request.repo,
+                change,
+                stage,
+                request.dispatched_at,
+                grace,
+                &request.observed_checks,
+            )
+        {
+            let elapsed = request.started.elapsed();
+            let valid_until = elapsed.saturating_add(evidence.valid_for);
+            // Notice when an active check finishes or loses its live receipt.
+            let recheck_at = if evidence.outcome == "running" {
+                valid_until.min(elapsed + Duration::from_secs(grace.min(5)))
+            } else {
+                valid_until
+            };
+            let new_evidence = request.progress.as_ref().is_none_or(|previous| {
+                previous.receipt != evidence.receipt || previous.outcome != evidence.outcome
+            });
+            request.progress = Some(RequestProgress {
+                receipt: evidence.receipt.clone(),
+                outcome: evidence.outcome.clone(),
+                valid_until,
+                recheck_at,
+            });
+            if !new_evidence {
+                return Ok(());
+            }
+            request.observed_checks.insert(evidence.receipt.clone());
+            let id = request.id.clone();
+            drop(active);
+            self.ledger
+                .lock()
+                .unwrap()
+                .requests
+                .get_mut(&id)
+                .unwrap()
+                .progress_extensions
+                .push(ProgressExtension {
+                    receipt: evidence.receipt,
+                    outcome: evidence.outcome,
+                    extra_seconds: evidence.valid_for.as_secs(),
+                });
+            return self.save();
+        }
+        let extended = request.progress.is_some();
+        drop(active);
+        let reason = if extended {
+            "the active model request stopped making check progress; its stage remains incomplete"
+        } else {
+            "the active model request exceeded its time allowance; its stage is incomplete and requires diagnosis before another attempt"
+        };
+        self.stop("request_timeout", reason)
     }
 
     pub(crate) fn remaining_request_time(&self) -> Duration {
         let ledger = self.ledger.lock().unwrap();
-        let request = self
-            .request_started
+        let limit = Duration::from_secs(ledger.policy.max_request_seconds);
+        let mut remaining = self
+            .active_request
             .lock()
             .unwrap()
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
-        let mut remaining =
-            Duration::from_secs(ledger.policy.max_request_seconds).saturating_sub(request);
+            .as_ref()
+            .map_or(limit, |request| {
+                request
+                    .progress
+                    .as_ref()
+                    .map_or(limit, |progress| progress.valid_until)
+                    .saturating_sub(request.started.elapsed())
+            });
         if let Some(limit) = ledger.policy.max_active_seconds {
             remaining = remaining.min(
                 Duration::from_secs(limit).saturating_sub(Duration::from_millis(self.elapsed_ms())),

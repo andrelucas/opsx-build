@@ -3,8 +3,11 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
+import time
 
 if "--version" in sys.argv:
     print("Claude fixture")
@@ -106,6 +109,32 @@ elif stage in ("apply", "repair"):
         message = "incorrect"
     Path("program.py").write_text(f"print({message!r})\n")
     Path("DELIVERY.md").write_text(f"Delivered message: {message}\n")
+    if stage == "apply" and mode.startswith("progress-"):
+        if mode == "progress-stalled":
+            time.sleep(10)
+        else:
+            helper = shlex.split(re.search(r"For checks you need to run, prefer (.+?) with one JSON object", prompt)[1])
+            command = {"progress-completed": "true", "progress-repeated": "true",
+                       "progress-check-timeout": "sleep 10"}.get(mode, "sleep 3")
+            check = {"key": "fixture-check", "command": command, "cwd": str(Path.cwd()),
+                     "tools": [], "runtime": "unknown", "runtime_reason": "Fixture executes each check",
+                     "timeout_seconds": 4 if mode == "progress-check-timeout" else 12}
+            subprocess.run(helper, input=json.dumps(check), text=True, check=mode != "progress-check-timeout")
+            if mode == "progress-completed":
+                time.sleep(3)
+            if mode in ("progress-dried-up", "progress-check-timeout"):
+                time.sleep(10)
+            if mode == "progress-rolling":
+                check.update(key="next-check", command="sleep 3; true")
+                subprocess.run(helper, input=json.dumps(check), text=True, check=True)
+            if mode in ("progress-repeated", "progress-repeated-live"):
+                if mode == "progress-repeated":
+                    time.sleep(2.3)
+                check["key"] = "renamed-fixture-check"
+                (root / "repeated-check-started").touch()
+                subprocess.run(helper, input=json.dumps(check), text=True, check=True)
+                (root / "repeated-check-ran").touch()
+                time.sleep(4)
     if mode == "rebuild" and name == "0001-delivery":
         observed = subprocess.check_output([sys.executable, "program.py"], text=True)
         assert observed.strip() == message

@@ -74,6 +74,18 @@ fn review(number: u32, closed: &[&str], reopened: &[&str]) -> Progress {
     }
 }
 
+#[test]
+fn progress_grace_defaults_on_and_an_explicit_opt_out_survives_resume() {
+    let default: Policy = serde_json::from_str("{}").unwrap();
+    assert_eq!(default.request_progress_grace_seconds, Some(900));
+    let disabled: Policy =
+        serde_json::from_str(r#"{"request_progress_grace_seconds":null}"#).unwrap();
+    let f = Fixture::new(disabled);
+    let guard = f.run.open(None).unwrap();
+    assert_eq!(f.ledger().policy.request_progress_grace_seconds, None);
+    drop(guard);
+}
+
 #[cfg(unix)]
 #[test]
 fn preflight_budget_cancels_the_reviewer_and_expires_with_its_scope() {
