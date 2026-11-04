@@ -252,14 +252,20 @@ fn maintainer_preflight_reports_conflict_and_bootstrap_reuses_the_stop_before_pl
         "{error}"
     );
     assert_eq!(f.preflights().len(), 1);
+    let preflights = f.preflights();
+    let call = &preflights[0];
+    let args = call["arguments"].as_array().unwrap();
+    assert!(args.iter().any(|arg| arg == "frontier-preflight"));
     assert!(
-        f.preflights()[0]["arguments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|arg| arg == "frontier-preflight")
+        args.windows(2)
+            .any(|pair| pair == ["--tools", "Read,Glob,Grep"])
     );
-    let prompt = f.preflights()[0]["prompt"].as_str().unwrap().to_owned();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--disallowedTools", "mcp__*"])
+    );
+    assert_eq!(call["effort"], "low");
+    let prompt = call["prompt"].as_str().unwrap();
     assert!(prompt.contains("Stop as soon as you can show a concrete blocker"));
     assert!(prompt.contains("plan delivery"));
     assert!(!prompt.contains("INCOMPLETE requests automatic continuation"));

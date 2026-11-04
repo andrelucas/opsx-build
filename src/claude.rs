@@ -516,6 +516,7 @@ pub fn build_claude_command(
             json_schema,
             additional_dirs: &[],
             plugin_dirs: &[],
+            preflight: false,
         },
     )
 }
@@ -525,6 +526,7 @@ struct ClaudeCommandOptions<'a> {
     json_schema: Option<&'a str>,
     additional_dirs: &'a [PathBuf],
     plugin_dirs: &'a [PathBuf],
+    preflight: bool,
 }
 
 fn build_claude_command_with_dirs(
@@ -545,6 +547,11 @@ fn build_claude_command_with_dirs(
     }
     for directory in options.plugin_dirs {
         args.extend(["--plugin-dir".to_owned(), directory.display().to_string()]);
+    }
+    if options.preflight {
+        args.extend(
+            ["--tools", "Read,Glob,Grep", "--disallowedTools", "mcp__*"].map(str::to_owned),
+        );
     }
     args.push("--print".to_owned());
     match output_format {
@@ -583,7 +590,12 @@ fn build_claude_command_with_dirs(
     } else {
         spec
     };
-    with_launcher_environment(spec, launcher)
+    let spec = with_launcher_environment(spec, launcher);
+    if options.preflight {
+        spec.env("CLAUDE_CODE_EFFORT_LEVEL", "low")
+    } else {
+        spec
+    }
 }
 
 pub fn build_interactive_claude_command(
@@ -1079,6 +1091,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                     json_schema: schema,
                     additional_dirs: &self.additional_dirs,
                     plugin_dirs: &self.plugin_dirs,
+                    preflight: protocol == StageProtocol::Preflight,
                 },
             );
             let spec = if let Some(repo) = self.resume_repo.as_deref() {
@@ -1195,6 +1208,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 json_schema: None,
                 additional_dirs: &self.additional_dirs,
                 plugin_dirs: &self.plugin_dirs,
+                preflight: false,
             },
         );
         let spec = if let Some(repo) = self.resume_repo.as_deref() {
@@ -1349,6 +1363,7 @@ fn build_compact_command(
             json_schema: None,
             additional_dirs,
             plugin_dirs,
+            preflight: false,
         },
     )
     .disable_stream_messages()
@@ -2116,6 +2131,7 @@ mod tests {
                 json_schema: None,
                 additional_dirs: &[PathBuf::from("/product")],
                 plugin_dirs: &[PathBuf::from("/private/plugin")],
+                preflight: false,
             },
         );
 
