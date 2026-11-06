@@ -3194,7 +3194,7 @@ impl<U: Ui> App<U> {
         else {
             return Ok(());
         };
-        state.review.record(
+        let result = state.review.record(
             repo,
             &change,
             claude.name(),

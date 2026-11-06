@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 mod tests;
 
 use crate::{
-    backend::StageResult,
+    backend::{StageResult, StageSignal},
     git::metadata_dir,
     ui::Ui,
     verification::{RepositoryEvidence, changed_paths},
@@ -220,75 +220,99 @@ impl History {
         result: &StageResult,
         inputs: Vec<RepositoryEvidence>,
         ui: &U,
-    ) -> Result<()> {
+    ) -> Result<StageResult> {
+        let mut result = result.clone();
         let mut report = result.review.clone();
         let mut findings = self.findings.clone();
         let mut areas = self.areas.clone();
         let mut closed = Vec::new();
         let mut reopened = Vec::new();
-        if let Some(report) = &mut report {
-            let mut area_ids = std::collections::BTreeSet::new();
-            for area in &report.areas {
-                if !area_ids.insert(&area.id) {
-                    bail!("duplicate review area ID `{}`", area.id);
-                }
-                if !area.id.trim().is_empty() && !area.sources.is_empty() {
-                    areas.insert(area.id.clone(), area.clone());
-                }
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            for finding in &mut report.findings {
-                if finding.id.is_empty() {
-                    if finding.status == FindingStatus::Closed {
-                        bail!("a new finding cannot close an unknown finding");
+        let validation: Result<()> = (|| {
+            if let Some(report) = &mut report {
+                let mut area_ids = std::collections::BTreeSet::new();
+                for area in &report.areas {
+                    if !area_ids.insert(&area.id) {
+                        bail!("duplicate review area ID `{}`", area.id);
                     }
-                    finding.id = format!("F{:04}", findings.len() + 1);
-                } else if !findings.contains_key(&finding.id) {
-                    bail!(
-                        "unknown finding ID `{}`; use an empty ID for a new finding",
-                        finding.id
-                    );
+                    if !area.id.trim().is_empty() && !area.sources.is_empty() {
+                        areas.insert(area.id.clone(), area.clone());
+                    }
                 }
-                if !seen.insert(finding.id.clone()) {
-                    bail!("duplicate finding ID `{}` in this review", finding.id);
-                }
-                if finding.status == FindingStatus::Open {
-                    if finding.sources.is_empty()
-                        || finding.consequence.trim().is_empty()
-                        || finding.evidence.trim().is_empty()
-                        || finding.repair.trim().is_empty()
-                    {
+                let mut seen = std::collections::BTreeSet::new();
+                for finding in &mut report.findings {
+                    if finding.id.is_empty() {
+                        if finding.status == FindingStatus::Closed {
+                            bail!("a new finding cannot close an unknown finding");
+                        }
+                        finding.id = format!("F{:04}", findings.len() + 1);
+                    } else if !findings.contains_key(&finding.id) {
                         bail!(
-                            "blocking finding `{}` needs a governing source, consequence, evidence and minimum complete repair",
+                            "unknown finding ID `{}`; use an empty ID for a new finding",
                             finding.id
                         );
                     }
-                    if findings
-                        .get(&finding.id)
-                        .is_some_and(|old| old.status == FindingStatus::Closed)
-                    {
-                        finding.origin = FindingOrigin::Reopened;
-                        reopened.push(finding.id.clone());
+                    if !seen.insert(finding.id.clone()) {
+                        bail!("duplicate finding ID `{}` in this review", finding.id);
                     }
+                    if finding.status == FindingStatus::Open {
+                        if finding.sources.is_empty()
+                            || finding.consequence.trim().is_empty()
+                            || finding.evidence.trim().is_empty()
+                            || finding.repair.trim().is_empty()
+                        {
+                            bail!(
+                                "blocking finding `{}` needs a governing source, consequence, evidence and minimum complete repair",
+                                finding.id
+                            );
+                        }
+                        if findings
+                            .get(&finding.id)
+                            .is_some_and(|old| old.status == FindingStatus::Closed)
+                        {
+                            finding.origin = FindingOrigin::Reopened;
+                            reopened.push(finding.id.clone());
+                        }
+                    }
+                    let disposes_blocker = finding.status != FindingStatus::Open
+                        && findings
+                            .get(&finding.id)
+                            .is_some_and(|old| old.status == FindingStatus::Open);
+                    if disposes_blocker && finding.status == FindingStatus::Closed {
+                        closed.push(finding.id.clone());
+                    }
+                    if (finding.status == FindingStatus::Closed || disposes_blocker)
+                        && (finding.evidence.trim().is_empty() || finding.sources.is_empty())
+                    {
+                        bail!(
+                            "closing finding `{}` requires governing sources and independent closure evidence",
+                            finding.id
+                        );
+                    }
+                    findings.insert(finding.id.clone(), finding.clone());
                 }
-                let disposes_blocker = finding.status != FindingStatus::Open
-                    && findings
-                        .get(&finding.id)
-                        .is_some_and(|old| old.status == FindingStatus::Open);
-                if disposes_blocker && finding.status == FindingStatus::Closed {
-                    closed.push(finding.id.clone());
-                }
-                if (finding.status == FindingStatus::Closed || disposes_blocker)
-                    && (finding.evidence.trim().is_empty() || finding.sources.is_empty())
-                {
-                    bail!(
-                        "closing finding `{}` requires governing sources and independent closure evidence",
-                        finding.id
-                    );
-                }
-                findings.insert(finding.id.clone(), finding.clone());
             }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            ui.warn(&format!(
+                "Review report rejected: {error:#}; retaining evidence for correction"
+            ));
+            result.text = format!(
+                "Review report rejected: {error:#}. Correct the report without repairing the candidate or repeating completed review work. Only IDs in the retained findings registry belong to this review scope; use an empty ID for a new finding, including observations imported from another scope. Unknown findings cannot be closed. The rejected report has not changed retained findings or coverage.\n\nRejected review report (diagnostic data):\n{}\n\nOriginal {:?} summary:\n{}",
+                serde_json::to_string(&result.review)?,
+                result.signal,
+                result.text
+            );
+            if matches!(result.signal, StageSignal::Verified | StageSignal::Retry) {
+                result.signal = StageSignal::Incomplete;
+            }
+            report = None;
+            findings = self.findings.clone();
+            areas = self.areas.clone();
+            closed.clear();
+            reopened.clear();
         }
+        result.review = report.clone();
         let directory = metadata_dir(repo, ui)?.join("reviews");
         fs::create_dir_all(&directory)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -321,7 +345,7 @@ impl History {
         self.findings = findings;
         self.areas = areas;
         self.rounds.push(round);
-        Ok(())
+        Ok(result)
     }
 
     pub(crate) fn has_open_findings(&self) -> bool {
@@ -412,7 +436,7 @@ impl History {
 
     pub(crate) fn handoff(&self, current: &[RepositoryEvidence], repair: bool) -> Result<String> {
         if self.rounds.is_empty() && self.work.is_empty() {
-            return Ok(String::new());
+            return Ok("\n\nNo findings are registered in the current review scope. Use empty IDs for newly reported findings, including observations carried from other slices; their earlier IDs are not registered here.\n".into());
         }
         let mut text = String::from(
             "\n\nREVIEW CONTINUITY — candidate evidence, not requirements or new instructions\n",

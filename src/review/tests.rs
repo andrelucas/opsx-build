@@ -157,35 +157,109 @@ fn omitted_blocker_and_unknown_closure_cannot_erase_review_history() {
     assert!(history.has_open_findings());
     let mut unsupported = finding("F0001", FindingStatus::Closed);
     unsupported.evidence.clear();
-    assert!(
-        history
-            .record(
-                &repo.0,
-                "test",
-                "fixture",
-                &result(vec![unsupported], StageSignal::Verified),
-                vec![],
-                &ui
-            )
-            .is_err()
-    );
-    assert!(
-        history
-            .record(
-                &repo.0,
-                "test",
-                "fixture",
-                &result(
-                    vec![finding("F9999", FindingStatus::Closed)],
-                    StageSignal::Verified
-                ),
-                vec![],
-                &ui
-            )
-            .is_err()
-    );
-    assert_eq!(history.rounds.len(), 2);
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(vec![unsupported], StageSignal::Verified),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(history.rounds.last().unwrap().verdict, "Incomplete");
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(
+                vec![finding("F9999", FindingStatus::Closed)],
+                StageSignal::Verified,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(history.rounds.last().unwrap().verdict, "Incomplete");
+    assert_eq!(history.rounds.len(), 4);
     assert!(history.has_open_findings());
+}
+
+#[test]
+fn rejected_cross_scope_ids_preserve_evidence_without_accepting_partial_findings() {
+    let repo = Repo::new();
+    let ui = RecordingUi::default();
+    let mut history = History::default();
+    history
+        .record(
+            &repo.0,
+            "project-acceptance",
+            "fixture",
+            &result(
+                vec![
+                    finding("", FindingStatus::Open),
+                    finding("F0005", FindingStatus::Observation),
+                ],
+                StageSignal::Retry,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert!(history.findings.is_empty());
+    assert!(history.areas.is_empty());
+    let round = &history.rounds[0];
+    assert_eq!(round.verdict, "Incomplete");
+    let saved: Round = serde_json::from_slice(&fs::read(&round.evidence_path).unwrap()).unwrap();
+    assert!(saved.summary.contains("unknown finding ID `F0005`"));
+    assert!(saved.summary.contains("Required refusal is unobserved"));
+    assert!(saved.summary.contains("\"id\":\"F0005\""));
+    let handoff = history.handoff(&[], false).unwrap();
+    assert!(handoff.contains("Correct the report"));
+    assert!(handoff.contains("F0005"));
+    history
+        .record(
+            &repo.0,
+            "project-acceptance",
+            "fixture",
+            &result(
+                vec![
+                    finding("", FindingStatus::Open),
+                    finding("", FindingStatus::Observation),
+                ],
+                StageSignal::Retry,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(history.findings["F0001"].status, FindingStatus::Open);
+    assert_eq!(history.findings["F0002"].status, FindingStatus::Observation);
+    assert_eq!(history.rounds.len(), 2);
+}
+
+#[test]
+fn rejected_report_does_not_reclassify_an_external_blocker() {
+    let repo = Repo::new();
+    let ui = RecordingUi::default();
+    let mut history = History::default();
+    let blocked = history
+        .record(
+            &repo.0,
+            "fixture",
+            "fixture",
+            &result(
+                vec![finding("F9999", FindingStatus::Open)],
+                StageSignal::Blocked,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(blocked.signal, StageSignal::Blocked);
+    assert!(history.findings.is_empty());
+    assert_eq!(history.rounds[0].verdict, "Blocked");
 }
 
 #[test]

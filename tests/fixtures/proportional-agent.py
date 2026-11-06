@@ -66,7 +66,7 @@ elif state["bootstrap"] and stage in ("propose", "repair"):
         result = {"opsx_status": "BLOCKED", "summary": "Fixture interruption before assignment completion"}
     else:
         record = json.loads((root / "record.json").read_text())
-        if mode == "rebuild":
+        if mode in ("rebuild", "cross-scope-finding"):
             record["slices"].append({"path": "0002-program.md", "requires": ["0001-delivery.md"]})
             record["obligations"][1]["accountable"] = "0002-program.md"
             record["acceptance"][1]["slices"].append("0002-program.md")
@@ -146,6 +146,23 @@ elif stage == "verify":
         assert Path("DELIVERY.md").is_file(), "The required delivery report was not implemented"
     result["opsx_status"] = "VERIFIED"
     result["review"] = {"findings": [], "areas": [{"id": "complete-owned-scope", "sources": ["contract.md#OWN-01"], "paths": ["program.py", "DELIVERY.md"], "status": "reviewed", "limitations": "Deterministic orchestration fixture"}]}
+    if mode == "cross-scope-finding" and name == "9999-project-acceptance":
+        assert not Path(".git/gate-calls").exists(), "Acceptance cannot run before review closure"
+        blocker = {"id": "", "kind": "implementation", "origin": "previously_missed", "evidence_kind": "code_review", "status": "open", "sources": ["contract.md#OWN-01"], "scope": ["DELIVERY.md"], "consequence": "Required delivery evidence is incomplete", "evidence": "Fixture integration defect", "repair": "Complete delivery evidence"}
+        observation = dict(blocker, id="F0005", status="observation", consequence="Prior-slice observation")
+        if not state["review"]["rounds"]:
+            result["opsx_status"] = "RETRY"
+            result["review"]["findings"] = [blocker, observation]
+        elif not state["review"]["findings"]:
+            assert state["verify_retries"] == 0, "Report correction cannot consume a repair"
+            assert "Correct the report" in prompt and "F0005" in prompt
+            observation["id"] = ""
+            result["opsx_status"] = "RETRY"
+            result["review"]["findings"] = [blocker, observation]
+        else:
+            blocker.update(id="F0001", status="closed", evidence="Independently verified fixture repair")
+            observation["id"] = "F0002"
+            result["review"]["findings"] = [blocker, observation]
     if mode == "unrelated-finding":
         result["opsx_status"] = "RETRY"
         result["review"]["findings"] = [{"id": "", "kind": "implementation", "origin": "new", "evidence_kind": "code_review", "status": "open", "sources": ["contract.md#OWN-02"], "scope": ["program.py"], "consequence": "An independent implementation defect remains", "evidence": "Fixture finding", "repair": "Fix the implementation without changing the inputs"}]

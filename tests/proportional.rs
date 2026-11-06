@@ -661,6 +661,54 @@ fn rebuild_keeps_multiple_slices_planning_review_and_final_integration_review() 
 }
 
 #[test]
+fn malformed_final_review_is_corrected_before_repair_and_acceptance() {
+    let f = Fixture::new();
+    let output = f.execute("cross-scope-finding");
+    Fixture::success(&output);
+    let calls = f.calls();
+    let terminal = calls
+        .iter()
+        .filter(|c| c["change"] == "9999-project-acceptance")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal.iter().filter(|c| c["stage"] == "verify").count(),
+        3
+    );
+    assert_eq!(
+        terminal.iter().filter(|c| c["stage"] == "repair").count(),
+        1
+    );
+    let mut rounds = fs::read_dir(f.root.join("repo/.git/opsx-build/reviews"))
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice::<Value>(&fs::read(entry.unwrap().path()).unwrap()).unwrap()
+        })
+        .filter(|round| round["change"] == "9999-project-acceptance")
+        .collect::<Vec<_>>();
+    rounds.sort_by_key(|round| round["number"].as_u64().unwrap());
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|r| r["verdict"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Incomplete", "Retry", "Verified"]
+    );
+    assert!(rounds[0]["report"].is_null());
+    assert!(
+        rounds[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("unknown finding ID `F0005`")
+    );
+    assert_eq!(rounds[2]["report"]["findings"][0]["status"], "closed");
+    assert_eq!(rounds[2]["report"]["findings"][1]["status"], "observation");
+    assert_eq!(
+        fs::read_to_string(f.root.join("repo/.git/gate-calls")).unwrap(),
+        "gate\n"
+    );
+}
+
+#[test]
 fn failed_final_acceptance_repairs_and_independently_reviews_before_running_again() {
     let f = Fixture::new();
     Fixture::success(&f.execute("final-failure"));
