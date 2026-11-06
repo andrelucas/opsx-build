@@ -709,6 +709,29 @@ fn malformed_final_review_is_corrected_before_repair_and_acceptance() {
 }
 
 #[test]
+fn omitting_a_rejected_reports_blocker_cannot_reach_acceptance() {
+    let f = Fixture::new();
+    let output = f.execute("omitted-rejected-blocker");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("without independently closing all retained findings")
+    );
+    let state = f.state();
+    assert_eq!(state["stage"], "verify");
+    assert_eq!(state["verify_retries"], 0);
+    assert_eq!(state["review"]["findings"]["F0001"]["status"], "open");
+    assert_eq!(state["review"]["rounds"][0]["verdict"], "Incomplete");
+    assert_eq!(state["review"]["rounds"][1]["verdict"], "Verified");
+    assert!(
+        f.calls().iter().all(|call| {
+            call["change"] != "9999-project-acceptance" || call["stage"] != "repair"
+        })
+    );
+    assert!(!f.root.join("repo/.git/gate-calls").exists());
+}
+
+#[test]
 fn failed_final_acceptance_repairs_and_independently_reviews_before_running_again() {
     let f = Fixture::new();
     Fixture::success(&f.execute("final-failure"));

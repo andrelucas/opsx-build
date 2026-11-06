@@ -298,7 +298,7 @@ impl History {
                 "Review report rejected: {error:#}; retaining evidence for correction"
             ));
             result.text = format!(
-                "Review report rejected: {error:#}. Correct the report without repairing the candidate or repeating completed review work. Only IDs in the retained findings registry belong to this review scope; use an empty ID for a new finding, including observations imported from another scope. Unknown findings cannot be closed. The rejected report has not changed retained findings or coverage.\n\nRejected review report (diagnostic data):\n{}\n\nOriginal {:?} summary:\n{}",
+                "Review report rejected: {error:#}. Correct the report without repairing the candidate or repeating completed review work. Only IDs in the retained findings registry belong to this review scope; use an empty ID for a new finding, including observations imported from another scope. Unknown findings cannot be closed. Reported open blockers remain retained under current-scope IDs and require evidence-backed disposition. Rejected closures and coverage have not been accepted.\n\nRejected review report (diagnostic data):\n{}\n\nOriginal {:?} summary:\n{}",
                 serde_json::to_string(&result.review)?,
                 result.signal,
                 result.text
@@ -311,6 +311,27 @@ impl History {
             areas = self.areas.clone();
             closed.clear();
             reopened.clear();
+            let mut seen = std::collections::BTreeSet::new();
+            for finding in result
+                .review
+                .iter()
+                .flat_map(|report| &report.findings)
+                .filter(|finding| finding.status == FindingStatus::Open)
+            {
+                let mut finding = finding.clone();
+                if !self.findings.contains_key(&finding.id) || !seen.insert(finding.id.clone()) {
+                    finding.id = format!("F{:04}", findings.len() + 1);
+                }
+                if self
+                    .findings
+                    .get(&finding.id)
+                    .is_some_and(|old| old.status == FindingStatus::Closed)
+                {
+                    finding.origin = FindingOrigin::Reopened;
+                    reopened.push(finding.id.clone());
+                }
+                findings.insert(finding.id.clone(), finding);
+            }
         }
         result.review = report.clone();
         let directory = metadata_dir(repo, ui)?.join("reviews");

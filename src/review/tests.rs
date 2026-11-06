@@ -187,7 +187,7 @@ fn omitted_blocker_and_unknown_closure_cannot_erase_review_history() {
 }
 
 #[test]
-fn rejected_cross_scope_ids_preserve_evidence_without_accepting_partial_findings() {
+fn rejected_cross_scope_ids_preserve_blockers_without_accepting_coverage() {
     let repo = Repo::new();
     let ui = RecordingUi::default();
     let mut history = History::default();
@@ -207,7 +207,8 @@ fn rejected_cross_scope_ids_preserve_evidence_without_accepting_partial_findings
             &ui,
         )
         .unwrap();
-    assert!(history.findings.is_empty());
+    assert_eq!(history.findings.len(), 1);
+    assert_eq!(history.findings["F0001"].status, FindingStatus::Open);
     assert!(history.areas.is_empty());
     let round = &history.rounds[0];
     assert_eq!(round.verdict, "Incomplete");
@@ -225,7 +226,7 @@ fn rejected_cross_scope_ids_preserve_evidence_without_accepting_partial_findings
             "fixture",
             &result(
                 vec![
-                    finding("", FindingStatus::Open),
+                    finding("F0001", FindingStatus::Open),
                     finding("", FindingStatus::Observation),
                 ],
                 StageSignal::Retry,
@@ -258,8 +259,103 @@ fn rejected_report_does_not_reclassify_an_external_blocker() {
         )
         .unwrap();
     assert_eq!(blocked.signal, StageSignal::Blocked);
-    assert!(history.findings.is_empty());
+    assert_eq!(history.findings["F0001"].status, FindingStatus::Open);
     assert_eq!(history.rounds[0].verdict, "Blocked");
+}
+
+#[test]
+fn rejected_reports_preserve_blockers_after_the_validation_error_and_across_resume() {
+    let repo = Repo::new();
+    let ui = RecordingUi::default();
+    let mut history = History::default();
+    let mut rejected = result(
+        vec![
+            finding("F9999", FindingStatus::Observation),
+            finding("", FindingStatus::Open),
+            finding("F0001", FindingStatus::Open),
+        ],
+        StageSignal::Retry,
+    );
+    rejected.review.as_mut().unwrap().findings[2].consequence = "A distinct blocker".into();
+    history
+        .record(&repo.0, "test", "fixture", &rejected, vec![], &ui)
+        .unwrap();
+    let mut history: History =
+        serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(vec![], StageSignal::Verified),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(history.findings.len(), 2);
+    assert!(history.has_open_findings());
+    assert_eq!(history.findings["F0002"].consequence, "A distinct blocker");
+    assert!(
+        history
+            .repair_findings()
+            .unwrap()
+            .contains("A distinct blocker")
+    );
+}
+
+#[test]
+fn rejected_closures_cannot_hide_a_duplicate_reopening_or_an_unsupported_blocker() {
+    let repo = Repo::new();
+    let ui = RecordingUi::default();
+    let mut history = History::default();
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(vec![finding("", FindingStatus::Open)], StageSignal::Retry),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(
+                vec![finding("F0001", FindingStatus::Closed)],
+                StageSignal::Verified,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    let mut unsupported = finding("F0001", FindingStatus::Open);
+    unsupported.evidence.clear();
+    history
+        .record(
+            &repo.0,
+            "test",
+            "fixture",
+            &result(
+                vec![
+                    finding("F0001", FindingStatus::Closed),
+                    unsupported.clone(),
+                    unsupported,
+                ],
+                StageSignal::Retry,
+            ),
+            vec![],
+            &ui,
+        )
+        .unwrap();
+    assert_eq!(history.findings.len(), 2);
+    assert_eq!(history.findings["F0001"].status, FindingStatus::Open);
+    assert_eq!(history.findings["F0002"].status, FindingStatus::Open);
+    assert_eq!(history.findings["F0001"].origin, FindingOrigin::Reopened);
+    assert_eq!(history.rounds.last().unwrap().reopened, ["F0001"]);
+    assert!(history.rounds.last().unwrap().closed.is_empty());
 }
 
 #[test]

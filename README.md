@@ -780,10 +780,13 @@ unfinished coverage cannot authorize Repair or acceptance. Missing terminal
 results retain their separate one-continuation protocol-recovery rule.
 
 If a Verify report uses unknown or duplicate finding IDs, or lacks required
-finding evidence, the runner saves the original report and validation error
-without changing retained findings or coverage. A `VERIFIED` or `RETRY` result
-then becomes `INCOMPLETE`: the next verifier corrects the report using the saved
-evidence under the same stage allowance, before repair or acceptance can proceed.
+finding evidence, the runner saves the original report and validation error.
+Reported open blockers remain retained under current-scope IDs; rejected closures
+and coverage are not accepted. Omitting a blocker from a corrected report cannot
+erase it: independent disposition still requires governing sources and evidence.
+A `VERIFIED` or `RETRY` result then becomes `INCOMPLETE`: the next verifier corrects
+the report using the saved evidence under the same stage allowance, before repair
+or acceptance can proceed.
 Finding IDs belong to the current review scope; observations brought from a
 completed slice need empty IDs in a new scope. `BLOCKED` still stops immediately.
 
