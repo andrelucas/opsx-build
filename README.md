@@ -1420,6 +1420,24 @@ are covered by the working-directory grant. Custom `GOPATH`, `GOMODCACHE`,
 Restart the nono invocation after changing its profile; existing sandboxed
 processes keep their original permissions.
 
+The profile also includes Java runtime access and read-only access to TLA+ tools
+under `/opt/tlaplus` and TLAPS installations under `~/.opam`. Linux additionally
+grants read access to `/etc/java`. TLAPS's Isabelle backend can write its user
+state under `~/.isabelle`; create that directory when provisioning TLAPS, before
+starting nono. Campaign-local jars, models, proof caches and TLC state directories
+use the working-directory grant. Other shared tool locations need their own grants.
+The macOS override also enables POSIX semaphores (`ipc_mode = full`), which
+Isabelle's Poly/ML runtime needs.
+
+On macOS, TLAPS invokes `ps`, but the system `/bin/ps` is setuid and cannot execute
+inside nono. Maria uses a TLAPS launcher at `~/.local/bin/tlapm` that prepends
+`~/.local/lib/tlaplus/bin` to its own PATH, then invokes
+`~/.opam/default/bin/tlapm`. That private directory contains a copy of `/bin/ps`
+with mode `0755` and an ad hoc code signature (`codesign --force --sign - PATH`).
+Use the launcher on PATH, or select it explicitly in the verification tool's
+settings. This keeps the helper scoped to TLAPS and requires no additional
+process-inspection permission in the profile.
+
 Git's XDG directory (`$XDG_CONFIG_HOME/git`, normally `~/.config/git`) has a
 read-only directory grant. On Linux this covers replacement files within that
 directory. A config-file symlink pointing outside it still relies on access to

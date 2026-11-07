@@ -8,14 +8,16 @@
     "access": "readwrite"
   },
   "groups": {
-    "include": ["git_config", "node_runtime", "python_runtime", "rust_runtime", "go_runtime"]
+    "include": ["git_config", "node_runtime", "python_runtime", "rust_runtime", "go_runtime", "java_runtime"]
   },
   "filesystem": {
     "read": [
       "$XDG_CONFIG_HOME/git",
       "$XDG_CONFIG_HOME/opsx-build",
       "$XDG_CONFIG_HOME/openspec",
-      "$HOME/.local/share/claude"
+      "$HOME/.local/share/claude",
+      "$HOME/.opam",
+      "/opt/tlaplus"
     ],
     "allow": [
       "$HOME/.claude",
@@ -26,6 +28,7 @@
       "$HOME/go/pkg/sumdb",
       "$HOME/.cargo/registry",
       "$HOME/.cargo/git",
+      "$HOME/.isabelle",
       "$HOME/.dap-cli",
       "$XDG_CONFIG_HOME/opencode",
       "$XDG_DATA_HOME/opencode",
@@ -60,12 +63,16 @@
           "/usr/share/python-wheels",
           "/etc/pki/ca-trust",
           "/etc/pki/tls",
+          "/etc/java",
           "/usr/include",
           "/etc/mime.types"
         ]
       }
     },
     "macos": {
+      "security": {
+        "ipc_mode": "full"
+      },
       "filesystem": {
         "allow": [
           "$HOME/Library/Keychains",
