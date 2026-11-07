@@ -545,6 +545,7 @@ fn read_events(directory: &Path) -> Result<(Vec<Event>, Vec<String>)> {
 #[derive(Parser)]
 #[command(
     name = "opsx-build corpus",
+    bin_name = "opsx-build corpus",
     about = "Export locally captured progress evidence; never invokes an agent"
 )]
 struct Args {
