@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:opsx-build:corpus:1",
+  "title": "opsx-build passive progress corpus, version 1",
+  "description": "Each JSONL file uses its named definition. Sequence, not wall time, defines causal order. Validate object SHA-256 and source references as well as shape. Annotations are supplied separately after human review.",
+  "$defs": {
+    "event": {
+      "type": "object",
+      "required": ["schema_version", "run_id", "sequence", "recorded_at_unix_ms", "kind", "request", "data"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "run_id": {"type": "string"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "recorded_at_unix_ms": {"type": "integer"},
+        "kind": {"type": "string"},
+        "request": {"type": ["object", "null"]},
+        "data": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "model_input": {
+      "type": "object",
+      "required": ["decision_id", "cutoff_sequence", "recorded_at_unix_ms", "context", "task", "file_snapshot", "events", "baseline", "check_scope", "latest_review", "operating_state", "limitations"],
+      "properties": {
+        "decision_id": {"type": "string"},
+        "cutoff_sequence": {"type": "integer", "minimum": 1},
+        "recorded_at_unix_ms": {"type": "integer"},
+        "context": {"type": ["object", "null"]},
+        "task": {"type": ["object", "null"]},
+        "file_snapshot": {"type": ["object", "null"]},
+        "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+        "baseline": {"type": "object"},
+        "check_scope": {"type": ["object", "null"]},
+        "latest_review": {"type": ["object", "null"]},
+        "operating_state": {"type": ["object", "null"]},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "required": ["schema_version", "decision_id", "run_id", "previous_cutoff_sequence", "input", "observed_policy", "later_outcome_sequences", "annotation", "training_eligible", "split"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "decision_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "previous_cutoff_sequence": {"type": "integer"},
+        "input": {"$ref": "#/$defs/model_input"},
+        "observed_policy": {"type": "object"},
+        "later_outcome_sequences": {"type": "array", "items": {"type": "integer"}},
+        "annotation": {"type": "null"},
+        "training_eligible": {"const": false},
+        "split": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [{"$ref": "#/$defs/event"}, {"$ref": "#/$defs/decision"}, {"$ref": "#/$defs/model_input"}]
+}

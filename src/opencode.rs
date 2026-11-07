@@ -476,7 +476,7 @@ impl<'a, U: Ui> OpenCodeBackend<'a, U> {
         let mut invocation = resolve_invocation(self.repo, prompt);
         invocation.message.push_str("\n\nThis OpenCode request supplies no structured result schema. Return the required final OPSX_STATUS line. For verification, emit the OPSX_REVIEW JSON object before that line.");
         let id = new_input_id();
-        usage.before_request()?;
+        usage.before_request_with_prompt(&invocation.message)?;
         if self.stream_transport {
             self.ui.start_stream(activity);
         }
@@ -802,6 +802,9 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
                 }
                 Err(error) => crate::usage::error_outcome(error).to_owned(),
             };
+            if let Ok(OpenCodeAttempt::Complete(result)) = &attempt {
+                usage.corpus_stage_result(result);
+            }
             usage.finish(&outcome);
             match attempt {
                 Err(error)

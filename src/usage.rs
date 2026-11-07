@@ -255,6 +255,28 @@ impl<'a, U: Ui> Attempt<'a, U> {
         }
         Ok(())
     }
+
+    pub(crate) fn before_request_with_prompt(&self, prompt: &str) -> anyhow::Result<()> {
+        self.before_request()?;
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.corpus_prompt(&self.record, prompt);
+        }
+        Ok(())
+    }
+
+    fn corpus(&self, kind: &str, data: Value) {
+        if let Some(guard) = self.ui.operating_policy() {
+            guard.corpus_observation(&self.record, kind, data);
+        }
+    }
+
+    pub(crate) fn corpus_stage_result(&self, result: &crate::backend::StageResult) {
+        self.corpus(
+            "stage_report",
+            serde_json::json!({"signal":format!("{:?}",result.signal),
+            "text":result.text,"review":result.review}),
+        );
+    }
     pub fn new(ui: &'a U, repo: &Path, identity: Identity<'_>, activity: &str) -> Self {
         let baseline = if identity.fresh {
             Some(Snapshot::zero())
@@ -323,7 +345,12 @@ impl<'a, U: Ui> Attempt<'a, U> {
         if self.record.tools.iter().any(|t| t.id == id) {
             return;
         }
-        // Grouping identifier only, not a cryptographic digest; arguments are never persisted.
+        self.corpus(
+            "tool_call",
+            serde_json::json!({"call_id":id,"name":name,"input":input}),
+        );
+        // Usage-log grouping only, not a cryptographic digest. Bounded visible
+        // arguments are retained separately in the passive corpus, not here.
         let fingerprint = (!input.is_null()).then(|| {
             let mut hasher = DefaultHasher::new();
             (name, input.to_string()).hash(&mut hasher);
@@ -368,6 +395,10 @@ impl<'a, U: Ui> Attempt<'a, U> {
         failed: Option<bool>,
         exit: Option<i64>,
     ) {
+        self.corpus(
+            "tool_result",
+            serde_json::json!({"call_id":id,"output":output,"failed":failed,"exit_code":exit}),
+        );
         if let Some(tool) = self.record.tools.iter_mut().find(|t| t.id == id) {
             tool.completed = true;
             tool.failed = failed;
@@ -440,6 +471,9 @@ impl<'a, U: Ui> Attempt<'a, U> {
                     .flatten()
                 {
                     match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            self.corpus("agent_text", serde_json::json!({"text":block["text"]}))
+                        }
                         Some("tool_use") => {
                             if let (Some(id), Some(name)) =
                                 (block["id"].as_str(), block["name"].as_str())
@@ -588,6 +622,9 @@ impl<'a, U: Ui> Attempt<'a, U> {
                 let Some(kind) = item["type"].as_str() else {
                     return;
                 };
+                if kind == "agentMessage" && event["method"] == "item/completed" {
+                    self.corpus("agent_text", serde_json::json!({"text":item["text"]}));
+                }
                 if matches!(
                     kind,
                     "commandExecution"
@@ -657,6 +694,7 @@ impl<'a, U: Ui> Attempt<'a, U> {
                 .and_then(Value::as_str),
         );
         match event["type"].as_str() {
+            Some("text") => self.corpus("agent_text", serde_json::json!({"text":part["text"]})),
             Some("step_finish") => {
                 let Some(id) = part["id"].as_str() else {
                     self.note("OpenCode step omitted its ID; usage cannot be deduplicated safely.");

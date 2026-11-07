@@ -131,7 +131,7 @@ impl AcceptanceGate {
             outcome: "running".to_owned(),
             results: Vec::new(),
         };
-        write_report(&report_path, &report)?;
+        write_report(&report_path, &report, ui)?;
         ui.info(&format!("Acceptance evidence: `{}`", report_path.display()));
         for (index, command) in self.commands.iter().enumerate() {
             check_inputs()?;
@@ -157,11 +157,11 @@ impl AcceptanceGate {
             );
             report.results.push(result);
             report.outcome = if success { "running" } else { "failed" }.to_owned();
-            write_report(&report_path, &report)?;
+            write_report(&report_path, &report, ui)?;
             execution?; // Pause/interruption retains an incomplete gate and its log.
             if let Err(error) = check_inputs() {
                 report.outcome = "protected-input-changed".to_owned();
-                write_report(&report_path, &report)?;
+                write_report(&report_path, &report, ui)?;
                 return Err(error);
             }
             if !success {
@@ -178,14 +178,14 @@ impl AcceptanceGate {
         }
         if before != product_snapshot(repo, change, ui)? {
             report.outcome = "inputs-changed-during-checks".to_owned();
-            write_report(&report_path, &report)?;
+            write_report(&report_path, &report, ui)?;
             return Ok(Some(format!(
                 "Acceptance commands changed tracked or non-ignored product inputs; results cannot certify the resulting tree. Finish required generation/setup in Apply/Repair, then rerun the unchanged checks. Evidence: {}",
                 report_path.display()
             )));
         }
         report.outcome = "passed".to_owned();
-        write_report(&report_path, &report)?;
+        write_report(&report_path, &report, ui)?;
         self.evidence = Some(Evidence {
             files: before,
             report: report_path,
@@ -214,8 +214,11 @@ fn product_snapshot<U: Ui>(repo: &Path, change: Option<&str>, ui: &U) -> Result<
     Ok(files)
 }
 
-fn write_report(path: &Path, report: &Report<'_>) -> Result<()> {
+fn write_report<U: Ui>(path: &Path, report: &Report<'_>, ui: &U) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    if let Some(guard) = ui.operating_policy() {
+        guard.corpus_artifact("acceptance_outcome", path);
+    }
     Ok(())
 }
 

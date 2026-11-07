@@ -2435,7 +2435,9 @@ interrupted attempts, with:
   plus a harness-reported cost estimate when supplied.
 - Observed tool calls, completion/error indicators, result character counts,
   recognized truncation markers, and fingerprints for repeated-call analysis.
-  Tool arguments and result text are not stored. Matching fingerprints are
+  Tool arguments and result text are not stored in the usage log; the separate
+  [progress corpus](docs/progress-corpus.md) retains bounded visible evidence.
+  Matching fingerprints are
   candidates for inspection, not proof of wasted work; a repeated check can be
   necessary after an edit. The `repeated` flag compares calls within one attempt.
   Schema version 2 also records `execution_fingerprint` and

@@ -2,6 +2,9 @@ use anyhow::Result;
 use opsx_build::{app::App, cli::Cli, ui::TerminalUi};
 
 fn main() -> Result<()> {
+    if let Some(code) = opsx_build::corpus::run_cli()? {
+        std::process::exit(code);
+    }
     if let Some(code) = opsx_build::checks::run_cli()? {
         std::process::exit(code);
     }

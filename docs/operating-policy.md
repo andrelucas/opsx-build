@@ -86,6 +86,10 @@ request limit.
 
 ## Durable state and reports
 
+Normal runs also retain a [passive progress corpus](progress-corpus.md) for
+later human annotation and assessor evaluation. It observes these decisions
+without changing their rules or allowances.
+
 The checkpoint references a private Git-metadata directory, normally:
 
 ```text

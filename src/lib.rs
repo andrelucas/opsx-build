@@ -14,6 +14,7 @@ mod codex_diagnostics;
 mod codex_home;
 mod codex_server;
 mod contracts;
+pub mod corpus;
 mod dashboard;
 pub mod git;
 pub mod model_confusions;

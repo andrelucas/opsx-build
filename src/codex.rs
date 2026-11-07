@@ -554,7 +554,7 @@ impl<'a, U: Ui> CodexBackend<'a, U> {
         });
         let prompt = text_protocol.as_deref().unwrap_or(prompt);
         self.ui.debug_prompt(activity, prompt);
-        usage.before_request()?;
+        usage.before_request_with_prompt(prompt)?;
         let input = codex_turn_input(self.repo, prompt);
         diagnostic.request(&input, schema.as_ref());
         let guard = self.ui.operating_policy();
@@ -870,6 +870,9 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
                     None
                 }
             };
+            if let Ok(TurnOutcome::Complete(result)) = &attempt {
+                usage.corpus_stage_result(result);
+            }
             usage.finish(&outcome);
             let attempt = attempt.map_err(|error| {
                 if let Some(path) = &report {

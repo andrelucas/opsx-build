@@ -587,6 +587,9 @@ impl<U: Ui> App<U> {
             rows,
         );
         self.ui.run_summary(&summary.render());
+        if let Ok(outcome) = serde_json::to_value(&summary) {
+            guard.corpus_outcome(outcome);
+        }
         match summary.save(&context) {
             Ok(path) => self
                 .ui

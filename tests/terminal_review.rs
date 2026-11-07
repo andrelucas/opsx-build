@@ -10,6 +10,71 @@ struct Fixture {
     root: PathBuf,
 }
 
+#[test]
+fn automatic_corpus_export_is_past_only_self_contained_and_does_not_dispatch_an_agent() {
+    let fixture = Fixture::new();
+    let output_path = fixture.root.join("corpus-export");
+    let export = Command::new(env!("CARGO_BIN_EXE_opsx-build"))
+        .args(["corpus", "export", "--repo"])
+        .arg(fixture.root.join("repo"))
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(
+        !fixture.root.join("calls").exists(),
+        "export dispatched an agent"
+    );
+    let records = |name: &str| -> Vec<serde_json::Value> {
+        fs::read_to_string(output_path.join(name))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let events = records("events.jsonl");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "stage_report"
+            && event["data"]
+                .to_string()
+                .contains("Fixture stopped at Propose")
+    }));
+    let decisions = records("decisions.jsonl");
+    let inputs = records("model-inputs.jsonl");
+    assert!(!decisions.is_empty());
+    assert_eq!(decisions.len(), inputs.len());
+    for (decision, input) in decisions.iter().zip(&inputs) {
+        assert_eq!(decision["input"], *input);
+        assert!(decision["annotation"].is_null());
+        assert_eq!(decision["training_eligible"], false);
+        assert!(input.get("observed_policy").is_none());
+        let cutoff = input["cutoff_sequence"].as_u64().unwrap();
+        for event in input["events"].as_array().unwrap() {
+            assert!(event["sequence"].as_u64().unwrap() < cutoff);
+            assert!(!event["kind"].as_str().unwrap().ends_with("_outcome"));
+        }
+    }
+    assert!(!records("outcomes.jsonl").is_empty());
+    assert!(output_path.join("objects").is_dir());
+    let schema: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path.join("schema.json")).unwrap()).unwrap();
+    assert!(schema["$defs"]["decision"].is_object());
+    let overwrite = Command::new(env!("CARGO_BIN_EXE_opsx-build"))
+        .args(["corpus", "export", "--repo"])
+        .arg(fixture.root.join("repo"))
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(!overwrite.status.success());
+    assert!(output_path.join("manifest.json").is_file());
+}
+
 impl Fixture {
     fn new() -> Self {
         let fixture = Self {

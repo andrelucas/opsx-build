@@ -937,6 +937,9 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 Err(error) if is_transient_api_error(error) => "provider_error".to_owned(),
                 Err(error) => crate::usage::error_outcome(error).to_owned(),
             };
+            if let Ok(ClaudeAttempt::Complete(result)) = &attempt {
+                usage.corpus_stage_result(result);
+            }
             usage.finish(&outcome);
             match attempt {
                 Ok(ClaudeAttempt::Complete(result)) if protocol == StageProtocol::Preflight => {
@@ -1098,10 +1101,10 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
                 spec
             };
             let output = if first_attempt && output_format == ClaudeOutputFormat::StreamJson {
-                usage.before_request()?;
+                usage.before_request_with_prompt(prompt)?;
                 self.run_stage_command(&spec, activity, timeout, usage)?
             } else {
-                usage.before_request()?;
+                usage.before_request_with_prompt(prompt)?;
                 self.runner.run(
                     &spec.policy_request(),
                     if first_attempt {

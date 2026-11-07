@@ -453,3 +453,116 @@ fn productive_reviews_cannot_silently_extend_a_selected_time_limit() {
     assert_eq!(f.report()["trigger"], "active_time_limit");
     assert_eq!(f.report()["trend"]["no_progress_reviews"], 0);
 }
+
+#[test]
+fn corpus_failure_does_not_change_request_allowances_or_timeout_decisions() {
+    for unavailable in [false, true] {
+        let fixture = Fixture::new(Policy {
+            max_requests_per_stage: 1,
+            max_request_seconds: 1,
+            ..Policy::default()
+        });
+        if unavailable {
+            fs::write(
+                fixture.root.join(".git/opsx-build/corpus"),
+                "cannot create a directory here",
+            )
+            .unwrap();
+        }
+        let guard = fixture.run.open(None).unwrap();
+        let usage = request(&fixture.root, "request");
+        guard.before_request(&usage).unwrap();
+        guard
+            .active_request
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(2);
+        assert!(is_stop(&guard.poll().unwrap_err()));
+        assert_eq!(fixture.report()["trigger"], "request_timeout");
+        guard.record_usage(&usage);
+        assert!(is_stop(
+            &guard
+                .before_request(&request(&fixture.root, "next"))
+                .unwrap_err()
+        ));
+        assert_eq!(fixture.report()["trigger"], "request_limit");
+        assert_eq!(fixture.ledger().stage_requests, 1);
+    }
+}
+
+#[test]
+fn corpus_capture_preserves_watchdog_check_extension_and_its_expiry() {
+    for unavailable in [false, true] {
+        let fixture = Fixture::new(Policy {
+            max_request_seconds: 1,
+            request_progress_grace_seconds: Some(10),
+            ..Policy::default()
+        });
+        if unavailable {
+            fs::write(
+                fixture.root.join(".git/opsx-build/corpus"),
+                "capture unavailable",
+            )
+            .unwrap();
+        }
+        let directory = fixture.root.join(".git/opsx-build/checks/scope");
+        fs::create_dir_all(directory.join("check")).unwrap();
+        fs::write(
+            directory.join("context.json"),
+            serde_json::to_vec(&serde_json::json!({"repositories":[fixture.root],"generation":0}))
+                .unwrap(),
+        )
+        .unwrap();
+        let guard = fixture.run.open(None).unwrap();
+        guard.observe_check_directory(directory.clone());
+        let mut usage = request(&fixture.root, "implementation");
+        usage.context.stage = Some("Apply".into());
+        guard.before_request(&usage).unwrap();
+        let now = crate::run_summary::now_ms();
+        {
+            let mut active = guard.active_request.lock().unwrap();
+            let active = active.as_mut().unwrap();
+            active.started = Instant::now() - Duration::from_secs(2);
+            active.dispatched_at = now - 500;
+        }
+        let path = directory.join("check/result.json");
+        let mut receipt = serde_json::json!({
+            "format_version":1,"runner_version":"fixture","path":path,"key":"test","change":"delivery","stage":"Apply",
+            "started_at_unix_ms":now-100,"sequence":1,"generation":0,
+            "spec":{"key":"test","command":"true","cwd":fixture.root,"tools":[],"runtime_reason":"fixture","timeout_seconds":10},
+            "inputs":null,"outcome":"passed","exit_code":0,"elapsed_ms":0,
+            "stdout":directory.join("check/stdout.log"),"stderr":directory.join("check/stderr.log"),
+            "log_hashes":null,"reused_from":null,"invalidation_reasons":[],"reuse_limitations":[]
+        });
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        guard.poll().unwrap();
+        assert_eq!(
+            fixture.ledger().requests[&usage.id]
+                .progress_extensions
+                .len(),
+            1
+        );
+        receipt["started_at_unix_ms"] = serde_json::json!(now - 20_000);
+        fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        guard
+            .active_request
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .progress
+            .as_mut()
+            .unwrap()
+            .recheck_at = Duration::ZERO;
+        assert!(is_stop(&guard.poll().unwrap_err()));
+        assert_eq!(fixture.report()["trigger"], "request_timeout");
+        assert!(
+            fixture.report()["reason"]
+                .as_str()
+                .unwrap()
+                .contains("stopped making check progress")
+        );
+    }
+}

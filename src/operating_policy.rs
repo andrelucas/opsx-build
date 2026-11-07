@@ -138,6 +138,7 @@ struct Ledger {
 
 /// Owned for the runner process lifetime; serialized independently of stage state.
 pub struct Guard {
+    corpus: crate::corpus::Capture,
     directory: PathBuf,
     ledger: Mutex<Ledger>,
     active_since: Instant,
@@ -244,6 +245,7 @@ impl Run {
             }
         }
         let guard = Guard {
+            corpus: crate::corpus::Capture::open(&self.directory),
             directory: self.directory.clone(),
             saved_active_ms: ledger.active_ms,
             ledger: Mutex::new(ledger),
@@ -320,11 +322,47 @@ impl Guard {
             ledger.next_stage = next_stage.to_owned();
         }
         self.save()?;
+        self.corpus.observe(|capture| {
+            capture.event("stage_boundary", serde_json::json!({"change":change,"next_stage":next_stage,"active_elapsed_known_ms":self.elapsed_ms()}))?;
+            capture.decision("stage_boundary", "observe", serde_json::json!({}))
+        });
         self.check(false)
     }
 
     pub(crate) fn observe_check_directory(&self, directory: PathBuf) {
+        self.corpus.observe(|capture| capture.scope(&directory));
         *self.check_directory.lock().unwrap() = Some(directory);
+    }
+
+    pub(crate) fn corpus_observation(
+        &self,
+        usage: &UsageRecord,
+        kind: &str,
+        data: serde_json::Value,
+    ) {
+        self.corpus
+            .observe(|capture| capture.observation(usage, kind, data));
+    }
+
+    pub(crate) fn corpus_prompt(&self, usage: &UsageRecord, prompt: &str) {
+        self.corpus.observe(|capture| capture.prompt(usage, prompt));
+    }
+
+    fn corpus_review(&self, progress: &Progress) {
+        self.corpus.observe(|capture| {
+            capture.artifact("review_record", &progress.evidence_path)?;
+            capture.event("review_progress", serde_json::to_value(progress)?)?;
+            capture.decision("review_recorded", "observe", serde_json::json!({}))
+        });
+    }
+
+    pub(crate) fn corpus_artifact(&self, kind: &str, path: &Path) {
+        self.corpus.observe(|capture| capture.artifact(kind, path));
+    }
+
+    pub(crate) fn corpus_outcome(&self, outcome: serde_json::Value) {
+        self.corpus
+            .observe(|capture| capture.event("run_outcome", outcome));
     }
 
     pub(crate) fn before_request(&self, usage: &UsageRecord) -> Result<()> {
@@ -374,10 +412,15 @@ impl Guard {
             progress: None,
             observed_checks: BTreeSet::new(),
         });
-        self.save()
+        self.save()?;
+        self.corpus.observe(|capture| capture.start(usage));
+        Ok(())
     }
 
     pub(crate) fn record_usage(&self, usage: &UsageRecord) {
+        self.corpus.observe(|capture| {
+            capture.finish(usage, self.check_directory.lock().unwrap().as_deref())
+        });
         {
             let mut ledger = self.ledger.lock().unwrap();
             if let Some(request) = ledger.requests.get_mut(&usage.id) {
@@ -468,6 +511,7 @@ impl Guard {
     }
 
     pub(crate) fn incomplete_review(&self, mut progress: Progress) -> Result<()> {
+        self.corpus_review(&progress);
         let mut ledger = self.ledger.lock().unwrap();
         if let Some(previous) = &ledger.incomplete_review
             && previous.change == progress.change
@@ -490,6 +534,7 @@ impl Guard {
     }
 
     pub(crate) fn review(&self, mut progress: Progress) -> Result<()> {
+        self.corpus_review(&progress);
         let mut ledger = self.ledger.lock().unwrap();
         if ledger.reviews.iter().any(|old| old.id == progress.id) {
             return Ok(());
@@ -590,6 +635,12 @@ impl Guard {
 
     pub(crate) fn poll(&self) -> Result<()> {
         self.check(false)?;
+        self.corpus.observe(|capture| {
+            capture.sample(
+                self.check_directory.lock().unwrap().as_deref(),
+                self.elapsed_ms(),
+            )
+        });
         let (limit, grace) = {
             let ledger = self.ledger.lock().unwrap();
             (
@@ -653,11 +704,16 @@ impl Guard {
                 .unwrap()
                 .progress_extensions
                 .push(ProgressExtension {
-                    receipt: evidence.receipt,
+                    receipt: evidence.receipt.clone(),
                     outcome: evidence.outcome,
                     extra_seconds: evidence.valid_for.as_secs(),
                 });
-            return self.save();
+            let saved = self.save();
+            self.corpus.observe(|capture| {
+                capture.checks(self.check_directory.lock().unwrap().as_deref())?;
+                capture.decision("watchdog_extension", "continue", serde_json::json!({"receipt":evidence.receipt,"active_elapsed_known_ms":self.elapsed_ms()}))
+            });
+            return saved;
         }
         let extended = request.progress.is_some();
         drop(active);
@@ -911,12 +967,19 @@ impl Guard {
             self.directory.join("stop.json").display()
         );
         fs::write(self.directory.join("stop.txt"), &text)?;
+        self.corpus.observe(|capture| {
+            capture.decision(kind, "stop", serde_json::json!({
+            "reason":reason,"policy":ledger.policy,"active_elapsed_known_ms":self.elapsed_ms(),
+            "no_progress_reviews":ledger.no_progress,"stage_requests":ledger.stage_requests
+        }))
+        });
         Err(PolicyStop(text).into())
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        self.corpus.close();
         let _ = self.save();
         // A fork may briefly hold a duplicate until exec closes it. End this
         // owner's lock explicitly instead of relying on the final descriptor.
