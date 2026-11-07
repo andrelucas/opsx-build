@@ -789,9 +789,7 @@ impl<U: Ui> AgentBackend for CodexBackend<'_, U> {
         let mut provider_retries = 0;
         let invocation = uuid::Uuid::new_v4().to_string();
         let mut attempt_number = 0;
-        let deadline = self
-            .stage_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let deadline = crate::backend::stage_deadline(self.ui, self.stage_timeout);
         loop {
             let remaining = deadline.map(|deadline| {
                 deadline

@@ -1,9 +1,29 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_INCOMPLETE_STAGE_RECOVERIES: u32 = 1;
+
+pub(crate) fn stage_deadline<U: crate::ui::Ui>(
+    ui: &U,
+    timeout: Option<Duration>,
+) -> Option<Instant> {
+    let timeout = timeout?;
+    if matches!(
+        ui.usage_context().stage.as_deref(),
+        Some("Apply" | "Repair")
+    ) && ui.operating_policy().is_some()
+    {
+        None
+    } else {
+        Instant::now().checked_add(timeout)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -37,7 +37,8 @@ Request and existing recovery bounds still apply.
 An explicit `INCOMPLETE` result means authorized work remains without an external
 decision or input. The runner continues automatically under the existing stage
 request allowance instead of asking the operator to run an identical resume.
-Other stages keep their session and original timeout. Verify uses one same-session
+Other stages keep their session. Apply and Repair use the progress watchdog;
+other stages retain their original deadlines. Verify uses one same-session
 continuation, then retains its partial review and starts a fresh verifier with
 the exact outstanding areas and prior evidence. Neither partial coverage nor
 known blockers alone authorize Repair before review is complete.
@@ -75,10 +76,12 @@ Cached receipts, repeated results without changed inputs, and agent output
 alone do not move the deadline.
 
 The runner rechecks live receipts, records the evidence for continuing, and
-stops when that evidence expires. Earlier worker-stage and cumulative
-active-time limits still apply. Contract preflight and independent acceptance
-use their own deadlines. Set `request_progress_grace_seconds` to another
-positive number to change the window after a result, or to `null` for a fixed
+stops when that evidence expires. Apply and Repair have no fixed worker-stage
+deadline: `local_worker_timeout_minutes` still bounds Explore, Propose and Verify.
+The initial request allowance, cumulative active-time limits and individual check
+timeouts remain in force. Contract preflight, transport/control operations,
+compaction and independent acceptance keep their own deadlines. Set
+`request_progress_grace_seconds` to another positive number to change the window after a result, or to `null` for a fixed
 request limit.
 
 ## Durable state and reports

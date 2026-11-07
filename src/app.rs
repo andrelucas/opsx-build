@@ -3913,7 +3913,7 @@ impl<U: Ui> App<U> {
             .info("Ask the worker agent to create the completion milestone commit");
         if let Some(frontier_launcher) = frontier_launcher {
             self.ui.info(&format!(
-                "Frontier fallback: {} after local TOO_LARGE or a {} minute worker timeout",
+                "Frontier fallback: {} after local TOO_LARGE or a {} minute Explore/Propose/Verify timeout",
                 frontier_launcher.program(),
                 self.cli.local_worker_timeout_minutes
             ));

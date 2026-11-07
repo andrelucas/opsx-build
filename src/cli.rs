@@ -740,7 +740,7 @@ pub(crate) struct CliArgs {
     #[arg(long, env = "OPSX_BUILD_MAX_PROVIDER_RETRIES", value_name = "N")]
     max_provider_retries: Option<u32>,
 
-    /// Maximum minutes for one local Explore, Propose, Apply, Verify, or Repair stage.
+    /// Maximum minutes for local Explore, Propose, or Verify; Apply/Repair use the progress watchdog.
     #[arg(
         long,
         env = "OPSX_BUILD_LOCAL_WORKER_TIMEOUT_MINUTES",

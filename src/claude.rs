@@ -898,9 +898,7 @@ impl<'a, U: Ui> ClaudeBackend<'a, U> {
         let mut provider_retries = 0;
         let invocation = uuid::Uuid::new_v4().to_string();
         let mut attempt_number = 0;
-        let deadline = self
-            .stage_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let deadline = crate::backend::stage_deadline(self.ui, self.stage_timeout);
 
         loop {
             let remaining = deadline.map(|deadline| {
@@ -1903,7 +1901,7 @@ pub fn stage_prompt(command: &str, subject: &str, protocol: StageProtocol) -> St
         | StageProtocol::Frontier => "",
     };
     format!(
-        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under the original stage timeout; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nIf this invocation supplies a structured result schema, return that object with `opsx_status` set to exactly one of: {terminal_values}, and a concise `summary`. A backend without a supplied schema must use the text result protocol: you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
+        "{task}\n\nThis invocation is controlled by opsx-build. Operate autonomously. Use BLOCKED only when progress genuinely requires a human decision or unavailable external input. Keep required delegated work within this invocation: wait using the runtime's tools, collect its results and finish the assigned phase before ending your turn. Do not end a turn merely to wait for background agents or schedule a later wakeup. If the harness requires a result before the phase is finished and no external input is needed, return INCOMPLETE with the remaining work and references to pending delegated results. INCOMPLETE requests automatic continuation within the remaining operating-policy allowance; it is not success or a blocker. Describe the exact outstanding work and pending result references. Ordinary stages continue in the same session under their applicable deadlines and remaining operating-policy allowance. Apply and Repair use the progress watchdog; Verify may hand retained review evidence to a fresh session. Use BLOCKED for a genuine external decision or unavailable input, not merely because owned work remains.\n\n{project_authority}{test_execution_policy}\n\n{model_confusions}\n\nSTAGE RESULT PROTOCOL — MANDATORY\n\nIf this invocation supplies a structured result schema, return that object with `opsx_status` set to exactly one of: {terminal_values}, and a concise `summary`. A backend without a supplied schema must use the text result protocol: you MUST NOT finish this invocation without emitting exactly one final line in the form `OPSX_STATUS: <value>` using the same allowed values. This obligation belongs to this outermost invocation even if a nested skill or OpenSpec command already reported success. Do not omit or paraphrase the fallback marker, wrap it in Markdown, or place text after it."
     )
 }
 
@@ -3189,6 +3187,135 @@ printf '{{"type":"result","subtype":"success","session_id":"00000000-0000-0000-0
                     .iter()
                     .all(|record| record.invocation_id == records[0].invocation_id)
             );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_and_repair_use_watchdog_while_other_stages_keep_their_deadline() {
+        use crate::{
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        for stage in ["Apply", "Repair", "Explore", "Propose", "Verify"] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-stage-deadline-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&directory)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let script = directory.join("agent.sh");
+            fs::write(&script, r#"
+IFS= read -r prompt
+sleep 0.15
+if [ -f first-finished ]; then status=READY; else touch first-finished; status=INCOMPLETE; fi
+printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":"%s","summary":"continued work"}}\n' "$status"
+"#).unwrap();
+            let ui = RecordingUi::default();
+            *ui.stage_override.lock().unwrap() = Some(stage.into());
+            let run = Run::new(
+                &directory,
+                Policy {
+                    max_request_seconds: 2,
+                    ..Policy::default()
+                },
+                &ui,
+            )
+            .unwrap();
+            ui.set_operating_policy(std::sync::Arc::new(run.open(None).unwrap()))
+                .unwrap();
+            let launcher = shell_launcher(&script);
+            let backend = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 0, &ui)
+                .with_stage_timeout(Duration::from_millis(40));
+            let result = backend.invoke(
+                SessionMode::New {
+                    id: SessionId::new(Uuid::new_v4().to_string()),
+                    name: None,
+                },
+                "Finish assigned work",
+                stage,
+                StageProtocol::Worker,
+            );
+            if matches!(stage, "Apply" | "Repair") {
+                assert_eq!(result.unwrap().signal, StageSignal::Ready, "{stage}");
+                assert_eq!(ui.records.lock().unwrap().len(), 2, "{stage}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.is::<WorkerEscalationRequested>(),
+                    "{stage}: {error:#}"
+                );
+            }
+            drop(backend);
+            drop(ui);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_still_stops_stalled_apply_and_repair() {
+        use crate::{
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        for stage in ["Apply", "Repair"] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-stalled-stage-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&directory)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let script = directory.join("agent.sh");
+            fs::write(&script, "IFS= read -r prompt\nsleep 10\n").unwrap();
+            let ui = RecordingUi::default();
+            *ui.stage_override.lock().unwrap() = Some(stage.into());
+            let run = Run::new(
+                &directory,
+                Policy {
+                    max_request_seconds: 1,
+                    ..Policy::default()
+                },
+                &ui,
+            )
+            .unwrap();
+            ui.set_operating_policy(std::sync::Arc::new(run.open(None).unwrap()))
+                .unwrap();
+            let launcher = shell_launcher(&script);
+            let backend = ClaudeBackend::new(&directory, &launcher, "auto", false, None, 0, &ui)
+                .with_stage_timeout(Duration::from_millis(40));
+            let error = backend
+                .invoke(
+                    SessionMode::New {
+                        id: SessionId::new(Uuid::new_v4().to_string()),
+                        name: None,
+                    },
+                    "Finish assigned work",
+                    stage,
+                    StageProtocol::Worker,
+                )
+                .unwrap_err();
+            assert!(
+                crate::operating_policy::is_stop(&error),
+                "{stage}: {error:#}"
+            );
+            assert_eq!(
+                ui.records.lock().unwrap()[0].outcome,
+                "policy_stop_incomplete"
+            );
+            drop(backend);
+            drop(ui);
             fs::remove_dir_all(directory).unwrap();
         }
     }

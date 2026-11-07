@@ -664,8 +664,8 @@ at startup; it does not infer worker capacity from model names or connection
 selection.
 
 Agenda runs also escalate when a bounded worker stage reports `TOO_LARGE`, exceeds
-`local_worker_timeout_minutes`, exhausts output-limit recovery, or receives the
-dashboard's `f` command. An operating-policy limit that expires first produces a
+`local_worker_timeout_minutes` in Explore, Propose or Verify, exhausts output-limit
+recovery, or receives the dashboard's `f` command. An operating-policy limit that expires first produces a
 preserved-work policy stop instead of capacity escalation.
 
 Exhausting `--max-verify-retries` stops at Repair with the implementation,
@@ -767,7 +767,8 @@ Every backend also accepts an explicit `INCOMPLETE` result in any stage: work
 remains, but it can continue without an external decision or input. The runner
 continues automatically within the durable operating-policy request allowance,
 without compacting just for this result. Ordinary stages retain the same session
-and original stage timeout. Verify first continues the same session once (sharing
+and applicable deadlines. Apply and Repair use the progress watchdog instead of a
+fixed worker-stage deadline. Verify first continues the same session once (sharing
 that turn with omitted-result recovery), then saves the partial review and opens
 a fresh verifier with retained findings, completed coverage, outstanding areas
 and check guidance. No repair cycle is consumed until a complete `RETRY`.
@@ -1854,7 +1855,8 @@ reasoning filters include reasoning, and model text is labelled `opencode`.
 Pause, stop, escalation, timeout, and operating-policy stops interrupt the
 server-side execution. The `c`, `C`, and `i` controls interrupt before compacting,
 reporting context, or applying operator direction, then continue the same stage.
-The original stage deadline and request/repair limits remain in force. Tool
+Applicable stage deadlines and request/repair limits remain in force. Apply and
+Repair retain the progress watchdog across continuations. Tool
 permission requests owned by this run are approved once, matching the previous
 unattended `--auto` behavior. Requests for external input stop with the form and
 session evidence; supply the missing decision with `--direction` before resuming.

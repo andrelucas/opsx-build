@@ -1022,6 +1022,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct RecordingUi {
         pub records: Mutex<Vec<UsageRecord>>,
+        pub stage_override: Mutex<Option<String>>,
         snapshots: Mutex<HashMap<String, Snapshot>>,
         policy: Mutex<Option<std::sync::Arc<crate::operating_policy::Guard>>>,
     }
@@ -1039,7 +1040,13 @@ pub(crate) mod tests {
         }
         fn usage_context(&self) -> UsageContext {
             UsageContext {
-                stage: Some("Apply".into()),
+                stage: Some(
+                    self.stage_override
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "Apply".into()),
+                ),
                 change: Some("0001-test".into()),
                 iteration: Some(1),
                 ..UsageContext::default()

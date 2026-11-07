@@ -791,6 +791,58 @@ done
     }
 
     #[test]
+    fn apply_and_repair_use_watchdog_instead_of_fixed_stage_deadline() {
+        use crate::{
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        for stage in ["Apply", "Repair"] {
+            let directory =
+                std::env::temp_dir().join(format!("opsx-codex-deadline-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&directory)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let ui = RecordingUi::default();
+            *ui.stage_override.lock().unwrap() = Some(stage.into());
+            let run = Run::new(&directory, Policy::default(), &ui).unwrap();
+            ui.set_operating_policy(Arc::new(run.open(None).unwrap()))
+                .unwrap();
+            let launcher = planning_test_launcher(&directory, r#""result":{}"#);
+            let script = directory.join("server.sh");
+            let completed = json!({"method":"turn/completed","params":{"threadId":"actual-thread","turn":{"id":"turn-1","status":"completed","items":[{"type":"agentMessage","text":"OPSX_STATUS: READY"}]}}});
+            let contents = std::fs::read_to_string(&script).unwrap().replace(
+                r#"printf '{"id":%s,"error":{"code":-32603,"message":"simulated turn failure"}}\n' "$id""#,
+                &format!(r#"printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"; sleep 0.15; printf '%s\n' '{completed}'"#),
+            );
+            std::fs::write(script, contents).unwrap();
+            let backend = CodexBackend::new(&directory, &launcher, "auto", None, &ui)
+                .with_stage_timeout(Duration::from_millis(40));
+            let result = backend
+                .invoke(
+                    SessionMode::New {
+                        id: SessionId::new("placeholder"),
+                        name: None,
+                    },
+                    "finish",
+                    stage,
+                    StageProtocol::Worker,
+                )
+                .unwrap();
+            assert_eq!(result.signal, crate::backend::StageSignal::Ready);
+            assert!(ui.records.lock().unwrap()[0].elapsed_ms >= 150);
+            drop(backend);
+            drop(ui);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn owned_server_cleanup_includes_its_child_process_group() {
         let directory =
             std::env::temp_dir().join(format!("opsx-codex-owned-group-{}", Uuid::new_v4()));

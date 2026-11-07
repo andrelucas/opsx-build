@@ -752,9 +752,7 @@ impl<U: Ui> AgentBackend for OpenCodeBackend<'_, U> {
         let mut provider_retries = 0;
         let invocation = uuid::Uuid::new_v4().to_string();
         let mut attempt_number = 0;
-        let deadline = self
-            .stage_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let deadline = crate::backend::stage_deadline(self.ui, self.stage_timeout);
 
         loop {
             let remaining = deadline.map(|deadline| {
@@ -2127,6 +2125,47 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(60));
         assert_eq!(ui.records.lock().unwrap()[0].tokens.input, Some(15));
+    }
+
+    #[test]
+    fn apply_and_repair_use_watchdog_instead_of_fixed_stage_deadline() {
+        use crate::{
+            opencode_server::tests::{FakeServer, turn},
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        for stage in ["Apply", "Repair"] {
+            let repo = std::env::temp_dir().join(format!("opsx-v2-deadline-{}", Uuid::new_v4()));
+            fs::create_dir_all(&repo).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let ui = RecordingUi::default();
+            *ui.stage_override.lock().unwrap() = Some(stage.into());
+            let run = Run::new(&repo, Policy::default(), &ui).unwrap();
+            ui.set_operating_policy(Arc::new(run.open(None).unwrap()))
+                .unwrap();
+            let mut events = turn("OPSX_STATUS: READY");
+            events[0]["_delay_ms"] = 150.into();
+            let server = FakeServer::start(&repo, vec![events]);
+            let launcher = launcher();
+            let backend = test_backend(&repo, &launcher, &ui, &server)
+                .with_stage_timeout(Duration::from_millis(40));
+            let result = backend
+                .invoke(new_session(), "finish", stage, StageProtocol::Worker)
+                .unwrap();
+            assert_eq!(result.signal, StageSignal::Ready);
+            assert!(ui.records.lock().unwrap()[0].elapsed_ms >= 150);
+            drop(backend);
+            drop(server);
+            drop(ui);
+            fs::remove_dir_all(repo).unwrap();
+        }
     }
 
     #[test]
