@@ -35,7 +35,7 @@ segments and partial final records instead of inferring a successful outcome.
 | `events.jsonl` | The complete captured observation stream for audit. |
 | `objects/<sha256>` | Deduplicated source contents, file manifests and complete retained check/review artifacts. Only objects reachable from exported observations are copied. |
 | `schema.json` | Version 1 JSON Schema, with named definitions for events, decisions and model inputs. |
-| `manifest.json` | Format/runner version, counts, capture gaps, content-hash algorithm and eligibility/privacy notes. |
+| `manifest.json` | Format/runner version, counts, capture gaps, duplicate tool results omitted from inputs, content-hash algorithm and eligibility/privacy notes. |
 
 `decision_id` combines run ID and cutoff sequence. Each event records wall time,
 sequence and, when available, request ID, invocation ID, backend attempt, session,
@@ -44,6 +44,18 @@ generation. Monotonic event sequence establishes observation order even if the
 wall clock moves. Baseline references and all input events precede the cutoff;
 later outcome references follow it. Observation times are runner receipt times,
 not independent attestations of when a provider or command performed the work.
+
+Capture suppresses identical tool-result deliveries within each backend dispatch,
+matching request ID, session ID, call ID and the full payload before redaction or
+clipping. Changed output, failure or exit status remains evidence, as do results
+from another call, session or dispatch. Missing identities are retained.
+
+When exporting older captures, the complete `events.jsonl` audit stream retains
+the original deliveries and sequence numbers. Decision inputs omit safely
+identifiable identical tool-result replays, including replays across checkpoints
+in the same dispatch. The manifest reports their count as
+`duplicate_tool_results_omitted_from_inputs`. Truncated, redacted or incomplete
+legacy payloads remain in inputs because equality cannot safely be established.
 
 ## What is captured
 

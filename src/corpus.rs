@@ -48,10 +48,21 @@ pub(crate) struct Recorder {
     repositories: Vec<PathBuf>,
     sampled: Instant,
     receipts: BTreeMap<PathBuf, String>,
+    tool_results: BTreeSet<String>,
 }
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn tool_result_key(request: Option<&Value>, data: &Value) -> Option<String> {
+    let request = request?;
+    let request_id = request["request_id"].as_str().filter(|id| !id.is_empty())?;
+    let session_id = request["session_id"].as_str().filter(|id| !id.is_empty())?;
+    let call_id = data["call_id"].as_str().filter(|id| !id.is_empty())?;
+    Some(digest(
+        &serde_json::to_vec(&json!([request_id, session_id, call_id, data])).expect("JSON value"),
+    ))
 }
 
 /// Structured credential fields are redacted. Arbitrary source/output text is
@@ -189,6 +200,7 @@ impl Recorder {
             repositories: Vec::new(),
             sampled: Instant::now(),
             receipts: BTreeMap::new(),
+            tool_results: BTreeSet::new(),
         };
         recorder.event("capture_started", json!({"runner_version":env!("CARGO_PKG_VERSION"),
             "prior_capture_gaps":gaps, "policy_run":policy,
@@ -230,6 +242,8 @@ impl Recorder {
     }
 
     pub(crate) fn start(&mut self, usage: &UsageRecord) -> Result<()> {
+        // Compatibility dispatches can reuse the same usage ID.
+        self.tool_results.clear();
         self.request = Some(
             json!({"request_id":usage.id, "invocation_id":usage.invocation_id,
             "attempt":usage.attempt, "session_id":usage.session_id,
@@ -255,6 +269,14 @@ impl Recorder {
         // Observed IDs may be updated by the provider after dispatch.
         if let Some(request) = self.request.as_mut() {
             request["session_id"] = json!(usage.session_id);
+        }
+        // Hash the full payload before redaction/clipping, preserving distinct
+        // updates even when their retained prefixes are identical.
+        if kind == "tool_result"
+            && let Some(key) = tool_result_key(self.request.as_ref(), &data)
+            && !self.tool_results.insert(key)
+        {
+            return Ok(());
         }
         self.event(kind, bounded(&data))
     }
@@ -633,6 +655,7 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
     let mut inputs = Vec::new();
     let mut outcomes = Vec::new();
     let mut gaps = Vec::new();
+    let mut duplicate_tool_results = 0;
     for directory in directories {
         let (events, warnings) = read_events(directory)?;
         gaps.extend(warnings);
@@ -650,6 +673,7 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
         let mut manifests = BTreeSet::new();
         let mut copied = BTreeSet::new();
         let mut window = Vec::new();
+        let mut tool_results = BTreeSet::new();
         for event in &events {
             let value = serde_json::to_value(event)?;
             for key in ["manifest_sha256", "artifact_sha256"] {
@@ -661,6 +685,23 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
                 manifests.insert(hash.to_owned());
             }
             all.push(value.clone());
+            if matches!(event.kind.as_str(), "request_started" | "capture_started") {
+                tool_results.clear();
+            }
+            // Old captures retain raw replays for audit. Only complete, known
+            // payloads can safely be deduplicated in the judge's input view.
+            if event.kind == "tool_result"
+                && event.data.get("truncated").is_none()
+                && ["output", "failed", "exit_code"]
+                    .iter()
+                    .all(|key| event.data.get(key).is_some())
+                && !event.data.to_string().contains("[REDACTED]")
+                && let Some(key) = tool_result_key(event.request.as_ref(), &event.data)
+                && !tool_results.insert(key)
+            {
+                duplicate_tool_results += 1;
+                continue;
+            }
             if event.kind.ends_with("_outcome") {
                 outcomes.push(value);
                 continue;
@@ -768,6 +809,7 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
         serde_json::to_vec_pretty(&json!({"schema_version":1,
         "runner_version":env!("CARGO_PKG_VERSION"),"runs":directories.len(),"decisions":decisions.len(),
         "events":all.len(),"capture_gaps":gaps,"content_hash":"SHA-256",
+        "duplicate_tool_results_omitted_from_inputs":duplicate_tool_results,
         "training_eligible":false,"annotations":"not supplied; observed policy actions are not labels",
         "privacy":"local project contents and visible tool data; review before external use"}))?,
     )?;

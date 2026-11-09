@@ -73,6 +73,248 @@ fn lines(path: &Path) -> Vec<Value> {
 }
 
 #[test]
+fn replayed_tool_results_are_captured_once_for_each_backend() {
+    for backend in ["claude", "codex", "opencode"] {
+        let fixture = Fixture::new();
+        let ui = RecordingUi::default();
+        let run =
+            crate::operating_policy::Run::new(&fixture.root, Default::default(), &ui).unwrap();
+        ui.set_operating_policy(std::sync::Arc::new(run.open(None).unwrap()))
+            .unwrap();
+        let mut usage = Attempt::new(
+            &ui,
+            &fixture.root,
+            Identity {
+                backend,
+                connection: None,
+                model: None,
+                session: "session",
+                invocation: "invocation",
+                attempt: 1,
+                fresh: true,
+            },
+            "Apply",
+        );
+        usage
+            .before_request_with_prompt("Check the source")
+            .unwrap();
+        let (started, completed) = match backend {
+            "claude" => (
+                json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":"true"}}]}}),
+                json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"passed","is_error":false}]}}),
+            ),
+            "codex" => (
+                json!({"method":"item/started","params":{"item":{"type":"commandExecution","id":"call","command":"true","cwd":"."}}}),
+                json!({"method":"item/completed","params":{"item":{"type":"commandExecution","id":"call","command":"true","cwd":".","aggregatedOutput":"passed","exitCode":0}}}),
+            ),
+            _ => (
+                json!({"type":"tool_use","part":{"callID":"call","tool":"bash","state":{"status":"running","input":{"command":"true"}}}}),
+                json!({"type":"tool_use","part":{"callID":"call","tool":"bash","state":{"status":"completed","input":{"command":"true"},"output":"passed","metadata":{"exit":0}}}}),
+            ),
+        };
+        usage.event(&started);
+        usage.event(&completed);
+        // Claude streams events, then replays stdout through this path. Other
+        // backends may also repeat completion notifications.
+        usage.output(&completed.to_string());
+        assert_eq!(usage.record.tools.len(), 1);
+        assert!(usage.record.tools[0].completed);
+        assert_eq!(usage.record.tools[0].failed, Some(false));
+        usage.finish("ready");
+        let output = fixture.export();
+        let events = lines(&output.join("events.jsonl"));
+        assert_eq!(
+            events.iter().filter(|e| e["kind"] == "tool_result").count(),
+            1,
+            "{backend}"
+        );
+    }
+}
+
+#[test]
+fn tool_result_deduplication_preserves_updates_calls_sessions_and_dispatches() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let mut usage = fixture.usage();
+    recorder.start(&usage).unwrap();
+    let original = json!({"call_id":"one","output":"first","failed":null,"exit_code":null});
+    let mut expected = vec![original.clone()];
+    recorder
+        .observation(&usage, "tool_result", original.clone())
+        .unwrap();
+    recorder
+        .observation(&usage, "tool_result", original.clone())
+        .unwrap();
+    let mut changed = original.clone();
+    for (field, value) in [
+        ("output", json!("second")),
+        ("failed", json!(false)),
+        ("exit_code", json!(0)),
+        ("failed", json!(true)),
+    ] {
+        changed[field] = value;
+        expected.push(changed.clone());
+        recorder
+            .observation(&usage, "tool_result", changed.clone())
+            .unwrap();
+    }
+    // A nonconsecutive replay is still the same delivery, not a new update.
+    recorder
+        .observation(&usage, "tool_result", original.clone())
+        .unwrap();
+    let mut another_call = original.clone();
+    another_call["call_id"] = json!("two");
+    expected.push(another_call.clone());
+    recorder
+        .observation(&usage, "tool_result", another_call)
+        .unwrap();
+    usage.session_id = "another-session".into();
+    expected.push(original.clone());
+    recorder
+        .observation(&usage, "tool_result", original.clone())
+        .unwrap();
+    // Compatibility dispatches may reuse a usage ID; ordinary retries do not.
+    for change_request_id in [false, true] {
+        if change_request_id {
+            usage.id = "another-request".into();
+        }
+        recorder.start(&usage).unwrap();
+        expected.push(original.clone());
+        recorder
+            .observation(&usage, "tool_result", original.clone())
+            .unwrap();
+    }
+    let (events, _) = read_events(&recorder.directory).unwrap();
+    let results = events
+        .iter()
+        .filter(|e| e.kind == "tool_result")
+        .map(|e| e.data.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn tool_result_deduplication_uses_full_output_before_capture_clipping() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let usage = fixture.usage();
+    recorder.start(&usage).unwrap();
+    let first = json!({"call_id":"call","output":format!("{}a", "x".repeat(MAX_TEXT)),"failed":false,"exit_code":0});
+    let mut changed = first.clone();
+    changed["output"] = json!(format!("{}b", "x".repeat(MAX_TEXT)));
+    assert_eq!(bounded(&first), bounded(&changed));
+    recorder
+        .observation(&usage, "tool_result", first.clone())
+        .unwrap();
+    recorder.observation(&usage, "tool_result", first).unwrap();
+    recorder
+        .observation(&usage, "tool_result", changed)
+        .unwrap();
+    let (events, _) = read_events(&recorder.directory).unwrap();
+    assert_eq!(events.iter().filter(|e| e.kind == "tool_result").count(), 2);
+}
+
+#[test]
+fn legacy_tool_result_replays_are_removed_only_from_model_inputs() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let usage = fixture.usage();
+    let first = json!({"call_id":"call","output":"first","failed":false,"exit_code":0});
+    let changed = json!({"call_id":"call","output":"changed","failed":true,"exit_code":7});
+    let another = json!({"call_id":"another","output":"first","failed":false,"exit_code":0});
+    recorder.start(&usage).unwrap();
+    // Write raw events to reproduce recordings made before capture deduplication.
+    recorder.event("tool_result", first.clone()).unwrap();
+    recorder.decision("first", "observe", json!({})).unwrap();
+    recorder.event("tool_result", first.clone()).unwrap();
+    recorder.event("tool_result", changed.clone()).unwrap();
+    recorder.event("tool_result", changed.clone()).unwrap();
+    recorder.event("tool_result", another.clone()).unwrap();
+    recorder.decision("second", "observe", json!({})).unwrap();
+    recorder.start(&usage).unwrap();
+    recorder.event("tool_result", first.clone()).unwrap();
+    recorder
+        .decision("next-dispatch", "observe", json!({}))
+        .unwrap();
+    let (raw, _) = read_events(&recorder.directory).unwrap();
+    let output = fixture.export();
+    assert_eq!(lines(&output.join("events.jsonl")).len(), raw.len());
+    let inputs = lines(&output.join("model-inputs.jsonl"));
+    let results = inputs
+        .iter()
+        .map(|input| {
+            input["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "tool_result")
+                .map(|event| event["data"].clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![vec![first.clone()], vec![changed, another], vec![first]]
+    );
+    let decisions = lines(&output.join("decisions.jsonl"));
+    let ids = raw
+        .iter()
+        .filter(|e| e.kind == "decision")
+        .map(|e| format!("{}:{}", e.run_id, e.sequence))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|d| d["decision_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    for (decision, input) in decisions.iter().zip(inputs) {
+        assert_eq!(decision["input"], input);
+        assert!(
+            input["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["sequence"].as_u64().unwrap()
+                    < input["cutoff_sequence"].as_u64().unwrap())
+        );
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["duplicate_tool_results_omitted_from_inputs"], 2);
+}
+
+#[test]
+fn incomplete_legacy_tool_results_remain_in_inputs_without_assuming_equality() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    recorder.start(&fixture.usage()).unwrap();
+    for data in [
+        json!({"call_id":null,"output":"same","failed":false,"exit_code":0}),
+        json!({"truncated":true,"original_bytes":99999,"retained_json_prefix":"same prefix"}),
+        json!({"call_id":"call","output":"[REDACTED]","failed":false,"exit_code":0}),
+    ] {
+        recorder.event("tool_result", data.clone()).unwrap();
+        recorder.event("tool_result", data).unwrap();
+    }
+    recorder
+        .decision("checkpoint", "observe", json!({}))
+        .unwrap();
+    let output = fixture.export();
+    let inputs = lines(&output.join("model-inputs.jsonl"));
+    assert_eq!(
+        inputs[0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "tool_result")
+            .count(),
+        6
+    );
+}
+
+#[test]
 fn exported_inputs_are_frozen_prefixes_with_durable_dirty_source_and_later_outcomes_separate() {
     let fixture = Fixture::new();
     #[cfg(unix)]
