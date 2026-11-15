@@ -251,14 +251,14 @@ pub(crate) struct Identity<'a> {
 impl<'a, U: Ui> Attempt<'a, U> {
     pub(crate) fn before_request(&self) -> anyhow::Result<()> {
         if let Some(guard) = self.ui.operating_policy() {
-            guard.before_request(&self.record)?;
+            guard.before_control_request(&self.record)?;
         }
         Ok(())
     }
 
     pub(crate) fn before_request_with_prompt(&self, prompt: &str) -> anyhow::Result<()> {
-        self.before_request()?;
         if let Some(guard) = self.ui.operating_policy() {
+            guard.before_request(&self.record)?;
             guard.corpus_prompt(&self.record, prompt);
         }
         Ok(())
@@ -266,7 +266,7 @@ impl<'a, U: Ui> Attempt<'a, U> {
 
     fn corpus(&self, kind: &str, data: Value) {
         if let Some(guard) = self.ui.operating_policy() {
-            guard.corpus_observation(&self.record, kind, data);
+            guard.observe_agent(&self.record, kind, data);
         }
     }
 

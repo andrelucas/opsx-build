@@ -19,8 +19,8 @@ output/provider retry, remediation and capacity-recovery limits still apply.
 | `max_recurring_finding_reviews` | 2 | Reopening rounds for the same independently closed finding within a change. Other closures cannot disguise repeated regression of that finding. |
 | `max_requests_per_stage` | 12 | Runner-dispatched backend requests for a stage/change, including continuations, compatibility retries and billable compaction/naming operations. |
 | `max_replans_without_verified_progress` | 2 | Capacity-recovery attempts without an intervening independent Verify/acceptance milestone. Checked before restoring a candidate's baseline. |
-| `max_request_seconds` | 3600 | Model-request runtime before checking for continued progress or cancelling. |
-| `request_progress_grace_seconds` | 900 | Time after new check evidence before Apply or Repair is considered stalled. |
+| `max_request_seconds` | 3600 | Apply/Repair reassessment point; other model requests retain this runtime limit. |
+| `request_progress_grace_seconds` | 900 | Reassessment window after fresh implementation or check observations in Apply/Repair. |
 | `max_active_seconds` | unset | Optional cumulative active time across normal resumes, including independent acceptance. Paused/offline time is excluded. |
 
 These are operating defaults, not claims that a particular round count diagnoses
@@ -64,31 +64,58 @@ neither suppresses new findings nor substitutes a cheaper acceptance route.
 
 ### Progress-aware implementation timeouts
 
-At the request limit, Apply or Repair continues while an eligible check started
-through `opsx-build check` is running within its own timeout, or for 15 minutes
-after new check evidence. Each new result can move that deadline. A first
-completed execution, a failure-to-pass transition, or a fresh execution with
+At the request limit, Apply or Repair reassesses recorded evidence rather than
+stopping solely because an hour has passed. Fresh tracked/non-ignored worktree
+contents, including the declared product repository, can earn the configured
+grace window. Timestamps, commits, narration, reads and status polling alone do
+not renew it. Previously observed worktree versions do not renew it on a revert
+or an unchanged rewrite. Input sampling is bounded to 4096 entries and 64 MiB;
+unavailable or incomplete fingerprints never count as changed inputs.
+
+Direct check telemetry also retains recent history and outstanding checks across
+quiet checkpoints. Recognised shell/command checks include common build/test
+commands, named check/native/proof scripts, TLC/TLAPS/Apalache and Kubernetes
+waits. A first command/input combination or an execution after changed known
+worktree inputs can earn time. Replays, new call IDs, descriptions and increased
+tool wait limits do not make the same execution new. Completion is evidence of
+an observed result, including failure; transport success is not a test pass.
+
+A pending check may wait until its declared tool deadline, measured from its
+observed start, rather than from each reassessment. Completion releases that
+wait and permits only recent-result grace. If telemetry provides no wait bound,
+the pending observation gets only one grace window from its start. A missing
+result is not independent proof that an OS process is live. Prefer the check
+helper for exact command/runtime inputs, externally changing dependencies and
+independently observed process liveness. These rules are deterministic signals,
+not semantic correctness judgments; no model classifier is called.
+
+The existing `opsx-build check` receipt rules also remain in force. An eligible
+check can run within its own timeout, or earn 15 minutes after new evidence. A
+first completed execution, a failure-to-pass transition, or a fresh execution with
 known changed inputs counts. A live command can run to its own timeout. Once a
 receipt for that command and working directory has supported continuing the
 dispatch, a repeat can qualify while running if the receipts show changed
 execution inputs.
-Cached receipts, repeated results without changed inputs, and agent output
-alone do not move the deadline.
+Cached receipts and repeated results without changed inputs do not move that
+deadline. The helper's repeat rules cannot be bypassed through its raw tool
+telemetry.
 
 The runner rechecks live receipts, records the evidence for continuing, and
 stops when that evidence expires. Apply and Repair have no fixed worker-stage
 deadline: `local_worker_timeout_minutes` still bounds Explore, Propose and Verify.
-The initial request allowance, cumulative active-time limits and individual check
-timeouts remain in force. Contract preflight, transport/control operations,
-compaction and independent acceptance keep their own deadlines. Set
-`request_progress_grace_seconds` to another positive number to change the window after a result, or to `null` for a fixed
-request limit.
+The initial allowance remains the first reassessment point. No-progress reviews,
+recurring findings, stage request counts, replans, cumulative active-time limits
+and individual check timeouts remain in force. Contract preflight,
+transport/control operations, compaction and independent acceptance keep their
+own deadlines. Set `request_progress_grace_seconds` to another positive number to
+change the window after a result, or to `null` for a fixed request limit.
 
 ## Durable state and reports
 
 Normal runs also retain a [passive progress corpus](progress-corpus.md) for
-later human annotation and assessor evaluation. It observes these decisions
-without changing their rules or allowances.
+later human annotation and assessor evaluation. Capture availability does not
+control watchdog decisions. Reassessment evidence and pending-check state are
+also retained in the request's operating-policy ledger.
 
 The checkpoint references a private Git-metadata directory, normally:
 

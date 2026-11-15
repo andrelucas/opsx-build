@@ -112,6 +112,8 @@ elif stage in ("apply", "repair"):
     if stage == "apply" and mode.startswith("progress-"):
         if mode == "progress-stalled":
             time.sleep(10)
+        elif mode == "progress-coding":
+            time.sleep(3)
         else:
             helper = shlex.split(re.search(r"For checks you need to run, prefer (.+?) with one JSON object", prompt)[1])
             command = {"progress-completed": "true", "progress-repeated": "true",

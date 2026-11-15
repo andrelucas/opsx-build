@@ -24,6 +24,7 @@ pub mod openspec;
 pub mod operating_policy;
 mod preflight;
 pub mod process;
+mod request_progress;
 pub mod review;
 mod run_summary;
 mod runner_executable;

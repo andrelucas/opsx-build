@@ -30,7 +30,7 @@ segments and partial final records instead of inferring a successful outcome.
 | File | Contents |
 | --- | --- |
 | `decisions.jsonl` | One record per decision point, with input, observed policy action, later outcome references, null annotation and `training_eligible: false`. |
-| `model-inputs.jsonl` | Past-only inputs: task, context, events since the previous checkpoint, current and baseline file/review evidence, check scope/generation and available operating counters. No observed policy action, later outcome or actor model metadata. |
+| `model-inputs.jsonl` | Past-only inputs: task, context, events since the previous checkpoint, current and baseline file/review evidence, check scope/generation and operating state with recent history and pending checks. No observed policy action, later outcome or actor model metadata. |
 | `outcomes.jsonl` | Request results, independent acceptance reports and run summaries, kept separate from judge inputs. |
 | `events.jsonl` | The complete captured observation stream for audit. |
 | `objects/<sha256>` | Deduplicated source contents, file manifests and complete retained check/review artifacts. Only objects reachable from exported observations are copied. |
@@ -44,6 +44,19 @@ generation. Monotonic event sequence establishes observation order even if the
 wall clock moves. Baseline references and all input events precede the cutoff;
 later outcome references follow it. Observation times are runner receipt times,
 not independent attestations of when a provider or command performed the work.
+
+`operating_state.recent_history` retains earlier observations from the current
+dispatch, before the preceding checkpoint, for up to 15 minutes and 256 events.
+The current `events` window complements it. `recent_history_truncated` records
+entry-budget omissions. `operating_state.pending_checks` retains recognised
+check calls awaiting results and current-dispatch helper receipts last observed
+running, even when the start has aged out of recent history. These entries retain
+their original observations and sequence numbers; they do not assert current OS
+process liveness. Results close pending calls, replayed calls do not reopen them,
+and new dispatch/capture boundaries reset state. An empty current event window
+therefore need not mean an idle request. Every retained observation still precedes
+the decision cutoff, and later outcomes and watchdog actions stay outside this
+history. Older captures gain these views when re-exported.
 
 Capture suppresses identical tool-result deliveries within each backend dispatch,
 matching request ID, session ID, call ID and the full payload before redaction or

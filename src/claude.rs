@@ -3325,6 +3325,77 @@ printf '{"type":"result","subtype":"success","structured_output":{"opsx_status":
 
     #[cfg(unix)]
     #[test]
+    fn pending_check_can_outlive_reassessment_but_its_own_deadline_cancels_the_backend() {
+        use crate::{
+            operating_policy::{Policy, Run},
+            usage::tests::RecordingUi,
+        };
+        for stage in ["Apply", "Repair"] {
+            for overdue in [false, true] {
+                let directory =
+                    std::env::temp_dir().join(format!("opsx-pending-check-{}", Uuid::new_v4()));
+                fs::create_dir_all(&directory).unwrap();
+                assert!(
+                    std::process::Command::new("git")
+                        .args(["init", "-q"])
+                        .current_dir(&directory)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let script = directory.join("agent.sh");
+                let wait_ms = if overdue { 300 } else { 3000 };
+                fs::write(&script, format!(r#"
+IFS= read -r prompt
+printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"check","name":"Bash","input":{{"command":"go test ./native","timeout":{wait_ms}}}}}]}}}}'
+sleep 1.3
+printf '%s\n' '{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"check","content":"ok","is_error":false}}]}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"opsx_status":"READY","summary":"bounded check completed"}}}}'
+"#)).unwrap();
+                let ui = RecordingUi::default();
+                *ui.stage_override.lock().unwrap() = Some(stage.into());
+                let run = Run::new(
+                    &directory,
+                    Policy {
+                        max_request_seconds: 1,
+                        request_progress_grace_seconds: Some(1),
+                        ..Policy::default()
+                    },
+                    &ui,
+                )
+                .unwrap();
+                ui.set_operating_policy(std::sync::Arc::new(run.open(None).unwrap()))
+                    .unwrap();
+                let launcher = shell_launcher(&script);
+                let backend =
+                    ClaudeBackend::new(&directory, &launcher, "auto", false, None, 0, &ui)
+                        .with_stage_timeout(Duration::from_millis(40));
+                let started = Instant::now();
+                let result = backend.invoke(
+                    SessionMode::New {
+                        id: SessionId::new(Uuid::new_v4().to_string()),
+                        name: None,
+                    },
+                    "Complete the bounded check",
+                    stage,
+                    StageProtocol::Worker,
+                );
+                if overdue {
+                    assert!(crate::operating_policy::is_stop(&result.unwrap_err()));
+                    assert!(started.elapsed() < Duration::from_secs(3));
+                } else {
+                    assert_eq!(result.unwrap().signal, StageSignal::Ready);
+                    assert!(ui.records.lock().unwrap()[0].elapsed_ms > 1000);
+                }
+                drop(backend);
+                drop(ui);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn incomplete_continuation_keeps_the_original_stage_deadline() {
         let directory =
             std::env::temp_dir().join(format!("opsx-incomplete-deadline-{}", Uuid::new_v4()));

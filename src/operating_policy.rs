@@ -81,13 +81,18 @@ struct Request {
     reported_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     progress_extensions: Vec<ProgressExtension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProgressExtension {
-    receipt: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<PathBuf>,
     outcome: String,
     extra_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<serde_json::Value>,
 }
 
 struct ActiveRequest {
@@ -99,10 +104,11 @@ struct ActiveRequest {
     context: crate::usage::UsageContext,
     progress: Option<RequestProgress>,
     observed_checks: BTreeSet<PathBuf>,
+    history: Option<crate::request_progress::History>,
 }
 
 struct RequestProgress {
-    receipt: PathBuf,
+    receipt: Option<PathBuf>,
     outcome: String,
     valid_until: Duration,
     recheck_at: Duration,
@@ -334,12 +340,30 @@ impl Guard {
         *self.check_directory.lock().unwrap() = Some(directory);
     }
 
-    pub(crate) fn corpus_observation(
-        &self,
-        usage: &UsageRecord,
-        kind: &str,
-        data: serde_json::Value,
-    ) {
+    pub(crate) fn observe_agent(&self, usage: &UsageRecord, kind: &str, data: serde_json::Value) {
+        let grace = self
+            .ledger
+            .lock()
+            .unwrap()
+            .policy
+            .request_progress_grace_seconds;
+        if let Some(grace) = grace {
+            let mut active = self.active_request.lock().unwrap();
+            if let Some(request) = active.as_mut()
+                && request.id == usage.id
+                && let Some(history) = request.history.as_mut()
+            {
+                let changed = history.observe(
+                    request.started.elapsed(),
+                    Duration::from_secs(grace),
+                    kind,
+                    &data,
+                );
+                if changed && let Some(progress) = request.progress.as_mut() {
+                    progress.recheck_at = progress.recheck_at.min(request.started.elapsed());
+                }
+            }
+        }
         self.corpus
             .observe(|capture| capture.observation(usage, kind, data));
     }
@@ -366,6 +390,14 @@ impl Guard {
     }
 
     pub(crate) fn before_request(&self, usage: &UsageRecord) -> Result<()> {
+        self.admit_request(usage, true)
+    }
+
+    pub(crate) fn before_control_request(&self, usage: &UsageRecord) -> Result<()> {
+        self.admit_request(usage, false)
+    }
+
+    fn admit_request(&self, usage: &UsageRecord, stage_dispatch: bool) -> Result<()> {
         self.check(true)?;
         let key = format!(
             "{:?}:{:?}:{:?}",
@@ -398,15 +430,29 @@ impl Guard {
                     elapsed_ms: 0,
                     reported_cost_usd: None,
                     progress_extensions: Vec::new(),
+                    watchdog: None,
                 });
             request.dispatches += 1;
             request.outcome = None;
         }
+        let check_directory = self.check_directory.lock().unwrap().clone();
+        let track_progress = stage_dispatch
+            && matches!(usage.context.stage.as_deref(), Some("Apply" | "Repair"))
+            && self
+                .ledger
+                .lock()
+                .unwrap()
+                .policy
+                .request_progress_grace_seconds
+                .is_some();
         *self.active_request.lock().unwrap() = Some(ActiveRequest {
             id: usage.id.clone(),
             started: Instant::now(),
             dispatched_at: crate::run_summary::now_ms(),
-            check_directory: self.check_directory.lock().unwrap().clone(),
+            history: track_progress.then(|| {
+                crate::request_progress::History::new(&usage.repo, check_directory.as_deref())
+            }),
+            check_directory,
             repo: usage.repo.clone(),
             context: usage.context.clone(),
             progress: None,
@@ -652,14 +698,51 @@ impl Guard {
         let Some(request) = active.as_mut() else {
             return Ok(());
         };
+        let elapsed = request.started.elapsed();
+        let reassess_at = request
+            .progress
+            .as_ref()
+            .map_or(Duration::from_secs(limit), |p| p.recheck_at);
+        if let (Some(history), Some(grace)) = (request.history.as_mut(), grace) {
+            history.sample(elapsed, Duration::from_secs(grace), elapsed >= reassess_at);
+        }
         let next_check = request
             .progress
             .as_ref()
-            .map_or(Duration::from_secs(limit), |progress| progress.recheck_at);
-        if request.started.elapsed() < next_check {
+            .map_or(Duration::from_secs(limit), |progress| progress.recheck_at)
+            .min(
+                request
+                    .history
+                    .as_ref()
+                    .and_then(|h| h.next_deadline())
+                    .unwrap_or(Duration::MAX),
+            );
+        if elapsed < next_check {
             return Ok(());
         }
+        let progress_state = request
+            .history
+            .as_ref()
+            .zip(grace)
+            .map(|(history, grace)| history.state(elapsed, Duration::from_secs(grace)));
+        if request
+            .history
+            .as_ref()
+            .is_some_and(|history| history.expired(elapsed))
+        {
+            let id = request.id.clone();
+            drop(active);
+            self.ledger
+                .lock()
+                .unwrap()
+                .requests
+                .get_mut(&id)
+                .unwrap()
+                .watchdog = progress_state;
+            return self.stop("request_timeout", "a pending implementation check exceeded its declared wait deadline; its stage remains incomplete");
+        }
         if let Some(grace) = grace
+            && request.history.is_some()
             && let Some(stage @ ("Apply" | "Repair")) = request.context.stage.as_deref()
             && let Some(change) = request.context.change.as_deref()
             && let Some(directory) = &request.check_directory
@@ -682,10 +765,11 @@ impl Guard {
                 valid_until
             };
             let new_evidence = request.progress.as_ref().is_none_or(|previous| {
-                previous.receipt != evidence.receipt || previous.outcome != evidence.outcome
+                previous.receipt.as_ref() != Some(&evidence.receipt)
+                    || previous.outcome != evidence.outcome
             });
             request.progress = Some(RequestProgress {
-                receipt: evidence.receipt.clone(),
+                receipt: Some(evidence.receipt.clone()),
                 outcome: evidence.outcome.clone(),
                 valid_until,
                 recheck_at,
@@ -696,18 +780,17 @@ impl Guard {
             request.observed_checks.insert(evidence.receipt.clone());
             let id = request.id.clone();
             drop(active);
-            self.ledger
-                .lock()
-                .unwrap()
-                .requests
-                .get_mut(&id)
-                .unwrap()
-                .progress_extensions
-                .push(ProgressExtension {
-                    receipt: evidence.receipt.clone(),
+            {
+                let mut ledger = self.ledger.lock().unwrap();
+                let request = ledger.requests.get_mut(&id).unwrap();
+                request.watchdog = progress_state;
+                request.progress_extensions.push(ProgressExtension {
+                    receipt: Some(evidence.receipt.clone()),
                     outcome: evidence.outcome,
                     extra_seconds: evidence.valid_for.as_secs(),
+                    evidence: None,
                 });
+            }
             let saved = self.save();
             self.corpus.observe(|capture| {
                 capture.checks(self.check_directory.lock().unwrap().as_deref())?;
@@ -715,10 +798,59 @@ impl Guard {
             });
             return saved;
         }
-        let extended = request.progress.is_some();
+        if let Some(grace) = grace
+            && let Some(history) = request.history.as_ref()
+            && let Some(valid_until) = history.allowance(elapsed, Duration::from_secs(grace))
+        {
+            let changed = request.progress.as_ref().is_none_or(|previous| {
+                previous.receipt.is_some() || previous.valid_until != valid_until
+            });
+            request.progress = Some(RequestProgress {
+                receipt: None,
+                outcome: "observed_work_or_check".into(),
+                valid_until,
+                recheck_at: valid_until,
+            });
+            let id = request.id.clone();
+            drop(active);
+            {
+                let mut ledger = self.ledger.lock().unwrap();
+                let request = ledger.requests.get_mut(&id).unwrap();
+                request.watchdog = progress_state.clone();
+                if changed {
+                    request.progress_extensions.push(ProgressExtension {
+                        receipt: None,
+                        outcome: "observed_work_or_check".into(),
+                        extra_seconds: valid_until.saturating_sub(elapsed).as_secs(),
+                        evidence: progress_state.clone(),
+                    });
+                }
+            }
+            if changed {
+                self.save()?;
+                self.corpus.observe(|capture| capture.decision("watchdog_reassessment", "continue",
+                    serde_json::json!({"evidence":progress_state,"active_elapsed_known_ms":self.elapsed_ms()})));
+            }
+            return Ok(());
+        }
+        let extended_check = request
+            .progress
+            .as_ref()
+            .is_some_and(|p| p.receipt.is_some());
+        let implementation = request.history.is_some();
+        let id = request.id.clone();
         drop(active);
-        let reason = if extended {
+        self.ledger
+            .lock()
+            .unwrap()
+            .requests
+            .get_mut(&id)
+            .unwrap()
+            .watchdog = progress_state;
+        let reason = if extended_check {
             "the active model request stopped making check progress; its stage remains incomplete"
+        } else if implementation {
+            "the active model request has no fresh implementation or check evidence for another reassessment; its stage remains incomplete"
         } else {
             "the active model request exceeded its time allowance; its stage is incomplete and requires diagnosis before another attempt"
         };
@@ -728,17 +860,33 @@ impl Guard {
     pub(crate) fn remaining_request_time(&self) -> Duration {
         let ledger = self.ledger.lock().unwrap();
         let limit = Duration::from_secs(ledger.policy.max_request_seconds);
+        let grace = ledger
+            .policy
+            .request_progress_grace_seconds
+            .map(Duration::from_secs);
         let mut remaining = self
             .active_request
             .lock()
             .unwrap()
             .as_ref()
             .map_or(limit, |request| {
+                let elapsed = request.started.elapsed();
+                if request.history.as_ref().is_some_and(|h| h.expired(elapsed)) {
+                    return Duration::ZERO;
+                }
+                let observed = request
+                    .history
+                    .as_ref()
+                    .zip(grace)
+                    .and_then(|(history, grace)| history.allowance(elapsed, grace))
+                    .unwrap_or(Duration::ZERO);
                 request
                     .progress
                     .as_ref()
+                    .filter(|p| p.receipt.is_some())
                     .map_or(limit, |progress| progress.valid_until)
-                    .saturating_sub(request.started.elapsed())
+                    .max(observed)
+                    .saturating_sub(elapsed)
             });
         if let Some(limit) = ledger.policy.max_active_seconds {
             remaining = remaining.min(

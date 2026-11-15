@@ -1,6 +1,6 @@
 //! Passive, local progress evidence. Nothing in this module grants more work or acceptance.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -674,6 +674,12 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
         let mut copied = BTreeSet::new();
         let mut window = Vec::new();
         let mut tool_results = BTreeSet::new();
+        let mut recent: VecDeque<Value> = VecDeque::new();
+        let mut pending_checks = BTreeMap::new();
+        let mut pending_receipts = BTreeMap::new();
+        let mut current_request = None;
+        let mut seen_calls = BTreeSet::new();
+        let mut history_truncated = false;
         for event in &events {
             let value = serde_json::to_value(event)?;
             for key in ["manifest_sha256", "artifact_sha256"] {
@@ -687,6 +693,16 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
             all.push(value.clone());
             if matches!(event.kind.as_str(), "request_started" | "capture_started") {
                 tool_results.clear();
+                recent.clear();
+                pending_checks.clear();
+                pending_receipts.clear();
+                current_request = if event.kind == "request_started" {
+                    Some((event.recorded_at_unix_ms, event.request.clone()))
+                } else {
+                    None
+                };
+                seen_calls.clear();
+                history_truncated = false;
             }
             // Old captures retain raw replays for audit. Only complete, known
             // payloads can safely be deduplicated in the judge's input view.
@@ -702,18 +718,108 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
                 duplicate_tool_results += 1;
                 continue;
             }
+            if let (Some(request), Some(call)) = (
+                event
+                    .request
+                    .as_ref()
+                    .and_then(|r| r["request_id"].as_str()),
+                event.data["call_id"].as_str(),
+            ) {
+                let key = (request.to_owned(), call.to_owned());
+                if event.kind == "tool_call"
+                    && seen_calls.insert(key.clone())
+                    && crate::request_progress::check_command(&event.data).is_some()
+                {
+                    pending_checks.insert(key, value.clone());
+                } else if event.kind == "tool_result" {
+                    seen_calls.insert(key.clone());
+                    pending_checks.remove(&key);
+                }
+            }
             if event.kind.ends_with("_outcome") {
+                if event.kind == "request_outcome" {
+                    pending_checks.clear();
+                    pending_receipts.clear();
+                    current_request = None;
+                }
                 outcomes.push(value);
                 continue;
             }
+            if event.kind == "check_receipt"
+                && let Some(path) = event.data["source_path"].as_str()
+            {
+                let record = &event.data["record"];
+                let current = current_request.as_ref().is_some_and(|(started, request)| {
+                    record["started_at_unix_ms"]
+                        .as_u64()
+                        .is_some_and(|at| at >= *started)
+                        && request.as_ref().is_some_and(|r| {
+                            record["stage"] == r["context"]["stage"]
+                                && record["change"] == r["context"]["change"]
+                        })
+                });
+                if current && record["outcome"] == "running" {
+                    pending_receipts.insert(path.to_owned(), value.clone());
+                } else {
+                    pending_receipts.remove(path);
+                }
+            }
+            let oldest = event
+                .recorded_at_unix_ms
+                .saturating_sub(crate::request_progress::HISTORY_SECONDS * 1000);
+            while recent
+                .front()
+                .is_some_and(|v| v["recorded_at_unix_ms"].as_u64().unwrap_or(0) < oldest)
+            {
+                recent.pop_front();
+            }
             if event.kind == "decision" {
                 let id = format!("{}:{}", event.run_id, event.sequence);
+                let mut operating_state = event.data["state"]
+                    .as_object()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .filter(|(key, _)| {
+                                matches!(
+                                    key.as_str(),
+                                    "active_elapsed_known_ms"
+                                        | "policy"
+                                        | "no_progress_reviews"
+                                        | "stage_requests"
+                                )
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect::<serde_json::Map<String, Value>>()
+                    })
+                    .unwrap_or_default();
+                operating_state.insert(
+                    "recent_history".into(),
+                    json!(
+                        recent
+                            .iter()
+                            .filter(|v| v["sequence"].as_u64().unwrap_or(0) <= previous)
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                let mut pending = pending_checks.values().collect::<Vec<&Value>>();
+                pending.sort_by_key(|v| v["sequence"].as_u64());
+                operating_state.insert("pending_checks".into(), json!(pending.iter().map(|call|
+                    json!({"call":call,"state":"awaiting_result; process liveness not independently established",
+                        "elapsed_ms":event.recorded_at_unix_ms.saturating_sub(call["recorded_at_unix_ms"].as_u64().unwrap_or(0))}))
+                    .chain(pending_receipts.values().map(|receipt| json!({"receipt":receipt,
+                        "state":"running_as_last_observed; current process liveness unknown"}))).collect::<Vec<_>>()));
+                operating_state.insert(
+                    "recent_history_window_seconds".into(),
+                    json!(crate::request_progress::HISTORY_SECONDS),
+                );
+                operating_state.insert("recent_history_truncated".into(), json!(history_truncated));
                 let input = json!({"decision_id":id, "cutoff_sequence":event.sequence,
                     "recorded_at_unix_ms":event.recorded_at_unix_ms, "context":event.request,
                     "task":task, "file_snapshot":snapshot, "events":window,"check_scope":scope,
                     "baseline":{"cutoff_sequence":previous,"file_snapshot":baseline_snapshot,"review":baseline_review},
                     "latest_review":review,
-                    "operating_state":event.data["state"].as_object().map(|fields|fields.iter().filter(|(key,_)|matches!(key.as_str(),"active_elapsed_known_ms"|"policy"|"no_progress_reviews"|"stage_requests")).map(|(k,v)|(k.clone(),v.clone())).collect::<serde_json::Map<String,Value>>()),
+                    "operating_state":operating_state,
                     "limitations":["event sequence defines observation order; timestamps are not independent clock attestations", "tool outputs and reviewer findings are observations, not human ground truth"]});
                 let later = events
                     .iter()
@@ -762,6 +868,11 @@ fn export_into(directories: &[PathBuf], output: &Path) -> Result<()> {
                     event.kind.as_str(),
                     "request_started" | "capture_started" | "capture_closed"
                 ) {
+                    recent.push_back(value.clone());
+                    if recent.len() > crate::request_progress::HISTORY_EVENTS {
+                        recent.pop_front();
+                        history_truncated = true;
+                    }
                     window.push(value);
                 }
             }

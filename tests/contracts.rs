@@ -731,7 +731,12 @@ fn a_policy_timeout_stops_owned_children_preserves_work_and_never_becomes_capaci
     f.review_workflow(false);
     let baseline = f.state()["slice_baseline"].clone();
     let policy = f.root.join("timeout.json");
-    fs::write(&policy, r#"{"max_request_seconds":1}"#).unwrap();
+    // This test requires an unconditional cancellation despite candidate edits.
+    fs::write(
+        &policy,
+        r#"{"max_request_seconds":1,"request_progress_grace_seconds":null}"#,
+    )
+    .unwrap();
     let option = format!("--operating-policy={}", policy.display());
     let result = f.run_with("review-timeout", true, &[&option]);
     let stderr = String::from_utf8_lossy(&result.stderr);

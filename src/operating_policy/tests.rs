@@ -57,6 +57,328 @@ fn request(root: &Path, activity: &str) -> UsageRecord {
     usage
 }
 
+fn age_request(guard: &Guard, seconds: u64) {
+    guard
+        .active_request
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .started = Instant::now() - Duration::from_secs(seconds);
+}
+
+fn check_started(guard: &Guard, usage: &UsageRecord, id: &str, timeout_ms: u64) {
+    guard.observe_agent(
+        usage,
+        "tool_call",
+        serde_json::json!({"call_id":id,"name":"Bash",
+        "input":{"command":"go test ./conformance/copyscenario", "timeout":timeout_ms}}),
+    );
+}
+
+#[test]
+fn pending_bounded_check_outlives_the_hour_and_expires_at_its_own_deadline() {
+    for stage in ["Apply", "Repair"] {
+        let f = Fixture::new(Policy::default());
+        let guard = f.run.open(None).unwrap();
+        let mut usage = request(&f.root, "long native calibration");
+        usage.context.stage = Some(stage.into());
+        guard.before_request(&usage).unwrap();
+        age_request(&guard, 3458);
+        check_started(&guard, &usage, "native", 3_500_000);
+        age_request(&guard, 3601);
+        guard.poll().unwrap();
+        assert!(guard.remaining_request_time() > Duration::from_secs(3300));
+        let ledger = f.ledger();
+        assert_eq!(
+            ledger.requests[&usage.id].watchdog.as_ref().unwrap()["pending_checks"][0]["call_id"],
+            "native"
+        );
+        assert_eq!(ledger.no_progress, 0);
+        assert_eq!(ledger.stage_requests, 1);
+        // Several quiet checkpoints cannot forget the still-pending check.
+        age_request(&guard, 5000);
+        guard.poll().unwrap();
+        // A fresh file edit cannot keep an overdue check alive.
+        fs::write(f.root.join("implementation.go"), "new code").unwrap();
+        age_request(&guard, 6959);
+        assert!(is_stop(&guard.poll().unwrap_err()));
+        assert!(
+            f.report()["reason"]
+                .as_str()
+                .unwrap()
+                .contains("declared wait deadline")
+        );
+    }
+}
+
+#[test]
+fn completed_check_releases_its_long_wait_and_recent_result_grace_expires() {
+    let f = Fixture::new(Policy::default());
+    let guard = f.run.open(None).unwrap();
+    let mut usage = request(&f.root, "native check");
+    usage.context.stage = Some("Apply".into());
+    guard.before_request(&usage).unwrap();
+    age_request(&guard, 3500);
+    check_started(&guard, &usage, "check", 3_600_000);
+    age_request(&guard, 3601);
+    guard.poll().unwrap();
+    guard.observe_agent(
+        &usage,
+        "tool_result",
+        serde_json::json!({"call_id":"check","failed":false,"exit_code":null,"output":"FAIL"}),
+    );
+    // Transport success is not promoted to a passing test verdict.
+    assert!(guard.remaining_request_time() <= Duration::from_secs(901));
+    guard.poll().unwrap();
+    assert!(
+        f.ledger().requests[&usage.id].watchdog.as_ref().unwrap()["pending_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    age_request(&guard, 4502);
+    assert!(is_stop(&guard.poll().unwrap_err()));
+}
+
+#[test]
+fn replayed_results_and_unchanged_command_retries_cannot_renew_progress() {
+    let f = Fixture::new(Policy {
+        max_request_seconds: 1,
+        request_progress_grace_seconds: Some(1),
+        ..Policy::default()
+    });
+    let guard = f.run.open(None).unwrap();
+    let mut usage = request(&f.root, "repeated test");
+    usage.context.stage = Some("Repair".into());
+    guard.before_request(&usage).unwrap();
+    check_started(&guard, &usage, "one", 5000);
+    let result = serde_json::json!({"call_id":"one","failed":true,"exit_code":1,"output":"FAIL"});
+    guard.observe_agent(&usage, "tool_result", result.clone());
+    age_request(&guard, 2);
+    guard.observe_agent(&usage, "tool_result", result);
+    // A new ID, new description and a larger timeout do not change inputs.
+    guard.observe_agent(&usage, "tool_call", serde_json::json!({"call_id":"two","name":"Bash",
+        "input":{"command":"go test ./conformance/copyscenario","description":"this time it will work","timeout":3_600_000}}));
+    assert!(is_stop(&guard.poll().unwrap_err()));
+    assert!(
+        f.ledger().requests[&usage.id]
+            .progress_extensions
+            .is_empty()
+    );
+}
+
+#[test]
+fn fresh_source_changes_earn_grace_even_without_corpus_and_unchanged_files_do_not_renew_it() {
+    for unavailable in [false, true] {
+        let f = Fixture::new(Policy {
+            max_request_seconds: 1,
+            request_progress_grace_seconds: Some(10),
+            ..Policy::default()
+        });
+        fs::write(f.root.join("code.go"), "original").unwrap();
+        if unavailable {
+            fs::write(f.root.join(".git/opsx-build/corpus"), "unavailable").unwrap();
+        }
+        let guard = f.run.open(None).unwrap();
+        let mut usage = request(&f.root, "implementation");
+        usage.context.stage = Some("Apply".into());
+        guard.before_request(&usage).unwrap();
+        fs::write(f.root.join("code.go"), "actual changed source").unwrap();
+        age_request(&guard, 2);
+        guard.poll().unwrap();
+        assert!(guard.remaining_request_time() > Duration::from_secs(9));
+        age_request(&guard, 13);
+        // Same bytes with a new mtime are not new work.
+        fs::write(f.root.join("code.go"), "actual changed source").unwrap();
+        assert!(is_stop(&guard.poll().unwrap_err()));
+    }
+}
+
+#[test]
+fn narration_reads_and_unbounded_silence_do_not_earn_reassessment_time() {
+    let f = Fixture::new(Policy {
+        max_request_seconds: 1,
+        ..Policy::default()
+    });
+    let guard = f.run.open(None).unwrap();
+    let mut usage = request(&f.root, "busy but unchanged");
+    usage.context.stage = Some("Apply".into());
+    guard.before_request(&usage).unwrap();
+    guard.observe_agent(
+        &usage,
+        "agent_text",
+        serde_json::json!({"text":"Making great progress"}),
+    );
+    guard.observe_agent(
+        &usage,
+        "tool_call",
+        serde_json::json!({"call_id":"read","name":"Read","input":{"file_path":"code.go"}}),
+    );
+    age_request(&guard, 2);
+    assert!(is_stop(&guard.poll().unwrap_err()));
+}
+
+#[test]
+fn implementation_reassessment_cannot_override_other_stages_opt_out_or_active_time() {
+    for stage in [
+        "Verify",
+        "Propose",
+        "Explore",
+        "Archive",
+        "Completion commit",
+        "Apply",
+        "Repair",
+    ] {
+        let f = Fixture::new(Policy {
+            max_request_seconds: 1,
+            request_progress_grace_seconds: if matches!(stage, "Apply" | "Repair") {
+                None
+            } else {
+                Some(10)
+            },
+            ..Policy::default()
+        });
+        let guard = f.run.open(None).unwrap();
+        let mut usage = request(&f.root, "check");
+        usage.context.stage = Some(stage.into());
+        guard.before_request(&usage).unwrap();
+        check_started(&guard, &usage, "check", 3_600_000);
+        fs::write(f.root.join("code.go"), "changed").unwrap();
+        age_request(&guard, 2);
+        assert!(is_stop(&guard.poll().unwrap_err()), "{stage}");
+    }
+    let f = Fixture::new(Policy {
+        max_active_seconds: Some(1),
+        ..Policy::default()
+    });
+    let mut guard = f.run.open(None).unwrap();
+    let mut usage = request(&f.root, "check");
+    usage.context.stage = Some("Apply".into());
+    guard.before_request(&usage).unwrap();
+    check_started(&guard, &usage, "check", 3_600_000);
+    guard.active_since = Instant::now() - Duration::from_secs(2);
+    assert!(is_stop(&guard.poll().unwrap_err()));
+    assert_eq!(f.report()["trigger"], "active_time_limit");
+}
+
+#[test]
+fn fresh_implementation_progress_does_not_reset_independent_review_safeguards() {
+    let f = Fixture::new(Policy {
+        max_request_seconds: 1,
+        ..Policy::default()
+    });
+    let guard = f.run.open(None).unwrap();
+    guard.review(review(1, &[], &[])).unwrap();
+    guard.review(review(2, &[], &[])).unwrap();
+    assert_eq!(f.ledger().no_progress, 1);
+    let mut usage = request(&f.root, "repair");
+    usage.context.stage = Some("Repair".into());
+    guard.before_request(&usage).unwrap();
+    fs::write(f.root.join("code.go"), "candidate repair").unwrap();
+    age_request(&guard, 2);
+    guard.poll().unwrap();
+    assert_eq!(f.ledger().no_progress, 1);
+    guard.record_usage(&usage);
+    guard.review(review(3, &[], &[])).unwrap();
+    assert!(is_stop(&guard.poll().unwrap_err()));
+    assert_eq!(f.report()["trigger"], "no_verified_progress");
+}
+
+#[test]
+fn control_requests_keep_their_deadline_even_inside_an_implementation_stage() {
+    for stage in ["Apply", "Repair"] {
+        let f = Fixture::new(Policy {
+            max_request_seconds: 1,
+            ..Policy::default()
+        });
+        let guard = f.run.open(None).unwrap();
+        let mut usage = request(&f.root, "Compacting session");
+        usage.context.stage = Some(stage.into());
+        guard.before_control_request(&usage).unwrap();
+        check_started(&guard, &usage, "check", 3_600_000);
+        fs::write(f.root.join("code.go"), "changed by some other activity").unwrap();
+        age_request(&guard, 2);
+        assert!(is_stop(&guard.poll().unwrap_err()));
+        assert!(
+            f.ledger().requests[&usage.id]
+                .progress_extensions
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn all_backends_feed_pending_check_state_and_completion_into_reassessment() {
+    use serde_json::json;
+    for backend in ["claude", "codex", "opencode"] {
+        let f = Fixture::new(Policy {
+            max_request_seconds: 1,
+            request_progress_grace_seconds: Some(10),
+            ..Policy::default()
+        });
+        let ui = RecordingUi::default();
+        *ui.stage_override.lock().unwrap() = Some("Apply".into());
+        let guard = std::sync::Arc::new(f.run.open(None).unwrap());
+        ui.set_operating_policy(guard.clone()).unwrap();
+        let mut usage = Attempt::new(
+            &ui,
+            &f.root,
+            Identity {
+                backend,
+                connection: None,
+                model: None,
+                session: "session",
+                invocation: "invocation",
+                attempt: 1,
+                fresh: true,
+            },
+            "Apply",
+        );
+        usage
+            .before_request_with_prompt("Finish the implementation")
+            .unwrap();
+        let (started, completed) = match backend {
+            "claude" => (
+                json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"check","name":"Bash","input":{"command":"go test ./native","timeout":60_000}}]}}),
+                json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"check","content":"ok","is_error":false}]}}),
+            ),
+            "codex" => (
+                json!({"method":"item/started","params":{"item":{"type":"commandExecution","id":"check","command":"go test ./native","cwd":"."}}}),
+                json!({"method":"item/completed","params":{"item":{"type":"commandExecution","id":"check","command":"go test ./native","cwd":".","aggregatedOutput":"ok","exitCode":0}}}),
+            ),
+            _ => (
+                json!({"type":"tool_use","part":{"callID":"check","tool":"bash","state":{"status":"running","input":{"command":"go test ./native","timeout":60_000}}}}),
+                json!({"type":"tool_use","part":{"callID":"check","tool":"bash","state":{"status":"completed","input":{"command":"go test ./native","timeout":60_000},"output":"ok","metadata":{"exit":0}}}}),
+            ),
+        };
+        usage.event(&started);
+        age_request(&guard, 2);
+        guard.poll().unwrap();
+        assert_eq!(
+            f.ledger().requests[&usage.record.id]
+                .watchdog
+                .as_ref()
+                .unwrap()["pending_checks"][0]["call_id"],
+            "check",
+            "{backend}"
+        );
+        usage.event(&completed);
+        guard.poll().unwrap();
+        assert!(
+            f.ledger().requests[&usage.record.id]
+                .watchdog
+                .as_ref()
+                .unwrap()["pending_checks"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{backend}"
+        );
+        usage.finish("ready");
+    }
+}
+
 fn review(number: u32, closed: &[&str], reopened: &[&str]) -> Progress {
     Progress {
         structured: true,

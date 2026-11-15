@@ -73,6 +73,206 @@ fn lines(path: &Path) -> Vec<Value> {
 }
 
 #[test]
+fn quiet_checkpoint_retains_recent_history_and_pending_check_until_its_result() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let usage = fixture.usage();
+    recorder.start(&usage).unwrap();
+    let call = json!({"call_id":"native","name":"Bash","input":{"command":"go test ./native","timeout":3_600_000}});
+    recorder
+        .observation(&usage, "tool_call", call.clone())
+        .unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    recorder
+        .observation(
+            &usage,
+            "tool_result",
+            json!({"call_id":"native","output":"FAIL","failed":false,"exit_code":null}),
+        )
+        .unwrap();
+    // An old replayed call cannot reopen a completed operation.
+    recorder.event("tool_call", call).unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    // Compatibility dispatches may reuse the request ID.
+    recorder.start(&usage).unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    let output = fixture.export();
+    let inputs = lines(&output.join("model-inputs.jsonl"));
+    assert!(inputs[1]["events"].as_array().unwrap().is_empty());
+    let state = &inputs[1]["operating_state"];
+    assert!(
+        state["recent_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "tool_call")
+    );
+    assert_eq!(
+        state["pending_checks"][0]["call"]["data"]["call_id"],
+        "native"
+    );
+    assert!(
+        inputs[2]["operating_state"]["pending_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        inputs[3]["operating_state"]["pending_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !inputs[3]["operating_state"]["recent_history"]
+            .to_string()
+            .contains("native")
+    );
+    let raw = lines(&output.join("events.jsonl"));
+    for input in inputs {
+        let cutoff = input["cutoff_sequence"].as_u64().unwrap();
+        let events = input["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                input["operating_state"]["recent_history"]
+                    .as_array()
+                    .unwrap()
+                    .iter(),
+            )
+            .chain(
+                input["operating_state"]["pending_checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| &p["call"]),
+            );
+        for event in events {
+            assert!(event["sequence"].as_u64().unwrap() < cutoff);
+            assert_eq!(
+                event,
+                &raw[event["sequence"].as_u64().unwrap() as usize - 1]
+            );
+            assert!(!event["kind"].as_str().unwrap().ends_with("_outcome"));
+            assert_ne!(event["kind"], "decision");
+            assert_ne!(event["kind"], "request_started");
+        }
+    }
+}
+
+#[test]
+fn pending_check_survives_history_window_expiry_without_fabricating_a_result() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let usage = fixture.usage();
+    recorder.start(&usage).unwrap();
+    recorder
+        .observation(
+            &usage,
+            "tool_call",
+            json!({"call_id":"proof","name":"Bash",
+        "input":{"command":"java -cp tla2tools.jar tlc2.TLC Spec","timeout":7_200_000}}),
+        )
+        .unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    let (mut events, _) = read_events(&recorder.directory).unwrap();
+    let last = events.last_mut().unwrap();
+    last.recorded_at_unix_ms += 1_800_000;
+    let path = fs::read_dir(&recorder.directory)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap();
+    drop(recorder);
+    write_jsonl(
+        &path,
+        &events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let output = fixture.export();
+    let inputs = lines(&output.join("model-inputs.jsonl"));
+    let state = &inputs[1]["operating_state"];
+    assert!(state["recent_history"].as_array().unwrap().is_empty());
+    assert_eq!(
+        state["pending_checks"][0]["call"]["data"]["call_id"],
+        "proof"
+    );
+    assert!(state["pending_checks"][0]["elapsed_ms"].as_u64().unwrap() >= 1_800_000);
+    assert!(
+        state["pending_checks"][0]["state"]
+            .as_str()
+            .unwrap()
+            .contains("liveness not independently")
+    );
+}
+
+#[test]
+fn pending_helper_receipts_retain_observed_state_but_stale_dispatches_do_not() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let mut usage = fixture.usage();
+    usage.context.stage = Some("Apply".into());
+    usage.context.change = Some("delivery".into());
+    recorder.start(&usage).unwrap();
+    let mut data = json!({"source_path":"receipt","record":{"stage":"Apply","change":"delivery",
+        "started_at_unix_ms":0,"outcome":"running","spec":{"timeout_seconds":3600}}});
+    recorder.event("check_receipt", data.clone()).unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    data["record"]["started_at_unix_ms"] = json!(crate::run_summary::now_ms());
+    recorder.event("check_receipt", data.clone()).unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    data["record"]["outcome"] = json!("passed");
+    recorder.event("check_receipt", data).unwrap();
+    recorder
+        .decision("periodic_observation", "observe", json!({}))
+        .unwrap();
+    let output = fixture.export();
+    let inputs = lines(&output.join("model-inputs.jsonl"));
+    assert!(
+        inputs[0]["operating_state"]["pending_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        inputs[2]["operating_state"]["pending_checks"][0]["receipt"]["data"]["record"]["outcome"],
+        "running"
+    );
+    assert!(
+        inputs[3]["operating_state"]["pending_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn replayed_tool_results_are_captured_once_for_each_backend() {
     for backend in ["claude", "codex", "opencode"] {
         let fixture = Fixture::new();

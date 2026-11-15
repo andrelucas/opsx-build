@@ -190,6 +190,7 @@ fn timed_apply(mode: &str) -> (Fixture, Output, Value) {
             json!({"max_request_seconds": 3, "request_progress_grace_seconds": 1})
         }
         "progress-dried-up"
+        | "progress-stalled"
         | "progress-rolling"
         | "progress-repeated-live"
         | "progress-check-timeout" => {
@@ -232,12 +233,27 @@ fn a_recent_new_check_result_earns_time_to_finish_apply() {
 }
 
 #[test]
-fn apply_without_check_evidence_stops_at_its_original_limit() {
+fn apply_stops_when_initial_code_changes_go_stale_without_checks() {
     let (fixture, output, apply) = timed_apply("progress-stalled");
     assert!(!output.status.success());
     assert_eq!(fixture.state()["stage"], "apply");
     assert_eq!(apply["outcome"], "policy_stop_incomplete");
-    assert!(apply.get("progress_extensions").is_none());
+    assert_eq!(
+        apply["progress_extensions"][0]["outcome"],
+        "observed_work_or_check"
+    );
+}
+
+#[test]
+fn fresh_implementation_without_check_receipts_earns_time_and_still_requires_the_gate() {
+    let (fixture, output, apply) = timed_apply("progress-coding");
+    Fixture::success(&output);
+    assert_eq!(fixture.state()["stage"], "done");
+    assert_eq!(
+        apply["progress_extensions"][0]["outcome"],
+        "observed_work_or_check"
+    );
+    assert!(fixture.root.join("repo/.git/gate-calls").is_file());
 }
 
 #[test]
