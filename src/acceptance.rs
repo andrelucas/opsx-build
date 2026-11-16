@@ -485,6 +485,70 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn internal_skill_symlinks_allow_acceptance_but_link_or_target_changes_invalidate_it() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("opsx-check-links-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join(".agents/skills/openspec-apply-change")).unwrap();
+        fs::create_dir_all(root.join(".claude/skills")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            root.join(".agents/skills/openspec-apply-change/SKILL.md"),
+            "original",
+        )
+        .unwrap();
+        let alias = root.join(".claude/skills/openspec-apply-change");
+        symlink("../../.agents/skills/openspec-apply-change", &alias).unwrap();
+        let ui = ControlUi::default();
+        let mut gate = AcceptanceGate::new(
+            vec!["cat .claude/skills/openspec-apply-change/SKILL.md > .git/checked".into()],
+            None,
+        )
+        .unwrap();
+        assert!(gate.run(&root, None, &ui, || Ok(())).unwrap().is_none());
+        assert_eq!(
+            fs::read_to_string(root.join(".git/checked")).unwrap(),
+            "original"
+        );
+        assert!(gate.is_current(&root, None, &ui).unwrap());
+        fs::write(
+            root.join(".agents/skills/openspec-apply-change/SKILL.md"),
+            "changed",
+        )
+        .unwrap();
+        assert!(!gate.is_current(&root, None, &ui).unwrap());
+        fs::write(
+            root.join(".agents/skills/openspec-apply-change/SKILL.md"),
+            "original",
+        )
+        .unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink("../../.agents/skills/./openspec-apply-change", &alias).unwrap();
+        assert!(!gate.is_current(&root, None, &ui).unwrap());
+        for command in [
+            "printf changed > .claude/skills/openspec-apply-change/SKILL.md",
+            "rm .claude/skills/openspec-apply-change; ln -s ../../.agents/skills/././openspec-apply-change .claude/skills/openspec-apply-change",
+        ] {
+            let mut gate = AcceptanceGate::new(vec![command.into()], None).unwrap();
+            assert!(
+                gate.run(&root, None, &ui, || Ok(()))
+                    .unwrap()
+                    .unwrap()
+                    .contains("changed tracked or non-ignored product inputs")
+            );
+            assert!(!gate.is_current(&root, None, &ui).unwrap());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn output_and_elapsed_time_are_visible_before_the_check_exits() {
         let root = std::env::temp_dir().join(format!("opsx-check-live-{}", uuid::Uuid::new_v4()));

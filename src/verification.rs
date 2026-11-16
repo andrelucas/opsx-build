@@ -13,6 +13,8 @@ use crate::{
     ui::Ui,
 };
 
+mod symlinks;
+
 pub(crate) type Files = BTreeMap<String, (String, bool)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +259,8 @@ pub(crate) fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
         .filter(|path| !path.is_empty())
         .collect::<std::collections::BTreeSet<_>>();
     let mut files = Files::new();
+    let root = repo.canonicalize()?;
+    let mut link_budget = symlinks::Budget::default();
     for path in paths {
         if !Path::new(path)
             .components()
@@ -264,17 +268,14 @@ pub(crate) fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
         {
             bail!("unsupported verification input path");
         }
-        // A submodule or symlink needs dependency-aware verification; fail open to
-        // normal agent inspection rather than asserting its inputs are unchanged.
-        for ancestor in Path::new(path)
+        let linked = Path::new(path)
             .ancestors()
             .filter(|p| !p.as_os_str().is_empty())
-        {
-            if let Ok(metadata) = fs::symlink_metadata(repo.join(ancestor))
-                && metadata.file_type().is_symlink()
-            {
-                bail!("symlink input `{path}` requires independent inspection");
-            }
+            .any(|p| fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.file_type().is_symlink()));
+        if linked {
+            let hash = symlinks::fingerprint(&root, Path::new(path), &mut link_budget)?;
+            files.insert(path.to_owned(), (hash, false));
+            continue;
         }
         let metadata = match fs::symlink_metadata(repo.join(path)) {
             Ok(metadata) => metadata,
@@ -296,7 +297,11 @@ pub(crate) fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
     if !files.is_empty() {
         // hash-object without -w writes no Git objects or index entries. Pass
         // literal paths as arguments in bounded batches, never through a shell.
-        let paths = files.keys().collect::<Vec<_>>();
+        let paths = files
+            .iter()
+            .filter(|(_, (hash, _))| hash.is_empty())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         let mut hashes = Vec::new();
         for batch in paths.chunks(128) {
             let output = runner.checked(
@@ -307,14 +312,14 @@ pub(crate) fn snapshot<U: Ui>(repo: &Path, ui: &U) -> Result<Files> {
             )?;
             hashes.extend(output.stdout.lines().map(str::to_owned));
         }
-        if hashes.len() != files.len() {
+        if hashes.len() != paths.len() {
             bail!("incomplete verification fingerprints");
         }
-        for ((_, (hash, _)), value) in files.iter_mut().zip(hashes) {
+        for (path, value) in paths.iter().zip(hashes) {
             if value.len() < 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
                 bail!("invalid verification fingerprint");
             }
-            *hash = value;
+            files.get_mut(path).unwrap().0 = value;
         }
     }
     Ok(files)
@@ -513,7 +518,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn executable_modes_are_inputs_and_symlinks_fall_back_to_inspection() {
+    fn executable_modes_are_inputs_and_external_symlinks_fall_back_to_inspection() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let repo = Repo::new();
         let ui = RecordingUi::default();
@@ -523,13 +528,240 @@ mod tests {
             changed_paths(&before, &snapshot(&repo.0, &ui).unwrap()),
             vec!["code.go"]
         );
-        symlink("code.go", repo.0.join("linked")).unwrap();
+        symlink(
+            repo.0.parent().unwrap().join("outside"),
+            repo.0.join("linked"),
+        )
+        .unwrap();
         let before = capture(&repo.0, None, &ui);
         let evidence = VerificationEvidence::finish("test", "verified".into(), before, &ui);
         assert!(
             evidence
                 .handoff(&repo.0, None, &ui)
                 .contains("Unknown: a stable snapshot")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openspec_skill_directory_alias_is_fingerprinted_without_modifying_git() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        let target = ".agents/skills/openspec-apply-change";
+        let alias = ".claude/skills/openspec-apply-change";
+        fs::create_dir_all(repo.0.join(target)).unwrap();
+        fs::create_dir_all(repo.0.join(".claude/skills")).unwrap();
+        fs::write(
+            repo.0.join(target).join("SKILL.md"),
+            "Implement the assigned change",
+        )
+        .unwrap();
+        symlink(
+            "../../.agents/skills/openspec-apply-change",
+            repo.0.join(alias),
+        )
+        .unwrap();
+        repo.git(&["add", ".agents", ".claude"]);
+        let index = fs::read(repo.0.join(".git/index")).unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        let before = snapshot(&repo.0, &ui).unwrap();
+        assert!(before.contains_key(alias));
+        assert_eq!(snapshot(&repo.0, &ui).unwrap(), before);
+        let evidence = VerificationEvidence::finish(
+            "delivery",
+            "Reviewed".into(),
+            capture(&repo.0, None, &ui),
+            &ui,
+        );
+        assert!(evidence.delivery_unchanged(&repo.0, &ui));
+        assert!(
+            evidence
+                .handoff(&repo.0, None, &ui)
+                .contains("None among tracked")
+        );
+        fs::write(repo.0.join(target).join("SKILL.md"), "Changed instructions").unwrap();
+        let after = snapshot(&repo.0, &ui).unwrap();
+        let changed = changed_paths(&before, &after);
+        assert!(changed.contains(&alias));
+        assert!(changed.contains(&".agents/skills/openspec-apply-change/SKILL.md"));
+        assert!(!evidence.delivery_unchanged(&repo.0, &ui));
+        assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), index);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_link_targets_track_contents_modes_membership_and_link_spelling() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        fs::create_dir_all(repo.0.join("build/target")).unwrap();
+        fs::write(repo.0.join("build/target/input"), "first").unwrap();
+        symlink("build/target", repo.0.join("alias")).unwrap();
+        repo.git(&["add", "alias"]);
+        let before = snapshot(&repo.0, &ui).unwrap();
+        assert!(!before.contains_key("build/target/input"));
+        fs::write(repo.0.join("build/target/input"), "first").unwrap();
+        assert_eq!(snapshot(&repo.0, &ui).unwrap(), before);
+        fs::write(repo.0.join("build/target/input"), "second").unwrap();
+        assert_eq!(
+            changed_paths(&before, &snapshot(&repo.0, &ui).unwrap()),
+            ["alias"]
+        );
+        fs::write(repo.0.join("build/target/input"), "first").unwrap();
+        fs::set_permissions(
+            repo.0.join("build/target/input"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+        fs::set_permissions(
+            repo.0.join("build/target/input"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        for directory in [false, true] {
+            let new = repo.0.join("build/target/new");
+            if directory {
+                fs::create_dir(&new).unwrap();
+            } else {
+                fs::write(&new, "new input").unwrap();
+            }
+            assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+            if directory {
+                fs::remove_dir(&new).unwrap();
+            } else {
+                fs::remove_file(&new).unwrap();
+            }
+            assert_eq!(snapshot(&repo.0, &ui).unwrap(), before);
+        }
+        fs::remove_file(repo.0.join("build/target/input")).unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+        fs::write(repo.0.join("build/target/input"), "first").unwrap();
+        fs::remove_file(repo.0.join("alias")).unwrap();
+        symlink("./build/target", repo.0.join("alias")).unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_chains_and_symlinked_ancestors_track_every_link_and_the_final_file() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        fs::create_dir_all(repo.0.join("build/real")).unwrap();
+        fs::write(repo.0.join("build/real/input"), "same").unwrap();
+        fs::write(repo.0.join("build/real/copy"), "same").unwrap();
+        symlink("real", repo.0.join("build/directory")).unwrap();
+        symlink("directory/input", repo.0.join("build/middle")).unwrap();
+        symlink("build/middle", repo.0.join("alias")).unwrap();
+        let before = snapshot(&repo.0, &ui).unwrap();
+        fs::remove_file(repo.0.join("build/middle")).unwrap();
+        symlink("directory/copy", repo.0.join("build/middle")).unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+        fs::remove_file(repo.0.join("build/middle")).unwrap();
+        symlink("directory/input", repo.0.join("build/middle")).unwrap();
+        fs::remove_file(repo.0.join("build/directory")).unwrap();
+        symlink("./real", repo.0.join("build/directory")).unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), before);
+        fs::write(repo.0.join("build/real/input"), "changed").unwrap();
+        let changed = snapshot(&repo.0, &ui).unwrap();
+        fs::write(repo.0.join("build/real/input"), "same").unwrap();
+        assert_ne!(snapshot(&repo.0, &ui).unwrap(), changed);
+        // Parent traversal must follow the actual directory link before '..'.
+        fs::remove_file(repo.0.join("alias")).unwrap();
+        symlink("build/directory/../directory/input", repo.0.join("alias")).unwrap();
+        snapshot(&repo.0, &ui).unwrap();
+        fs::remove_file(repo.0.join("alias")).unwrap();
+        symlink(
+            repo.0.canonicalize().unwrap().join("build/real/input"),
+            repo.0.join("alias"),
+        )
+        .unwrap();
+        snapshot(&repo.0, &ui).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_paths_beneath_a_replaced_directory_cannot_hide_a_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        fs::create_dir(repo.0.join("tracked")).unwrap();
+        fs::write(repo.0.join("tracked/input"), "same").unwrap();
+        repo.git(&["add", "tracked/input"]);
+        fs::create_dir_all(repo.0.join("build/real")).unwrap();
+        fs::write(repo.0.join("build/real/input"), "same").unwrap();
+        fs::remove_dir_all(repo.0.join("tracked")).unwrap();
+        symlink("build/real", repo.0.join("tracked")).unwrap();
+        let before = snapshot(&repo.0, &ui).unwrap();
+        assert!(before.contains_key("tracked/input"));
+        fs::remove_file(repo.0.join("tracked")).unwrap();
+        symlink("./build/real", repo.0.join("tracked")).unwrap();
+        let after = snapshot(&repo.0, &ui).unwrap();
+        let changed = changed_paths(&before, &after);
+        assert!(changed.contains(&"tracked/input"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_external_cyclic_and_metadata_links_cannot_certify_unchanged_inputs() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let outside = Repo::new();
+        let ui = RecordingUi::default();
+        fs::create_dir_all(repo.0.join("build/loop")).unwrap();
+        symlink(".", repo.0.join("build/loop/self")).unwrap();
+        symlink("second", repo.0.join("build/first")).unwrap();
+        symlink("first", repo.0.join("build/second")).unwrap();
+        symlink(&outside.0, repo.0.join("build/outside")).unwrap();
+        symlink(
+            repo.0.canonicalize().unwrap().join("code.go"),
+            outside.0.join("return"),
+        )
+        .unwrap();
+        for target in [
+            PathBuf::from("missing"),
+            outside.0.join("code.go"),
+            PathBuf::from("build/first"),
+            PathBuf::from("build/loop"),
+            PathBuf::from("build/outside/return"),
+            PathBuf::from(".git/config"),
+        ] {
+            symlink(target, repo.0.join("alias")).unwrap();
+            assert!(snapshot(&repo.0, &ui).is_err());
+            fs::remove_file(repo.0.join("alias")).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_expansion_is_bounded_before_reading_large_inputs() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let ui = RecordingUi::default();
+        fs::create_dir_all(repo.0.join("build/target")).unwrap();
+        fs::File::create(repo.0.join("build/target/large"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        symlink("build/target", repo.0.join("alias")).unwrap();
+        assert!(
+            snapshot(&repo.0, &ui)
+                .unwrap_err()
+                .to_string()
+                .contains("64 MiB")
+        );
+        fs::remove_file(repo.0.join("build/target/large")).unwrap();
+        for n in 0..4097 {
+            fs::File::create(repo.0.join(format!("build/target/{n}"))).unwrap();
+        }
+        assert!(
+            snapshot(&repo.0, &ui)
+                .unwrap_err()
+                .to_string()
+                .contains("4096 entries")
         );
     }
 

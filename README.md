@@ -1205,17 +1205,27 @@ including file additions, deletions and executable-mode changes. Sidecar runs co
 repositories. No index, working-tree content or Git history is changed by this
 measurement.
 
+In-repository symlinks are fingerprinted with their link text, intermediate
+links and resolved target contents, including ignored target files and directory
+membership. Resolution stays inside the repository at every hop. Link spelling,
+retargeting, target content and executable-mode changes invalidate the evidence.
+Expansion is bounded to 4096 entries and 64 MiB per snapshot. Broken links,
+external targets, cycles and links into Git metadata cannot certify unchanged
+inputs. This also applies to independent acceptance's
+before/after input checks; ordinary OpenSpec skill aliases are supported.
+
 Completion packages the verified and archived work. Its scope review determines
 which changed files belong in the commit; it does not reopen design, requirement
 coverage or checks of unchanged documents. Archive's recorded move, sync and link
 checks are reused when still applicable, alongside Verify's results. Changes to
 code, tests, fixtures, dependencies, build configuration or governing
-requirements require reassessing and rerunning affected checks. Ignored files,
-external inputs and environment changes remain the agent's responsibility;
-repository policies requiring fresh checks still apply. Missing/old evidence,
-changes during Verify, unreadable inputs, symlinks or submodules fall back to
-targeted evidence inspection rather than certifying unchanged inputs. An older
-checkpoint or recovered Archive without a report requires inspecting durable
+requirements require reassessing and rerunning affected checks. Ignored files
+outside linked targets, external inputs and environment changes remain the
+agent's responsibility; repository policies requiring fresh checks still apply.
+Missing/old evidence,
+changes during Verify, unreadable inputs, unsupported links or submodules fall
+back to targeted evidence inspection rather than certifying unchanged inputs. An
+older checkpoint or recovered Archive without a report requires inspecting durable
 archive state and affected operations, without automatically repeating all
 verification. Normal Git hooks, protected-input checks and maintainer acceptance
 gates remain in force. These handoffs do not weaken Verify or introduce another
