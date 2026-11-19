@@ -43,7 +43,56 @@ Ludwig's existing QEMU/KVM is reused. Lima is installed under `~/.local`; its
 instances and caches stay in the user's home filesystem. Existing host Docker,
 Podman and Kubernetes stores are not used by the guest.
 
-## Start a campaign clone
+## Run a campaign with opsx-build
+
+Install the opsx-build host binary on the machine that runs Lima. From a
+standalone campaign checkout on that host, select a stopped, prepared base.
+Many campaigns can share the same base and each gets its own writable clone.
+The launcher inherits the base's architecture and uses its installed `mise`
+and `opsx-campaign` wrapper. The scripts above prepare the x86_64 base on
+Ludwig. For Apple Silicon, the launcher can use a separately prepared arm64
+Ubuntu base with the tools that campaign needs.
+
+```sh
+opsx-build lima prepare --base campaign-base
+```
+
+To set resources per campaign, put this optional file in the campaign root
+as `opsx-build.lima.toml`. Memory and disk are in GiB.
+
+```toml
+cpus = 8
+memory = 16
+disk = 100
+```
+
+Options `--cpus`, `--memory`, and `--disk` on `lima prepare` override the file.
+Omitted values inherit the base settings. Use `--repo PATH` with any Lima
+command to select a campaign from elsewhere.
+
+Prepare copies the campaign, including its Git history and any bundled
+dependency inputs. Use the printed `limactl shell` command to sign in to the
+agents and set up connection profiles in the clone. Back on the host, run:
+
+```sh
+opsx-build lima run -- preflight
+opsx-build lima run -- execute
+```
+
+Once a run has a checkpoint, continue with `opsx-build lima run -- --resume`.
+Each command starts the recorded clone if needed. The guest retains its
+checkout, agent sign-in and checkpoint between runs. The host records which
+clone to use under `$XDG_STATE_HOME/opsx-build/lima` (by default
+`~/.local/state/opsx-build/lima`), keyed to the host checkout's absolute path.
+Use that same host checkout to resume or export.
+
+When a guest command finishes, copy back a reviewable checkpoint with
+`opsx-build lima export /path/to/new-directory`. The export includes Git
+metadata and ignored artifacts. If the transfer fails, retry with a fresh
+destination. To release VM resources between runs, stop the clone using
+`limactl stop`. Lima keeps the guest disk for the next run.
+
+## Manage a campaign clone manually
 
 On Ludwig:
 

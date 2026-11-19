@@ -496,6 +496,7 @@ impl Cli {
     name = "opsx-build",
     version,
     about = "Build an OpenSpec change through synchronous agent stages",
+    after_help = "Optional Lima builder commands: opsx-build lima --help",
     args_override_self = true
 )]
 pub(crate) struct CliArgs {

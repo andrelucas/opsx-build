@@ -12,6 +12,8 @@ and lets the repository, OpenSpec artifacts, and selected agent do their own
 jobs. Claude Code is the default backend; OpenCode and Codex are available as
 explicit worker or frontier backends.
 
+To run a campaign in a VM, see the [optional Lima workflow](lima/README.md).
+
 During an ordinary run it deliberately does **not** infer file ownership or
 require a clean working tree. Read-only file fingerprints support the handoff
 between Verify, Archive and completion commit; they do not determine commit scope.
