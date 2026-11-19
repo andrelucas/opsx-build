@@ -45,8 +45,9 @@ Podman and Kubernetes stores are not used by the guest.
 
 ## Run a campaign with opsx-build
 
-Install the opsx-build host binary on the machine that runs Lima. From a
-standalone campaign checkout on that host, select a stopped, prepared base.
+Install the [opsx-build host binary](../README.md#installation) on the machine
+that runs Lima, and make sure `limactl` is on `PATH`. From a standalone campaign
+checkout on that host, select a stopped, prepared base.
 Many campaigns can share the same base and each gets its own writable clone.
 The launcher inherits the base's architecture and uses its installed `mise`
 and `opsx-campaign` wrapper. The scripts above prepare the x86_64 base on
@@ -79,18 +80,26 @@ opsx-build lima run -- preflight
 opsx-build lima run -- execute
 ```
 
-Once a run has a checkpoint, continue with `opsx-build lima run -- --resume`.
-Each command starts the recorded clone if needed. The guest retains its
-checkout, agent sign-in and checkpoint between runs. The host records which
-clone to use under `$XDG_STATE_HOME/opsx-build/lima` (by default
+If you ran `bootstrap` separately and it completed, start delivery with
+`opsx-build lima run -- --loop advance`. Pass the same supplied-contract
+options to both commands if they are absent from `opsx-build.md`. To continue
+an interrupted run, use `opsx-build lima run -- --resume`.
+
+`lima run` and `lima export` start the recorded clone if needed. The guest
+retains its checkout, agent sign-in and checkpoint between runs. The host
+records which clone to use under `$XDG_STATE_HOME/opsx-build/lima` (by default
 `~/.local/state/opsx-build/lima`), keyed to the host checkout's absolute path.
 Use that same host checkout to resume or export.
 
 When a guest command finishes, copy back a reviewable checkpoint with
 `opsx-build lima export /path/to/new-directory`. The export includes Git
-metadata and ignored artifacts. If the transfer fails, retry with a fresh
-destination. To release VM resources between runs, stop the clone using
-`limactl stop`. Lima keeps the guest disk for the next run.
+metadata, checkpoints and ignored artifacts. For a completed run with an
+independent acceptance gate, the exported `.git/opsx-build/last-run.json` has
+`stage` set to `done`. The passing `result.json` and logs are under
+`.git/opsx-build/acceptance/`. If the transfer fails, retry with a fresh
+destination. To release VM resources, run `limactl stop <clone-name>` after
+export or between runs.
+Lima keeps the guest disk for the next run.
 
 ## Manage a campaign clone manually
 
@@ -129,13 +138,14 @@ harness sandbox, as the Amygdala launcher does. Its profile grants broad access
 to the campaign, tools and guest OS, while keeping nono's own state private.
 The shared Lima builder profile uses nono's `developer` network profile, adds
 `proxy.golang.org` and `sum.golang.org` for Go module downloads and checksum
-verification, and provides private loopback for local tests. The builder
-configures the OpenSpec workflows before launch and grants access to its
-shared skill directory. A small AppArmor allowance enables nono's namespaces
-on Ubuntu. Adjust
-`~/.local/share/campaign-builder/network.json` for additional model endpoints,
-registries or a campaign's Kubernetes API. Provisioning is done before this
-campaign policy is applied. Cluster credentials and cluster creation are
+verification, and provides private loopback for local tests. The guest is
+configured to install OpenSpec Propose, Apply, Verify and Archive. With
+OpenSpec 2.1, opsx-build can discover workflows installed under `~/.agents/skills`
+when the campaign has no matching workflow. The profile grants read access to
+that directory. A small AppArmor allowance enables nono's namespaces on Ubuntu.
+Adjust `~/.local/share/campaign-builder/network.json` for additional model
+endpoints, registries or a campaign's Kubernetes API. Provisioning runs before
+the campaign policy takes effect. Cluster credentials and cluster creation are
 separate from installing Docker, kind and kubectl; the base creates no cluster.
 The nono policy applies to the campaign process tree; container networking is
 managed by Docker.
@@ -204,7 +214,7 @@ its installed tools and passed `builder-check`. Further checks passed:
 Agent authentication and campaign-specific connections are still supplied in
 each clone. No campaign was launched as part of these installation checks.
 
-## Real Sirocco campaign trial
+## Real Sirocco campaign checks
 
 On 19 November 2026, `sirocco` was cloned on Ludwig with 8 CPUs, 16 GiB RAM
 and a 100 GiB virtual disk. It contains a copy of
@@ -233,5 +243,18 @@ mise exec -- nono run \
 ```
 
 Host logs are `~/campaign-builder/sirocco-preflight.log` and
-`~/campaign-builder/sirocco-environment-preflight.log` on Ludwig. The clone is
-left running. No delivery campaign or final acceptance suite was launched.
+`~/campaign-builder/sirocco-environment-preflight.log` on Ludwig.
+
+The separate Protocols 0.10.0 campaign exercised delivery and export on a
+fresh 4-CPU, 8 GiB clone. After guest agent sign-in and bootstrap, the clone
+was stopped. This command started the clone and completed delivery and
+independent final acceptance without operator fixes.
+
+```sh
+opsx-build lima run -- --loop --obligation-inventory=obligations.json advance
+```
+
+The gate checked generated bindings and the packaged Go consumer with a fresh
+module cache. `opsx-build lima export` produced a clean checkout at the accepted
+commit, with the passing report and command logs intact. The clone was stopped
+after export.
