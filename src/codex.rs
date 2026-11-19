@@ -1098,20 +1098,32 @@ fn codex_turn_input(repo: &Path, prompt: &str) -> Value {
         repo.join(".claude/skills").join(name).join("SKILL.md"),
         repo.join(".opencode/skills").join(name).join("SKILL.md"),
     ];
-    if let Some(path) = skill_candidates.into_iter().find(|path| path.is_file()) {
-        return json!([
-            {"type": "skill", "name": name, "path": path},
-            {"type": "text", "text": remainder}
-        ]);
-    }
-    let command_candidates = [
+    let project_command = [
         repo.join(".claude/commands")
             .join(format!("{command_path}.md")),
         repo.join(".claude/commands").join(&command_path),
         repo.join(".opencode/commands")
             .join(format!("{opencode_name}.md")),
-    ];
-    let Some(path) = command_candidates.into_iter().find(|path| path.is_file()) else {
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    if let Some(path) = skill_candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .or_else(|| {
+            if project_command.is_some() {
+                return None;
+            }
+            let directory = crate::skills::global_agents_skills()?;
+            crate::skills::installed_openspec_skill(&directory, name)
+        })
+    {
+        return json!([
+            {"type": "skill", "name": name, "path": path},
+            {"type": "text", "text": remainder}
+        ]);
+    }
+    let Some(path) = project_command else {
         return json!([{"type": "text", "text": prompt}]);
     };
     let Ok(instructions) = std::fs::read_to_string(path) else {

@@ -1,3 +1,6 @@
+[env]
+OPENSPEC_TELEMETRY = "0"
+
 # Most tools follow normal releases. Sirocco's existing generation checks require
 # the four exact Go/Buf/generator versions below; its TLC input requires 1.7.4.
 [tools]
@@ -116,7 +119,9 @@ run = [
   'sudo usermod -aG docker "$USER"',
   'sudo apparmor_parser -r /etc/apparmor.d/campaign-nono',
   'install -m 0755 "$HOME/.local/share/campaign-builder/bin/"* "$HOME/.local/bin/"',
-  'mkdir -p "$HOME/campaigns" "$HOME/.claude" "$HOME/.codex" "$HOME/.local/state/opencode" "$HOME/.docker" "$HOME/.kube"',
+  'mkdir -p "$HOME/campaigns" "$HOME/.agents" "$HOME/.claude" "$HOME/.codex" "$HOME/.local/state/opencode" "$HOME/.docker" "$HOME/.kube"',
+  'openspec config set profile custom',
+  "openspec config set workflows '[\"propose\",\"apply\",\"verify\",\"archive\"]'",
   'for tool in tlc sany pcal tla2xml tlatex; do ln -sf "$HOME/.local/bin/tla-tool" "$HOME/.local/bin/$tool"; done',
   'bash "$HOME/.local/share/campaign-builder/build-tlaps.sh"',
   'bash "$HOME/.local/share/campaign-builder/build-opsx.sh"',

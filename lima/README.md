@@ -128,8 +128,11 @@ opsx-campaign execute
 harness sandbox, as the Amygdala launcher does. Its profile grants broad access
 to the campaign, tools and guest OS, while keeping nono's own state private.
 The shared Lima builder profile uses nono's `developer` network profile, adds
-`proxy.golang.org` for public Go modules, and provides private loopback for
-local tests. A small AppArmor allowance enables this on Ubuntu. Adjust
+`proxy.golang.org` and `sum.golang.org` for Go module downloads and checksum
+verification, and provides private loopback for local tests. The builder
+configures the OpenSpec workflows before launch and grants access to its
+shared skill directory. A small AppArmor allowance enables nono's namespaces
+on Ubuntu. Adjust
 `~/.local/share/campaign-builder/network.json` for additional model endpoints,
 registries or a campaign's Kubernetes API. Provisioning is done before this
 campaign policy is applied. Cluster credentials and cluster creation are

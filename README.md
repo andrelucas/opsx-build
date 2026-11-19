@@ -2630,6 +2630,10 @@ so that initialization installs the required workflows. Codex receives the
 installed Claude/OpenSpec workflows as explicit App Server inputs, so a separate
 Codex integration is not required by opsx-build.
 
+OpenSpec 2.1 can install workflows for the user account. opsx-build checks
+these installed skills when the project has no matching workflow. Explicit
+workflow commands still have first priority.
+
 Only when preparing a campaign manually, initialize OpenSpec yourself:
 
 ```sh

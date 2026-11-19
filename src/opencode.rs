@@ -1128,6 +1128,16 @@ fn skill_exists(repo: &Path, name: &str) -> bool {
     ]
     .iter()
     .any(|path| path.is_file())
+        || crate::skills::global_agents_skills()
+            .and_then(|directory| crate::skills::installed_openspec_skill(&directory, name))
+            .is_some()
+            && ![
+                ".opencode/commands",
+                ".opencode/command",
+                ".claude/commands",
+            ]
+            .iter()
+            .any(|directory| repo.join(directory).join(format!("{name}.md")).is_file())
 }
 
 fn parse_opencode_output(stdout: &str) -> Result<StageResult> {

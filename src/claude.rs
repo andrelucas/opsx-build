@@ -342,6 +342,20 @@ impl SkillCommands {
     }
 
     pub(crate) fn discover_for(repo: &Path, cli: &Cli, backend: BackendKind) -> Result<Self> {
+        let global_skills = match backend {
+            BackendKind::Claude => {
+                let connection = if cli.worker_connection.backend == BackendKind::Claude {
+                    &cli.worker_connection
+                } else {
+                    &cli.frontier_connection
+                };
+                ClaudeLauncher::from_connection(connection)
+                    .ok()
+                    .and_then(|launcher| claude_config_dir(repo, &launcher))
+                    .map(|directory| directory.join("skills"))
+            }
+            BackendKind::Codex | BackendKind::OpenCode => crate::skills::global_agents_skills(),
+        };
         Ok(Self {
             explore: resolve_bundled_command(cli.explore_command.as_deref(), "explore-unattended"),
             propose: resolve_bundled_command(cli.propose_command.as_deref(), "propose-unattended"),
@@ -357,6 +371,7 @@ impl SkillCommands {
                     SkillCandidate::opencode_command("opsx-apply.md", "opsx-apply"),
                 ],
                 "apply",
+                global_skills.as_deref(),
             )?,
             verify: resolve_command(
                 repo,
@@ -370,6 +385,7 @@ impl SkillCommands {
                     SkillCandidate::opencode_command("opsx-verify.md", "opsx-verify"),
                 ],
                 "verify",
+                global_skills.as_deref(),
             )?,
             archive: resolve_command(
                 repo,
@@ -383,6 +399,7 @@ impl SkillCommands {
                     SkillCandidate::opencode_command("opsx-archive.md", "opsx-archive"),
                 ],
                 "archive",
+                global_skills.as_deref(),
             )?,
         })
     }
@@ -444,6 +461,7 @@ fn resolve_command(
     explicit: Option<&str>,
     candidates: &[SkillCandidate],
     stage: &str,
+    global_skills: Option<&Path>,
 ) -> Result<String> {
     if let Some(command) = explicit {
         return Ok(normalize_command(command));
@@ -456,8 +474,16 @@ fn resolve_command(
         return Ok(candidate.invocation.clone());
     }
 
+    let name = format!("openspec-{stage}-change");
+    if global_skills
+        .and_then(|directory| crate::skills::installed_openspec_skill(directory, &name))
+        .is_some()
+    {
+        return Ok(format!("/{name}"));
+    }
+
     bail!(
-        "could not discover the {stage} workflow in `.agents`, `.claude` or `.opencode`; install the OpenSpec {stage} skill or pass `--{stage}-command /your-command`"
+        "could not discover the {stage} workflow in project or user skills; install the OpenSpec {stage} skill or pass `--{stage}-command /your-command`"
     )
 }
 
@@ -2309,11 +2335,35 @@ mod tests {
                 SkillCandidate::opencode_command("opsx-apply.md", "opsx-apply"),
             ],
             "apply",
+            None,
         )
         .unwrap();
 
         assert_eq!(command, "/opsx-apply");
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn discovers_global_openspec_workflow_after_project_and_explicit_choices() {
+        let root = std::env::temp_dir().join(format!("opsx-global-workflow-{}", Uuid::new_v4()));
+        let repo = root.join("project");
+        let global = root.join("home/.claude/skills");
+        let candidates = [SkillCandidate::command("opsx/apply.md", "opsx:apply")];
+        let discover =
+            |explicit| resolve_command(&repo, explicit, &candidates, "apply", Some(&global));
+
+        assert!(discover(None).is_err());
+        let skill = global.join("openspec-apply-change/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(skill, "Global OpenSpec workflow").unwrap();
+        assert_eq!(discover(None).unwrap(), "/openspec-apply-change");
+
+        let project = repo.join(".claude/commands/opsx/apply.md");
+        fs::create_dir_all(project.parent().unwrap()).unwrap();
+        fs::write(project, "Project workflow").unwrap();
+        assert_eq!(discover(None).unwrap(), "/opsx:apply");
+        assert_eq!(discover(Some("custom-apply")).unwrap(), "/custom-apply");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

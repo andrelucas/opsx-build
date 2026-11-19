@@ -8,7 +8,7 @@
       "/usr", "/etc", "/opt", "/tmp", "/var", "/run", "/dev", "/proc", "/sys",
       "$HOME/campaigns", "$HOME/.local/bin", "$HOME/.local/share",
       "$HOME/.config", "$HOME/.cache", "$HOME/.cargo", "$HOME/.rustup",
-      "$HOME/go", "$HOME/.claude", "$HOME/.codex", "$HOME/.local/state/opencode",
+      "$HOME/go", "$HOME/.agents", "$HOME/.claude", "$HOME/.codex", "$HOME/.local/state/opencode",
       "$HOME/.docker", "$HOME/.kube", "$HOME/.opam"
     ],
     "allow_file": ["$HOME/.claude.json", "$HOME/.gitconfig"],
@@ -16,7 +16,7 @@
   },
   "network": {
     "network_profile": "developer",
-    "allow_domain": ["proxy.golang.org"]
+    "allow_domain": ["proxy.golang.org", "sum.golang.org"]
   },
   "linux": {
     "isolate": { "network": true, "loopback": true }

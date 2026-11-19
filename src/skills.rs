@@ -1,7 +1,25 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::cli::BackendKind;
 use anyhow::{Context, Result};
+
+pub(crate) fn global_agents_skills() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/skills"))
+}
+
+pub(crate) fn installed_openspec_skill(directory: &Path, name: &str) -> Option<PathBuf> {
+    if !matches!(
+        name,
+        "openspec-apply-change" | "openspec-verify-change" | "openspec-archive-change"
+    ) {
+        return None;
+    }
+    let path = directory.join(name).join("SKILL.md");
+    path.is_file().then_some(path)
+}
 
 const BUNDLED_SKILLS: &[BundledSkill] = &[
     BundledSkill {
