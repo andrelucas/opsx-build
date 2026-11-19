@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec nono run --profile "$HOME/.local/share/campaign-builder/network.json" \
+  --allow-cwd -- opsx-build --no-harness-sandbox "$@"

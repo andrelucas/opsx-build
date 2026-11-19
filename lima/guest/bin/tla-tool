@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "$(basename "$0")" in
+  tlc) class=tlc2.TLC ;;
+  sany) class=tla2sany.drivers.SANY ;;
+  pcal) class=pcal.trans ;;
+  tla2xml) class=tla2sany.xml.XMLExporter ;;
+  tlatex) class=tla2tex.TLA ;;
+esac
+exec java -cp "$(mise where http:tla2tools)/lib/tla2tools.jar" "$class" "$@"

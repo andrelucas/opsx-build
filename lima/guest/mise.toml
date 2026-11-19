@@ -1,0 +1,123 @@
+# Most tools follow normal releases. Sirocco's existing generation checks require
+# the four exact Go/Buf/generator versions below; its TLC input requires 1.7.4.
+[tools]
+node = "24"
+python = "3"
+rust = "stable"
+java = "temurin-25"
+claude = "latest"
+codex = "latest"
+"aqua:anomalyco/opencode" = "latest"
+"npm:@fission-ai/openspec" = "latest"
+nono = "latest"
+go = "1.27.1"
+buf = "1.73.0"
+protoc-gen-go = "1.36.12"
+protoc-gen-go-grpc = "1.6.2"
+protoc = "latest"
+"go:golang.org/x/tools/gopls" = "latest"
+gotestsum = "latest"
+"go:github.com/rancher/dapper" = "latest"
+kind = "latest"
+kubectl = "latest"
+
+[tools."http:tla2tools"]
+version = "1.7.4"
+url = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
+checksum = "sha256:936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+bin_path = "lib"
+bin = "tla2tools.jar"
+
+[tools."http:pd"]
+version = "8.5.8"
+url = "https://tiup-mirrors.pingcap.com/pd-v8.5.8-linux-amd64.tar.gz"
+
+[tools."http:tikv"]
+version = "8.5.8"
+url = "https://tiup-mirrors.pingcap.com/tikv-v8.5.8-linux-amd64.tar.gz"
+
+[bootstrap.packages]
+"apt:build-essential" = "latest"
+"apt:clang" = "latest"
+"apt:lld" = "latest"
+"apt:cmake" = "latest"
+"apt:ninja-build" = "latest"
+"apt:ccache" = "latest"
+"apt:pkg-config" = "latest"
+"apt:libssl-dev" = "latest"
+"apt:zlib1g-dev" = "latest"
+"apt:libaio1t64" = "latest"
+"apt:libnuma1" = "latest"
+"apt:liburing-dev" = "latest"
+"apt:libfuse3-dev" = "latest"
+"apt:xfsprogs" = "latest"
+"apt:git" = "latest"
+"apt:curl" = "latest"
+"apt:rsync" = "latest"
+"apt:unzip" = "latest"
+"apt:xz-utils" = "latest"
+"apt:jq" = "latest"
+"apt:ripgrep" = "latest"
+"apt:tmux" = "latest"
+"apt:strace" = "latest"
+"apt:gdb" = "latest"
+"apt:sqlite3" = "latest"
+"apt:netcat-openbsd" = "latest"
+"apt:iproute2" = "latest"
+"apt:iputils-ping" = "latest"
+"apt:lsof" = "latest"
+"apt:docker.io" = "latest"
+"apt:docker-buildx" = "latest"
+"apt:docker-compose-v2" = "latest"
+"apt:chrony" = "latest"
+"apt:opam" = "latest"
+"apt:gawk" = "latest"
+"apt:time" = "latest"
+"apt:wget" = "latest"
+"apt:m4" = "latest"
+
+[bootstrap.mise_shell_activate]
+bash = true
+
+[dotfiles]
+"~/.bash_profile/local-bin" = { line = 'export PATH="$HOME/.local/bin:$PATH"', position = "prepend" }
+"~/.bashrc/local-bin" = { line = 'export PATH="$HOME/.local/bin:$PATH"', position = "prepend" }
+
+[bootstrap.services.docker]
+state = "running"
+enabled = true
+
+[bootstrap.services.chrony]
+state = "running"
+enabled = true
+
+[bootstrap.files."~/.gitconfig"]
+content = """
+[user]
+    name = André Lucas
+    email = andre@ae-35.com
+[init]
+    defaultBranch = main
+"""
+
+[bootstrap.files."/etc/apparmor.d/campaign-nono"]
+content = """
+abi <abi/4.0>,
+include <tunables/global>
+profile campaign-nono /home/*/.local/share/mise/installs/nono/**/nono flags=(unconfined) {
+    userns,
+}
+"""
+
+[tasks.bootstrap]
+description = "Finish the reusable campaign environment"
+run = [
+  'python -m pip install -r "$HOME/.local/share/campaign-builder/requirements.txt"',
+  'sudo usermod -aG docker "$USER"',
+  'sudo apparmor_parser -r /etc/apparmor.d/campaign-nono',
+  'install -m 0755 "$HOME/.local/share/campaign-builder/bin/"* "$HOME/.local/bin/"',
+  'mkdir -p "$HOME/campaigns" "$HOME/.claude" "$HOME/.codex" "$HOME/.local/state/opencode" "$HOME/.docker" "$HOME/.kube"',
+  'for tool in tlc sany pcal tla2xml tlatex; do ln -sf "$HOME/.local/bin/tla-tool" "$HOME/.local/bin/$tool"; done',
+  'bash "$HOME/.local/share/campaign-builder/build-tlaps.sh"',
+  'bash "$HOME/.local/share/campaign-builder/build-opsx.sh"',
+]

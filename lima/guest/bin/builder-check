@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+test "$(uname -m)" = x86_64
+for tool in claude codex opencode openspec opsx-build nono buf protoc-gen-go protoc-gen-go-grpc gotestsum kind; do
+  "$tool" --version
+done
+go version
+gopls version
+rustc --version
+node --version
+python --version
+python -c 'import boto3, yaml, psutil, requests'
+java -version
+tlapm --version
+pd-server --version
+tikv-server --version
+kubectl version --client
+docker info --format '{{.ServerVersion}}'
+docker buildx version
+git var GIT_AUTHOR_IDENT
+opsx-campaign --version

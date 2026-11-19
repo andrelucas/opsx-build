@@ -1,0 +1,13 @@
+# Run on Ludwig with QEMU/KVM. Override resources with limactl's CLI flags.
+minimumLimaVersion: 2.3.0
+base:
+  - template:_images/ubuntu-24.04
+vmType: qemu
+arch: x86_64
+cpus: 8
+memory: 16GiB
+disk: 100GiB
+mounts: []
+containerd:
+  system: false
+  user: false

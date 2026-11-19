@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "name": "campaign-vm",
+    "description": "Broad guest filesystem access, keeping nono's own state private, with filtered campaign networking"
+  },
+  "filesystem": {
+    "allow": [
+      "/usr", "/etc", "/opt", "/tmp", "/var", "/run", "/dev", "/proc", "/sys",
+      "$HOME/campaigns", "$HOME/.local/bin", "$HOME/.local/share",
+      "$HOME/.config", "$HOME/.cache", "$HOME/.cargo", "$HOME/.rustup",
+      "$HOME/go", "$HOME/.claude", "$HOME/.codex", "$HOME/.local/state/opencode",
+      "$HOME/.docker", "$HOME/.kube", "$HOME/.opam"
+    ],
+    "allow_file": ["$HOME/.claude.json", "$HOME/.gitconfig"],
+    "bypass_protection": ["$HOME/.config", "$HOME/.local/share", "$HOME/.docker", "$HOME/.kube"]
+  },
+  "network": {
+    "network_profile": "developer",
+    "allow_domain": ["proxy.golang.org"]
+  },
+  "linux": {
+    "isolate": { "network": true, "loopback": true }
+  }
+}
