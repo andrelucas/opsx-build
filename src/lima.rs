@@ -1,10 +1,10 @@
 //! Host-side VM lifecycle. The guest checkout owns the build state.
 use std::{
     env, fs,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -59,6 +59,9 @@ struct Resources {
     /// Virtual disk size in GiB.
     #[arg(long)]
     disk: Option<f32>,
+    #[arg(skip)]
+    #[serde(default)]
+    claude_subscription: bool,
 }
 
 impl Resources {
@@ -75,6 +78,7 @@ impl Resources {
             cpus: self.cpus.or(defaults.cpus),
             memory: self.memory.or(defaults.memory),
             disk: self.disk.or(defaults.disk),
+            claude_subscription: defaults.claude_subscription,
         };
         for (key, size) in [("memory", resources.memory), ("disk", resources.disk)] {
             ensure!(
@@ -144,11 +148,15 @@ pub fn run_cli() -> Result<Option<i32>> {
     eprintln!("Lima campaign: {}:{guest_dir}", campaign.instance);
     match action {
         Action::Run { args } => {
-            let status = shell(&campaign.instance, guest_dir)
-                .args(["mise", "exec", "--", "opsx-campaign"])
-                .args(args)
-                .status()
-                .context("running the campaign with limactl shell")?;
+            let status = if campaign.resources.claude_subscription {
+                run_with_claude_token(&campaign.instance, guest_dir, args)?
+            } else {
+                shell(&campaign.instance, guest_dir)
+                    .args(["mise", "exec", "--", "opsx-campaign"])
+                    .args(args)
+                    .status()
+                    .context("running the campaign with limactl shell")?
+            };
             Ok(Some(status.code().unwrap_or(1)))
         }
         Action::Export { destination } => {
@@ -157,6 +165,61 @@ pub fn run_cli() -> Result<Option<i32>> {
         }
         Action::Prepare { .. } => unreachable!(),
     }
+}
+
+fn host_config_file(name: &str) -> Result<PathBuf> {
+    let root = env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .context("set HOME or XDG_CONFIG_HOME to locate the Claude subscription configuration")?;
+    Ok(root.join("opsx-build").join(name))
+}
+
+fn run_with_claude_token(
+    instance: &str,
+    guest_dir: &str,
+    args: Vec<String>,
+) -> Result<std::process::ExitStatus> {
+    let path = host_config_file("claude-token")?;
+    let token = fs::read_to_string(&path)
+        .with_context(|| format!("reading Claude setup token from {}", path.display()))?;
+    let token = token.trim();
+    ensure!(
+        !token.is_empty() && !token.contains(char::is_whitespace),
+        "expected one Claude setup token in {}",
+        path.display()
+    );
+    let mut child = limactl()
+        .args([
+            "shell",
+            "--tty=false",
+            "--start",
+            "--workdir",
+            guest_dir,
+            instance,
+        ])
+        .args([
+            "bash",
+            "-c",
+            r#"IFS= read -r CLAUDE_CODE_OAUTH_TOKEN || exit 1
+export CLAUDE_CODE_OAUTH_TOKEN
+export OPSX_BUILD_CONFIG="$HOME/.local/share/campaign-builder/lima-claude.toml"
+exec mise exec -- opsx-campaign "$@""#,
+            "opsx-build",
+        ])
+        .args(args)
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("starting the campaign with limactl shell")?;
+    // Feed SSH via a pipe so the token stays out of subprocess arguments.
+    let mut input = child.stdin.take().expect("piped campaign stdin");
+    let sent = writeln!(input, "{token}");
+    drop(input);
+    let status = child.wait().context("waiting for limactl shell")?;
+    sent.context("sending the Claude setup token to the guest")?;
+    Ok(status)
 }
 
 fn state_path(repo: &Path) -> Result<PathBuf> {
@@ -188,6 +251,17 @@ fn prepare(
             && !repo.join(".git/objects/info/alternates").exists(),
         "Lima import needs a standalone Git checkout with its own .git directory and objects"
     );
+    let claude_config = if resources.claude_subscription {
+        let path = host_config_file("lima-claude.toml")?;
+        ensure!(
+            path.is_file(),
+            "missing Claude connection profiles at {}",
+            path.display()
+        );
+        Some(path)
+    } else {
+        None
+    };
     let instances = output(
         limactl().args(["list", "--format", "{{.Name}} {{.Status}}"]),
         "listing Lima instances",
@@ -254,11 +328,25 @@ fn prepare(
         ]),
         "copying the campaign to the guest; retry 'lima prepare' if the transfer fails",
     )?;
+    if let Some(path) = claude_config {
+        checked(
+            limactl()
+                .args(["copy", "--backend=rsync"])
+                .arg(path)
+                .arg(format!(
+                    "{}:~/.local/share/campaign-builder/lima-claude.toml",
+                    campaign.instance
+                )),
+            "copying the Claude connection profiles to the guest",
+        )?;
+    }
     campaign.guest_dir = Some(guest_dir.clone());
     save(state, &campaign)?;
     let instance = &campaign.instance;
     println!("Campaign staged in {instance}:{guest_dir}");
-    println!("Open 'limactl shell {instance}' to set up guest agent sign-in and connections.");
+    if !campaign.resources.claude_subscription {
+        println!("Open 'limactl shell {instance}' to set up guest agent sign-in and connections.");
+    }
     Ok(())
 }
 
@@ -319,4 +407,19 @@ fn output(command: &mut Command, action: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8(result.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_subscription_is_opt_in() {
+        let old: Resources = serde_json::from_str(r#"{"cpus":4,"memory":8,"disk":null}"#).unwrap();
+        assert!(!old.claude_subscription);
+
+        let enabled: Resources = toml::from_str("cpus = 4\nclaude_subscription = true").unwrap();
+        assert_eq!(enabled.cpus, NonZeroU32::new(4));
+        assert!(enabled.claude_subscription);
+    }
 }

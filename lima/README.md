@@ -101,6 +101,39 @@ destination. To release VM resources, run `limactl stop <clone-name>` after
 export or between runs.
 Lima keeps the guest disk for the next run.
 
+### Use a Claude subscription on the builder
+
+Run `claude setup-token` on the Lima host and save the token as a single line
+in `~/.config/opsx-build/claude-token` with permissions `0600`. Use
+`$XDG_CONFIG_HOME/opsx-build/` if the host sets `XDG_CONFIG_HOME`.
+
+In the same host directory, put the guest's opsx-build configuration in
+`lima-claude.toml`. Put the token reference on each connection so existing
+campaigns can keep their recorded shared environment setting. For example,
+these two profiles use Sonnet for delivery and Opus for frontier work.
+
+```toml
+[connections.anthropic]
+model = "sonnet"
+
+[connections.anthropic.env]
+CLAUDE_CODE_OAUTH_TOKEN = { from_env = "CLAUDE_CODE_OAUTH_TOKEN" }
+
+[connections.anthropic-frontier]
+model = "opus"
+
+[connections.anthropic-frontier.env]
+CLAUDE_CODE_OAUTH_TOKEN = { from_env = "CLAUDE_CODE_OAUTH_TOKEN" }
+```
+
+Select those connection names in the campaign and set `claude_subscription = true`
+in its `opsx-build.lima.toml` before `lima prepare`. Preparation copies the
+connection configuration into the guest's builder directory. On each unattended
+`lima run`, including `--resume`, the launcher reads the current host token and
+sends it to the guest over SSH stdin. The token stays out of the source archive,
+clone configuration and campaign export. Use a fresh clone to pick up changes
+to `lima-claude.toml`.
+
 ## Manage a campaign clone manually
 
 On Ludwig:
