@@ -12,8 +12,6 @@ python --version
 python -c 'import boto3, yaml, psutil, requests'
 java -version
 tlapm --version
-pd-server --version
-tikv-server --version
 kubectl version --client
 docker info --format '{{.ServerVersion}}'
 docker buildx version

@@ -1,0 +1,14 @@
+# The generation and SDK checks require these exact versions.
+[tools]
+go = "1.27.1"
+buf = "1.73.0"
+protoc-gen-go = "1.36.12"
+protoc-gen-go-grpc = "1.6.2"
+
+[tools."http:pd"]
+version = "8.5.8"
+url = "https://tiup-mirrors.pingcap.com/pd-v8.5.8-linux-amd64.tar.gz"
+
+[tools."http:tikv"]
+version = "8.5.8"
+url = "https://tiup-mirrors.pingcap.com/tikv-v8.5.8-linux-amd64.tar.gz"

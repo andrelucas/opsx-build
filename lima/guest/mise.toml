@@ -1,8 +1,6 @@
 [env]
 OPENSPEC_TELEMETRY = "0"
 
-# Most tools follow normal releases. Sirocco's existing generation checks require
-# the four exact Go/Buf/generator versions below; its TLC input requires 1.7.4.
 [tools]
 node = "24"
 python = "3"
@@ -13,10 +11,10 @@ codex = "latest"
 "aqua:anomalyco/opencode" = "latest"
 "npm:@fission-ai/openspec" = "latest"
 nono = "latest"
-go = "1.27.1"
-buf = "1.73.0"
-protoc-gen-go = "1.36.12"
-protoc-gen-go-grpc = "1.6.2"
+go = "latest"
+buf = "latest"
+protoc-gen-go = "latest"
+protoc-gen-go-grpc = "latest"
 protoc = "latest"
 "go:golang.org/x/tools/gopls" = "latest"
 gotestsum = "latest"
@@ -30,14 +28,6 @@ url = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
 checksum = "sha256:936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 bin_path = "lib"
 bin = "tla2tools.jar"
-
-[tools."http:pd"]
-version = "8.5.8"
-url = "https://tiup-mirrors.pingcap.com/pd-v8.5.8-linux-amd64.tar.gz"
-
-[tools."http:tikv"]
-version = "8.5.8"
-url = "https://tiup-mirrors.pingcap.com/tikv-v8.5.8-linux-amd64.tar.gz"
 
 [bootstrap.packages]
 "apt:build-essential" = "latest"

@@ -7,9 +7,10 @@ storage live on the VM disk.
 
 `lima.yaml` describes the VM. `guest/mise.toml` describes its tools and Ubuntu
 packages. The short scripts install Lima, prepare the base, and build opsx-build
-from a supplied source archive. Most tools use latest/stable releases. The exact
-Go, Buf, generator and TLC versions are required by existing Sirocco checks;
-PD and TiKV use 8.5.8. Installed tools are retained in the prepared image.
+from a supplied source archive. Most base tools follow latest or stable releases.
+The Sirocco profile adds PD and TiKV 8.5.8 and selects the exact Go, Buf and
+generator versions required by Sirocco's checks. Installed tools are retained
+in the prepared images.
 TLAPS is built once from upstream source inside Ubuntu, using its supported
 opam/Make build. This avoids the newer glibc required by the current upstream
 binary. The installed proof system is then reused by snapshots and clones.
@@ -42,6 +43,33 @@ also work when cloning, so each campaign can have different allocations.
 Ludwig's existing QEMU/KVM is reused. Lima is installed under `~/.local`; its
 instances and caches stay in the user's home filesystem. Existing host Docker,
 Podman and Kubernetes stores are not used by the guest.
+
+## Prepare a Sirocco builder
+
+From `~/campaign-builder` on Ludwig, derive a builder from the stopped base.
+The Sirocco profile uses Linux x86_64 PD and TiKV binaries.
+
+```sh
+bash prepare-profile.sh campaign-base profiles/sirocco.toml campaign-sirocco
+```
+
+The helper installs the profile as `~/.config/mise/config.local.toml` in the
+new guest so its tool versions take precedence over the base defaults. It
+applies `[tools]` and `[bootstrap.packages]`, runs `builder-check`, and leaves
+the builder stopped with a `prepared` snapshot. When updating the base or
+profile, prepare a new builder name and use it for new campaigns.
+
+Base images built before the split still have PD and TiKV on disk. Build from
+the current base manifest to start with only the shared toolchain.
+
+From a Sirocco campaign checkout on Ludwig, select that builder.
+
+```sh
+opsx-build lima prepare --base campaign-sirocco --cpus 8 --memory 16
+```
+
+The prepared builder carries the binaries. Each campaign supplies its own
+credentials and starts its own PD/TiKV cluster when the checks need one.
 
 ## Run a campaign with opsx-build
 
@@ -273,7 +301,7 @@ The campaign tools were inventoried on Amygdala on 19 November 2026:
 - Rust/Cargo, Node/npm, Python with Boto3, PyYAML, psutil and requests, Java.
 - Go, Buf, protoc, both Go generators, gopls, gotestsum and Dapper.
 - TLC, SANY, PlusCal, TLA+ XML/LaTeX tools and TLAPS with its backend provers.
-- PD/TiKV 8.5.8, Docker, kind and kubectl.
+- Docker, kind and kubectl.
 - OCaml/opam, C/C++ build tools, Clang/LLD, CMake, Ninja, ccache, native development
   libraries, Git, rsync, jq, ripgrep, tmux and debugging/network utilities.
 
@@ -283,9 +311,10 @@ iteration for refinement with actual campaigns.
 
 ## First validation on Ludwig
 
-On 19 November 2026, the prepared base was stopped, snapshotted as `prepared`,
-and cloned as `campaign-check` with 4 CPUs and 8 GiB RAM. The clone retained
-its installed tools and passed `builder-check`. Further checks passed:
+On 19 November 2026, before the Sirocco profile was split out, the prepared
+base was stopped, snapshotted as `prepared`, and cloned as `campaign-check`
+with 4 CPUs and 8 GiB RAM. The clone retained its installed tools and passed
+`builder-check`. Further checks passed:
 
 - TLC model checking.
 - Source-built TLAPS proofs using SMT, Zenon, Isabelle and PTL under nono,
