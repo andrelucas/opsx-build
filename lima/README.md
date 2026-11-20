@@ -72,8 +72,9 @@ Omitted values inherit the base settings. Use `--repo PATH` with any Lima
 command to select a campaign from elsewhere.
 
 Prepare copies the campaign, including its Git history and any bundled
-dependency inputs. Use the printed `limactl shell` command to sign in to the
-agents and set up connection profiles in the clone. Back on the host, run:
+dependency inputs. For Claude, configure [host token forwarding](#use-a-claude-subscription-on-the-builder)
+before preparing the clone. For Codex, [sign in to the prepared clone](#use-chatgpt-pro-with-codex).
+From the host campaign checkout, run the prerequisite check and start delivery.
 
 ```sh
 opsx-build lima run -- preflight
@@ -132,7 +133,60 @@ connection configuration into the guest's builder directory. On each unattended
 `lima run`, including `--resume`, the launcher reads the current host token and
 sends it to the guest over SSH stdin. The token stays out of the source archive,
 clone configuration and campaign export. Use a fresh clone to pick up changes
-to `lima-claude.toml`.
+to `lima-claude.toml`. On Ludwig, both connections used the forwarded token
+on a fresh clone, including after a stop and resume, without a guest sign-in.
+
+### Use ChatGPT Pro with Codex
+
+Each fresh clone currently needs one device login. The worker and frontier
+share it, and stopping and restarting that clone preserves it. Enable device
+code login in your ChatGPT security settings. After `lima prepare`, open a
+guest shell on Ludwig, replacing `opsx-EXAMPLE` with the printed clone name.
+
+```sh
+limactl shell --workdir=/tmp opsx-EXAMPLE
+```
+
+Inside the guest, set `cli_auth_credentials_store = "file"` at the top level
+of `~/.codex/config.toml`. Start the login, open the printed URL on your
+workstation, and enter the code. Then check the status.
+
+```sh
+mise exec -- codex login --device-auth
+mise exec -- codex login status
+```
+
+The status command should report `Logged in using ChatGPT`. The unattended
+runner links to the guest's `~/.codex/auth.json`. The login stays on the
+clone's disk, outside the campaign checkout that `lima export` copies.
+
+Create `~/.config/opsx-build/` in the guest if needed. Add this connection to
+its `config.toml` and select `codex` for both worker and frontier in the
+campaign. Campaigns with an explicit Claude command, backend or model also
+need those settings updated for Codex.
+
+```toml
+[connections.codex]
+backend = "codex"
+```
+
+The Codex subscription connection needs HTTPS access to `chatgpt.com`.
+In the guest's `~/.local/share/campaign-builder/network.json`, add
+`"chatgpt.com"` to the existing `network.allow_domain` array. Leave the
+existing domains in place. A successful `codex login status` checks the
+saved login. Campaign preflight exercises the connection under nono.
+
+Back in the campaign checkout on Ludwig, run `opsx-build lima run -- preflight`
+for a supplied-contract campaign. For a campaign with a saved checkpoint,
+`opsx-build lima run -- --resume` restarts the same clone after `limactl stop`
+and reuses its login.
+
+On 20 November 2026 the stop-and-resume test on Ludwig completed a second
+delivery slice without another sign-in. The Sirocco campaign also passed
+preflight and final acceptance with the same login. That clone had a guest
+opsx-build binary that honors `--no-harness-sandbox` during Codex preflight.
+As of that test, fresh clones from Ludwig's base need the `chatgpt.com` edit
+and a [rebuilt guest opsx-build](#iterate-on-the-base) for Codex preflight.
 
 ## Manage a campaign clone manually
 

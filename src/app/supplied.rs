@@ -54,11 +54,7 @@ impl<U: Ui> App<U> {
         } else {
             ensure_model_confusion_plugin(repo, &self.ui)?
         };
-        let mut launcher = launcher.clone();
-        if let AgentLauncher::Codex(launcher) = &mut launcher {
-            launcher.harness_sandbox = true;
-        }
-        let reviewer = self.frontier_backend(repo, &launcher, &plugin, "plan");
+        let reviewer = self.frontier_backend(repo, launcher, &plugin, "plan");
         crate::preflight::run(
             repo,
             contracts,

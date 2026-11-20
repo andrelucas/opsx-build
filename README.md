@@ -13,6 +13,8 @@ jobs. Claude Code is the default backend; OpenCode and Codex are available as
 explicit worker or frontier backends.
 
 To run a campaign in a VM, see the [optional Lima workflow](lima/README.md).
+The builder guide covers [Claude subscription token forwarding](lima/README.md#use-a-claude-subscription-on-the-builder)
+and [Codex device login with ChatGPT Pro](lima/README.md#use-chatgpt-pro-with-codex).
 
 During an ordinary run it deliberately does **not** infer file ownership or
 require a clean working tree. Read-only file fingerprints support the handoff
@@ -206,8 +208,10 @@ without recording a pass.
 
 Preflight is read-only and leaves planning, implementation review and running
 the gate to later stages. A failing repair baseline is expected when the
-contract calls for a repair. Claude uses plan permissions and Codex uses its
-read-only sandbox. Repository changes invalidate any review result.
+contract calls for a repair. Claude uses plan permissions. Codex uses its
+read-only sandbox by default and honors `--no-harness-sandbox` when an external
+sandbox provides isolation. Repository changes invalidate any review result in
+either mode.
 
 Supplied-contract bootstrap, execute and advance workflows perform this check
 automatically before their first planning or implementation request. Resume also
