@@ -153,17 +153,62 @@ If the origin of a changed, untracked input is ambiguous, export reports the pat
 When the VM generates a new `.git/opsx-build/contract-preflight.json`, its report
 replaces an earlier preflight report in the host checkout.
 
-The VM owns the build while it runs. Resuming uses the guest checkout. A
-maintainer correction made on the host must reach the guest separately before
-the resumed build can use it. Export only transfers results to the host.
+### Correct a blocked campaign from the host
+
+Wait for the blocked run to exit. Edit the contract, acceptance files or campaign
+settings in the **original host checkout**. From that directory, run:
+
+```sh
+opsx-build lima sync --resume
+```
+
+The launcher finds the existing clone, sends the edits, runs `accept-changes`
+there and resumes its checkpoint. If the maintainer needs to inspect the VM's
+latest implementation first, run `opsx-build lima export` before editing.
+
+Use `opsx-build lima sync` on its own to transfer edits and leave the campaign
+paused. For a blocker found by standalone preflight before a checkpoint exists,
+sync the correction, then run `opsx-build lima run -- preflight`.
+
+Sync includes tracked edits, deletions, staged changes, and new files visible to
+Git. You can leave edits uncommitted. If the maintainer committed the fix, the
+guest keeps that commit, merging compatible histories when both have advanced.
+Ignored local files and private run data under `.git/opsx-build` stay on their
+own side. If both checkouts changed the same file incompatibly, sync names it
+and leaves the campaign paused. Ordinary `lima run -- --resume` continues with
+the inputs already in the VM.
+
+### Export a separate snapshot
 
 For a separate, complete snapshot, use `opsx-build lima export /path/to/new-directory`.
 For a completed run with an
 independent acceptance gate, the exported `.git/opsx-build/last-run.json` has
 `stage` set to `done`. The passing `result.json` and logs are under
-`.git/opsx-build/acceptance/`. To release VM resources, run `limactl stop <clone-name>` after
-export or between runs.
-Lima keeps the guest disk for the next run.
+`.git/opsx-build/acceptance/`.
+
+### Remove an exported campaign clone
+
+From the original host campaign directory, export the results and reclaim the
+clone's disk in one command:
+
+```sh
+opsx-build lima export --cleanup
+```
+
+If you already exported with this version of the launcher, run
+`opsx-build lima cleanup`. A separate snapshot also qualifies:
+`opsx-build lima export /path/to/new-directory --cleanup`. Use a separate
+snapshot to preserve a branch or stash that exists only in the guest.
+
+Close guest shells and finish or pause the run before cleanup. The launcher
+checks the recorded export against the host files and the current guest
+checkout. It can briefly start a stopped clone to do this. If either copy
+has changed, or the export predates cleanup support, export again. Once
+verified, the launcher stops and deletes only this campaign's clone and
+removes its registration. The exported checkout and reusable builder stay
+available. Guest-local data outside the campaign checkout is discarded.
+
+To release RAM and keep the clone for another run, use `limactl stop <clone-name>`.
 
 ### Use a Claude subscription on the builder
 

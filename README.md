@@ -375,6 +375,11 @@ implementation, review and archive. Their existing bounded remediation and
 
 ### Accepting maintainer corrections
 
+For a Lima campaign, edit the original host checkout after the run stops, then
+run `opsx-build lima sync --resume`. The launcher transfers the edits, accepts
+the corrected inputs in the guest and resumes the same checkpoint.
+[Lima maintainer workflow](lima/README.md#correct-a-blocked-campaign-from-the-host)
+
 While the campaign is stopped, the overseeing maintainer may edit its working
 directory with normal tools and record the correction in Git. Then run:
 

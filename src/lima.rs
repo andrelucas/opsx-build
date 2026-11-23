@@ -1,4 +1,5 @@
 //! Host-side VM lifecycle. The guest checkout owns the build state.
+mod cleanup;
 mod collect;
 use std::{
     collections::BTreeSet,
@@ -60,7 +61,20 @@ enum Action {
         memory: Option<f32>,
     },
     /// Collect results in the original campaign checkout, or export a separate copy.
-    Export { destination: Option<PathBuf> },
+    Export {
+        destination: Option<PathBuf>,
+        /// Stop and delete this clone after verifying the export.
+        #[arg(long)]
+        cleanup: bool,
+    },
+    /// Stop and delete this campaign's clone after verifying its last successful export.
+    Cleanup,
+    /// Send maintainer edits from this checkout to its paused campaign clone.
+    Sync {
+        /// Accept the corrected inputs and resume the existing checkpoint after syncing.
+        #[arg(long)]
+        resume: bool,
+    },
 }
 
 #[derive(Args, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -132,6 +146,8 @@ struct Campaign {
     #[serde(default)]
     env: BTreeSet<String>,
     guest_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exported: Option<cleanup::Receipt>,
 }
 
 const CLAUDE_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -146,6 +162,31 @@ pub fn run_cli() -> Result<Option<i32>> {
     let ui = TerminalUi::new(false, false, false);
     let repo = repository_root(&repo, &ui)?.canonicalize()?;
     let state = state_path(&repo)?;
+    // Shells can coexist with a run, but must have exited before deleting the VM.
+    let _shell_guard = if matches!(
+        action,
+        Action::Shell | Action::Cleanup | Action::Export { cleanup: true, .. }
+    ) {
+        fs::create_dir_all(state.parent().unwrap())?;
+        let guard = fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(state.with_extension("shell-lock"))?;
+        if matches!(action, Action::Shell) {
+            guard
+                .try_lock_shared()
+                .context("cleanup is active for this campaign")?;
+        } else {
+            guard
+                .try_lock()
+                .context("close the campaign shell before cleanup")?;
+        }
+        Some(guard)
+    } else {
+        None
+    };
     // A shell only reads the atomically saved location and can coexist with a run.
     let _lock = if matches!(action, Action::Shell) {
         None
@@ -192,7 +233,12 @@ pub fn run_cli() -> Result<Option<i32>> {
         return Ok(Some(0));
     }
 
-    let campaign: Campaign = campaign.context("run 'opsx-build lima prepare --base NAME' first")?;
+    if matches!(action, Action::Cleanup) && campaign.is_none() {
+        println!("No campaign clone is registered here.");
+        return Ok(Some(0));
+    }
+    let mut campaign: Campaign =
+        campaign.context("run 'opsx-build lima prepare --base NAME' first")?;
     let guest_dir = campaign
         .guest_dir
         .as_deref()
@@ -216,29 +262,86 @@ pub fn run_cli() -> Result<Option<i32>> {
                 .context("opening the guest campaign shell")?;
             Ok(Some(status.code().unwrap_or(1)))
         }
-        Action::Run { args } => {
-            let status =
-                if campaign.resources.claude_subscription && !campaign.env.contains(CLAUDE_TOKEN) {
-                    run_with_claude_token(&campaign.instance, guest_dir, args)?
-                } else {
-                    shell(&campaign.instance, guest_dir)
-                        .args(["mise", "exec", "--", "opsx-campaign"])
-                        .args(args)
-                        .status()
-                        .context("running the campaign with limactl shell")?
-                };
-            Ok(Some(status.code().unwrap_or(1)))
+        Action::Run { args } => run_guest(&campaign, guest_dir, args).map(Some),
+        Action::Sync { resume } => {
+            collect::sync(&campaign.instance, guest_dir, &repo, &state)?;
+            if resume {
+                let code = run_guest(&campaign, guest_dir, vec!["accept-changes".into()])?;
+                if code != 0 {
+                    return Ok(Some(code));
+                }
+                return run_guest(&campaign, guest_dir, vec!["--resume".into()]).map(Some);
+            }
+            Ok(Some(0))
         }
-        Action::Export { destination } => {
-            if let Some(path) = destination {
-                export(&campaign.instance, guest_dir, &path)?;
+        Action::Cleanup => {
+            cleanup::remove(&campaign, &state)?;
+            Ok(Some(0))
+        }
+        Action::Export {
+            destination,
+            cleanup: remove,
+        } => {
+            if campaign.exported.take().is_some() {
+                save(&state, &campaign)?;
+            }
+            let target = destination.as_deref().unwrap_or(&repo);
+            let full = destination.is_some();
+            let signatures = if full {
+                if remove {
+                    ensure_guest_idle(&campaign.instance, guest_dir)?;
+                }
+                export(&campaign.instance, guest_dir, target)?;
+                collect::signature(target, true).map(|s| Some((s.clone(), s)))
             } else {
-                collect::export(&campaign.instance, guest_dir, &repo, &state)?;
+                Ok(collect::export(
+                    &campaign.instance,
+                    guest_dir,
+                    &repo,
+                    &state,
+                )?)
+            };
+            let receipt = signatures.and_then(|signature| {
+                cleanup::Receipt::new(
+                    &campaign.instance,
+                    target,
+                    full,
+                    signature.context(
+                        "the pending export was staged by an older launcher; export once more",
+                    )?,
+                )
+            });
+            match receipt {
+                Ok(receipt) => {
+                    campaign.exported = Some(receipt);
+                    save(&state, &campaign)
+                        .context("export succeeded but could not record it for cleanup")?;
+                }
+                Err(error) if remove => {
+                    return Err(error).context("export succeeded but cleanup could not verify it");
+                }
+                Err(error) => eprintln!("Export succeeded without a cleanup record: {error}"),
+            }
+            if remove {
+                cleanup::remove(&campaign, &state)?;
             }
             Ok(Some(0))
         }
         Action::Prepare { .. } => unreachable!(),
     }
+}
+
+fn run_guest(campaign: &Campaign, dir: &str, args: Vec<String>) -> Result<i32> {
+    let status = if campaign.resources.claude_subscription && !campaign.env.contains(CLAUDE_TOKEN) {
+        run_with_claude_token(&campaign.instance, dir, args)?
+    } else {
+        shell(&campaign.instance, dir)
+            .args(["mise", "exec", "--", "opsx-campaign"])
+            .args(args)
+            .status()
+            .context("running the campaign with limactl shell")?
+    };
+    Ok(status.code().unwrap_or(1))
 }
 
 fn host_config_file(name: &str) -> Result<PathBuf> {
@@ -291,17 +394,20 @@ exec mise exec -- opsx-campaign "$@""#,
 }
 
 fn with_input(command: &mut Command, input: &str) -> Result<ExitStatus> {
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
         .stdin(Stdio::piped())
         .spawn()
-        .context("starting limactl shell")?;
+        .with_context(|| format!("starting {program}"))?;
     let sent = child
         .stdin
         .take()
         .expect("piped stdin")
         .write_all(input.as_bytes());
-    let status = child.wait().context("waiting for limactl shell")?;
-    sent.context("writing to limactl shell")?;
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {program}"))?;
+    sent.with_context(|| format!("writing to {program}"))?;
     Ok(status)
 }
 
@@ -350,6 +456,20 @@ fn save(path: &Path, campaign: &Campaign) -> Result<()> {
     Ok(())
 }
 
+fn list_instances() -> Result<String> {
+    output(
+        limactl().args(["list", "--format", "{{.Name}} {{.Status}}"]),
+        "listing Lima instances",
+    )
+}
+
+fn instance_status<'a>(list: &'a str, name: &str) -> Option<&'a str> {
+    list.lines().find_map(|line| {
+        let (instance, status) = line.split_once(' ')?;
+        (instance == name).then_some(status.trim())
+    })
+}
+
 fn prepare(
     repo: &Path,
     state: &Path,
@@ -375,16 +495,8 @@ fn prepare(
         None
     };
     let exports = login_environment(&env, resources.claude_subscription)?;
-    let instances = output(
-        limactl().args(["list", "--format", "{{.Name}} {{.Status}}"]),
-        "listing Lima instances",
-    )?;
-    let status = |name: &str| {
-        instances.lines().find_map(|line| {
-            let (instance, status) = line.split_once(' ')?;
-            (instance == name).then_some(status.trim())
-        })
-    };
+    let instances = list_instances()?;
+    let status = |name: &str| instance_status(&instances, name);
     let mut campaign = if let Some(saved) = saved.filter(|saved| status(&saved.instance).is_some())
     {
         ensure!(
@@ -409,6 +521,7 @@ fn prepare(
             resources,
             env,
             guest_dir: None,
+            exported: None,
         };
         save(state, &campaign)?;
         campaign

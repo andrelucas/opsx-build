@@ -1,4 +1,5 @@
 //! Stage and check an inbound export before publishing anything in the host checkout.
+mod sync;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -8,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
+pub(super) use sync::sync;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,10 @@ const METADATA: [&str; 2] = ["opsx-build", "ospx-build"];
 struct Baseline {
     files: Files,
     index: String,
+    #[serde(default)]
+    index_tree: Option<String>,
+    #[serde(default)]
+    inputs: Option<BTreeSet<PathBuf>>,
 }
 
 pub(super) fn baseline(state: &Path, instance: &str) -> PathBuf {
@@ -140,6 +146,57 @@ fn scan(root: &Path, all_git: bool) -> Result<Files> {
     Ok(out)
 }
 
+// Keep this byte format in step with checkout_signature.py. PathBuf keys are
+// ordered by their components, so children follow their parent immediately.
+fn signature_from_files(repo: &Path, files: &Files, full: bool) -> Result<String> {
+    let mut hash = Sha256::new();
+    for (path, kind) in files {
+        if !full
+            && let Ok(relative) = path.strip_prefix(".git")
+            && !METADATA.iter().any(|name| relative.starts_with(name))
+        {
+            continue;
+        }
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update([0]);
+        hash.update(kind.as_bytes());
+        hash.update([0]);
+    }
+    if !full {
+        for args in [
+            &["rev-parse", "HEAD"][..],
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            &["ls-files", "--stage", "-z"],
+            &[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname) %(objectname)",
+            ],
+        ] {
+            hash.update(git_bytes(repo, args)?);
+            hash.update([0]);
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(super) fn signature(repo: &Path, full: bool) -> Result<String> {
+    signature_from_files(repo, &scan(repo, full)?, full)
+}
+
+pub(super) fn check_exported_refs(repo: &Path, guest_refs: &[u8]) -> Result<()> {
+    let host = git_bytes(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])?;
+    let refs: BTreeSet<_> = host.split(|&b| b == b'\n').collect();
+    for guest in guest_refs.split(|&b| b == b'\n').filter(|r| !r.is_empty()) {
+        ensure!(
+            refs.contains(guest),
+            "guest ref {} is not in the host export; use 'opsx-build lima export <new-directory> --cleanup' for a full snapshot",
+            String::from_utf8_lossy(guest.split(|&b| b == b' ').next().unwrap_or(guest))
+        );
+    }
+    Ok(())
+}
+
 fn save_base(data: &Baseline, path: &Path) -> Result<()> {
     let tmp = path.with_extension("base-tmp");
     fs::write(&tmp, serde_json::to_vec(data)?)?;
@@ -152,6 +209,8 @@ pub(super) fn remember(repo: &Path, path: &Path) -> Result<()> {
         &Baseline {
             files: scan(repo, false)?,
             index: index(repo)?,
+            index_tree: Some(git_text(repo, &["write-tree"])?),
+            inputs: Some(sync::inputs(repo)?),
         },
         path,
     )
@@ -409,7 +468,7 @@ fn prepare_donor(guest: &Path, host: &Path) -> Result<()> {
 
 // Before this feature, prepare didn't record a baseline. The host commit is
 // the provable common input. Unknown, overlapping untracked inputs conflict.
-fn legacy_base(host: &Path, stage: &Path) -> Result<Baseline> {
+fn legacy_base(host: &Path, stage: &Path, revision: &str) -> Result<Baseline> {
     let clean = stage.join("clean");
     fs::create_dir(&clean)?;
     let idx = stage.join("clean-index");
@@ -424,10 +483,15 @@ fn legacy_base(host: &Path, stage: &Path) -> Result<Baseline> {
             "reading the original committed inputs",
         )
     };
-    run(&["read-tree", "HEAD"])?;
+    run(&["read-tree", revision])?;
     run(&["checkout-index", "--all"])?;
     Ok(Baseline {
         files: scan(&clean, false)?,
+        inputs: Some(sync::paths(&run(&["ls-files", "-z"])?)?),
+        index_tree: Some(git_text(
+            host,
+            &["rev-parse", &format!("{revision}^{{tree}}")],
+        )?),
         index: format!("{:x}", Sha256::digest(run(&["ls-files", "--stage", "-z"])?)),
     })
 }
@@ -529,8 +593,7 @@ fn import_git(guest: &Path, candidate: &Path) -> Result<()> {
     Ok(())
 }
 
-fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Path) -> Result<()> {
-    standalone(repo)?;
+fn check_host_git_idle(repo: &Path) -> Result<()> {
     let gitdir = repo.join(".git");
     for busy in [
         "index.lock",
@@ -545,6 +608,12 @@ fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Pat
             "host Git operation in progress at .git/{busy}"
         );
     }
+    Ok(())
+}
+
+fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Path) -> Result<()> {
+    standalone(repo)?;
+    check_host_git_idle(repo)?;
     super::ensure_guest_idle(instance, guest_dir)?;
     let guest = stage.join("guest");
     fs::create_dir(&guest)?;
@@ -563,14 +632,20 @@ fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Pat
     copy_checkout(repo, &before, &[])?;
     let mut old: Baseline = match fs::read(anchor) {
         Ok(data) => serde_json::from_slice(&data)?,
-        Err(e) if e.kind() == ErrorKind::NotFound => legacy_base(&before, stage)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => legacy_base(&before, stage, "HEAD")?,
         Err(e) => return Err(e.into()),
     };
     let local = scan(&before, false)?;
     let incoming = Baseline {
         files: scan(&guest, false)?,
         index: index(&guest)?,
+        index_tree: None,
+        inputs: Some(sync::inputs(&guest)?),
     };
+    fs::write(
+        stage.join("guest-signature"),
+        signature_from_files(&guest, &incoming.files, false)?,
+    )?;
     // Preflight regenerates this cache in each checkout. When both have a
     // regular report and the guest has a new result, collect the guest's copy.
     let report = Path::new(".git/opsx-build/contract-preflight.json");
@@ -598,6 +673,11 @@ fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Pat
         &["--exclude=/opsx-build", "--exclude=/ospx-build"],
     )?;
     import_git(&guest, &admin)?;
+    // Keep the exported index tree in the host object database for a later sync.
+    let incoming = Baseline {
+        index_tree: Some(git_text(&admin, &["write-tree"])?),
+        ..incoming
+    };
     apply(&incoming.files, &wanted, &before, &guest)?;
     let donor = stage.join("donor-git");
     fs::rename(guest.join(".git"), &donor)?;
@@ -612,7 +692,12 @@ fn plan(instance: &str, guest_dir: &str, repo: &Path, stage: &Path, anchor: &Pat
     Ok(())
 }
 
-pub(super) fn export(instance: &str, guest_dir: &str, repo: &Path, state: &Path) -> Result<()> {
+pub(super) fn export(
+    instance: &str,
+    guest_dir: &str,
+    repo: &Path,
+    state: &Path,
+) -> Result<Option<(String, String)>> {
     let stage = state.with_extension("export-staging");
     ensure!(
         !stage.starts_with(repo),
@@ -679,10 +764,16 @@ pub(super) fn export(instance: &str, guest_dir: &str, repo: &Path, state: &Path)
     }
     let next: Baseline = serde_json::from_slice(&fs::read(stage.join("next-base"))?)?;
     save_base(&next, &anchor)?;
+    // An interrupted export staged by an older launcher can still finish.
+    let signature = match fs::read_to_string(stage.join("guest-signature")) {
+        Ok(value) => Some((value, signature_from_files(&after, &new, false)?)),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
     drop(_index_lock);
     fs::remove_dir_all(stage)?;
     println!("Exported campaign into {}", repo.display());
-    Ok(())
+    Ok(signature)
 }
 
 #[cfg(test)]
