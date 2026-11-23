@@ -1,16 +1,17 @@
 //! Host-side VM lifecycle. The guest checkout owns the build state.
 mod collect;
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{ErrorKind, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
-use opsx_build::{git::repository_root, ui::TerminalUi};
+use opsx_build::{git::repository_root, process::shell_quote, ui::TerminalUi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -35,6 +36,9 @@ enum Action {
         /// Name of an existing, stopped Lima base instance.
         #[arg(long)]
         base: String,
+        /// Persist this host variable in the guest user's login environment. Repeat for more names.
+        #[arg(long, value_name = "NAME")]
+        env: Vec<String>,
         #[command(flatten)]
         resources: Resources,
     },
@@ -43,6 +47,17 @@ enum Action {
         /// Guest opsx-build arguments, such as execute or --resume.
         #[arg(last = true, required = true)]
         args: Vec<String>,
+    },
+    /// Open an interactive shell in the guest campaign checkout, starting the VM if needed.
+    Shell,
+    /// Change the campaign clone's CPU or RAM allocation after pausing the campaign.
+    Resize {
+        /// Number of virtual CPUs.
+        #[arg(long, required_unless_present = "memory")]
+        cpus: Option<NonZeroU32>,
+        /// Guest RAM in GiB.
+        #[arg(long)]
+        memory: Option<f32>,
     },
     /// Collect results in the original campaign checkout, or export a separate copy.
     Export { destination: Option<PathBuf> },
@@ -60,7 +75,8 @@ struct Resources {
     /// Virtual disk size in GiB.
     #[arg(long)]
     disk: Option<f32>,
-    #[arg(skip)]
+    /// Install the host's Claude subscription token and connection profiles for interactive use in the clone.
+    #[arg(long)]
     #[serde(default)]
     claude_subscription: bool,
 }
@@ -79,18 +95,23 @@ impl Resources {
             cpus: self.cpus.or(defaults.cpus),
             memory: self.memory.or(defaults.memory),
             disk: self.disk.or(defaults.disk),
-            claude_subscription: defaults.claude_subscription,
+            claude_subscription: self.claude_subscription || defaults.claude_subscription,
         };
-        for (key, size) in [("memory", resources.memory), ("disk", resources.disk)] {
+        resources.validate()?;
+        Ok(resources)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (key, size) in [("memory", self.memory), ("disk", self.disk)] {
             ensure!(
                 size.is_none_or(|size| size.is_finite() && size > 0.0),
                 "Lima {key} must be a positive size in GiB"
             );
         }
-        Ok(resources)
+        Ok(())
     }
 
-    fn clone_args(&self, command: &mut Command) {
+    fn add_args(&self, command: &mut Command) {
         if let Some(cpus) = self.cpus {
             command.arg(format!("--cpus={cpus}"));
         }
@@ -108,8 +129,12 @@ struct Campaign {
     instance: String,
     base: String,
     resources: Resources,
+    #[serde(default)]
+    env: BTreeSet<String>,
     guest_dir: Option<String>,
 }
+
+const CLAUDE_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 pub fn run_cli() -> Result<Option<i32>> {
     let mut args = env::args_os();
@@ -121,23 +146,49 @@ pub fn run_cli() -> Result<Option<i32>> {
     let ui = TerminalUi::new(false, false, false);
     let repo = repository_root(&repo, &ui)?.canonicalize()?;
     let state = state_path(&repo)?;
-    fs::create_dir_all(state.parent().unwrap())?;
-    let lock = fs::File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(state.with_extension("lock"))?;
-    lock.try_lock()
-        .context("another Lima command is active for this campaign")?;
+    // A shell only reads the atomically saved location and can coexist with a run.
+    let _lock = if matches!(action, Action::Shell) {
+        None
+    } else {
+        fs::create_dir_all(state.parent().unwrap())?;
+        let lock = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state.with_extension("lock"))?;
+        lock.try_lock()
+            .context(if matches!(action, Action::Resize { .. }) {
+                "another Lima command is active for this campaign; pause the run before resizing"
+            } else {
+                "another Lima command is active for this campaign"
+            })?;
+        Some(lock)
+    };
 
     let campaign = match fs::read(&state) {
         Ok(bytes) => Some(serde_json::from_slice(&bytes).context("invalid Lima campaign record")?),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error).with_context(|| format!("reading {}", state.display())),
     };
-    if let Action::Prepare { base, resources } = action {
-        prepare(&repo, &state, campaign, base, resources.resolve(&repo)?)?;
+    if let Action::Prepare {
+        base,
+        resources,
+        mut env,
+    } = action
+    {
+        // The CLI flag requests a login token. TOML alone keeps forwarding it per run.
+        if resources.claude_subscription {
+            env.push(CLAUDE_TOKEN.to_owned());
+        }
+        prepare(
+            &repo,
+            &state,
+            campaign,
+            base,
+            resources.resolve(&repo)?,
+            env.into_iter().collect(),
+        )?;
         return Ok(Some(0));
     }
 
@@ -148,16 +199,34 @@ pub fn run_cli() -> Result<Option<i32>> {
         .context("campaign import is incomplete; retry 'lima prepare' with the same options")?;
     eprintln!("Lima campaign: {}:{guest_dir}", campaign.instance);
     match action {
+        Action::Resize { cpus, memory } => {
+            resize(
+                &campaign.instance,
+                Resources {
+                    cpus,
+                    memory,
+                    ..Resources::default()
+                },
+            )?;
+            Ok(Some(0))
+        }
+        Action::Shell => {
+            let status = shell(&campaign.instance, guest_dir)
+                .status()
+                .context("opening the guest campaign shell")?;
+            Ok(Some(status.code().unwrap_or(1)))
+        }
         Action::Run { args } => {
-            let status = if campaign.resources.claude_subscription {
-                run_with_claude_token(&campaign.instance, guest_dir, args)?
-            } else {
-                shell(&campaign.instance, guest_dir)
-                    .args(["mise", "exec", "--", "opsx-campaign"])
-                    .args(args)
-                    .status()
-                    .context("running the campaign with limactl shell")?
-            };
+            let status =
+                if campaign.resources.claude_subscription && !campaign.env.contains(CLAUDE_TOKEN) {
+                    run_with_claude_token(&campaign.instance, guest_dir, args)?
+                } else {
+                    shell(&campaign.instance, guest_dir)
+                        .args(["mise", "exec", "--", "opsx-campaign"])
+                        .args(args)
+                        .status()
+                        .context("running the campaign with limactl shell")?
+                };
             Ok(Some(status.code().unwrap_or(1)))
         }
         Action::Export { destination } => {
@@ -181,11 +250,7 @@ fn host_config_file(name: &str) -> Result<PathBuf> {
     Ok(root.join("opsx-build").join(name))
 }
 
-fn run_with_claude_token(
-    instance: &str,
-    guest_dir: &str,
-    args: Vec<String>,
-) -> Result<std::process::ExitStatus> {
+fn claude_token() -> Result<String> {
     let path = host_config_file("claude-token")?;
     let token = fs::read_to_string(&path)
         .with_context(|| format!("reading Claude setup token from {}", path.display()))?;
@@ -195,7 +260,13 @@ fn run_with_claude_token(
         "expected one Claude setup token in {}",
         path.display()
     );
-    let mut child = limactl()
+    Ok(token.to_owned())
+}
+
+fn run_with_claude_token(instance: &str, guest_dir: &str, args: Vec<String>) -> Result<ExitStatus> {
+    let token = claude_token()?;
+    let mut command = limactl();
+    command
         .args([
             "shell",
             "--tty=false",
@@ -214,17 +285,52 @@ exec mise exec -- opsx-campaign "$@""#,
             "opsx-build",
         ])
         .args(args)
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove(CLAUDE_TOKEN);
+    with_input(&mut command, &format!("{token}\n"))
+        .context("sending the Claude setup token to the guest")
+}
+
+fn with_input(command: &mut Command, input: &str) -> Result<ExitStatus> {
+    let mut child = command
         .stdin(Stdio::piped())
         .spawn()
-        .context("starting the campaign with limactl shell")?;
-    // Feed SSH via a pipe so the token stays out of subprocess arguments.
-    let mut input = child.stdin.take().expect("piped campaign stdin");
-    let sent = writeln!(input, "{token}");
-    drop(input);
+        .context("starting limactl shell")?;
+    let sent = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes());
     let status = child.wait().context("waiting for limactl shell")?;
-    sent.context("sending the Claude setup token to the guest")?;
+    sent.context("writing to limactl shell")?;
     Ok(status)
+}
+
+fn login_environment(names: &BTreeSet<String>, subscription: bool) -> Result<String> {
+    let mut exports = String::new();
+    if subscription && names.contains(CLAUDE_TOKEN) && !names.contains("OPSX_BUILD_CONFIG") {
+        exports.push_str(
+            "export OPSX_BUILD_CONFIG=\"$HOME/.local/share/campaign-builder/lima-claude.toml\"\n",
+        );
+    }
+    for name in names {
+        let mut chars = name.chars();
+        ensure!(
+            chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric()),
+            "--env expects a shell variable name"
+        );
+        let value = if subscription && name == CLAUDE_TOKEN {
+            claude_token()?
+        } else {
+            env::var(name).map_err(|_| {
+                anyhow::anyhow!("--env {name} needs a UTF-8 value in the host environment")
+            })?
+        };
+        exports.push_str(&format!("export {name}={}\n", shell_quote(&value)));
+    }
+    Ok(exports)
 }
 
 fn state_path(repo: &Path) -> Result<PathBuf> {
@@ -250,6 +356,7 @@ fn prepare(
     saved: Option<Campaign>,
     base: String,
     resources: Resources,
+    env: BTreeSet<String>,
 ) -> Result<()> {
     ensure!(
         fs::symlink_metadata(repo.join(".git")).is_ok_and(|entry| entry.is_dir())
@@ -267,6 +374,7 @@ fn prepare(
     } else {
         None
     };
+    let exports = login_environment(&env, resources.claude_subscription)?;
     let instances = output(
         limactl().args(["list", "--format", "{{.Name}} {{.Status}}"]),
         "listing Lima instances",
@@ -285,7 +393,7 @@ fn prepare(
             saved.instance
         );
         ensure!(
-            saved.base == base && saved.resources == resources,
+            saved.base == base && saved.resources == resources && saved.env == env,
             "retry the incomplete Lima import with its original base and resources"
         );
         saved
@@ -299,6 +407,7 @@ fn prepare(
             instance: format!("opsx-{}", &id[..16]),
             base,
             resources,
+            env,
             guest_dir: None,
         };
         save(state, &campaign)?;
@@ -317,7 +426,7 @@ fn prepare(
     if status(&campaign.instance).is_none() {
         let mut clone = limactl();
         clone.args(["clone", "--tty=false", &campaign.base, &campaign.instance]);
-        campaign.resources.clone_args(&mut clone);
+        campaign.resources.add_args(&mut clone);
         checked(&mut clone, "cloning the prepared Lima base")?;
     }
     // A retry gets an empty staging directory even if an earlier transfer was partial.
@@ -354,13 +463,66 @@ fn prepare(
             "copying the Claude connection profiles to the guest",
         )?;
     }
+    if !exports.is_empty() {
+        let mut command = shell(&campaign.instance, "/tmp");
+        command
+            .args(["bash", "-c", include_str!("../lima/install-login-env.sh")])
+            .stdout(Stdio::null());
+        ensure!(
+            with_input(&mut command, &exports)?.success(),
+            "installing the guest login environment failed"
+        );
+    }
     campaign.guest_dir = Some(guest_dir.clone());
     save(state, &campaign)?;
     let instance = &campaign.instance;
     println!("Campaign staged in {instance}:{guest_dir}");
+    println!("Open the campaign shell: opsx-build lima shell");
     if !campaign.resources.claude_subscription {
-        println!("Open 'limactl shell {instance}' to set up guest agent sign-in and connections.");
+        println!("Use the guest shell to set up agent sign-in and connections.");
     }
+    Ok(())
+}
+
+fn resize(instance: &str, resources: Resources) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Instance {
+        status: String,
+        cpus: u32,
+        memory: u64,
+    }
+    resources.validate()?;
+    let info = output(
+        limactl().args(["list", "--json", instance]),
+        "reading the clone's allocation",
+    )?;
+    let current: Instance =
+        serde_json::from_str(&info).context("could not read the clone's CPU and RAM allocation")?;
+    ensure!(
+        matches!(current.status.as_str(), "Running" | "Stopped"),
+        "cannot resize a clone in state {}",
+        current.status
+    );
+    if resources.cpus.is_none_or(|n| n.get() == current.cpus)
+        && resources
+            .memory
+            .is_none_or(|gib| gib == current.memory as f32 / (1_u32 << 30) as f32)
+    {
+        println!("The clone already has the requested allocation.");
+        return Ok(());
+    }
+    if current.status == "Running" {
+        ensure_guest_idle(instance, "/")?;
+        checked(
+            limactl().args(["stop", instance]),
+            "stopping the clone for resizing",
+        )?;
+    }
+    let mut edit = limactl();
+    edit.args(["edit", "--tty=false", instance]);
+    resources.add_args(&mut edit);
+    checked(&mut edit, "updating the stopped clone's allocation")?;
+    println!("Clone resized. Resume a paused campaign with 'opsx-build lima run -- --resume'.");
     Ok(())
 }
 
@@ -441,6 +603,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resize_accepts_only_cpu_and_memory_changes() {
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(
+                ["opsx-build lima", "resize"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        for flags in [
+            &["--cpus", "4"][..],
+            &["--memory", "6.5"],
+            &["--cpus", "2", "--memory", "8"],
+        ] {
+            assert!(parse(flags).is_ok());
+        }
+        for flags in [&[][..], &["--disk", "80"], &["--cpus", "0"]] {
+            assert!(parse(flags).is_err());
+        }
+        for size in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                Resources {
+                    memory: Some(size),
+                    ..Resources::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn claude_subscription_is_opt_in() {
         let old: Resources = serde_json::from_str(r#"{"cpus":4,"memory":8,"disk":null}"#).unwrap();
         assert!(!old.claude_subscription);
@@ -448,5 +641,86 @@ mod tests {
         let enabled: Resources = toml::from_str("cpus = 4\nclaude_subscription = true").unwrap();
         assert_eq!(enabled.cpus, NonZeroU32::new(4));
         assert!(enabled.claude_subscription);
+    }
+
+    #[test]
+    fn prepare_accepts_a_claude_subscription_without_campaign_config() {
+        let cli = Cli::try_parse_from([
+            "opsx-build lima",
+            "prepare",
+            "--base",
+            "test-base",
+            "--claude-subscription",
+        ])
+        .unwrap();
+        let Action::Prepare { resources, .. } = cli.action else {
+            unreachable!()
+        };
+        let unconfigured = env::temp_dir().join(Uuid::new_v4().to_string());
+        assert!(
+            resources
+                .resolve(&unconfigured)
+                .unwrap()
+                .claude_subscription
+        );
+    }
+
+    #[test]
+    fn older_campaign_records_have_no_persisted_environment() {
+        let campaign: Campaign = serde_json::from_str(
+            r#"{"instance":"old","base":"base","resources":{"claude_subscription":true},"guest_dir":"/tmp/checkout"}"#,
+        ).unwrap();
+        assert!(campaign.env.is_empty());
+        assert!(campaign.resources.claude_subscription);
+    }
+
+    #[test]
+    fn rejects_invalid_or_missing_host_variables() {
+        for name in ["X=secret", "0NAME", "OPSX_LIMA_TEST_UNSET_9F7D"] {
+            let error = login_environment(&BTreeSet::from([name.to_owned()]), false).unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_login_file_is_private_and_retry_preserves_the_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = env::temp_dir().join(format!("opsx-lima-login-{}", Uuid::new_v4()));
+        fs::create_dir(&home).unwrap();
+        let profile = home.join(".bash_profile");
+        fs::write(&profile, "export EXISTING_SETTING=yes\n").unwrap();
+        let value = "spaces ' \" $(false)\nsecond line\n";
+        let mut setup = Command::new("bash");
+        setup
+            .args(["-c", include_str!("../lima/install-login-env.sh")])
+            .env("HOME", &home);
+        for setting in ["previous", value] {
+            assert!(
+                with_input(
+                    &mut setup,
+                    &format!("export EXAMPLE={}\n", shell_quote(setting))
+                )
+                .unwrap()
+                .success()
+            );
+        }
+        let mode = fs::metadata(home.join(".config/opsx-build/lima-env.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            fs::read_to_string(profile)
+                .unwrap()
+                .matches("lima-env.sh")
+                .count(),
+            1
+        );
+        assert!(Command::new("bash")
+            .args(["-c", r#". "$HOME/.bash_profile" && [[ $EXAMPLE == "$EXPECTED" && $EXISTING_SETTING == yes ]]"#])
+            .env("HOME", &home).env("EXPECTED", value).status().unwrap().success());
+        fs::remove_dir_all(home).unwrap();
     }
 }

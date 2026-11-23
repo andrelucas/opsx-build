@@ -99,6 +99,25 @@ Options `--cpus`, `--memory`, and `--disk` on `lima prepare` override the file.
 Omitted values inherit the base settings. Use `--repo PATH` with any Lima
 command to select a campaign from elsewhere.
 
+To change an existing clone's CPUs or RAM, pause the campaign in the dashboard
+and wait for the launcher to exit. From the same host checkout, run:
+
+```sh
+opsx-build lima resize --cpus 12 --memory 32
+opsx-build lima run -- --resume
+```
+
+You can supply either size on its own. Resizing stops the VM if needed, closing
+any guest shells. Resume starts the same checkout at its saved checkpoint.
+Set the disk size with `--disk` when preparing the clone.
+
+To copy a host environment variable into the guest user's login environment,
+add `--env NAME` to `lima prepare`. Repeat the option for additional names.
+For example, `BUILD_REGION=eu opsx-build lima prepare --base campaign-base --env BUILD_REGION`
+sets `BUILD_REGION=eu` in the clone. The values are captured at preparation and
+stored in a user-only file outside the guest checkout. They survive VM restarts
+and are included in snapshots of that clone. Campaign exports omit them.
+
 Prepare copies the campaign, including its Git history and any bundled
 dependency inputs. For Claude, configure [host token forwarding](#use-a-claude-subscription-on-the-builder)
 before preparing the clone. For Codex, [sign in to the prepared clone](#use-chatgpt-pro-with-codex).
@@ -114,7 +133,11 @@ If you ran `bootstrap` separately and it completed, start delivery with
 options to both commands if they are absent from `opsx-build.md`. To continue
 an interrupted run, use `opsx-build lima run -- --resume`.
 
-`lima run` and `lima export` start the recorded clone if needed. The guest
+From the host campaign directory, open a terminal in the guest checkout with
+`opsx-build lima shell`. You can use it while a campaign is running in another
+terminal. Type `exit` to close the shell.
+
+`lima run`, `lima shell` and `lima export` start the recorded clone if needed. The guest
 retains its checkout, agent sign-in and checkpoint between runs. The host
 records which clone to use under `$XDG_STATE_HOME/opsx-build/lima` (by default
 `~/.local/state/opsx-build/lima`), keyed to the host checkout's absolute path.
@@ -167,24 +190,37 @@ model = "opus"
 CLAUDE_CODE_OAUTH_TOKEN = { from_env = "CLAUDE_CODE_OAUTH_TOKEN" }
 ```
 
-Select those connection names in the campaign and set `claude_subscription = true`
-in its `opsx-build.lima.toml` before `lima prepare`. Preparation copies the
-connection configuration into the guest's builder directory. On each unattended
-`lima run`, including `--resume`, the launcher reads the current host token and
-sends it to the guest over SSH stdin. The token stays out of the source archive,
-clone configuration and campaign export. Use a fresh clone to pick up changes
-to `lima-claude.toml`. On Ludwig, both connections used the forwarded token
-on a fresh clone, including after a stop and resume, without a guest sign-in.
+For an interactive campaign on Ludwig, select the subscription when preparing
+the clone. You can run this from a campaign checkout without an `opsx-build.lima.toml`:
+
+```sh
+opsx-build lima prepare --base campaign-sirocco --claude-subscription
+opsx-build lima run -- --worker-connection=anthropic --frontier-connection=anthropic-frontier \
+  --frontier-worker --stream-agent=reasoning autoconfigure
+opsx-build lima run -- execute
+```
+
+With this option, preparation reads the existing host `claude-token` file and
+sets both the token and `OPSX_BUILD_CONFIG` in the clone. Run from a terminal
+to use the dashboard and its keyboard controls. You can also open
+`opsx-build lima shell` and run `opsx-campaign` there.
+
+For per-run token forwarding, set `claude_subscription = true` in
+`opsx-build.lima.toml` and omit the command-line flag. Each unattended
+`lima run` then reads the current host token and sends it over SSH stdin.
+Adding `--env CLAUDE_CODE_OAUTH_TOKEN` to that setup selects the same persistent
+login as `--claude-subscription`.
+Both modes copy the connection profiles from `lima-claude.toml` during preparation.
 
 ### Use ChatGPT Pro with Codex
 
 Each fresh clone currently needs one device login. The worker and frontier
 share it, and stopping and restarting that clone preserves it. Enable device
 code login in your ChatGPT security settings. After `lima prepare`, open a
-guest shell on Ludwig, replacing `opsx-EXAMPLE` with the printed clone name.
+guest shell from the host campaign checkout on Ludwig.
 
 ```sh
-limactl shell --workdir=/tmp opsx-EXAMPLE
+opsx-build lima shell
 ```
 
 Inside the guest, set `cli_auth_credentials_store = "file"` at the top level

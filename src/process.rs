@@ -1009,7 +1009,7 @@ pub fn diagnostic_text(output: &ProcessOutput) -> String {
     }
 }
 
-pub(crate) fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     if value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "-._/:=".contains(character))
