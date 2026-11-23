@@ -11,6 +11,7 @@
       "$HOME/go", "$HOME/.agents", "$HOME/.claude", "$HOME/.codex", "$HOME/.local/state/opencode",
       "$HOME/.docker", "$HOME/.kube", "$HOME/.opam"
     ],
+    "read": ["/home/linuxbrew/.linuxbrew"],
     "allow_file": ["$HOME/.claude.json", "$HOME/.gitconfig"],
     "bypass_protection": ["$HOME/.config", "$HOME/.local/share", "$HOME/.docker", "$HOME/.kube"]
   },

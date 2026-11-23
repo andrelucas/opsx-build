@@ -63,7 +63,6 @@ bin = "tla2tools.jar"
 "apt:docker-buildx" = "latest"
 "apt:docker-compose-v2" = "latest"
 "apt:chrony" = "latest"
-"apt:opam" = "latest"
 "apt:gawk" = "latest"
 "apt:time" = "latest"
 "apt:wget" = "latest"
@@ -113,6 +112,6 @@ run = [
   'openspec config set profile custom',
   "openspec config set workflows '[\"propose\",\"apply\",\"verify\",\"archive\"]'",
   'for tool in tlc sany pcal tla2xml tlatex; do ln -sf "$HOME/.local/bin/tla-tool" "$HOME/.local/bin/$tool"; done',
-  'bash "$HOME/.local/share/campaign-builder/build-tlaps.sh"',
+  'bash "$HOME/.local/share/campaign-builder/install-tlaps.sh"',
   'bash "$HOME/.local/share/campaign-builder/build-opsx.sh"',
 ]

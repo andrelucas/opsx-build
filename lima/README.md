@@ -11,9 +11,9 @@ from a supplied source archive. Most base tools follow latest or stable releases
 The Sirocco profile adds PD and TiKV 8.5.8 and selects the exact Go, Buf and
 generator versions required by Sirocco's checks. Installed tools are retained
 in the prepared images.
-TLAPS is built once from upstream source inside Ubuntu, using its supported
-opam/Make build. This avoids the newer glibc required by the current upstream
-binary. The installed proof system is then reused by snapshots and clones.
+The base bootstrap installs the TLAPS Linux bottle from
+`andrelucas/tlapm/tlapm`. Snapshots and clones reuse the installed proof
+manager and its bundled provers.
 
 ## Prepare the base on Ludwig
 
@@ -298,12 +298,9 @@ mise exec -- bash ~/.local/share/campaign-builder/build-opsx.sh
 The helper removes the supplied source and temporary compilation directory
 after installation. It installs the executable under `~/.local/bin`.
 
-TLAPS has a separate short `build-tlaps.sh` helper. Its upstream source checkout
-and opam environment are retained for incremental builds; the installed proof
-system lives under `~/.local/share/tlaps`. The helper skips an existing
-installation, so refreshing TLAPS source is an explicit base-image update.
-Opam installs the OCaml compiler and libraries during this initial build;
-clones reuse the compiled proof system.
+The TLAPS installer uses Linuxbrew to fetch and install the bottle. It links
+`tlapm` into `~/.local/bin`. The builder policy grants the campaign process read
+access to the Linuxbrew prefix for the prover binaries and runtime libraries.
 
 ## Software included
 
@@ -314,7 +311,7 @@ The campaign tools were inventoried on Amygdala on 19 November 2026:
 - Go, Buf, protoc, both Go generators, gopls, gotestsum and Dapper.
 - TLC, SANY, PlusCal, TLA+ XML/LaTeX tools and TLAPS with its backend provers.
 - Docker, kind and kubectl.
-- OCaml/opam, C/C++ build tools, Clang/LLD, CMake, Ninja, ccache, native development
+- C/C++ build tools, Clang/LLD, CMake, Ninja, ccache, native development
   libraries, Git, rsync, jq, ripgrep, tmux and debugging/network utilities.
 
 Ubuntu supplies the native packages. Mise manages the language runtimes and
@@ -329,7 +326,7 @@ with 4 CPUs and 8 GiB RAM. The clone retained its installed tools and passed
 `builder-check`. Further checks passed:
 
 - TLC model checking.
-- Source-built TLAPS proofs using SMT, Zenon, Isabelle and PTL under nono,
+- TLAPS proofs using SMT, Zenon, Isabelle and PTL under nono,
   plus strict rejection of an invalid theorem.
 - PD/TiKV 8.5.8 startup and store registration under the campaign nono policy.
 - Local TCP, an allowed GitHub request, a blocked unlisted domain, and blocked
