@@ -120,13 +120,25 @@ records which clone to use under `$XDG_STATE_HOME/opsx-build/lima` (by default
 `~/.local/state/opsx-build/lima`), keyed to the host checkout's absolute path.
 Use that same host checkout to resume or export.
 
-When a guest command finishes, copy back a reviewable checkpoint with
-`opsx-build lima export /path/to/new-directory`. The export includes Git
-metadata, checkpoints and ignored artifacts. For a completed run with an
+When the campaign finishes or pauses, run `opsx-build lima export` from the
+original host checkout. This fast-forwards the host branch and collects the
+guest's staged and unstaged files, ignored artifacts and campaign checkpoints.
+Host-only files and host Git configuration are preserved. Conflicting files,
+divergent commits or incompatible staged edits stop the export before publication.
+Clones prepared with older launchers use the host commit as their initial baseline.
+If the origin of a changed, untracked input is ambiguous, export reports the path.
+When the VM generates a new `.git/opsx-build/contract-preflight.json`, its report
+replaces an earlier preflight report in the host checkout.
+
+The VM owns the build while it runs. Resuming uses the guest checkout. A
+maintainer correction made on the host must reach the guest separately before
+the resumed build can use it. Export only transfers results to the host.
+
+For a separate, complete snapshot, use `opsx-build lima export /path/to/new-directory`.
+For a completed run with an
 independent acceptance gate, the exported `.git/opsx-build/last-run.json` has
 `stage` set to `done`. The passing `result.json` and logs are under
-`.git/opsx-build/acceptance/`. If the transfer fails, retry with a fresh
-destination. To release VM resources, run `limactl stop <clone-name>` after
+`.git/opsx-build/acceptance/`. To release VM resources, run `limactl stop <clone-name>` after
 export or between runs.
 Lima keeps the guest disk for the next run.
 

@@ -1,4 +1,5 @@
 //! Host-side VM lifecycle. The guest checkout owns the build state.
+mod collect;
 use std::{
     env, fs,
     io::{ErrorKind, Write},
@@ -43,8 +44,8 @@ enum Action {
         #[arg(last = true, required = true)]
         args: Vec<String>,
     },
-    /// Copy the complete guest checkout to a new host directory.
-    Export { destination: PathBuf },
+    /// Collect results in the original campaign checkout, or export a separate copy.
+    Export { destination: Option<PathBuf> },
 }
 
 #[derive(Args, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,7 +161,11 @@ pub fn run_cli() -> Result<Option<i32>> {
             Ok(Some(status.code().unwrap_or(1)))
         }
         Action::Export { destination } => {
-            export(&campaign.instance, guest_dir, &destination)?;
+            if let Some(path) = destination {
+                export(&campaign.instance, guest_dir, &path)?;
+            } else {
+                collect::export(&campaign.instance, guest_dir, &repo, &state)?;
+            }
             Ok(Some(0))
         }
         Action::Prepare { .. } => unreachable!(),
@@ -300,6 +305,15 @@ fn prepare(
         campaign
     };
     println!("Preparing Lima campaign in {}", campaign.instance);
+    let baseline = collect::baseline(&state, &campaign.instance);
+    if let Err(error) = collect::remember(&repo, &baseline) {
+        if baseline.try_exists()? {
+            fs::remove_file(&baseline)?;
+        }
+        eprintln!(
+            "Could not record a file baseline for in-place export ({error}); export will check against the committed inputs."
+        );
+    }
     if status(&campaign.instance).is_none() {
         let mut clone = limactl();
         clone.args(["clone", "--tty=false", &campaign.base, &campaign.instance]);
@@ -347,6 +361,19 @@ fn prepare(
     if !campaign.resources.claude_subscription {
         println!("Open 'limactl shell {instance}' to set up guest agent sign-in and connections.");
     }
+    Ok(())
+}
+
+// A campaign started directly in a guest shell does not hold the host lock.
+fn ensure_guest_idle(instance: &str, dir: &str) -> Result<()> {
+    let processes = output(
+        shell(instance, dir).args(["ps", "-e", "-o", "comm="]),
+        "checking for an active campaign in the guest",
+    )?;
+    ensure!(
+        !processes.lines().any(|name| name.trim() == "opsx-build"),
+        "pause the active guest campaign before continuing"
+    );
     Ok(())
 }
 
