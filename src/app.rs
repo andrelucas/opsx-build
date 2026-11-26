@@ -705,7 +705,7 @@ impl<U: Ui> App<U> {
                 .map(Ok)
                 .unwrap_or_else(default_sidecar_root)?;
             let plan = SidecarPlan::new(&product_repo, context_path, &root)?;
-            self.ui.banner(&product_repo.display().to_string());
+            self.ui.campaign_banner(&product_repo, Some(context_path));
             if self.cli.dry_run {
                 self.ui
                     .warn("DRY RUN — the external OpenSpec store would not be created");
@@ -775,7 +775,10 @@ impl<U: Ui> App<U> {
             || product_repo.clone(),
             |sidecar| sidecar.planning_root.clone(),
         );
-        self.ui.banner(&product_repo.display().to_string());
+        if !self.cli.resume {
+            self.ui
+                .campaign_banner(&product_repo, self.cli.bootstrap_context.as_deref());
+        }
         if let Some(sidecar) = &sidecar {
             self.ui.info(&format!(
                 "Planning sidecar `{}`: `{}`",
@@ -1402,6 +1405,10 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
     ) -> Result<()> {
         let mut state = load_state(repo, &self.ui)?;
+        self.ui.campaign_banner(
+            state.product_repo.as_deref().unwrap_or(repo),
+            state.context_path.as_deref(),
+        );
         if let Some(contracts) = &state.contracts {
             contracts.check_inventory_selection(repo, self.cli.obligation_inventory.as_deref())?;
             contracts.check_selection(

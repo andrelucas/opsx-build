@@ -100,6 +100,7 @@ impl<U: Ui> App<U> {
                     .is_file()
                     .then(|| repo.join("context.md"))
             });
+        self.ui.campaign_banner(repo, context.as_deref());
         let mut definitions = saved
             .as_ref()
             .map(|state| state.context_definitions.clone())

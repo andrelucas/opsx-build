@@ -139,6 +139,7 @@ struct ScrollbarDrag {
 }
 
 pub(crate) struct StreamDashboard {
+    campaign_name: String,
     repo: String,
     change_name: Option<String>,
     campaign: Option<CampaignDashboardView>,
@@ -170,6 +171,7 @@ pub(crate) struct StreamDashboard {
 
 impl StreamDashboard {
     pub(crate) fn enter(
+        campaign_name: String,
         repo: String,
         change_name: Option<String>,
         campaign: Option<CampaignDashboardView>,
@@ -189,6 +191,7 @@ impl StreamDashboard {
 
         let now = Instant::now();
         let mut dashboard = Self {
+            campaign_name,
             repo,
             change_name,
             campaign,
@@ -291,11 +294,11 @@ impl StreamDashboard {
         });
         match (&campaign, &self.change_name) {
             (Some(campaign), Some(change)) => {
-                format!("opsx-build  {campaign}  change: {change}  {}", self.repo)
+                format!("{campaign}  change: {change}  {}", self.repo)
             }
-            (Some(campaign), None) => format!("opsx-build  {campaign}  {}", self.repo),
-            (None, Some(change)) => format!("opsx-build  change: {change}  {}", self.repo),
-            (None, None) => format!("opsx-build  {}", self.repo),
+            (Some(campaign), None) => format!("{campaign}  {}", self.repo),
+            (None, Some(change)) => format!("change: {change}  {}", self.repo),
+            (None, None) => self.repo.clone(),
         }
     }
 
@@ -1041,7 +1044,7 @@ impl StreamDashboard {
             &mut output,
             0,
             width,
-            &self.header_text(),
+            &format!("opsx-build  {}", self.campaign_name),
             Color::Cyan,
             true,
         )?;
@@ -1079,8 +1082,8 @@ impl StreamDashboard {
                 &mut output,
                 2,
                 width,
-                &"─".repeat(width as usize),
-                Color::DarkGrey,
+                &self.header_text(),
+                Color::Cyan,
                 false,
             )?;
         }
@@ -1419,6 +1422,7 @@ mod tests {
     fn dashboard() -> StreamDashboard {
         let now = Instant::now();
         let mut dashboard = StreamDashboard {
+            campaign_name: "Reader protection".into(),
             repo: "/repo".to_owned(),
             change_name: None,
             campaign: None,
@@ -1605,12 +1609,19 @@ mod tests {
     #[test]
     fn header_shows_change_name_when_known() {
         let mut dashboard = dashboard();
-        assert_eq!(dashboard.header_text(), "opsx-build  /repo");
+        assert_eq!(dashboard.header_text(), "/repo");
+        let mut frame = Vec::new();
+        dashboard.draw_to(&mut frame, 35, 1).unwrap();
+        assert!(
+            String::from_utf8(frame)
+                .unwrap()
+                .contains("opsx-build  Reader protection")
+        );
 
         dashboard.set_change_name(Some("slice-m-test-infrastructure".to_owned()));
         assert_eq!(
             dashboard.header_text(),
-            "opsx-build  change: slice-m-test-infrastructure  /repo"
+            "change: slice-m-test-infrastructure  /repo"
         );
     }
 
@@ -1884,7 +1895,7 @@ mod tests {
             upcoming: Vec::new(),
         }));
 
-        assert_eq!(dashboard.header_text(), "opsx-build  iteration 2/10  /repo");
+        assert_eq!(dashboard.header_text(), "iteration 2/10  /repo");
         assert!(dashboard.panels.is_empty());
         let lines = dashboard.render_lines_at(Instant::now());
         assert!(lines[0].text.contains("iteration 1 · slice-a"));
@@ -2484,6 +2495,7 @@ mod tests {
             return;
         }
         let mut dashboard = StreamDashboard::enter(
+            "Example".to_owned(),
             "/tmp/example".to_owned(),
             Some("example-change".to_owned()),
             None,

@@ -74,6 +74,11 @@ opsx-build --repo ~/git/my-project \
   bootstrap
 ```
 
+The dashboard and startup banner show the first level-one Markdown heading
+in the selected context file as the campaign name. If it has no title, they
+show the checkout directory name. The same name is used when resuming with
+the saved context.
+
 When `--context` is omitted, `bootstrap` and `execute` use `context.md` from the
 campaign's Git repository root (selected by `--repo`, or the current directory).
 An explicit `--context PATH` takes precedence; explicit relative paths are

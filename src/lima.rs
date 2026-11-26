@@ -243,7 +243,11 @@ pub fn run_cli() -> Result<Option<i32>> {
         .guest_dir
         .as_deref()
         .context("campaign import is incomplete; retry 'lima prepare' with the same options")?;
-    eprintln!("Lima campaign: {}:{guest_dir}", campaign.instance);
+    eprintln!(
+        "Lima campaign: {} → {}:{guest_dir}",
+        repo.display(),
+        campaign.instance
+    );
     match action {
         Action::Resize { cpus, memory } => {
             resize(
@@ -544,11 +548,18 @@ fn prepare(
     }
     // A retry gets an empty staging directory even if an earlier transfer was partial.
     let guest_dir = output(
-        shell(&campaign.instance, "/tmp").args([
-            "bash",
-            "-c",
-            r#"mkdir -p "$HOME/campaigns" && mktemp -d "$HOME/campaigns/opsx.XXXXXXXX""#,
-        ]),
+        shell(&campaign.instance, "/tmp")
+            .args([
+                "bash",
+                "-c",
+                r#"set -eu
+mkdir -p "$HOME/campaigns"
+parent=$(mktemp -d "$HOME/campaigns/opsx.XXXXXXXX")
+mkdir -- "$parent/$1"
+printf '%s\n' "$parent/$1""#,
+                "opsx-build",
+            ])
+            .arg(repo.file_name().unwrap_or_else(|| "campaign".as_ref())),
         "creating the guest campaign directory",
     )?;
     ensure!(

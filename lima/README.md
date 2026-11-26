@@ -77,6 +77,10 @@ Install the [opsx-build host binary](../README.md#installation) on the machine
 that runs Lima, and make sure `limactl` is on `PATH`. From a standalone campaign
 checkout on that host, select a stopped, prepared base.
 Many campaigns can share the same base and each gets its own writable clone.
+The launcher prints the host checkout beside the instance and guest path.
+New guest checkouts keep the host directory name under a private staging
+directory. Inside the guest, the dashboard shows the title from the campaign
+context or falls back to the checkout directory name.
 The launcher inherits the base's architecture and uses its installed `mise`
 and `opsx-campaign` wrapper. The scripts above prepare the x86_64 base on
 Ludwig. For Apple Silicon, the launcher can use a separately prepared arm64

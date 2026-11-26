@@ -22,6 +22,47 @@ use crate::{
 const FILE_NAME: &str = "opsx-build.md";
 const PRESET_WARNING: &str = "This preset is managed externally. Changes to it may alter the model or parameters used by this campaign without changing opsx-build.md.";
 
+/// A context heading is a display label only. A campaign can run without one.
+pub(crate) fn display_name(repo: &Path, context: Option<&Path>) -> String {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+
+    let default = repo.join("context.md");
+    let path = context.unwrap_or(&default);
+    if path.is_file()
+        && let Ok(document) = fs::read_to_string(path)
+    {
+        let mut events = Parser::new(&document);
+        while let Some(event) = events.next() {
+            if let Event::Start(Tag::Heading {
+                level: HeadingLevel::H1,
+                ..
+            }) = event
+            {
+                let mut title = String::new();
+                for inline in events.by_ref() {
+                    match inline {
+                        Event::End(TagEnd::Heading(_)) => break,
+                        Event::Text(value) | Event::Code(value) => title.push_str(&value),
+                        Event::SoftBreak | Event::HardBreak => title.push(' '),
+                        _ => {}
+                    }
+                }
+                let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                let title: String = title.chars().filter(|c| !c.is_control()).collect();
+                if !title.is_empty() {
+                    return title;
+                }
+            }
+        }
+    }
+    repo.file_name()
+        .unwrap_or(repo.as_os_str())
+        .to_string_lossy()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigureInputs {
     pub(crate) defaults: Vec<String>,
@@ -175,7 +216,7 @@ pub fn configure<U: Ui>(cli: &Cli, ui: &U) -> Result<()> {
         .as_ref()
         .context("missing configuration inputs")?;
     let base = base_directory(&cli.repo)?;
-    ui.banner(&base.display().to_string());
+    ui.campaign_banner(&base, cli.bootstrap_context.as_deref());
     let automatic = cli.request == "autoconfigure";
     ui.info(if automatic {
         "Autoconfigure this campaign using the resolved worker connection and model"
@@ -666,6 +707,26 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn campaign_name_uses_the_context_heading_then_the_checkout_name() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let repo = root.join("kv-owner-recovery");
+        fs::create_dir_all(&repo).unwrap();
+        assert_eq!(display_name(&repo, None), "kv-owner-recovery");
+        fs::write(
+            repo.join("context.md"),
+            "```md\n# Example\n```\n\n# Recover *KV* with `TiKV`\n",
+        )
+        .unwrap();
+        assert_eq!(display_name(&repo, None), "Recover KV with TiKV");
+        let selected = repo.join("brief.md");
+        fs::write(&selected, "Recover reads\n=============\n").unwrap();
+        assert_eq!(display_name(&repo, Some(&selected)), "Recover reads");
+        fs::write(&selected, "## Only a section\n").unwrap();
+        assert_eq!(display_name(&repo, Some(&selected)), "kv-owner-recovery");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn detects_edits_but_excludes_runtime_bookkeeping_and_line_endings() {

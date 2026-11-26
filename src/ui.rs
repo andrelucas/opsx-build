@@ -1,5 +1,6 @@
 use std::{
     io::IsTerminal,
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -68,6 +69,9 @@ pub trait Ui {
         false
     }
     fn banner(&self, repo: &str);
+    fn campaign_banner(&self, repo: &Path, _context: Option<&Path>) {
+        self.banner(&repo.display().to_string());
+    }
     fn change_name(&self, change: Option<&str>);
     fn campaign(&self, _campaign: Option<CampaignView>) {}
     fn bootstrap_continues(&self, _continues: bool) {}
@@ -117,6 +121,7 @@ pub struct TerminalUi {
 #[derive(Default)]
 struct TerminalState {
     repo: String,
+    campaign_name: String,
     change_name: Option<String>,
     stage: Option<StageView>,
     campaign: Option<CampaignView>,
@@ -229,9 +234,18 @@ impl Ui for TerminalUi {
     }
 
     fn banner(&self, repo: &str) {
-        self.state.lock().unwrap().repo = repo.to_owned();
+        self.campaign_banner(Path::new(repo), None);
+    }
+
+    fn campaign_banner(&self, repo: &Path, context: Option<&Path>) {
+        let name = crate::campaign_config::display_name(repo, context);
+        let repo = repo.display().to_string();
+        let mut state = self.state.lock().unwrap();
+        state.repo.clone_from(&repo);
+        state.campaign_name.clone_from(&name);
+        drop(state);
         let title = Style::new().bold().cyan().apply_to("opsx-build");
-        self.write_line(&format!("{title}  {repo}"));
+        self.write_line(&format!("{title}  {name}  {repo}"));
     }
 
     fn change_name(&self, change: Option<&str>) {
@@ -312,12 +326,13 @@ impl Ui for TerminalUi {
         }
         if self.dashboard_enabled {
             let repo = state.repo.clone();
+            let name = state.campaign_name.clone();
             let change_name = state.change_name.clone();
             let campaign = state.campaign.as_ref().map(campaign_dashboard_view);
             let frontier_enabled = !state.frontier_disabled;
             let bootstrap_continues = state.bootstrap_continues;
             drop(state);
-            match StreamDashboard::enter(repo, change_name, campaign) {
+            match StreamDashboard::enter(name, repo, change_name, campaign) {
                 Ok(mut dashboard) => {
                     dashboard.set_frontier_enabled(frontier_enabled);
                     dashboard.set_bootstrap_continues(bootstrap_continues);
@@ -407,13 +422,14 @@ impl Ui for TerminalUi {
             self.info(message);
             return;
         }
-        let (repo, change_name, stage, campaign, frontier_enabled, bootstrap_continues) = {
+        let (name, repo, change_name, stage, campaign, frontier_enabled, bootstrap_continues) = {
             let mut state = self.state.lock().unwrap();
             if let Some(dashboard) = state.dashboard.as_mut() {
                 dashboard.start_stream(message);
                 return;
             }
             (
+                state.campaign_name.clone(),
                 state.repo.clone(),
                 state.change_name.clone(),
                 state.stage.clone(),
@@ -422,7 +438,7 @@ impl Ui for TerminalUi {
                 state.bootstrap_continues,
             )
         };
-        match StreamDashboard::enter(repo, change_name, campaign) {
+        match StreamDashboard::enter(name, repo, change_name, campaign) {
             Ok(mut dashboard) => {
                 dashboard.set_frontier_enabled(frontier_enabled);
                 dashboard.set_bootstrap_continues(bootstrap_continues);
