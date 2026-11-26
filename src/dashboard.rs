@@ -12,7 +12,9 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color, Colors, Print, ResetColor, SetAttribute, SetColors, SetForegroundColor,
+    },
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
@@ -26,6 +28,10 @@ const MAX_CLAUDE_MESSAGE_LINES: usize = 200;
 const CLAUDE_MESSAGE_HEAD_LINES: usize = 120;
 const CLAUDE_MESSAGE_TAIL_LINES: usize = MAX_CLAUDE_MESSAGE_LINES - CLAUDE_MESSAGE_HEAD_LINES;
 const SOURCE_LABEL_WIDTH: usize = 8;
+const CAMPAIGN_BANNER_COLORS: Colors = Colors {
+    foreground: Some(Color::AnsiValue(195)), // pale cyan
+    background: Some(Color::AnsiValue(23)),  // dark teal
+};
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1046,7 +1052,7 @@ impl StreamDashboard {
             output,
             MoveTo(0, 0),
             SetAttribute(Attribute::Bold),
-            SetAttribute(Attribute::Reverse),
+            SetColors(CAMPAIGN_BANNER_COLORS),
             Print(pad_str(&title, width.into(), Alignment::Left, None)),
             SetAttribute(Attribute::Reset)
         )?;
@@ -1621,10 +1627,10 @@ mod tests {
     }
 
     #[test]
-    fn campaign_banner_inverts_exactly_one_full_row_after_resize() {
+    fn campaign_banner_colors_exactly_one_full_row_after_resize() {
         let mut dashboard = dashboard();
         dashboard.campaign_name = "界面".into();
-        let reverse = SetAttribute(Attribute::Reverse).to_string();
+        let colors = SetColors(CAMPAIGN_BANNER_COLORS).to_string();
         let reset = SetAttribute(Attribute::Reset).to_string();
         for (width, expected) in [
             (20, "opsx-build  界面    "),
@@ -1634,11 +1640,12 @@ mod tests {
             let mut frame = Vec::new();
             dashboard.draw_to(&mut frame, width, 5).unwrap();
             let frame = String::from_utf8(frame).unwrap();
-            let (_, banner) = frame.split_once(&reverse).expect("reverse-video banner");
+            assert!(!frame.contains(&SetAttribute(Attribute::Reverse).to_string()));
+            let (_, banner) = frame.split_once(&colors).expect("colored campaign banner");
             let (text, rest) = banner.split_once(&reset).unwrap();
             assert_eq!(text, expected);
             assert!(rest.contains(&MoveTo(0, 1).to_string()));
-            assert!(!rest.contains(&reverse));
+            assert!(!rest.contains(&colors));
         }
     }
 
