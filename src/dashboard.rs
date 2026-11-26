@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use console::truncate_str;
+use console::{Alignment, pad_str, truncate_str};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
@@ -1040,13 +1040,15 @@ impl StreamDashboard {
         if resized {
             queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
         }
-        draw_row(
-            &mut output,
-            0,
-            width,
-            &format!("opsx-build  {}", self.campaign_name),
-            Color::Cyan,
-            true,
+        let title = format!("opsx-build  {}", self.campaign_name);
+        let title = truncate_str(&title, width.into(), "…");
+        queue!(
+            output,
+            MoveTo(0, 0),
+            SetAttribute(Attribute::Bold),
+            SetAttribute(Attribute::Reverse),
+            Print(pad_str(&title, width.into(), Alignment::Left, None)),
+            SetAttribute(Attribute::Reset)
         )?;
 
         if height > 1 {
@@ -1610,19 +1612,34 @@ mod tests {
     fn header_shows_change_name_when_known() {
         let mut dashboard = dashboard();
         assert_eq!(dashboard.header_text(), "/repo");
-        let mut frame = Vec::new();
-        dashboard.draw_to(&mut frame, 35, 1).unwrap();
-        assert!(
-            String::from_utf8(frame)
-                .unwrap()
-                .contains("opsx-build  Reader protection")
-        );
 
         dashboard.set_change_name(Some("slice-m-test-infrastructure".to_owned()));
         assert_eq!(
             dashboard.header_text(),
             "change: slice-m-test-infrastructure  /repo"
         );
+    }
+
+    #[test]
+    fn campaign_banner_inverts_exactly_one_full_row_after_resize() {
+        let mut dashboard = dashboard();
+        dashboard.campaign_name = "界面".into();
+        let reverse = SetAttribute(Attribute::Reverse).to_string();
+        let reset = SetAttribute(Attribute::Reset).to_string();
+        for (width, expected) in [
+            (20, "opsx-build  界面    "),
+            (14, "opsx-build  … "),
+            (1, "…"),
+        ] {
+            let mut frame = Vec::new();
+            dashboard.draw_to(&mut frame, width, 5).unwrap();
+            let frame = String::from_utf8(frame).unwrap();
+            let (_, banner) = frame.split_once(&reverse).expect("reverse-video banner");
+            let (text, rest) = banner.split_once(&reset).unwrap();
+            assert_eq!(text, expected);
+            assert!(rest.contains(&MoveTo(0, 1).to_string()));
+            assert!(!rest.contains(&reverse));
+        }
     }
 
     #[test]
