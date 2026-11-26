@@ -911,6 +911,26 @@ pub(crate) fn configure_stream_process(command: &mut Command) {
 #[cfg(not(unix))]
 pub(crate) fn configure_stream_process(_command: &mut Command) {}
 
+/// Capture a small status response, bounding the lifetime of the probe and its children.
+pub fn probe_output(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
+    configure_stream_process(command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let started = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() >= timeout {
+            kill_stream_process(&mut child)?;
+            child.wait()?;
+            bail!("status probe timed out after {}s", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(child.wait_with_output()?)
+}
+
 #[cfg(unix)]
 pub(crate) fn interrupt_stream_process(child: &mut Child) -> std::io::Result<()> {
     signal_process_group(child, libc::SIGINT)

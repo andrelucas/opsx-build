@@ -110,6 +110,10 @@ pub(super) fn remove(campaign: &Campaign, state: &Path) -> Result<()> {
     if anchor.try_exists()? {
         fs::remove_file(anchor)?;
     }
+    match fs::remove_file(state.with_extension("checkout")) {
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        result => result?,
+    }
     fs::remove_file(state)?;
     println!(
         "Cleaned up {instance}. Export: {}",

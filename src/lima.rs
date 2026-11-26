@@ -1,6 +1,7 @@
 //! Host-side VM lifecycle. The guest checkout owns the build state.
 mod cleanup;
 mod collect;
+mod list;
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -32,6 +33,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// List this user's registered campaign VMs and their current activity.
+    List,
     /// Create a campaign clone and stage the checkout for guest sign-in.
     Prepare {
         /// Name of an existing, stopped Lima base instance.
@@ -159,6 +162,10 @@ pub fn run_cli() -> Result<Option<i32>> {
         return Ok(None);
     }
     let Cli { repo, action } = Cli::parse_from(program.into_iter().chain(args));
+    if matches!(action, Action::List) {
+        list::show(&state_directory()?)?;
+        return Ok(Some(0));
+    }
     let ui = TerminalUi::new(false, false, false);
     let repo = repository_root(&repo, &ui)?.canonicalize()?;
     let state = state_path(&repo)?;
@@ -208,7 +215,15 @@ pub fn run_cli() -> Result<Option<i32>> {
     };
 
     let campaign = match fs::read(&state) {
-        Ok(bytes) => Some(serde_json::from_slice(&bytes).context("invalid Lima campaign record")?),
+        Ok(bytes) => {
+            let saved = serde_json::from_slice(&bytes).context("invalid Lima campaign record")?;
+            if !matches!(action, Action::Cleanup)
+                && let Err(error) = list::remember(&state, &repo)
+            {
+                eprintln!("Could not record the checkout name for 'lima list': {error:#}");
+            }
+            Some(saved)
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error).with_context(|| format!("reading {}", state.display())),
     };
@@ -331,7 +346,7 @@ pub fn run_cli() -> Result<Option<i32>> {
             }
             Ok(Some(0))
         }
-        Action::Prepare { .. } => unreachable!(),
+        Action::Prepare { .. } | Action::List => unreachable!(),
     }
 }
 
@@ -443,14 +458,18 @@ fn login_environment(names: &BTreeSet<String>, subscription: bool) -> Result<Str
     Ok(exports)
 }
 
-fn state_path(repo: &Path) -> Result<PathBuf> {
+fn state_directory() -> Result<PathBuf> {
     let root = env::var_os("XDG_STATE_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .context("set HOME or XDG_STATE_HOME to save the Lima campaign location")?;
+    Ok(root.join("opsx-build/lima"))
+}
+
+fn state_path(repo: &Path) -> Result<PathBuf> {
     let key = Sha256::digest(repo.as_os_str().as_encoded_bytes());
-    Ok(root.join("opsx-build/lima").join(format!("{key:x}.json")))
+    Ok(state_directory()?.join(format!("{key:x}.json")))
 }
 
 fn save(path: &Path, campaign: &Campaign) -> Result<()> {
@@ -527,6 +546,7 @@ fn prepare(
             guest_dir: None,
             exported: None,
         };
+        list::remember(state, repo)?;
         save(state, &campaign)?;
         campaign
     };

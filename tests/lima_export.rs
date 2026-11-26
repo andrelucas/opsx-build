@@ -590,7 +590,7 @@ fn cleanup_requires_a_successful_export_and_a_current_guest_and_host_copy() {
             .unwrap()
             .any(|e| matches!(
                 e.unwrap().path().extension().and_then(|s| s.to_str()),
-                Some("json" | "export-base")
+                Some("json" | "export-base" | "checkout")
             ))
     );
 }

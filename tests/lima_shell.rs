@@ -44,6 +44,10 @@ fn shell_opens_the_recorded_checkout_while_run_holds_the_lock() {
     fs::write(&state, r#"{"instance":"test-vm","base":"base","resources":{},"guest_dir":"/guest/campaign with spaces"}"#).unwrap();
 
     let shell = invoke(&["shell"]);
+    assert_eq!(
+        fs::read_link(state.with_extension("checkout")).unwrap(),
+        repo.canonicalize().unwrap()
+    );
     assert!(String::from_utf8_lossy(&shell.stderr).contains(&format!(
         "Lima campaign: {} → test-vm:/guest/campaign with spaces",
         repo.canonicalize().unwrap().display()

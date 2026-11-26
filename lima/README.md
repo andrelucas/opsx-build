@@ -90,6 +90,16 @@ Ubuntu base with the tools that campaign needs.
 opsx-build lima prepare --base campaign-base
 ```
 
+From any directory on the Lima host, run `opsx-build lima list` to see the
+registered campaign checkouts, their instances, VM power state and run status.
+Active runs appear first. The launcher checks for a runner in the guest checkout,
+including one launched from a guest shell, and reads the last checkpoint stage.
+A powered-on guest can show `Done` or `Idle`. A stopped VM shows `Not running`
+and stays stopped. An unreachable running guest shows `Unknown`.
+
+New registrations remember the host checkout name. Older registrations show
+the guest path until a campaign command is used from the original host checkout.
+
 To set resources per campaign, put this optional file in the campaign root
 as `opsx-build.lima.toml`. Memory and disk are in GiB.
 
