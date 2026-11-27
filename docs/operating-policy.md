@@ -20,7 +20,7 @@ output/provider retry, remediation and capacity-recovery limits still apply.
 | `max_requests_per_stage` | 12 | Runner-dispatched backend requests for a stage/change, including continuations, compatibility retries and billable compaction/naming operations. |
 | `max_replans_without_verified_progress` | 2 | Capacity-recovery attempts without an intervening independent Verify/acceptance milestone. Checked before restoring a candidate's baseline. |
 | `max_request_seconds` | 3600 | Apply/Repair reassessment point; other model requests retain this runtime limit. |
-| `request_progress_grace_seconds` | 900 | Reassessment window after fresh implementation or check observations in Apply/Repair. |
+| `request_progress_grace_seconds` | 900, or 1800 with `--frontier-worker` | Reassessment window after fresh implementation or check observations in Apply/Repair. |
 | `max_active_seconds` | unset | Optional cumulative active time across normal resumes, including independent acceptance. Paused/offline time is excluded. |
 
 These are operating defaults, not claims that a particular round count diagnoses
@@ -90,9 +90,9 @@ independently observed process liveness. These rules are deterministic signals,
 not semantic correctness judgments; no model classifier is called.
 
 The existing `opsx-build check` receipt rules also remain in force. An eligible
-check can run within its own timeout, or earn 15 minutes after new evidence. A
-first completed execution, a failure-to-pass transition, or a fresh execution with
-known changed inputs counts. A live command can run to its own timeout. Once a
+check can run within its own timeout or earn the selected grace window after new
+evidence. A first completed execution, a failure-to-pass transition, or a fresh
+execution with known changed inputs counts. A live command can run to its own timeout. Once a
 receipt for that command and working directory has supported continuing the
 dispatch, a repeat can qualify while running if the receipts show changed
 execution inputs.

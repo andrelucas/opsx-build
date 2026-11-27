@@ -113,6 +113,32 @@ fn pending_bounded_check_outlives_the_hour_and_expires_at_its_own_deadline() {
 }
 
 #[test]
+fn frontier_worker_allows_a_quiet_check_to_run_for_half_an_hour() {
+    for frontier_worker in [false, true] {
+        let f = Fixture::new(Policy::load(None, frontier_worker).unwrap());
+        let guard = f.run.open(None).unwrap();
+        let mut usage = request(&f.root, "quiet gate");
+        usage.context.stage = Some("Apply".into());
+        guard.before_request(&usage).unwrap();
+        age_request(&guard, 2600);
+        guard.observe_agent(
+            &usage,
+            "tool_call",
+            serde_json::json!({
+                "call_id":"gate", "name":"Bash", "input":{"command":"go test ./..."}
+            }),
+        );
+        // First reassessment, just over 16 minutes into the gate.
+        age_request(&guard, 3601);
+        if frontier_worker {
+            guard.poll().unwrap();
+            age_request(&guard, 4401);
+        }
+        assert!(is_stop(&guard.poll().unwrap_err()));
+    }
+}
+
+#[test]
 fn completed_check_releases_its_long_wait_and_recent_result_grace_expires() {
     let f = Fixture::new(Policy::default());
     let guard = f.run.open(None).unwrap();
@@ -406,6 +432,22 @@ fn progress_grace_defaults_on_and_an_explicit_opt_out_survives_resume() {
     let guard = f.run.open(None).unwrap();
     assert_eq!(f.ledger().policy.request_progress_grace_seconds, None);
     drop(guard);
+}
+
+#[test]
+fn explicit_progress_grace_overrides_the_frontier_default_including_null() {
+    let f = Fixture::new(Policy::default());
+    let path = f.root.join("policy.json");
+    for (contents, expected) in [
+        (r#"{"max_request_seconds":120}"#, Some(1800)),
+        (r#"{"request_progress_grace_seconds":900}"#, Some(900)),
+        (r#"{"request_progress_grace_seconds":72}"#, Some(72)),
+        (r#"{"request_progress_grace_seconds":null}"#, None),
+    ] {
+        fs::write(&path, contents).unwrap();
+        let policy = Policy::load(Some(&path), true).unwrap();
+        assert_eq!(policy.request_progress_grace_seconds, expected);
+    }
 }
 
 #[cfg(unix)]
@@ -748,7 +790,7 @@ fn policy_limits_are_validated_and_concurrent_resume_cannot_double_spend_the_all
     let path = f.root.join("policy.json");
     for invalid in [r#"{"max_no_progress_reviews":0}"#, r#"{"max_cost_usd":1}"#] {
         fs::write(&path, invalid).unwrap();
-        assert!(Policy::read(&path).is_err());
+        assert!(Policy::load(Some(&path), false).is_err());
     }
     let _guard = f.run.open(None).unwrap();
     assert!(

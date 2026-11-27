@@ -113,13 +113,7 @@ impl<U: Ui> App<U> {
         let _guard = if self.cli.dry_run {
             None
         } else {
-            let policy = self
-                .cli
-                .operating_policy
-                .as_ref()
-                .map(|path| crate::operating_policy::Policy::read(&repo.join(path)))
-                .transpose()?
-                .unwrap_or_default();
+            let policy = self.configured_policy(repo)?;
             let run = crate::operating_policy::Run::new(repo, policy, &self.ui)?;
             let guard = Arc::new(run.open(None)?);
             self.ui.set_operating_policy(guard.clone())?;

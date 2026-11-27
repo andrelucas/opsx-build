@@ -701,14 +701,21 @@ fn request_guard_bounds_internal_continuations_and_policy_files_are_pinned_until
     let policy = f.root.join("operating.json");
     fs::write(&policy, r#"{"max_requests_per_stage":1}"#).unwrap();
     let option = format!("--operating-policy={}", policy.display());
-    let result = f.run_with("review-incomplete-loop", true, &[&option]);
+    let result = f.run_with(
+        "review-incomplete-loop",
+        true,
+        &["--frontier-worker", &option],
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("OPERATING POLICY STOP"), "{stderr}");
     assert_eq!(f.calls(), 1); // No second backend continuation was purchased.
     assert_eq!(f.state()["stage"], "apply");
     let directory = PathBuf::from(f.state()["operating"]["directory"].as_str().unwrap());
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap();
+    let stop_report = || -> serde_json::Value {
+        serde_json::from_slice(&fs::read(directory.join("stop.json")).unwrap()).unwrap()
+    };
+    let report = stop_report();
+    assert_eq!(report["policy"]["request_progress_grace_seconds"], 1800);
     assert_eq!(report["trigger"], "request_limit");
     assert!(
         report["unfinished_stage"]
@@ -719,6 +726,10 @@ fn request_guard_bounds_internal_continuations_and_policy_files_are_pinned_until
     fs::write(&policy, r#"{"max_requests_per_stage":2}"#).unwrap();
     f.run("review-incomplete-loop", true); // Editing the source file cannot silently raise a limit.
     assert_eq!(f.calls(), 1);
+    assert_eq!(
+        stop_report()["policy"]["request_progress_grace_seconds"],
+        1800
+    );
     f.run_with("review-incomplete-loop", true, &[&option]);
     assert_eq!(f.calls(), 2);
     assert_eq!(f.state()["too_large"], serde_json::Value::Null);

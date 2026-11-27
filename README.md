@@ -669,9 +669,12 @@ For agenda sizing, the frontier planner assumes a smaller local worker by
 default. Pass `--frontier-worker` when your selected worker is a frontier-capable
 model, for example `opsx-build execute --frontier-worker`. This adjusts the
 planner's capacity assumption during bootstrap, frontier replanning, and
-acceptance remediation. It does not select a connection or model, change stage
-timeouts, or relax the evidence required for `TOO_LARGE`. Both modes plan
-coherent, testable delivery slices and keep internal steps as tasks within them.
+acceptance remediation. On a new run it also doubles the default Apply/Repair
+progress grace from 15 to 30 minutes. An explicit `request_progress_grace_seconds`
+in the operating policy takes precedence. Resume uses the run's saved policy.
+Connection selection, stage deadlines and the evidence required for `TOO_LARGE`
+are independent of this flag. Both modes plan coherent, testable delivery slices
+and keep internal steps as tasks within them.
 
 Use `--frontier-worker` on subsequent invocations, including `--resume`, or set
 `frontier_worker = true` in the config file (environment equivalent:

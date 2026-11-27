@@ -1553,6 +1553,15 @@ impl<U: Ui> App<U> {
         self.run_workflows(repo, launcher, frontier_launcher, commands, state)
     }
 
+    fn configured_policy(&self, repo: &Path) -> Result<crate::operating_policy::Policy> {
+        let path = self
+            .cli
+            .operating_policy
+            .as_ref()
+            .map(|path| repo.join(path));
+        crate::operating_policy::Policy::load(path.as_deref(), self.cli.frontier_worker)
+    }
+
     fn run_workflows(
         &self,
         repo: &Path,
@@ -1561,22 +1570,20 @@ impl<U: Ui> App<U> {
         commands: &SkillCommands,
         mut state: RunState,
     ) -> Result<()> {
-        let selected_policy = self
-            .cli
-            .operating_policy
-            .as_ref()
-            .filter(|_| state.operating.is_none() || self.cli.operating_policy_explicit)
-            .map(|path| crate::operating_policy::Policy::read(&self.cli.repo.join(path)))
-            .transpose()?;
-        if state.operating.is_none() {
+        let revision = if state.operating.is_none() {
             state.operating = Some(crate::operating_policy::Run::new(
                 repo,
-                selected_policy.clone().unwrap_or_default(),
+                self.configured_policy(&self.cli.repo)?,
                 &self.ui,
             )?);
             persist_state(repo, &state, &self.ui)?;
-        }
-        let guard = Arc::new(state.operating.as_ref().unwrap().open(selected_policy)?);
+            None
+        } else if self.cli.operating_policy_explicit {
+            Some(self.configured_policy(&self.cli.repo)?)
+        } else {
+            None
+        };
+        let guard = Arc::new(state.operating.as_ref().unwrap().open(revision)?);
         self.ui.set_operating_policy(guard.clone())?;
         state.checks.ensure(repo, &self.ui)?;
         if let Some(contracts) = &mut state.contracts

@@ -582,7 +582,7 @@ pub(crate) struct CliArgs {
     #[arg(long, overrides_with = "local_only")]
     no_local_only: bool,
 
-    /// Plan delivery slices for a frontier-capable worker instead of a smaller local model.
+    /// Plan for a frontier-capable worker and default to 30 minutes of Apply/Repair progress grace.
     #[arg(
         long,
         env = "OPSX_BUILD_FRONTIER_WORKER",
@@ -590,7 +590,7 @@ pub(crate) struct CliArgs {
     )]
     frontier_worker: bool,
 
-    /// Plan for a smaller worker when frontier-worker is configured.
+    /// Use smaller-worker planning and the normal 15-minute progress grace by default.
     #[arg(long, overrides_with = "frontier_worker")]
     no_frontier_worker: bool,
 
@@ -2361,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_worker_defaults_to_false_and_only_changes_planning_capacity() {
+    fn frontier_worker_defaults_off_and_preserves_connections_and_stage_timeout() {
         let default = resolve_values(args(["opsx-build"]), FileConfig::default(), None).unwrap();
         assert!(!default.frontier_worker);
         for request in ["bootstrap", "execute", "advance"] {

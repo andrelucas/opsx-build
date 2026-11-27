@@ -32,23 +32,40 @@ pub(crate) struct Policy {
 
 impl Default for Policy {
     fn default() -> Self {
+        Self::for_worker(false)
+    }
+}
+
+impl Policy {
+    fn for_worker(frontier_worker: bool) -> Self {
         Self {
             max_no_progress_reviews: 2,
             max_recurring_finding_reviews: 2,
             max_requests_per_stage: 12,
             max_replans_without_verified_progress: 2,
             max_request_seconds: 3600,
-            request_progress_grace_seconds: Some(900),
+            request_progress_grace_seconds: Some(if frontier_worker { 30 * 60 } else { 15 * 60 }),
             max_active_seconds: None,
             acknowledge_unresolved_requests: Vec::new(),
         }
     }
-}
 
-impl Policy {
-    pub(crate) fn read(path: &Path) -> Result<Self> {
-        let policy: Self = serde_json::from_slice(&fs::read(path)?)
+    pub(crate) fn load(path: Option<&Path>, frontier_worker: bool) -> Result<Self> {
+        let defaults = Self::for_worker(frontier_worker);
+        let Some(path) = path else {
+            return Ok(defaults);
+        };
+        let bytes = fs::read(path)?;
+        let mut policy: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid operating policy {}", path.display()))?;
+        // An explicit 900 or null must win even when selecting frontier defaults.
+        if frontier_worker
+            && serde_json::from_slice::<serde_json::Value>(&bytes)?
+                .get("request_progress_grace_seconds")
+                .is_none()
+        {
+            policy.request_progress_grace_seconds = defaults.request_progress_grace_seconds;
+        }
         if policy.max_no_progress_reviews == 0
             || policy.max_recurring_finding_reviews == 0
             || policy.max_requests_per_stage == 0
