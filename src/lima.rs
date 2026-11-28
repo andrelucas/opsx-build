@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
+use opsx_build::network::Requirements;
 use opsx_build::{git::repository_root, process::shell_quote, ui::TerminalUi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -283,7 +284,9 @@ pub fn run_cli() -> Result<Option<i32>> {
         }
         Action::Run { args } => run_guest(&campaign, guest_dir, args).map(Some),
         Action::Sync { resume } => {
+            let network = Requirements::read(&repo)?;
             collect::sync(&campaign.instance, guest_dir, &repo, &state)?;
+            install_network(&campaign.instance, &network)?;
             if resume {
                 let code = run_guest(&campaign, guest_dir, vec!["accept-changes".into()])?;
                 if code != 0 {
@@ -501,6 +504,7 @@ fn prepare(
     resources: Resources,
     env: BTreeSet<String>,
 ) -> Result<()> {
+    let network = Requirements::read(repo)?;
     ensure!(
         fs::symlink_metadata(repo.join(".git")).is_ok_and(|entry| entry.is_dir())
             && !repo.join(".git/objects/info/alternates").exists(),
@@ -617,6 +621,7 @@ printf '%s\n' "$parent/$1""#,
             "installing the guest login environment failed"
         );
     }
+    install_network(&campaign.instance, &network)?;
     campaign.guest_dir = Some(guest_dir.clone());
     save(state, &campaign)?;
     let instance = &campaign.instance;
@@ -625,6 +630,40 @@ printf '%s\n' "$parent/$1""#,
     if !campaign.resources.claude_subscription {
         println!("Use the guest shell to set up agent sign-in and connections.");
     }
+    Ok(())
+}
+
+fn install_network(instance: &str, network: &Requirements) -> Result<()> {
+    let mut command = shell(instance, "/tmp");
+    command.args([
+        "bash",
+        "-c",
+        r#"set -eu
+if [ "$1" = empty ] && [ ! -e /etc/opsx-build/campaign-network.json ]; then exit 0; fi
+test "$("$HOME/.local/bin/opsx-campaign" --network-policy-version)" = 1 || {
+    echo 'Update the builder launcher to support campaign network requirements.' >&2; exit 1
+}
+exec /usr/bin/sudo -n /bin/sh -ec '
+    PATH=/usr/bin:/bin
+    dir=/etc/opsx-build
+    install -d -m 0755 "$dir"
+    tmp=$(mktemp "$dir/.campaign-network.XXXXXXXX")
+    trap "rm -f -- \"$tmp\"" EXIT
+    cat > "$tmp"
+    chmod 0644 "$tmp"
+    mv -fT "$tmp" "$dir/campaign-network.json"
+' "#,
+        "opsx-build",
+        if network.is_empty() {
+            "empty"
+        } else {
+            "configured"
+        },
+    ]);
+    ensure!(
+        with_input(&mut command, &serde_json::to_string(network)?)?.success(),
+        "could not install the maintainer's network requirements in {instance}"
+    );
     Ok(())
 }
 

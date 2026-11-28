@@ -66,7 +66,7 @@ impl<U: Ui> App<U> {
         )
     }
 
-    pub(super) fn preflight(&self, repo: &Path) -> Result<()> {
+    pub(super) fn preflight(&self, repo: &Path, network_declared: bool) -> Result<()> {
         let path = crate::git::metadata_path(repo, &self.ui, "opsx-build")?.join("last-run.json");
         let saved = if path.exists() {
             Some(load_state_file(&path)?)
@@ -75,6 +75,11 @@ impl<U: Ui> App<U> {
         };
         let contracts = match self.capture_contracts(repo)? {
             Some(contracts) => contracts,
+            None if network_declared
+                && saved.as_ref().is_none_or(|state| state.contracts.is_none()) =>
+            {
+                return Ok(());
+            }
             None => {
                 let previous = saved.as_ref().and_then(|state| state.contracts.as_ref())
                     .context("preflight requires supplied contracts from campaign settings, --supplied-contracts --contract PATH, or an existing supplied-contract checkpoint")?;

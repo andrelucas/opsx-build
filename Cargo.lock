@@ -580,6 +580,7 @@ dependencies = [
  "sha2",
  "toml",
  "ureq",
+ "url",
  "uuid",
 ]
 

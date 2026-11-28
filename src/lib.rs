@@ -18,6 +18,7 @@ pub mod corpus;
 mod dashboard;
 pub mod git;
 pub mod model_confusions;
+pub mod network;
 pub mod opencode;
 mod opencode_server;
 pub mod openspec;

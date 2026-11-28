@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $# == 1 && $1 == --network-policy-version ]]; then
+  echo 1
+  exit
+fi
+export OPSX_BUILD_APPROVED_NETWORK=/etc/opsx-build/campaign-network.json
+network_args=()
+if [[ -f "$OPSX_BUILD_APPROVED_NETWORK" ]]; then
+  hosts=$(/usr/bin/jq -r '.http_hosts | keys[]' "$OPSX_BUILD_APPROVED_NETWORK")
+  while IFS= read -r host; do
+    if [[ -n "$host" ]]; then network_args+=(--allow-domain "$host"); fi
+  done <<< "$hosts"
+fi
 exec nono run --profile "$HOME/.local/share/campaign-builder/network.json" \
-  --allow-cwd -- opsx-build --no-harness-sandbox "$@"
+  "${network_args[@]}" --allow-cwd -- opsx-build --no-harness-sandbox "$@"

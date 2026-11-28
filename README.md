@@ -167,6 +167,36 @@ input. These instructions guide model judgment; the runner's structural agenda
 checks cannot prove semantic conformance. Updating the binary changes subsequent
 stage prompts, not a model invocation that is already running.
 
+### Campaign network requirements
+
+A maintainer can create or edit `opsx-build.network.toml` at the campaign Git
+root. The runner reads it on each preflight, launch and resume, so editing it
+requires no new `autoconfigure` step.
+
+```toml
+[http_hosts]
+"kube.example.org" = ["https://kube.example.org:6443/readyz"]
+"registry.example.org" = ["https://registry.example.org/v2/"]
+```
+
+Under `[http_hosts]`, add one quoted key per lowercase hostname or IP address.
+Each key requests HTTP(S) proxy access to that host across its ports and paths.
+List one or more read-only probe URLs for the same host in the array. To move a
+service, change its URL and, if its address changed, rename the key too. Delete
+the entry to withdraw that campaign's request for the host.
+
+Each probe must return 2xx to an unauthenticated GET at the specified port
+and path. The check uses the runner's proxy and TLS trust settings and does
+not follow redirects. Credentials, query strings, fragments and wildcards are
+rejected. For Lima, edit the host checkout and sync it to the clone before
+testing. [Lima network configuration and private CAs](lima/README.md#campaign-network-access)
+
+Standalone `preflight`, launch and resume check the declared requirements
+before starting an agent. A failed probe reports the endpoint or capability
+and leaves the checkpoint in place. A cached contract review never skips these
+network checks. With only a network declaration, standalone preflight needs
+neither supplied contracts nor an agent connection.
+
 ### Implementing supplied contracts
 
 For campaigns whose behaviour and component scope are already specified, select

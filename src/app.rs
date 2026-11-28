@@ -641,6 +641,14 @@ impl<U: Ui> App<U> {
 
         prerequisite_exists("git", &requested_repo, &self.ui)?;
         let product_repo = repository_root(&requested_repo, &self.ui)?;
+        let check_network = !self.cli.forget
+            && !self.cli.update_skills
+            && !matches!(
+                self.cli.request.as_str(),
+                "accept-changes" | "render-agenda" | "check-agenda" | "rewind"
+            );
+        let network_declared =
+            check_network && crate::network::preflight(&product_repo, &self.ui, self.cli.dry_run)?;
         if self.cli.flush_preflight_cache || self.cli.request == "preflight" {
             crate::preflight::flush(&product_repo, &self.ui, self.cli.dry_run)?;
         }
@@ -648,7 +656,7 @@ impl<U: Ui> App<U> {
             return self.accept_changes(&product_repo);
         }
         if self.cli.request == "preflight" {
-            return self.preflight(&product_repo);
+            return self.preflight(&product_repo, network_declared);
         }
         if matches!(self.cli.request.as_str(), "render-agenda" | "check-agenda") {
             let state = load_state(&product_repo, &self.ui)?;

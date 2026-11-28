@@ -167,6 +167,64 @@ If the origin of a changed, untracked input is ambiguous, export reports the pat
 When the VM generates a new `.git/opsx-build/contract-preflight.json`, its report
 replaces an earlier preflight report in the host checkout.
 
+### Campaign network access
+
+Edit `opsx-build.network.toml` at the Git root of the **original host checkout**.
+For a Kubernetes API, use its address as the quoted key and its readiness URL
+as the value. Substitute your cluster's address and port in this example.
+
+```toml
+[http_hosts]
+"192.0.2.45" = ["https://192.0.2.45:6443/readyz"]
+```
+
+`lima prepare` picks up the file when creating a clone. For an existing
+paused campaign, run these commands from the host checkout after adding,
+changing or removing an entry. Uncommitted edits are sufficient.
+
+```sh
+opsx-build lima sync
+opsx-build lima run -- preflight
+```
+
+Sync updates the clone's copy of the host declaration in
+`/etc/opsx-build/campaign-network.json`. The guest wrapper grants nono proxied
+HTTP(S) access to each declared host. Preflight checks the exact URL inside
+that policy and leaves the campaign paused. Existing installations need the
+updated host launcher, guest binary and guest wrapper.
+[Campaign network file format](../README.md#campaign-network-requirements)
+
+#### When the service uses a private CA
+
+If curl reports `unable to get local issuer certificate`, the clone needs the
+public CA that signed the service certificate. For Kubernetes, use a trusted
+kubeconfig on the host. Set `kubeconfig` to its path and `vm` to the campaign's
+instance name from `opsx-build lima list`. Check that the selected cluster's
+server matches the declared address.
+
+```sh
+kubectl --kubeconfig="$kubeconfig" config view --minify \
+  -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+```
+
+For a cluster with a single CA certificate, run the following on the host.
+It copies only that public certificate into the Ubuntu clone's system trust
+store and repeats preflight.
+
+```sh
+kubectl --kubeconfig="$kubeconfig" config view --minify --flatten --raw \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' |
+  openssl base64 -d -A |
+  limactl shell --workdir /tmp "$vm" sudo -n openssl x509 \
+    -out /usr/local/share/ca-certificates/campaign-cluster.crt &&
+  limactl shell --workdir /tmp "$vm" sudo -n update-ca-certificates &&
+  opsx-build lima run -- preflight
+```
+
+A passing `/readyz` check establishes HTTPS reachability. An acceptance gate
+that uses Kubernetes also needs its own kubeconfig and credentials in the
+clone, and the gate must select that cluster.
+
 ### Correct a blocked campaign from the host
 
 Wait for the blocked run to exit. Edit the contract, acceptance files or campaign
